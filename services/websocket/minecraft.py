@@ -17,10 +17,10 @@ logger = get_logger(__name__)
 
 # 命令前缀定义
 COMMANDS = {
-    "GPT 聊天": "chat",
-    "GPT 脚本": "chat_script",
-    "GPT 保存": "save",
-    "GPT 上下文": "context",
+    "AGENT 聊天": "chat",
+    "AGENT 脚本": "chat_script",
+    "AGENT 保存": "save",
+    "AGENT 上下文": "context",
     "运行命令": "run_command",
     "切换模型": "switch_model",
     "帮助": "help",
@@ -46,7 +46,7 @@ class MinecraftProtocolHandler:
         """创建欢迎消息"""
         message = f"""
 -----------
-成功连接 MCBE GPT Agent v2.0
+成功连接 MCBE AI Agent v2.0
 连接 ID: {connection_id[:8]}...
 当前模型: {provider}/{model}
 上下文: {'启用' if context_enabled else '关闭'}
@@ -130,11 +130,11 @@ class MinecraftProtocolHandler:
         """获取帮助文本"""
         return """
 可用命令:
-• GPT 聊天 <内容> - 与 AI 对话
-• GPT 脚本 <内容> - 使用脚本事件发送
-• GPT 上下文 <启用/关闭/状态> - 管理上下文
+• AGENT 聊天 <内容> - 与 AI 对话
+• AGENT 脚本 <内容> - 使用脚本事件发送
+• AGENT 上下文 <启用/关闭/状态> - 管理上下文
 • 切换模型 <provider> - 切换 LLM (deepseek/openai/anthropic/ollama)
-• GPT 保存 - 保存对话历史
+• AGENT 保存 - 保存对话历史
 • 运行命令 <命令> - 执行游戏命令
 • 帮助 - 显示此帮助
         """.strip()

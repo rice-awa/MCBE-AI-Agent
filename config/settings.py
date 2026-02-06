@@ -52,7 +52,7 @@ class Settings(BaseSettings):
 
     # DeepSeek 配置
     deepseek_api_key: str | None = Field(default=None, alias="DEEPSEEK_API_KEY")
-    deepseek_model: str = "deepseek-reasoner"
+    deepseek_model: str = "deepseek-chat"
     deepseek_base_url: str = "https://api.deepseek.com"
 
     # OpenAI 配置

@@ -179,15 +179,15 @@ python -m mcbe_ai_agent.main
 ### 3. 开始聊天
 
 ```
-GPT 聊天 你好，请介绍一下自己
+AGENT 聊天 你好，请介绍一下自己
 ```
 
 ### 4. 其他命令
 
 ```
-GPT 上下文 启用          # 启用对话上下文
-GPT 上下文 关闭          # 关闭对话上下文
-GPT 上下文 状态          # 查看当前状态
+AGENT 上下文 启用          # 启用对话上下文
+AGENT 上下文 关闭          # 关闭对话上下文
+AGENT 上下文 状态          # 查看当前状态
 切换模型 openai          # 切换到 OpenAI
 切换模型 deepseek        # 切换回 DeepSeek
 帮助                     # 显示帮助信息
