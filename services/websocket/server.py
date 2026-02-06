@@ -1,0 +1,330 @@
+"""WebSocket 服务器"""
+
+import asyncio
+import json
+from typing import Any
+
+import websockets
+from websockets.server import WebSocketServerProtocol, serve
+
+from mcbe_ai_agent.core.queue import MessageBroker
+from mcbe_ai_agent.services.websocket.connection import ConnectionManager
+from mcbe_ai_agent.services.websocket.minecraft import MinecraftProtocolHandler
+from mcbe_ai_agent.services.auth.jwt_handler import JWTHandler
+from mcbe_ai_agent.config.settings import Settings
+from mcbe_ai_agent.config.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class WebSocketServer:
+    """
+    WebSocket 服务器
+
+    职责:
+    - 接受 Minecraft 客户端连接
+    - 处理玩家消息和命令
+    - 将聊天请求提交到消息队列
+    - 响应发送由 ConnectionManager 独立处理
+    """
+
+    def __init__(
+        self,
+        broker: MessageBroker,
+        settings: Settings,
+        jwt_handler: JWTHandler,
+    ):
+        self.broker = broker
+        self.settings = settings
+        self.jwt_handler = jwt_handler
+        self.connection_manager = ConnectionManager(broker)
+        self.protocol_handler = MinecraftProtocolHandler()
+        self._server: Any = None
+
+    async def start(self) -> None:
+        """启动 WebSocket 服务器"""
+        ws_config = self.settings.websocket
+
+        self._server = await serve(
+            self.handle_connection,
+            self.settings.host,
+            self.settings.port,
+            ping_interval=ws_config.ping_interval,
+            ping_timeout=ws_config.ping_timeout,
+            close_timeout=ws_config.close_timeout,
+            max_size=ws_config.max_size,
+            max_queue=ws_config.max_queue,
+        )
+
+        logger.info(
+            "websocket_server_started",
+            host=self.settings.host,
+            port=self.settings.port,
+        )
+
+    async def stop(self) -> None:
+        """停止 WebSocket 服务器"""
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+
+        logger.info("websocket_server_stopped")
+
+    async def handle_connection(self, websocket: WebSocketServerProtocol) -> None:
+        """
+        处理单个 WebSocket 连接
+
+        Args:
+            websocket: WebSocket 连接
+        """
+        # 注册连接
+        state = await self.connection_manager.register(websocket)
+
+        try:
+            # 发送初始化消息
+            await websocket.send(json.dumps({"Result": "true"}))
+
+            # 订阅玩家消息事件
+            subscribe_msg = self.protocol_handler.create_subscribe_message()
+            await websocket.send(subscribe_msg)
+
+            # 发送欢迎消息
+            welcome_text = self.protocol_handler.create_welcome_message(
+                connection_id=str(state.id),
+                model=self.settings.get_provider_config().model,
+                provider=self.settings.default_provider,
+                context_enabled=state.context_enabled,
+            )
+            welcome_cmd = self.protocol_handler.create_info_message(welcome_text)
+            await websocket.send(welcome_cmd)
+
+            logger.info(
+                "client_connected",
+                connection_id=str(state.id),
+            )
+
+            # 处理消息循环
+            async for message in websocket:
+                await self.handle_message(state, message)
+
+        except websockets.exceptions.ConnectionClosed:
+            logger.info(
+                "client_disconnected",
+                connection_id=str(state.id),
+            )
+        except Exception as e:
+            logger.error(
+                "connection_error",
+                connection_id=str(state.id),
+                error=str(e),
+                exc_info=True,
+            )
+        finally:
+            # 注销连接
+            await self.connection_manager.unregister(state.id)
+
+    async def handle_message(self, state: Any, message: str) -> None:
+        """
+        处理接收到的消息
+
+        Args:
+            state: 连接状态
+            message: 消息内容（JSON 字符串）
+        """
+        try:
+            data = json.loads(message)
+
+            # 解析玩家消息
+            player_event = self.protocol_handler.parse_player_message(data)
+            if not player_event:
+                return
+
+            # 更新玩家名称
+            if player_event.sender and not state.player_name:
+                state.player_name = player_event.sender
+
+            # 解析命令
+            cmd_type, content = self.protocol_handler.parse_command(
+                player_event.message
+            )
+
+            if not cmd_type:
+                return  # 不是命令，忽略
+
+            logger.info(
+                "command_received",
+                connection_id=str(state.id),
+                command=cmd_type,
+                player=player_event.sender,
+            )
+
+            # 处理命令
+            await self.handle_command(state, cmd_type, content)
+
+        except json.JSONDecodeError:
+            logger.warning(
+                "invalid_json",
+                connection_id=str(state.id),
+            )
+        except Exception as e:
+            logger.error(
+                "message_handling_error",
+                connection_id=str(state.id),
+                error=str(e),
+                exc_info=True,
+            )
+
+    async def handle_command(
+        self, state: Any, cmd_type: str, content: str
+    ) -> None:
+        """
+        处理命令
+
+        Args:
+            state: 连接状态
+            cmd_type: 命令类型
+            content: 命令内容
+        """
+        # 登录命令不需要认证
+        if cmd_type == "login":
+            await self.handle_login(state, content)
+            return
+
+        # 其他命令需要认证
+        if not await self.check_auth(state):
+            error_msg = self.protocol_handler.create_error_message("请先登录")
+            await state.websocket.send(error_msg)
+            return
+
+        # 路由到具体处理器
+        if cmd_type == "chat" or cmd_type == "chat_script":
+            await self.handle_chat(state, content)
+        elif cmd_type == "context":
+            await self.handle_context(state, content)
+        elif cmd_type == "switch_model":
+            await self.handle_switch_model(state, content)
+        elif cmd_type == "help":
+            await self.handle_help(state)
+        elif cmd_type == "save":
+            await self.handle_save(state)
+        elif cmd_type == "run_command":
+            await self.handle_run_command(state, content)
+
+    async def handle_login(self, state: Any, password: str) -> None:
+        """处理登录"""
+        if self.jwt_handler.verify_password(password):
+            # 检查是否已有有效 token
+            if self.jwt_handler.is_token_valid(str(state.id)):
+                msg = self.protocol_handler.create_info_message("您已登录")
+                await state.websocket.send(msg)
+                return
+
+            # 生成新 token
+            token = self.jwt_handler.generate_token()
+            self.jwt_handler.save_token(str(state.id), token)
+            state.authenticated = True
+
+            msg = self.protocol_handler.create_success_message("登录成功！")
+            await state.websocket.send(msg)
+
+            logger.info("user_authenticated", connection_id=str(state.id))
+        else:
+            msg = self.protocol_handler.create_error_message("密码错误")
+            await state.websocket.send(msg)
+
+    async def check_auth(self, state: Any) -> bool:
+        """检查认证状态"""
+        stored_token = self.jwt_handler.get_stored_token(str(state.id))
+        if stored_token and self.jwt_handler.verify_token(stored_token):
+            state.authenticated = True
+            return True
+        return False
+
+    async def handle_chat(self, state: Any, content: str) -> None:
+        """处理聊天请求（非阻塞）"""
+        if not content:
+            msg = self.protocol_handler.create_error_message("请输入聊天内容")
+            await state.websocket.send(msg)
+            return
+
+        # 创建聊天请求
+        chat_req = self.protocol_handler.create_chat_request(state, content)
+
+        # 提交到消息队列（非阻塞！）
+        try:
+            await self.broker.submit_request(state.id, chat_req, priority=0)
+            logger.debug(
+                "chat_request_queued",
+                connection_id=str(state.id),
+                content_length=len(content),
+            )
+        except asyncio.QueueFull:
+            msg = self.protocol_handler.create_error_message(
+                "服务器繁忙，请稍后重试"
+            )
+            await state.websocket.send(msg)
+
+    async def handle_context(self, state: Any, option: str) -> None:
+        """处理上下文管理"""
+        if option == "启用":
+            state.context_enabled = True
+            msg = self.protocol_handler.create_success_message("上下文已启用")
+        elif option == "关闭":
+            state.context_enabled = False
+            msg = self.protocol_handler.create_success_message("上下文已关闭")
+        elif option == "状态":
+            status = "启用" if state.context_enabled else "关闭"
+            msg = self.protocol_handler.create_info_message(f"上下文状态: {status}")
+        else:
+            msg = self.protocol_handler.create_error_message(
+                "无效选项，请使用: 启用/关闭/状态"
+            )
+
+        await state.websocket.send(msg)
+
+    async def handle_switch_model(self, state: Any, provider: str) -> None:
+        """处理模型切换"""
+        available = self.settings.list_available_providers()
+
+        if provider.lower() in available:
+            state.current_provider = provider.lower()
+            config = self.settings.get_provider_config(provider.lower())
+            msg = self.protocol_handler.create_success_message(
+                f"已切换到 {provider}/{config.model}"
+            )
+        else:
+            msg = self.protocol_handler.create_error_message(
+                f"不可用的提供商。可用: {', '.join(available)}"
+            )
+
+        await state.websocket.send(msg)
+
+    async def handle_help(self, state: Any) -> None:
+        """显示帮助"""
+        help_text = self.protocol_handler.get_help_text()
+        msg = self.protocol_handler.create_info_message(help_text)
+        await state.websocket.send(msg)
+
+    async def handle_save(self, state: Any) -> None:
+        """保存对话"""
+        # TODO: 实现对话历史保存
+        msg = self.protocol_handler.create_info_message("对话保存功能开发中")
+        await state.websocket.send(msg)
+
+    async def handle_run_command(self, state: Any, command: str) -> None:
+        """执行游戏命令"""
+        if not command:
+            msg = self.protocol_handler.create_error_message("请输入命令")
+            await state.websocket.send(msg)
+            return
+
+        from mcbe_ai_agent.models.minecraft import MinecraftCommand
+
+        cmd = MinecraftCommand.create_raw(command)
+        await state.websocket.send(cmd.model_dump_json())
+
+        logger.info(
+            "command_executed",
+            connection_id=str(state.id),
+            command=command,
+        )
