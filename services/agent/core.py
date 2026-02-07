@@ -1,5 +1,6 @@
 """PydanticAI Agent 核心定义"""
 
+import re
 from dataclasses import asdict, is_dataclass
 from typing import Any, AsyncIterator
 
@@ -126,6 +127,12 @@ async def stream_chat(
         StreamEvent: 流式事件
     """
     sequence = 0
+    use_sentence_mode = deps.settings.stream_sentence_mode
+    
+    # 句子模式：缓冲器和正则匹配
+    if use_sentence_mode:
+        sentence_end_pattern = re.compile(r'[。！？\n.!?]+')
+        buffer = ""
 
     try:
         # 使用 run_stream 进行流式处理
@@ -136,12 +143,48 @@ async def stream_chat(
         ) as result:
             # 流式输出文本内容
             async for chunk in result.stream_text(delta=True):
-                yield StreamEvent(
-                    event_type="content",
-                    content=chunk,
-                    sequence=sequence,
-                )
-                sequence += 1
+                if use_sentence_mode:
+                    # 句子模式：缓冲并按完整句子发送
+                    buffer += chunk
+                    
+                    # 查找所有完整句子
+                    sentences = []
+                    last_end = 0
+                    for match in sentence_end_pattern.finditer(buffer):
+                        # 提取句子（包含结束符）
+                        sentence = buffer[last_end : match.end()]
+                        sentences.append(sentence)
+                        last_end = match.end()
+                    
+                    # 发送完整句子
+                    for sentence in sentences:
+                        if sentence.strip():  # 跳过纯空白句子
+                            yield StreamEvent(
+                                event_type="content",
+                                content=sentence,
+                                sequence=sequence,
+                            )
+                            sequence += 1
+                    
+                    # 保留未完成的部分
+                    buffer = buffer[last_end:]
+                else:
+                    # 实时模式：直接发送每个 chunk
+                    yield StreamEvent(
+                        event_type="content",
+                        content=chunk,
+                        sequence=sequence,
+                    )
+                    sequence += 1
+
+        # 句子模式：发送剩余缓冲内容（如果有）
+        if use_sentence_mode and buffer.strip():
+            yield StreamEvent(
+                event_type="content",
+                content=buffer,
+                sequence=sequence,
+            )
+            sequence += 1
 
         # 发送完成事件
         yield StreamEvent(

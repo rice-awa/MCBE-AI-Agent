@@ -43,7 +43,6 @@ class Application:
             worker = AgentWorker(self.broker, self.settings, worker_id=i)
             await worker.start()
             self.workers.append(worker)
-            logger.info("agent_worker_started", worker_id=i)
 
         # 启动 WebSocket 服务器
         await self.ws_server.start()

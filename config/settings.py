@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     system_prompt: str = "请始终保持积极和专业的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown"
     enable_reasoning_output: bool = True
     max_history_turns: int = 20
+    stream_sentence_mode: bool = Field(
+        default=True,
+        description="流式输出是否按完整句子发送（True=按句子发送，False=实时流式输出）"
+    )
 
     # 队列配置
     queue_max_size: int = 100
