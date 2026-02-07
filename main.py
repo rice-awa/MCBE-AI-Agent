@@ -8,6 +8,7 @@ from config.settings import get_settings
 from config.logging import setup_logging, get_logger
 from core.queue import MessageBroker
 from services.agent.worker import AgentWorker
+from services.agent.providers import ProviderRegistry
 from services.websocket.server import WebSocketServer
 from services.auth.jwt_handler import JWTHandler
 
@@ -37,6 +38,9 @@ class Application:
             default_provider=self.settings.default_provider,
             worker_count=self.settings.llm_worker_count,
         )
+
+        # 预热 LLM 模型
+        await ProviderRegistry.warmup_models(self.settings)
 
         # 启动 Agent Workers
         for i in range(self.settings.llm_worker_count):

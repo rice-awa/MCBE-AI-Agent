@@ -76,6 +76,10 @@ class Settings(BaseSettings):
         default=True,
         description="流式输出是否按完整句子发送（True=按句子发送，False=实时流式输出）"
     )
+    llm_warmup_enabled: bool = Field(
+        default=True,
+        description="是否在启动时预热 LLM 模型，提高首次响应速度"
+    )
 
     # 队列配置
     queue_max_size: int = 100

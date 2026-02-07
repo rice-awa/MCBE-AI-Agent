@@ -1,5 +1,6 @@
 """LLM Provider 注册表"""
 
+import asyncio
 from typing import Any
 
 from pydantic_ai.models import Model
@@ -7,7 +8,7 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.deepseek import DeepSeekProvider
 
-from config.settings import LLMProviderConfig
+from config.settings import LLMProviderConfig, Settings
 from core.exceptions import ProviderNotFoundError, ProviderNotConfiguredError
 from config.logging import get_logger
 
@@ -130,6 +131,45 @@ class ProviderRegistry:
     def list_providers(cls) -> list[str]:
         """列出所有支持的提供商"""
         return ["deepseek", "openai", "anthropic", "ollama"]
+
+    @classmethod
+    async def warmup_models(cls, settings: Settings) -> None:
+        """
+        预热 LLM 模型，提前创建默认 provider 的模型实例
+        
+        Args:
+            settings: 应用配置
+        """
+        if not settings.llm_warmup_enabled:
+            logger.info("llm_warmup_disabled")
+            return
+        
+        logger.info(
+            "llm_warmup_starting",
+            default_provider=settings.default_provider,
+        )
+        
+        try:
+            # 获取默认 provider 配置
+            provider_config = settings.get_provider_config(settings.default_provider)
+            
+            # 创建模型实例（这会初始化客户端）
+            model = cls.get_model(provider_config)
+            
+            logger.info(
+                "llm_warmup_completed",
+                provider=settings.default_provider,
+                model=provider_config.model,
+            )
+            
+        except Exception as e:
+            # 预热失败不影响启动，记录警告即可
+            logger.warning(
+                "llm_warmup_failed",
+                provider=settings.default_provider,
+                error=str(e),
+                exc_info=True,
+            )
 
     @classmethod
     def get_model_string(cls, config: LLMProviderConfig) -> str:
