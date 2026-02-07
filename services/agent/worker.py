@@ -1,6 +1,7 @@
 """Agent Worker - 从队列消费请求并处理"""
 
 import asyncio
+import time
 from uuid import UUID
 
 import httpx
@@ -145,13 +146,50 @@ class AgentWorker:
 
         # 流式处理
         sequence = 0
+        event_count = 0
+        response_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        start_time = time.monotonic()
         try:
             async for event in stream_chat(request.content, deps, model):
+                event_count += 1
+                if event.event_type == "content" and event.content:
+                    response_parts.append(event.content)
+                elif event.event_type == "reasoning" and event.content:
+                    reasoning_parts.append(event.content)
+
+                if event.metadata and event.metadata.get("is_complete"):
+                    response_text = "".join(response_parts)
+                    reasoning_text = "".join(reasoning_parts)
+                    duration_ms = int((time.monotonic() - start_time) * 1000)
+                    logger.info(
+                        "chat_response_complete",
+                        worker_id=self.worker_id,
+                        connection_id=str(connection_id),
+                        response=response_text,
+                        response_length=len(response_text),
+                        reasoning_length=len(reasoning_text),
+                        chunk_count=event_count,
+                        duration_ms=duration_ms,
+                        usage=event.metadata.get("usage"),
+                    )
+                elif event.event_type == "error":
+                    response_text = "".join(response_parts)
+                    logger.error(
+                        "chat_response_error",
+                        worker_id=self.worker_id,
+                        connection_id=str(connection_id),
+                        error=event.content,
+                        response=response_text,
+                        response_length=len(response_text),
+                    )
+
                 chunk = StreamChunk(
                     connection_id=connection_id,
                     chunk_type=event.event_type,  # type: ignore
                     content=event.content,
                     sequence=sequence,
+                    delivery=request.delivery,
                 )
 
                 await self.broker.send_response(connection_id, chunk)

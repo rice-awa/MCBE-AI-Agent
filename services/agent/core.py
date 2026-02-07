@@ -1,6 +1,7 @@
 """PydanticAI Agent 核心定义"""
 
-from typing import AsyncIterator
+from dataclasses import asdict, is_dataclass
+from typing import Any, AsyncIterator
 
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models import Model
@@ -94,6 +95,20 @@ async def send_game_message(
         return f"消息发送失败: {str(e)}"
 
 
+def _serialize_usage(usage: Any | None) -> dict[str, Any] | None:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return usage
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump()  # type: ignore[no-any-return]
+    if hasattr(usage, "dict"):
+        return usage.dict()  # type: ignore[no-any-return]
+    if is_dataclass(usage):
+        return asdict(usage)
+    return {"value": str(usage)}
+
+
 async def stream_chat(
     prompt: str,
     deps: AgentDependencies,
@@ -135,7 +150,7 @@ async def stream_chat(
             sequence=sequence,
             metadata={
                 "is_complete": True,
-                "usage": result.usage().model_dump() if result.usage() else None,
+                "usage": _serialize_usage(result.usage()),
             },
         )
 
