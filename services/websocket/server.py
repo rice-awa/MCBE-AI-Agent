@@ -7,12 +7,12 @@ from typing import Any
 import websockets
 from websockets.server import WebSocketServerProtocol, serve
 
-from mcbe_ai_agent.core.queue import MessageBroker
-from mcbe_ai_agent.services.websocket.connection import ConnectionManager
-from mcbe_ai_agent.services.websocket.minecraft import MinecraftProtocolHandler
-from mcbe_ai_agent.services.auth.jwt_handler import JWTHandler
-from mcbe_ai_agent.config.settings import Settings
-from mcbe_ai_agent.config.logging import get_logger
+from core.queue import MessageBroker
+from services.websocket.connection import ConnectionManager
+from services.websocket.minecraft import MinecraftProtocolHandler
+from services.auth.jwt_handler import JWTHandler
+from config.settings import Settings
+from config.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -318,7 +318,7 @@ class WebSocketServer:
             await state.websocket.send(msg)
             return
 
-        from mcbe_ai_agent.models.minecraft import MinecraftCommand
+        from models.minecraft import MinecraftCommand
 
         cmd = MinecraftCommand.create_raw(command)
         await state.websocket.send(cmd.model_dump_json())

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 from uuid import UUID
 
-from mcbe_ai_agent.config.logging import get_logger
+from config.logging import get_logger
 
 T = TypeVar("T")
 logger = get_logger(__name__)

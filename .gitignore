@@ -1,2 +1,21 @@
+# env files
 .venv/*
 .env
+.env.local
+
+# coding agent
+.claude
+.qoder
+.kiro
+.vscode
+.cursor
+
+# logs
+logs/*
+
+
+# 忽略 Python 缓存文件
+**/__pycache__
+*.pyc
+*.py[cod]
+*$py.class

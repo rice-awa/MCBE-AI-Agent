@@ -7,10 +7,10 @@ from uuid import UUID, uuid4
 
 from websockets.server import WebSocketServerProtocol
 
-from mcbe_ai_agent.core.queue import MessageBroker
-from mcbe_ai_agent.models.messages import StreamChunk
-from mcbe_ai_agent.models.minecraft import MinecraftCommand
-from mcbe_ai_agent.config.logging import get_logger
+from core.queue import MessageBroker
+from models.messages import StreamChunk
+from models.minecraft import MinecraftCommand
+from config.logging import get_logger
 
 logger = get_logger(__name__)
 

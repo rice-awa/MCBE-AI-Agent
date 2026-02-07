@@ -5,13 +5,13 @@ from uuid import UUID
 
 import httpx
 
-from mcbe_ai_agent.core.queue import MessageBroker
-from mcbe_ai_agent.services.agent.core import stream_chat
-from mcbe_ai_agent.services.agent.providers import ProviderRegistry
-from mcbe_ai_agent.models.messages import ChatRequest, StreamChunk
-from mcbe_ai_agent.models.agent import AgentDependencies
-from mcbe_ai_agent.config.settings import Settings
-from mcbe_ai_agent.config.logging import get_logger
+from core.queue import MessageBroker
+from services.agent.core import stream_chat
+from services.agent.providers import ProviderRegistry
+from models.messages import ChatRequest, StreamChunk
+from models.agent import AgentDependencies
+from config.settings import Settings
+from config.logging import get_logger
 
 logger = get_logger(__name__)
 

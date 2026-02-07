@@ -8,8 +8,8 @@ from typing import Optional
 
 import jwt
 
-from mcbe_ai_agent.config.settings import Settings
-from mcbe_ai_agent.config.logging import get_logger
+from config.settings import Settings
+from config.logging import get_logger
 
 logger = get_logger(__name__)
 

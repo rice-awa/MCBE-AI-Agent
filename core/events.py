@@ -96,7 +96,7 @@ class EventBus:
             except Exception as e:
                 # 记录错误但不中断其他处理器
                 import asyncio
-                from mcbe_ai_agent.config.logging import get_logger
+                from config.logging import get_logger
                 logger = get_logger(__name__)
                 logger.error(
                     "event_handler_error",

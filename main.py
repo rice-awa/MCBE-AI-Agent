@@ -4,12 +4,12 @@ import asyncio
 import signal
 from typing import Any
 
-from mcbe_ai_agent.config.settings import get_settings
-from mcbe_ai_agent.config.logging import setup_logging, get_logger
-from mcbe_ai_agent.core.queue import MessageBroker
-from mcbe_ai_agent.services.agent.worker import AgentWorker
-from mcbe_ai_agent.services.websocket.server import WebSocketServer
-from mcbe_ai_agent.services.auth.jwt_handler import JWTHandler
+from config.settings import get_settings
+from config.logging import setup_logging, get_logger
+from core.queue import MessageBroker
+from services.agent.worker import AgentWorker
+from services.websocket.server import WebSocketServer
+from services.auth.jwt_handler import JWTHandler
 
 logger = get_logger(__name__)
 
@@ -89,7 +89,10 @@ async def main() -> None:
     # 注册信号处理器
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, lambda s=sig: app.handle_shutdown(s))
+        try:
+            loop.add_signal_handler(sig, lambda s=sig: app.handle_shutdown(s))
+        except NotImplementedError:
+            signal.signal(sig, lambda *_: app.handle_shutdown(sig))
 
     try:
         # 启动应用

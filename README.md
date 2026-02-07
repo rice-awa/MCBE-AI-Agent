@@ -116,17 +116,33 @@ mcbe_ai_agent/
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 准备环境 (推荐)
+
+强烈建议在 Python 虚拟环境中运行项目，以避免依赖冲突：
+
+**Windows:**
+```powershell
+python -m venv venv
+.\venv\Scripts\activate
+```
+
+**Linux/macOS:**
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### 2. 安装依赖
 
 ```bash
 cd mcbe_ai_agent
-pip install -e .
+pip install -r requirements.txt
 ```
 
-### 2. 初始化配置
+### 3. 初始化配置
 
 ```bash
-python -m mcbe_ai_agent.cli init
+python cli.py init
 ```
 
 这会创建 `.env` 文件，编辑并填入 API 密钥：
@@ -137,28 +153,28 @@ SECRET_KEY=your-secret-key
 WEBSOCKET_PASSWORD=your-password
 ```
 
-### 3. 查看配置信息
+### 4. 查看配置信息
 
 ```bash
-python -m mcbe_ai_agent.cli info
+python cli.py info
 ```
 
-### 4. 测试 LLM 连接
+### 5. 测试 LLM 连接
 
 ```bash
-python -m mcbe_ai_agent.cli test-provider deepseek
+python cli.py test-provider deepseek
 ```
 
-### 5. 启动服务器
+### 6. 启动服务器
 
 ```bash
-python -m mcbe_ai_agent.cli serve
+python cli.py serve
 ```
 
 或使用环境变量：
 
 ```bash
-python -m mcbe_ai_agent.main
+python main.py
 ```
 
 ## 游戏内使用
@@ -216,7 +232,7 @@ AGENT 上下文 状态          # 查看当前状态
 在代码中可以通过 `Settings` 类访问所有配置：
 
 ```python
-from mcbe_ai_agent.config import get_settings
+from config import get_settings
 
 settings = get_settings()
 print(settings.default_provider)
@@ -392,7 +408,7 @@ netstat -an | grep 8080
 
 测试提供商连接：
 ```bash
-python -m mcbe_ai_agent.cli test-provider deepseek
+python cli.py test-provider deepseek
 ```
 
 检查日志：

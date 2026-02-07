@@ -2,10 +2,10 @@
 
 __version__ = "2.0.0"
 
-from mcbe_ai_agent.config.settings import Settings, get_settings
-from mcbe_ai_agent.core.queue import MessageBroker
-from mcbe_ai_agent.services.agent.core import chat_agent
-from mcbe_ai_agent.services.websocket.server import WebSocketServer
+from config.settings import Settings, get_settings
+from core.queue import MessageBroker
+from services.agent.core import chat_agent
+from services.websocket.server import WebSocketServer
 
 __all__ = [
     "Settings",

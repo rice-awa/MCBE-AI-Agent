@@ -5,8 +5,8 @@ from typing import AsyncIterator
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models import Model
 
-from mcbe_ai_agent.models.agent import AgentDependencies, StreamEvent
-from mcbe_ai_agent.config.logging import get_logger
+from models.agent import AgentDependencies, StreamEvent
+from config.logging import get_logger
 
 logger = get_logger(__name__)
 

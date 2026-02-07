@@ -6,8 +6,8 @@ from pathlib import Path
 
 import click
 
-from mcbe_ai_agent.config.settings import get_settings
-from mcbe_ai_agent.main import main as app_main
+from config.settings import get_settings
+from main import main as app_main
 
 
 @click.group()
@@ -65,7 +65,7 @@ def info():
 def test_provider(provider: str):
     """测试 LLM 提供商连接"""
     import httpx
-    from mcbe_ai_agent.services.agent.providers import ProviderRegistry
+    from services.agent.providers import ProviderRegistry
 
     settings = get_settings()
 

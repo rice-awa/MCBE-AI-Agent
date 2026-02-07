@@ -29,7 +29,9 @@ def setup_logging(log_level: str = "INFO", enable_file_logging: bool = True) -> 
 
     # 开发环境使用彩色控制台输出
     if sys.stdout.isatty():
-        processors.append(structlog.dev.ConsoleRenderer(colors=True))
+        processors.append(
+            structlog.dev.ConsoleRenderer(colors=True, pad_level=False, pad_event=False)
+        )
     else:
         processors.append(structlog.processors.JSONRenderer())
 
@@ -49,7 +51,7 @@ def setup_logging(log_level: str = "INFO", enable_file_logging: bool = True) -> 
         log_dir.mkdir(exist_ok=True)
 
         file_handler = logging.FileHandler(
-            log_dir / "mcbe_ai_agent.log",
+            log_dir / "log",
             encoding="utf-8",
         )
         file_handler.setLevel(getattr(logging, log_level))

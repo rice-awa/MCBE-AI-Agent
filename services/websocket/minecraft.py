@@ -3,15 +3,15 @@
 import json
 from typing import Any
 
-from mcbe_ai_agent.models.minecraft import (
+from models.minecraft import (
     MinecraftMessage,
     MinecraftSubscribe,
     MinecraftCommand,
     PlayerMessageEvent,
 )
-from mcbe_ai_agent.models.messages import ChatRequest
-from mcbe_ai_agent.services.websocket.connection import ConnectionState
-from mcbe_ai_agent.config.logging import get_logger
+from models.messages import ChatRequest
+from services.websocket.connection import ConnectionState
+from config.logging import get_logger
 
 logger = get_logger(__name__)
 

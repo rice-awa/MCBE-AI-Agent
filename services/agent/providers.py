@@ -7,9 +7,9 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.deepseek import DeepSeekProvider
 
-from mcbe_ai_agent.config.settings import LLMProviderConfig
-from mcbe_ai_agent.core.exceptions import ProviderNotFoundError, ProviderNotConfiguredError
-from mcbe_ai_agent.config.logging import get_logger
+from config.settings import LLMProviderConfig
+from core.exceptions import ProviderNotFoundError, ProviderNotConfiguredError
+from config.logging import get_logger
 
 logger = get_logger(__name__)
 

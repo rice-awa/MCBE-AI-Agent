@@ -6,7 +6,7 @@ from uuid import UUID
 
 import httpx
 
-from mcbe_ai_agent.config.settings import Settings
+from config.settings import Settings
 
 
 @dataclass
