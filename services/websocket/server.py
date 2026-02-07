@@ -197,8 +197,10 @@ class WebSocketServer:
             return
 
         # 路由到具体处理器
-        if cmd_type == "chat" or cmd_type == "chat_script":
-            await self.handle_chat(state, content)
+        if cmd_type == "chat":
+            await self.handle_chat(state, content, delivery="tellraw")
+        elif cmd_type == "chat_script":
+            await self.handle_chat(state, content, delivery="scriptevent")
         elif cmd_type == "context":
             await self.handle_context(state, content)
         elif cmd_type == "switch_model":
@@ -240,7 +242,9 @@ class WebSocketServer:
             return True
         return False
 
-    async def handle_chat(self, state: Any, content: str) -> None:
+    async def handle_chat(
+        self, state: Any, content: str, delivery: str
+    ) -> None:
         """处理聊天请求（非阻塞）"""
         if not content:
             msg = self.protocol_handler.create_error_message("请输入聊天内容")
@@ -248,7 +252,9 @@ class WebSocketServer:
             return
 
         # 创建聊天请求
-        chat_req = self.protocol_handler.create_chat_request(state, content)
+        chat_req = self.protocol_handler.create_chat_request(
+            state, content, delivery=delivery
+        )
 
         # 提交到消息队列（非阻塞！）
         try:
@@ -321,7 +327,7 @@ class WebSocketServer:
         from models.minecraft import MinecraftCommand
 
         cmd = MinecraftCommand.create_raw(command)
-        await state.websocket.send(cmd.model_dump_json())
+        await state.websocket.send(cmd.model_dump_json(exclude_none=True))
 
         logger.info(
             "command_executed",

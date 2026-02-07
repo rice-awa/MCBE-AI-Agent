@@ -23,6 +23,7 @@ class ChatRequest(BaseMessage):
     player_name: str | None = None
     use_context: bool = True
     provider: str | None = None  # 可选指定 LLM 提供商
+    delivery: Literal["tellraw", "scriptevent"] = "tellraw"
 
 
 class ChatResponse(BaseMessage):
@@ -42,6 +43,7 @@ class StreamChunk(BaseMessage):
     chunk_type: Literal["reasoning", "content", "error", "thinking_start", "thinking_end"]
     content: str
     sequence: int
+    delivery: Literal["tellraw", "scriptevent"] = "tellraw"
 
 
 class SystemNotification(BaseMessage):

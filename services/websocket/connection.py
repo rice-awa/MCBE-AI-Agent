@@ -199,7 +199,12 @@ class ConnectionManager:
         else:
             message = chunk.content
 
-        if message:
+        if not message:
+            return
+
+        if chunk.delivery == "scriptevent":
+            await self._send_script_event(state, message)
+        else:
             await self._send_game_message(state, message)
 
     async def _send_game_message(
@@ -211,7 +216,7 @@ class ConnectionManager:
 
         try:
             command = MinecraftCommand.create_tellraw(message, color="§a")
-            await state.websocket.send(command.model_dump_json())
+            await state.websocket.send(command.model_dump_json(exclude_none=True))
 
             logger.debug(
                 "game_message_sent",
@@ -232,7 +237,7 @@ class ConnectionManager:
 
         try:
             cmd = MinecraftCommand.create_raw(command)
-            await state.websocket.send(cmd.model_dump_json())
+            await state.websocket.send(cmd.model_dump_json(exclude_none=True))
 
             logger.debug(
                 "command_executed",
@@ -244,5 +249,28 @@ class ConnectionManager:
                 "run_command_error",
                 connection_id=str(state.id),
                 command=command,
+                error=str(e),
+            )
+
+    async def _send_script_event(
+        self, state: ConnectionState, message: str
+    ) -> None:
+        """通过 scriptevent 发送消息"""
+        if not state.websocket:
+            return
+
+        try:
+            command = MinecraftCommand.create_scriptevent(message)
+            await state.websocket.send(command.model_dump_json(exclude_none=True))
+
+            logger.debug(
+                "script_event_sent",
+                connection_id=str(state.id),
+                message_length=len(message),
+            )
+        except Exception as e:
+            logger.error(
+                "send_script_event_error",
+                connection_id=str(state.id),
                 error=str(e),
             )

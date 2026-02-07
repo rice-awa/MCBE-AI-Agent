@@ -46,7 +46,12 @@ class MinecraftMessage(BaseModel):
 class MinecraftCommand(BaseModel):
     """Minecraft 命令消息"""
 
-    header: MinecraftHeader = Field(default_factory=lambda: MinecraftHeader(messagePurpose="commandRequest"))
+    header: MinecraftHeader = Field(
+        default_factory=lambda: MinecraftHeader(
+            messagePurpose="commandRequest",
+            EventName="commandRequest",
+        )
+    )
     body: MinecraftCommandBody
 
     @classmethod

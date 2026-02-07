@@ -17,6 +17,7 @@ logger = get_logger(__name__)
 
 # 命令前缀定义
 COMMANDS = {
+    "#登录": "login",
     "AGENT 聊天": "chat",
     "AGENT 脚本": "chat_script",
     "AGENT 保存": "save",
@@ -34,7 +35,7 @@ class MinecraftProtocolHandler:
     def create_subscribe_message() -> str:
         """创建订阅玩家消息事件的消息"""
         subscribe = MinecraftSubscribe.player_message()
-        return subscribe.model_dump_json()
+        return subscribe.model_dump_json(exclude_none=True)
 
     @staticmethod
     def create_welcome_message(
@@ -104,7 +105,10 @@ class MinecraftProtocolHandler:
 
     @staticmethod
     def create_chat_request(
-        state: ConnectionState, content: str, provider: str | None = None
+        state: ConnectionState,
+        content: str,
+        provider: str | None = None,
+        delivery: str | None = None,
     ) -> ChatRequest:
         """
         创建聊天请求
@@ -123,6 +127,7 @@ class MinecraftProtocolHandler:
             player_name=state.player_name,
             use_context=state.context_enabled,
             provider=provider or state.current_provider,
+            delivery=delivery or "tellraw",
         )
 
     @staticmethod
@@ -144,18 +149,18 @@ class MinecraftProtocolHandler:
         """创建错误消息"""
         return MinecraftCommand.create_tellraw(
             f"❌ 错误: {error}", color="§c"
-        ).model_dump_json()
+        ).model_dump_json(exclude_none=True)
 
     @staticmethod
     def create_info_message(info: str) -> str:
         """创建信息消息"""
         return MinecraftCommand.create_tellraw(
             f"ℹ️ {info}", color="§b"
-        ).model_dump_json()
+        ).model_dump_json(exclude_none=True)
 
     @staticmethod
     def create_success_message(message: str) -> str:
         """创建成功消息"""
         return MinecraftCommand.create_tellraw(
             f"✅ {message}", color="§a"
-        ).model_dump_json()
+        ).model_dump_json(exclude_none=True)

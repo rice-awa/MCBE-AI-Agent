@@ -19,3 +19,5 @@ logs/*
 *.pyc
 *.py[cod]
 *$py.class
+
+data/tokens.json
