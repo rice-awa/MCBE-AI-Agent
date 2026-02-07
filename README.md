@@ -2,7 +2,7 @@
 
 ## 概述
 
-这是 MCBE WebSocket GPT 项目的完全重构版本，采用现代化异步架构，基于 PydanticAI 框架，支持多种 LLM 提供商，实现了 WebSocket 和 LLM 请求的完全解耦。
+这是 [MCBE WebSocket GPT](https://github.com/rice-awa/MCBE_WebSocket_gpt) 项目的完全重构版本，采用现代化异步架构，基于 PydanticAI 框架，支持多种 LLM 提供商，实现了 WebSocket 和 LLM 请求的完全解耦。
 
 ## 核心特性
 
@@ -168,13 +168,13 @@ python cli.py test-provider deepseek
 ### 6. 启动服务器
 
 ```bash
-python cli.py serve
+python main.py
 ```
 
-或使用环境变量：
+或使用cli版：
 
 ```bash
-python main.py
+python cli.py serve
 ```
 
 ## 游戏内使用
@@ -480,7 +480,7 @@ print(stats)  # {"pending_requests": N, "active_connections": M}
 
 ## 许可证
 
-MIT License - 与原项目保持一致
+[MIT](./LICENSE)
 
 ## 来源及参考
 
