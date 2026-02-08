@@ -81,6 +81,12 @@ class Settings(BaseSettings):
         description="是否在启动时预热 LLM 模型，提高首次响应速度"
     )
 
+    # Minecraft Wiki API 配置
+    mcwiki_base_url: str = Field(
+        default="https://mcwiki.rice-awa.top",
+        alias="MCWIKI_BASE_URL",
+    )
+
     # 队列配置
     queue_max_size: int = 100
     llm_worker_count: int = 2

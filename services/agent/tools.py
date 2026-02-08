@@ -9,6 +9,12 @@ from pydantic_ai import Agent, RunContext
 from config.logging import get_logger
 from models.agent import AgentDependencies
 from models.minecraft import MinecraftCommand
+from services.agent.mcwiki import (
+    build_mcwiki_url,
+    build_page_url,
+    build_search_params,
+    normalize_limit,
+)
 
 logger = get_logger(__name__)
 
@@ -269,6 +275,161 @@ def register_agent_tools(chat_agent: Agent[AgentDependencies, str]) -> None:
                 error=str(e),
             )
             return f"请求失败: {str(e)}"
+
+    @chat_agent.tool
+    async def mcwiki_search(
+        ctx: RunContext[AgentDependencies],
+        query: str,
+        limit: int = 5,
+        namespaces: list[int] | None = None,
+        use_cache: bool = True,
+        pretty: bool = False,
+    ) -> str:
+        """
+        搜索 Minecraft Wiki 内容
+
+        Args:
+            ctx: 运行上下文
+            query: 搜索关键词
+            limit: 返回结果数量（1-50）
+            namespaces: 命名空间列表
+            use_cache: 是否使用缓存
+            pretty: 是否格式化 JSON
+
+        Returns:
+            搜索结果摘要
+        """
+        logger.info(
+            "agent_tool_call",
+            tool="mcwiki_search",
+            query=query,
+            connection_id=str(ctx.deps.connection_id),
+        )
+
+        base_url = ctx.deps.settings.mcwiki_base_url
+        search_limit = normalize_limit(limit, default=5)
+        params = build_search_params(query, search_limit, namespaces, use_cache, pretty)
+        url = build_mcwiki_url(base_url, "api/search")
+
+        try:
+            response = await ctx.deps.http_client.get(url, params=params)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as e:
+            logger.error(
+                "agent_tool_error",
+                tool="mcwiki_search",
+                error=str(e),
+            )
+            return f"搜索请求失败: {str(e)}"
+
+        if not payload.get("success"):
+            error = payload.get("error", {})
+            message = error.get("message", "搜索失败")
+            return f"搜索失败: {message}"
+
+        results = payload.get("data", {}).get("results", [])
+        if not results:
+            return "未找到相关条目。"
+
+        lines = ["搜索结果："]
+        for index, item in enumerate(results, start=1):
+            title = item.get("title", "未知标题")
+            url_item = item.get("url", "")
+            snippet = item.get("snippet", "")
+            line = f"{index}. {title}"
+            if url_item:
+                line += f" - {url_item}"
+            if snippet:
+                line += f"\n   摘要: {snippet}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    @chat_agent.tool
+    async def mcwiki_get_page(
+        ctx: RunContext[AgentDependencies],
+        page_name: str,
+        format: str = "markdown",
+        use_cache: bool = True,
+        include_metadata: bool = True,
+        pretty: bool = False,
+        max_chars: int = 2000,
+    ) -> str:
+        """
+        获取 Minecraft Wiki 页面内容
+
+        Args:
+            ctx: 运行上下文
+            page_name: 页面名称
+            format: 输出格式（html/markdown/both/wikitext）
+            use_cache: 是否使用缓存
+            include_metadata: 是否包含元数据
+            pretty: 是否格式化 JSON
+            max_chars: 最大返回字符数
+
+        Returns:
+            页面内容摘要
+        """
+        logger.info(
+            "agent_tool_call",
+            tool="mcwiki_get_page",
+            page_name=page_name,
+            connection_id=str(ctx.deps.connection_id),
+        )
+
+        base_url = ctx.deps.settings.mcwiki_base_url
+        url = build_page_url(base_url, page_name)
+        params = {
+            "format": format,
+            "useCache": "true" if use_cache else "false",
+            "includeMetadata": "true" if include_metadata else "false",
+        }
+        if pretty:
+            params["pretty"] = "true"
+
+        try:
+            response = await ctx.deps.http_client.get(url, params=params)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as e:
+            logger.error(
+                "agent_tool_error",
+                tool="mcwiki_get_page",
+                error=str(e),
+            )
+            return f"页面请求失败: {str(e)}"
+
+        if not payload.get("success"):
+            error = payload.get("error", {})
+            message = error.get("message", "页面获取失败")
+            return f"页面获取失败: {message}"
+
+        page = payload.get("data", {}).get("page", {})
+        title = page.get("title", page_name)
+        url_item = page.get("url", "")
+        content = page.get("content", {})
+        text_content = ""
+
+        if format == "wikitext":
+            text_content = content.get("wikitext", "")
+        elif format == "html":
+            text_content = content.get("html", "")
+        elif format == "markdown":
+            text_content = content.get("markdown", "")
+        else:
+            text_content = content.get("markdown") or content.get("html") or ""
+
+        if not text_content:
+            return f"页面 {title} 内容为空或解析失败。"
+
+        text_content = text_content.strip()
+        if len(text_content) > max_chars:
+            text_content = text_content[:max_chars] + "..."
+
+        header = f"页面: {title}"
+        if url_item:
+            header += f" - {url_item}"
+        return f"{header}\n{text_content}"
 
     @chat_agent.tool
     async def list_available_providers(
