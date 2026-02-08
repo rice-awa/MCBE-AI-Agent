@@ -9,6 +9,7 @@ from pydantic_ai.models import Model
 
 from models.agent import AgentDependencies, StreamEvent
 from config.logging import get_logger
+from services.agent.tools import register_agent_tools
 
 logger = get_logger(__name__)
 
@@ -29,71 +30,7 @@ async def dynamic_system_prompt(ctx: RunContext[AgentDependencies]) -> str:
     return base_prompt + player_info
 
 
-@chat_agent.tool
-async def run_minecraft_command(
-    ctx: RunContext[AgentDependencies],
-    command: str,
-) -> str:
-    """
-    执行 Minecraft 命令
-
-    Args:
-        ctx: 运行上下文
-        command: 要执行的命令（不包括前导斜杠）
-
-    Returns:
-        执行结果描述
-    """
-    logger.info(
-        "agent_tool_call",
-        tool="run_minecraft_command",
-        command=command,
-        connection_id=str(ctx.deps.connection_id),
-    )
-
-    try:
-        await ctx.deps.run_command(command)
-        return f"已执行命令: /{command}"
-    except Exception as e:
-        logger.error(
-            "agent_tool_error",
-            tool="run_minecraft_command",
-            error=str(e),
-        )
-        return f"命令执行失败: {str(e)}"
-
-
-@chat_agent.tool
-async def send_game_message(
-    ctx: RunContext[AgentDependencies],
-    message: str,
-) -> str:
-    """
-    向游戏发送消息
-
-    Args:
-        ctx: 运行上下文
-        message: 要发送的消息
-
-    Returns:
-        发送结果
-    """
-    logger.info(
-        "agent_tool_call",
-        tool="send_game_message",
-        connection_id=str(ctx.deps.connection_id),
-    )
-
-    try:
-        await ctx.deps.send_to_game(message)
-        return "消息已发送到游戏"
-    except Exception as e:
-        logger.error(
-            "agent_tool_error",
-            tool="send_game_message",
-            error=str(e),
-        )
-        return f"消息发送失败: {str(e)}"
+register_agent_tools(chat_agent)
 
 
 def _serialize_usage(usage: Any | None) -> dict[str, Any] | None:
