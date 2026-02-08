@@ -68,6 +68,9 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3"
 
+    # MCWiki 配置
+    mcwiki_base_url: str = "https://mcwiki.rice-awa.top"
+
     # Agent 配置
     system_prompt: str = "请始终保持积极和专业的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown"
     enable_reasoning_output: bool = True

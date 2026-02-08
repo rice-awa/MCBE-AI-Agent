@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import quote
 
 from pydantic_ai import Agent, RunContext
+from pydantic import BaseModel, Field
 
 from config.logging import get_logger
 from models.agent import AgentDependencies
@@ -15,6 +17,26 @@ logger = get_logger(__name__)
 
 def register_agent_tools(chat_agent: Agent[AgentDependencies, str]) -> None:
     """注册 Agent 工具到指定的 Agent 实例"""
+
+    class McWikiSearchParams(BaseModel):
+        """MCWiki 搜索参数"""
+
+        query: str = Field(..., description="搜索关键词")
+        limit: int = Field(default=5, ge=1, le=50, description="结果数量限制")
+        namespaces: str | None = Field(default=None, description="命名空间，逗号分隔")
+        pretty: bool = Field(default=False, description="是否返回格式化 JSON")
+
+    class McWikiPageParams(BaseModel):
+        """MCWiki 页面参数"""
+
+        page_name: str = Field(..., description="页面名称")
+        format: Literal["html", "markdown", "both", "wikitext"] = Field(
+            default="markdown",
+            description="内容格式",
+        )
+        use_cache: bool = Field(default=True, description="是否使用缓存")
+        include_metadata: bool = Field(default=False, description="是否包含元数据")
+        max_chars: int = Field(default=2000, ge=200, le=8000, description="最大返回字符数")
 
     @chat_agent.tool
     async def run_minecraft_command(
@@ -285,6 +307,134 @@ def register_agent_tools(chat_agent: Agent[AgentDependencies, str]) -> None:
         """
         providers = ctx.deps.settings.list_available_providers()
         return "可用 Provider: " + ", ".join(providers)
+
+    @chat_agent.tool
+    async def mcwiki_search(
+        ctx: RunContext[AgentDependencies],
+        params: McWikiSearchParams,
+    ) -> str:
+        """
+        搜索 MCWiki 内容
+
+        Args:
+            ctx: 运行上下文
+            params: 搜索参数
+
+        Returns:
+            搜索结果摘要
+        """
+        logger.info(
+            "agent_tool_call",
+            tool="mcwiki_search",
+            query=params.query,
+            connection_id=str(ctx.deps.connection_id),
+        )
+
+        base_url = ctx.deps.settings.mcwiki_base_url.rstrip("/")
+        try:
+            response = await ctx.deps.http_client.get(
+                f"{base_url}/api/search",
+                params={
+                    "q": params.query,
+                    "limit": params.limit,
+                    "namespaces": params.namespaces,
+                    "pretty": "true" if params.pretty else "false",
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not payload.get("success"):
+                return f"搜索失败: {payload.get('error', {}).get('message', '未知错误')}"
+
+            data = payload.get("data", {})
+            results = data.get("results", [])
+            if not results:
+                return f"未找到与“{params.query}”相关的页面。"
+
+            lines = [f"搜索“{params.query}”结果（共 {data.get('pagination', {}).get('totalHits', 0)} 条）:"]
+            for item in results:
+                title = item.get("title", "未知标题")
+                url = item.get("url", "")
+                snippet = (item.get("snippet") or "").strip()
+                if snippet:
+                    lines.append(f"- {title}：{snippet} {url}")
+                else:
+                    lines.append(f"- {title}：{url}")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error(
+                "agent_tool_error",
+                tool="mcwiki_search",
+                error=str(e),
+            )
+            return f"搜索请求失败: {str(e)}"
+
+    @chat_agent.tool
+    async def mcwiki_get_page(
+        ctx: RunContext[AgentDependencies],
+        params: McWikiPageParams,
+    ) -> str:
+        """
+        获取 MCWiki 页面内容
+
+        Args:
+            ctx: 运行上下文
+            params: 页面参数
+
+        Returns:
+            页面内容摘要
+        """
+        logger.info(
+            "agent_tool_call",
+            tool="mcwiki_get_page",
+            page_name=params.page_name,
+            format=params.format,
+            connection_id=str(ctx.deps.connection_id),
+        )
+
+        base_url = ctx.deps.settings.mcwiki_base_url.rstrip("/")
+        page_name = quote(params.page_name)
+        try:
+            response = await ctx.deps.http_client.get(
+                f"{base_url}/api/page/{page_name}",
+                params={
+                    "format": params.format,
+                    "useCache": "true" if params.use_cache else "false",
+                    "includeMetadata": "true" if params.include_metadata else "false",
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not payload.get("success"):
+                return f"页面获取失败: {payload.get('error', {}).get('message', '未知错误')}"
+
+            page = payload.get("data", {}).get("page", {})
+            title = page.get("title") or page.get("pageName") or params.page_name
+            content = page.get("content", {})
+            text = ""
+            if params.format == "wikitext":
+                text = content.get("wikitext", "")
+            elif params.format == "html":
+                text = content.get("html", "")
+            elif params.format == "both":
+                text = content.get("markdown") or content.get("html") or ""
+            else:
+                text = content.get("markdown", "")
+
+            text = text.strip()
+            if not text:
+                return f"页面“{title}”没有返回可用内容。"
+
+            if len(text) > params.max_chars:
+                text = text[: params.max_chars].rstrip() + "..."
+            return f"《{title}》内容摘录：\n{text}"
+        except Exception as e:
+            logger.error(
+                "agent_tool_error",
+                tool="mcwiki_get_page",
+                error=str(e),
+            )
+            return f"页面请求失败: {str(e)}"
 
 
 def escape_command_text(text: str) -> str:
