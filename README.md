@@ -132,6 +132,13 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
+**Termux (Android):**
+```bash
+pkg install python -y
+python -m venv venv
+source venv/bin/activate
+```
+
 ### 2. 安装依赖
 
 ```bash
@@ -177,6 +184,82 @@ python main.py
 python cli.py serve
 ```
 
+## Termux 部署指南
+
+### 1. 准备工作
+
+在 Termux 中安装必要的包：
+
+```bash
+# 更换清华源（可选）
+termux-change-repo
+
+# 更新包管理器
+pkg update && pkg upgrade -y
+
+# 安装基础工具
+pkg install python git wget curl -y
+
+```
+
+### 2. 获取项目
+
+```bash
+# 克隆项目(如无法使用git克隆可直接下载压缩包到本地，解压使用)
+git clone https://github.com/rice-awa/MCBE-AI-Agent
+cd MCBE-AI-Agent
+
+# 创建虚拟环境
+python -m venv venv
+source venv/bin/activate
+```
+
+### 3. 安装依赖
+
+```bash
+# 安装项目依赖
+pip install -r requirements.txt
+```
+
+### 4. Termux 特定配置
+
+由于 Termux 的特殊环境，可能需要调整一些配置：
+
+```bash
+# 1. 确保主机设置为 0.0.0.0 而不是 localhost
+# 编辑 .env 文件
+HOST=0.0.0.0
+PORT=8080
+
+# 2. 获取 Termux 的 IP 地址
+ifconfig | grep inet
+
+# 3. 确保 Termux 可以监听端口
+# 可能需要允许 Termux 的网络访问权限
+```
+
+### 5. 启动服务
+
+```bash
+# 启动服务器
+python main.py
+
+# 或使用守护进程方式（使用 tmux 或 screen）
+pkg install tmux -y
+tmux new -s mcbe_agent
+source venv/bin/activate
+python main.py
+# 按 Ctrl+B 然后按 D 分离会话
+```
+
+### 6. Minecraft 连接
+
+在 MCBE 中使用 Termux 的 IP 地址或本地回环地址：
+
+```
+/wsserver localhost:8080
+```
+
 ## 游戏内使用
 
 ### 1. 连接服务器
@@ -208,6 +291,68 @@ AGENT 上下文 状态          # 查看当前状态
 切换模型 deepseek        # 切换回 DeepSeek
 帮助                     # 显示帮助信息
 运行命令 time set day    # 执行游戏命令
+```
+
+## Termux 常见问题
+
+### 1. 端口无法访问
+
+**解决方案**:
+```bash
+# 检查 Termux 是否具有必要权限
+termux-setup-storage
+
+# 使用 ngrok 绕过防火墙
+ngrok http 8080
+```
+
+### 2. Python 包安装失败
+**解决方案**:
+```bash
+# 更新 pip 和 setuptools
+pip install --upgrade pip setuptools wheel
+
+# 使用清华源加速
+pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### 3. 内存不足
+
+**解决方案**:
+```bash
+# 使用轻量级模型
+DEFAULT_MODEL=deepseek-chat  # 而不是 deepseek-reasoner
+
+# 减少工作线程
+LLM_WORKER_COUNT=1
+
+# 优化虚拟内存
+pkg install tur-repo -y
+pkg install zram -y
+```
+
+### 4. 后台运行
+
+**使用 tmux**:
+```bash
+# 安装 tmux
+pkg install tmux -y
+
+# 创建新会话
+tmux new -s mcbe_agent
+
+# 在会话中启动
+cd ~/mcbe_ai_agent
+source venv/bin/activate
+python main.py
+
+# 分离会话: Ctrl+B, 然后按 D
+# 重新连接: tmux attach -t mcbe_agent
+```
+
+**使用 nohup**:
+```bash
+nohup python main.py > mcbe.log 2>&1 &
 ```
 
 ## 配置说明
@@ -345,6 +490,61 @@ async def _response_sender():
 | 日志系统 | print/基础 logging | structlog |
 | 代码组织 | 单文件 | 模块化分层 |
 
+## Termux 优化建议
+
+### 1. 网络配置
+
+```bash
+# 使用 zerotier 创建虚拟局域网
+pkg install zerotier-one -y
+zerotier-one -d
+zerotier-cli join <network_id>
+
+# 或使用 tailscale
+pkg install tailscale -y
+tailscale up
+```
+
+### 2. 性能优化
+
+```bash
+# 安装性能监控工具
+pkg install htop proot-distro -y
+
+# 使用轻量级系统
+proot-distro install ubuntu
+proot-distro login ubuntu
+```
+
+### 3. 存储优化
+
+```bash
+# 清理缓存
+pkg clean
+pip cache purge
+
+# 使用外部存储
+termux-setup-storage
+ln -s /storage/emulated/0/Download/mcbe_data ./data
+```
+
+### 4. 自动化脚本
+
+创建 `termux_start.sh`:
+```bash
+#!/data/data/com.termux/files/usr/bin/bash
+
+# 激活虚拟环境
+source ~/mcbe_ai_agent/venv/bin/activate
+
+# 启动服务
+cd ~/mcbe_ai_agent
+python main.py
+
+# 设置可执行权限
+chmod +x termux_start.sh
+```
+
 ## 开发指南
 
 ### 添加新的 LLM Provider
@@ -397,11 +597,17 @@ async def handle_command(self, state, cmd_type, content):
 
 ## 故障排查
 
-### 1. 连接失败
+### 1. Termux 连接失败
 
-检查防火墙和端口：
 ```bash
-netstat -an | grep 8080
+# 检查端口监听
+netstat -tulpn | grep 8080
+
+# 检查防火墙
+iptables -L
+
+# 测试本地连接
+curl http://localhost:8080/health
 ```
 
 ### 2. LLM 请求失败
@@ -416,12 +622,29 @@ python cli.py test-provider deepseek
 tail -f logs/mcbe_ai_agent.log
 ```
 
-### 3. 队列积压
+### 3. 内存问题
 
-查看统计信息（在代码中）：
-```python
-stats = broker.get_stats()
-print(stats)  # {"pending_requests": N, "active_connections": M}
+```bash
+# 查看内存使用
+free -h
+
+# 查看进程内存
+ps aux | grep python
+
+# 优化配置
+export LLM_WORKER_COUNT=1
+export DEFAULT_MODEL="deepseek-chat"
+```
+
+### 4. Python 依赖问题
+
+```bash
+# 重新安装依赖
+pip uninstall -r requirements.txt -y
+pip install --no-cache-dir -r requirements.txt
+
+# 使用预编译包
+pip install --prefer-binary -r requirements.txt
 ```
 
 ## 扩展性
@@ -452,7 +675,12 @@ print(stats)  # {"pending_requests": N, "active_connections": M}
    - 不要提交 `.env` 到版本控制
    - 使用密钥管理服务（如 AWS Secrets Manager）
 
-3. **速率限制**
+3. **Termux 特定安全**
+   - 定期更新 Termux 包
+   - 使用强密码保护设备
+   - 仅在有需要时开放端口
+
+4. **速率限制**
    - 在 `MessageBroker` 实现请求速率限制
    - 防止单用户滥用
 
@@ -466,6 +694,7 @@ print(stats)  # {"pending_requests": N, "active_connections": M}
 - [ ] 多语言支持
 - [ ] Docker 容器化
 - [ ] Kubernetes 部署示例
+- [ ] Termux 优化包
 
 ## 技术栈
 
@@ -477,6 +706,7 @@ print(stats)  # {"pending_requests": N, "active_connections": M}
 - **PyJWT**: JWT 认证
 - **structlog**: 结构化日志
 - **Click**: CLI 工具
+- **Termux**: Android 终端环境
 
 ## 许可证
 
@@ -486,9 +716,11 @@ print(stats)  # {"pending_requests": N, "active_connections": M}
 
 - 原项目: [rice-awa/MCBE_WebSocket_gpt](https://github.com/rice-awa/MCBE_WebSocket_gpt)
 - PydanticAI: [pydantic/pydantic-ai](https://github.com/pydantic/pydantic-ai)
+- Termux: [termux/termux-app](https://github.com/termux/termux-app)
 
 ---
 
-**版本**: 2.0.0
-**重构完成时间**: 2026-02-06
-**架构**: 现代化异步 + PydanticAI
+**版本**: 2.0.0  
+**重构完成时间**: 2026-02-06  
+**架构**: 现代化异步 + PydanticAI  
+**平台支持**: Windows, Linux, macOS, Termux (Android)
