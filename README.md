@@ -375,6 +375,7 @@ nohup python main.py > mcbe.log 2>&1 &
 | `ANTHROPIC_API_KEY` | Anthropic API Key | - |
 | `DEFAULT_PROVIDER` | 默认 LLM | `deepseek` |
 | `LLM_WORKER_COUNT` | Worker 数量 | `2` |
+| `STREAM_SENTENCE_MODE` | true=流式按句输出，false=关闭流式并在完成后按句子分批输出 | `true` |
 | `LOG_LEVEL` | 日志级别 | `INFO` |
 
 ### Settings 配置

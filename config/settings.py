@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     max_history_turns: int = 20
     stream_sentence_mode: bool = Field(
         default=True,
-        description="流式输出是否按完整句子发送（True=按句子发送，False=实时流式输出）"
+        description="是否开启流式输出（True=开启并按完整句子输出，False=关闭流式并在完成后按句子分批输出）"
     )
     llm_warmup_enabled: bool = Field(
         default=True,
