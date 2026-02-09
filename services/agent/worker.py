@@ -5,6 +5,7 @@ import time
 from uuid import UUID
 
 import httpx
+from pydantic_ai.messages import ModelMessage, ModelRequest
 
 from core.queue import MessageBroker
 from services.agent.core import stream_chat
@@ -74,8 +75,15 @@ class AgentWorker:
         """Worker 主循环"""
         while self._running:
             try:
-                # 从队列获取请求
-                item = await self.broker.get_request()
+                # 从队列获取请求（带超时，避免无限期阻塞）
+                try:
+                    item = await asyncio.wait_for(
+                        self.broker.get_request(),
+                        timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    # 超时后继续循环，检查 _running 状态
+                    continue
 
                 # 处理请求
                 await self._process_request(item)
@@ -105,12 +113,34 @@ class AgentWorker:
         request: ChatRequest = item.payload
         connection_id: UUID = item.connection_id
 
+        # 同一连接请求串行处理，避免多 worker 并发导致上下文乱序。
+        connection_lock = self.broker.get_connection_lock(connection_id)
+        async with connection_lock:
+            await self._process_request_locked(request, connection_id)
+
+    async def _process_request_locked(
+        self,
+        request: ChatRequest,
+        connection_id: UUID,
+    ) -> None:
+        """处理单个请求（已持有连接锁）"""
+
         logger.info(
             "processing_chat_request",
             worker_id=self.worker_id,
             connection_id=str(connection_id),
             content_length=len(request.content),
         )
+
+        message_history: list[ModelMessage] | None = None
+        if request.use_context:
+            message_history = self.broker.get_conversation_history(connection_id)
+            logger.debug(
+                "chat_history_loaded",
+                worker_id=self.worker_id,
+                connection_id=str(connection_id),
+                history_message_count=len(message_history),
+            )
 
         # 构建依赖
         deps = AgentDependencies(
@@ -151,7 +181,12 @@ class AgentWorker:
         reasoning_parts: list[str] = []
         start_time = time.monotonic()
         try:
-            async for event in stream_chat(request.content, deps, model):
+            async for event in stream_chat(
+                request.content,
+                deps,
+                model,
+                message_history=message_history,
+            ):
                 event_count += 1
                 if event.event_type == "content" and event.content:
                     response_parts.append(event.content)
@@ -159,6 +194,24 @@ class AgentWorker:
                     reasoning_parts.append(event.content)
 
                 if event.metadata and event.metadata.get("is_complete"):
+                    all_messages = event.metadata.get("all_messages")
+                    if request.use_context and isinstance(all_messages, list):
+                        if self.broker.get_response_queue(connection_id) is not None:
+                            trimmed_history = self._trim_history(
+                                all_messages,
+                                self.settings.max_history_turns,
+                            )
+                            self.broker.set_conversation_history(
+                                connection_id,
+                                trimmed_history,
+                            )
+                            logger.debug(
+                                "chat_history_updated",
+                                worker_id=self.worker_id,
+                                connection_id=str(connection_id),
+                                history_message_count=len(trimmed_history),
+                            )
+
                     response_text = "".join(response_parts)
                     reasoning_text = "".join(reasoning_parts)
                     duration_ms = int((time.monotonic() - start_time) * 1000)
@@ -204,6 +257,30 @@ class AgentWorker:
                 exc_info=True,
             )
             await self._send_error_chunk(connection_id, str(e), sequence)
+
+    @staticmethod
+    def _trim_history(
+        messages: list[ModelMessage],
+        max_turns: int,
+    ) -> list[ModelMessage]:
+        """按“用户轮次”裁剪历史，保留最近 N 轮对话。"""
+        if max_turns <= 0:
+            return []
+
+        user_turns = 0
+        for idx in range(len(messages) - 1, -1, -1):
+            message = messages[idx]
+            if isinstance(message, ModelRequest):
+                has_user_prompt = any(
+                    getattr(part, "part_kind", None) == "user-prompt"
+                    for part in message.parts
+                )
+                if has_user_prompt:
+                    user_turns += 1
+                    if user_turns > max_turns:
+                        return list(messages[idx + 1 :])
+
+        return list(messages)
 
     def _create_send_callback(self, connection_id: UUID):
         """创建发送消息到游戏的回调"""

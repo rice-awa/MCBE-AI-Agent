@@ -45,8 +45,7 @@ class MinecraftProtocolHandler:
         context_enabled: bool,
     ) -> str:
         """创建欢迎消息"""
-        message = f"""
------------
+        message = f"""-----------
 成功连接 MCBE AI Agent v2.0
 连接 ID: {connection_id[:8]}...
 当前模型: {provider}/{model}

@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 from uuid import UUID
 
+from pydantic_ai.messages import ModelMessage
+
 from config.logging import get_logger
 
 T = TypeVar("T")
@@ -42,6 +44,10 @@ class MessageBroker:
         )
         # 响应队列: Agent -> WS (每个连接一个)
         self._response_queues: dict[UUID, asyncio.Queue[Any]] = {}
+        # 对话历史: 按连接存储 pydantic-ai message_history
+        self._conversation_histories: dict[UUID, list[ModelMessage]] = {}
+        # 连接锁: 保证同一连接的请求按顺序处理
+        self._connection_locks: dict[UUID, asyncio.Lock] = {}
         # 序列号计数器
         self._sequence = 0
         # 锁
@@ -121,6 +127,7 @@ class MessageBroker:
 
         queue: asyncio.Queue[Any] = asyncio.Queue()
         self._response_queues[connection_id] = queue
+        self._connection_locks.setdefault(connection_id, asyncio.Lock())
         logger.info(
             "connection_registered",
             connection_id=str(connection_id),
@@ -135,13 +142,18 @@ class MessageBroker:
         Args:
             connection_id: 连接 ID
         """
-        if queue := self._response_queues.pop(connection_id, None):
+        queue = self._response_queues.pop(connection_id, None)
+        self.clear_conversation_history(connection_id)
+        self._connection_locks.pop(connection_id, None)
+
+        if queue:
             # 清空队列中的待处理消息
             while not queue.empty():
                 try:
                     queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+
             logger.info(
                 "connection_unregistered",
                 connection_id=str(connection_id),
@@ -178,6 +190,27 @@ class MessageBroker:
         """获取指定连接的响应队列"""
         return self._response_queues.get(connection_id)
 
+    def get_connection_lock(self, connection_id: UUID) -> asyncio.Lock:
+        """获取连接级锁，确保同一连接请求串行处理"""
+        return self._connection_locks.setdefault(connection_id, asyncio.Lock())
+
+    def get_conversation_history(self, connection_id: UUID) -> list[ModelMessage]:
+        """获取连接的对话历史副本"""
+        history = self._conversation_histories.get(connection_id, [])
+        return list(history)
+
+    def set_conversation_history(
+        self,
+        connection_id: UUID,
+        history: list[ModelMessage],
+    ) -> None:
+        """更新连接的对话历史"""
+        self._conversation_histories[connection_id] = list(history)
+
+    def clear_conversation_history(self, connection_id: UUID) -> None:
+        """清理连接的对话历史"""
+        self._conversation_histories.pop(connection_id, None)
+
     @property
     def pending_requests(self) -> int:
         """待处理请求数量"""
@@ -193,4 +226,5 @@ class MessageBroker:
         return {
             "pending_requests": self.pending_requests,
             "active_connections": self.active_connections,
+            "active_conversations": len(self._conversation_histories),
         }

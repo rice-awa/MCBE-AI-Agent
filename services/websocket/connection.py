@@ -13,6 +13,7 @@ from models.minecraft import MinecraftCommand
 from config.logging import get_logger
 
 logger = get_logger(__name__)
+ws_raw_logger = get_logger("websocket.raw")
 
 
 @dataclass
@@ -110,6 +111,43 @@ class ConnectionManager:
         """活跃连接数"""
         return len(self._connections)
 
+    async def shutdown_all(self) -> None:
+        """
+        关闭所有连接
+
+        在服务器关闭时调用，以确保所有连接都被正常关闭
+        """
+        logger.info(
+            "shutting_down_all_connections",
+            connection_count=len(self._connections)
+        )
+
+        # 取消所有响应发送任务
+        for connection_id, task in list(self._sender_tasks.items()):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # 关闭所有 WebSocket 连接
+        for state in list(self._connections.values()):
+            if state.websocket:
+                try:
+                    await state.websocket.close()
+                except Exception as e:
+                    logger.error(
+                        "error_closing_websocket",
+                        connection_id=str(state.id),
+                        error=str(e)
+                    )
+
+        # 清空所有连接
+        self._connections.clear()
+        self._sender_tasks.clear()
+
+        logger.info("all_connections_closed")
+
     async def _response_sender(self, state: ConnectionState) -> None:
         """
         响应发送协程 - 独立于 LLM 请求
@@ -124,10 +162,10 @@ class ConnectionManager:
 
         while state.id in self._connections:
             try:
-                # 使用超时避免永久阻塞
+                # 使用超时避免永久阻塞（缩短超时时间以便更快响应关闭）
                 response = await asyncio.wait_for(
                     state.response_queue.get(),  # type: ignore
-                    timeout=1.0,
+                    timeout=0.5,  # 从 1.0 秒减少到 0.5 秒
                 )
 
                 await self._handle_response(state, response)
@@ -216,7 +254,14 @@ class ConnectionManager:
 
         try:
             command = MinecraftCommand.create_tellraw(message, color="§a")
-            await state.websocket.send(command.model_dump_json(exclude_none=True))
+            payload = command.model_dump_json(exclude_none=True)
+            await state.websocket.send(payload)
+            ws_raw_logger.info(
+                "websocket_response_sent",
+                connection_id=str(state.id),
+                source="stream_tellraw",
+                payload=payload,
+            )
 
             logger.debug(
                 "game_message_sent",
@@ -237,7 +282,14 @@ class ConnectionManager:
 
         try:
             cmd = MinecraftCommand.create_raw(command)
-            await state.websocket.send(cmd.model_dump_json(exclude_none=True))
+            payload = cmd.model_dump_json(exclude_none=True)
+            await state.websocket.send(payload)
+            ws_raw_logger.info(
+                "websocket_response_sent",
+                connection_id=str(state.id),
+                source="stream_run_command",
+                payload=payload,
+            )
 
             logger.debug(
                 "command_executed",
@@ -253,15 +305,25 @@ class ConnectionManager:
             )
 
     async def _send_script_event(
-        self, state: ConnectionState, message: str
+        self,
+        state: ConnectionState,
+        message: str,
+        message_id: str = "server:data",
     ) -> None:
         """通过 scriptevent 发送消息"""
         if not state.websocket:
             return
 
         try:
-            command = MinecraftCommand.create_scriptevent(message)
-            await state.websocket.send(command.model_dump_json(exclude_none=True))
+            command = MinecraftCommand.create_scriptevent(message, message_id)
+            payload = command.model_dump_json(exclude_none=True)
+            await state.websocket.send(payload)
+            ws_raw_logger.info(
+                "websocket_response_sent",
+                connection_id=str(state.id),
+                source="stream_scriptevent",
+                payload=payload,
+            )
 
             logger.debug(
                 "script_event_sent",

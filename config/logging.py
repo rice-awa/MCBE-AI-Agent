@@ -2,6 +2,7 @@
 
 import logging
 import sys
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 import structlog
@@ -25,6 +26,47 @@ def _build_renderer(colors: bool) -> structlog.types.Processor:
         pad_level=False,
         pad_event=False,
     )
+
+
+def _create_daily_file_handler(
+    log_path: Path,
+    level: int,
+    formatter: logging.Formatter,
+) -> TimedRotatingFileHandler:
+    """创建按天轮转的文件处理器。"""
+    handler = TimedRotatingFileHandler(
+        filename=log_path,
+        when="midnight",
+        interval=1,
+        backupCount=30,
+        encoding="utf-8",
+        utc=True,
+    )
+    handler.suffix = "%Y-%m-%d"
+
+    def _namer(default_name: str) -> str:
+        # 例如 app.log.2026-02-09 -> app-2026-02-09.log
+        if ".log." in default_name:
+            prefix, date = default_name.rsplit(".log.", 1)
+            return f"{prefix}-{date}.log"
+        return default_name
+
+    handler.namer = _namer
+    handler.setLevel(level)
+    handler.setFormatter(formatter)
+    return handler
+
+
+def _setup_named_logger(
+    logger_name: str,
+    level: int,
+    handler: logging.Handler,
+) -> None:
+    named_logger = logging.getLogger(logger_name)
+    named_logger.setLevel(level)
+    named_logger.handlers.clear()
+    named_logger.addHandler(handler)
+    named_logger.propagate = True
 
 
 def setup_logging(log_level: str = "INFO", enable_file_logging: bool = True) -> None:
@@ -69,19 +111,42 @@ def setup_logging(log_level: str = "INFO", enable_file_logging: bool = True) -> 
         log_dir = Path("logs")
         log_dir.mkdir(exist_ok=True)
 
-        file_handler = logging.FileHandler(
-            log_dir / "log",
-            encoding="utf-8",
-        )
-        file_handler.setLevel(level)
-
         file_renderer = _build_renderer(colors=False)
         file_formatter = structlog.stdlib.ProcessorFormatter(
             processor=file_renderer,
             foreign_pre_chain=shared_processors,
         )
-        file_handler.setFormatter(file_formatter)
-        root_logger.addHandler(file_handler)
+
+        raw_file_formatter = structlog.stdlib.ProcessorFormatter(
+            processor=structlog.processors.JSONRenderer(),
+            foreign_pre_chain=shared_processors,
+        )
+
+        app_handler = _create_daily_file_handler(
+            log_dir / "app.log",
+            level,
+            file_formatter,
+        )
+        root_logger.addHandler(app_handler)
+
+        ws_raw_handler = _create_daily_file_handler(
+            log_dir / "websocket.log",
+            level,
+            raw_file_formatter,
+        )
+        _setup_named_logger("websocket.raw", level, ws_raw_handler)
+
+        llm_raw_handler = _create_daily_file_handler(
+            log_dir / "llm.log",
+            level,
+            raw_file_formatter,
+        )
+        _setup_named_logger("llm.raw", level, llm_raw_handler)
+    else:
+        # 避免禁用文件日志时仍保留历史 handler
+        for logger_name in ("websocket.raw", "llm.raw"):
+            named_logger = logging.getLogger(logger_name)
+            named_logger.handlers.clear()
 
 
 def get_logger(name: str | None = None) -> structlog.BoundLogger:

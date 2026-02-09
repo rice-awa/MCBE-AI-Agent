@@ -67,6 +67,9 @@ class Application:
         for worker in self.workers:
             await worker.stop()
 
+        # 关闭 Provider 维护的 HTTP 客户端
+        await ProviderRegistry.shutdown()
+
         logger.info("application_stopped")
 
     def handle_shutdown(self, sig: Any) -> None:

@@ -15,6 +15,7 @@ from config.settings import Settings
 from config.logging import get_logger
 
 logger = get_logger(__name__)
+ws_raw_logger = get_logger("websocket.raw")
 
 
 class WebSocketServer:
@@ -64,6 +65,12 @@ class WebSocketServer:
 
     async def stop(self) -> None:
         """停止 WebSocket 服务器"""
+        logger.info("stopping_websocket_server")
+
+        # 先关闭所有活跃连接
+        await self.connection_manager.shutdown_all()
+
+        # 再关闭服务器
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -82,11 +89,15 @@ class WebSocketServer:
 
         try:
             # 发送初始化消息
-            await websocket.send(json.dumps({"Result": "true"}))
+            await self._send_ws_payload(
+                state,
+                json.dumps({"Result": "true"}),
+                source="connection_init",
+            )
 
             # 订阅玩家消息事件
             subscribe_msg = self.protocol_handler.create_subscribe_message()
-            await websocket.send(subscribe_msg)
+            await self._send_ws_payload(state, subscribe_msg, source="subscribe")
 
             # 发送欢迎消息
             welcome_text = self.protocol_handler.create_welcome_message(
@@ -96,7 +107,7 @@ class WebSocketServer:
                 context_enabled=state.context_enabled,
             )
             welcome_cmd = self.protocol_handler.create_info_message(welcome_text)
-            await websocket.send(welcome_cmd)
+            await self._send_ws_payload(state, welcome_cmd, source="welcome")
 
             logger.info(
                 "client_connected",
@@ -132,6 +143,12 @@ class WebSocketServer:
             message: 消息内容（JSON 字符串）
         """
         try:
+            ws_raw_logger.info(
+                "websocket_request_received",
+                connection_id=str(state.id),
+                payload=message,
+            )
+
             data = json.loads(message)
 
             # 解析玩家消息
@@ -193,7 +210,7 @@ class WebSocketServer:
         # 其他命令需要认证
         if not await self.check_auth(state):
             error_msg = self.protocol_handler.create_error_message("请先登录")
-            await state.websocket.send(error_msg)
+            await self._send_ws_payload(state, error_msg, source="auth")
             return
 
         # 路由到具体处理器
@@ -218,7 +235,7 @@ class WebSocketServer:
             # 检查是否已有有效 token
             if self.jwt_handler.is_token_valid(str(state.id)):
                 msg = self.protocol_handler.create_info_message("您已登录")
-                await state.websocket.send(msg)
+                await self._send_ws_payload(state, msg, source="login")
                 return
 
             # 生成新 token
@@ -227,12 +244,12 @@ class WebSocketServer:
             state.authenticated = True
 
             msg = self.protocol_handler.create_success_message("登录成功！")
-            await state.websocket.send(msg)
+            await self._send_ws_payload(state, msg, source="login")
 
             logger.info("user_authenticated", connection_id=str(state.id))
         else:
             msg = self.protocol_handler.create_error_message("密码错误")
-            await state.websocket.send(msg)
+            await self._send_ws_payload(state, msg, source="login")
 
     async def check_auth(self, state: Any) -> bool:
         """检查认证状态"""
@@ -248,7 +265,7 @@ class WebSocketServer:
         """处理聊天请求（非阻塞）"""
         if not content:
             msg = self.protocol_handler.create_error_message("请输入聊天内容")
-            await state.websocket.send(msg)
+            await self._send_ws_payload(state, msg, source="chat")
             return
 
         # 创建聊天请求
@@ -268,7 +285,7 @@ class WebSocketServer:
             msg = self.protocol_handler.create_error_message(
                 "服务器繁忙，请稍后重试"
             )
-            await state.websocket.send(msg)
+            await self._send_ws_payload(state, msg, source="chat")
 
     async def handle_context(self, state: Any, option: str) -> None:
         """处理上下文管理"""
@@ -277,6 +294,7 @@ class WebSocketServer:
             msg = self.protocol_handler.create_success_message("上下文已启用")
         elif option == "关闭":
             state.context_enabled = False
+            self.broker.clear_conversation_history(state.id)
             msg = self.protocol_handler.create_success_message("上下文已关闭")
         elif option == "状态":
             status = "启用" if state.context_enabled else "关闭"
@@ -286,7 +304,7 @@ class WebSocketServer:
                 "无效选项，请使用: 启用/关闭/状态"
             )
 
-        await state.websocket.send(msg)
+        await self._send_ws_payload(state, msg, source="context")
 
     async def handle_switch_model(self, state: Any, provider: str) -> None:
         """处理模型切换"""
@@ -294,6 +312,7 @@ class WebSocketServer:
 
         if provider.lower() in available:
             state.current_provider = provider.lower()
+            self.broker.clear_conversation_history(state.id)
             config = self.settings.get_provider_config(provider.lower())
             msg = self.protocol_handler.create_success_message(
                 f"已切换到 {provider}/{config.model}"
@@ -303,34 +322,48 @@ class WebSocketServer:
                 f"不可用的提供商。可用: {', '.join(available)}"
             )
 
-        await state.websocket.send(msg)
+        await self._send_ws_payload(state, msg, source="switch_model")
 
     async def handle_help(self, state: Any) -> None:
         """显示帮助"""
         help_text = self.protocol_handler.get_help_text()
         msg = self.protocol_handler.create_info_message(help_text)
-        await state.websocket.send(msg)
+        await self._send_ws_payload(state, msg, source="help")
 
     async def handle_save(self, state: Any) -> None:
         """保存对话"""
         # TODO: 实现对话历史保存
         msg = self.protocol_handler.create_info_message("对话保存功能开发中")
-        await state.websocket.send(msg)
+        await self._send_ws_payload(state, msg, source="save")
 
     async def handle_run_command(self, state: Any, command: str) -> None:
         """执行游戏命令"""
         if not command:
             msg = self.protocol_handler.create_error_message("请输入命令")
-            await state.websocket.send(msg)
+            await self._send_ws_payload(state, msg, source="run_command")
             return
 
         from models.minecraft import MinecraftCommand
 
         cmd = MinecraftCommand.create_raw(command)
-        await state.websocket.send(cmd.model_dump_json(exclude_none=True))
+        await self._send_ws_payload(
+            state,
+            cmd.model_dump_json(exclude_none=True),
+            source="run_command",
+        )
 
         logger.info(
             "command_executed",
             connection_id=str(state.id),
             command=command,
+        )
+
+    async def _send_ws_payload(self, state: Any, payload: str, source: str) -> None:
+        """统一发送 WebSocket 响应并记录原始输出。"""
+        await state.websocket.send(payload)
+        ws_raw_logger.info(
+            "websocket_response_sent",
+            connection_id=str(state.id),
+            source=source,
+            payload=payload,
         )
