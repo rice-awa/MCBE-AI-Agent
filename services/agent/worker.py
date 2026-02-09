@@ -225,6 +225,9 @@ class AgentWorker:
                         chunk_count=event_count,
                         duration_ms=duration_ms,
                         usage=event.metadata.get("usage"),
+                        tool_calls=event.metadata.get("tool_calls"),
+                        tool_returns=event.metadata.get("tool_returns"),
+                        tool_fallback_used=event.metadata.get("tool_fallback_used"),
                     )
                 elif event.event_type == "error":
                     response_text = "".join(response_parts)

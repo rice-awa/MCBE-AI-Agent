@@ -60,6 +60,57 @@ def _serialize_usage(usage: Any | None) -> dict[str, Any] | None:
     return {"value": str(usage)}
 
 
+def _extract_all_messages(result: Any) -> list[ModelMessage]:
+    """兼容不同 pydantic-ai 版本，提取 all_messages。"""
+    all_messages_attr = getattr(result, "all_messages", None)
+    if callable(all_messages_attr):
+        messages = all_messages_attr()
+        if isinstance(messages, list):
+            return messages
+    return []
+
+
+def _extract_result_usage(result: Any) -> Any | None:
+    """兼容不同 pydantic-ai 版本，提取 usage。"""
+    usage_attr = getattr(result, "usage", None)
+    if callable(usage_attr):
+        return usage_attr()
+    return usage_attr
+
+
+def _extract_result_output(result: Any) -> str:
+    """兼容不同 pydantic-ai 版本，提取最终文本输出。"""
+    for field_name in ("output", "data"):
+        if hasattr(result, field_name):
+            value = getattr(result, field_name)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                return value
+            return str(value)
+    return ""
+
+
+def _count_tool_parts(messages: list[ModelMessage]) -> tuple[int, int]:
+    """统计消息链路中的 tool-call / tool-return 数量。"""
+    tool_calls = 0
+    tool_returns = 0
+
+    for message in messages:
+        parts = getattr(message, "parts", None)
+        if not parts:
+            continue
+
+        for part in parts:
+            part_kind = getattr(part, "part_kind", None)
+            if part_kind == "tool-call":
+                tool_calls += 1
+            elif part_kind == "tool-return":
+                tool_returns += 1
+
+    return tool_calls, tool_returns
+
+
 def _extract_complete_sentences(buffer: str) -> tuple[list[str], str]:
     """从缓冲区提取完整句子，并返回剩余未完成文本。"""
     sentences: list[str] = []
@@ -129,6 +180,12 @@ async def stream_chat(
     use_stream_mode = deps.settings.stream_sentence_mode
     sentence_buffer = ""
     full_response_parts: list[str] = []
+    emitted_content = False
+    all_messages: list[ModelMessage] = []
+    serialized_usage: dict[str, Any] | None = None
+    tool_calls = 0
+    tool_returns = 0
+    fallback_used = False
 
     try:
         # 使用 run_stream 进行流式处理
@@ -140,6 +197,8 @@ async def stream_chat(
         ) as result:
             # 流式输出文本内容
             async for chunk in result.stream_text(delta=True):
+                full_response_parts.append(chunk)
+
                 if use_stream_mode:
                     # 流式模式：缓冲并按完整句子发送
                     sentence_buffer += chunk
@@ -151,28 +210,90 @@ async def stream_chat(
                             content=sentence,
                             sequence=sequence,
                         )
+                        emitted_content = True
+                        sequence += 1
+
+            all_messages = _extract_all_messages(result)
+            serialized_usage = _serialize_usage(_extract_result_usage(result))
+
+        tool_calls, tool_returns = _count_tool_parts(all_messages)
+
+        # DeepSeek 流式场景下可能出现“返回了 tool_call，但未继续执行工具链”的情况。
+        # 发现 tool_call/return 数不一致时，回退到非流式 run，确保链路完整：
+        # 用户指令 -> tool_call -> tool_response -> 再次请求模型 -> 最终响应。
+        if tool_calls > tool_returns:
+            fallback_used = True
+            logger.warning(
+                "tool_chain_incomplete_on_stream",
+                connection_id=str(deps.connection_id),
+                tool_calls=tool_calls,
+                tool_returns=tool_returns,
+            )
+
+            fallback_result = await chat_agent.run(
+                prompt,
+                deps=deps,
+                model=model,
+                message_history=message_history,
+            )
+
+            all_messages = _extract_all_messages(fallback_result)
+            serialized_usage = _serialize_usage(_extract_result_usage(fallback_result))
+            tool_calls, tool_returns = _count_tool_parts(all_messages)
+
+            fallback_output = _extract_result_output(fallback_result)
+            # 若前面已推送过内容，避免重复回复；仅用 fallback 来补齐工具执行链路与上下文。
+            if fallback_output.strip() and not emitted_content:
+                if use_stream_mode:
+                    fallback_sentences, fallback_tail = _extract_complete_sentences(fallback_output)
+                    if fallback_tail.strip():
+                        fallback_sentences.append(fallback_tail)
+
+                    for sentence in fallback_sentences:
+                        yield StreamEvent(
+                            event_type="content",
+                            content=sentence,
+                            sequence=sequence,
+                        )
+                        emitted_content = True
                         sequence += 1
                 else:
-                    # 非流式模式：先收集完整回复，结束后再按句子分批发送。
-                    full_response_parts.append(chunk)
-
-        if use_stream_mode and sentence_buffer.strip():
-            yield StreamEvent(
-                event_type="content",
-                content=sentence_buffer,
-                sequence=sequence,
-            )
-            sequence += 1
-
-        if not use_stream_mode:
-            full_response = "".join(full_response_parts)
-            for chunk in _iter_sentence_batches(full_response):
+                    for chunk in _iter_sentence_batches(fallback_output):
+                        yield StreamEvent(
+                            event_type="content",
+                            content=chunk,
+                            sequence=sequence,
+                        )
+                        emitted_content = True
+                        sequence += 1
+        else:
+            if use_stream_mode and sentence_buffer.strip():
                 yield StreamEvent(
                     event_type="content",
-                    content=chunk,
+                    content=sentence_buffer,
                     sequence=sequence,
                 )
+                emitted_content = True
                 sequence += 1
+
+            if not use_stream_mode:
+                full_response = "".join(full_response_parts)
+                for chunk in _iter_sentence_batches(full_response):
+                    yield StreamEvent(
+                        event_type="content",
+                        content=chunk,
+                        sequence=sequence,
+                    )
+                    emitted_content = True
+                    sequence += 1
+
+        logger.debug(
+            "tool_chain_status",
+            connection_id=str(deps.connection_id),
+            tool_calls=tool_calls,
+            tool_returns=tool_returns,
+            fallback_used=fallback_used,
+        )
 
         # 发送完成事件
         yield StreamEvent(
@@ -181,8 +302,11 @@ async def stream_chat(
             sequence=sequence,
             metadata={
                 "is_complete": True,
-                "usage": _serialize_usage(result.usage()),
-                "all_messages": result.all_messages(),
+                "usage": serialized_usage,
+                "all_messages": all_messages,
+                "tool_calls": tool_calls,
+                "tool_returns": tool_returns,
+                "tool_fallback_used": fallback_used,
             },
         )
 

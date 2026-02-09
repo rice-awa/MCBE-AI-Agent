@@ -18,8 +18,13 @@ async def _noop(_: str) -> None:
 
 
 class _FakeResult:
-    def __init__(self, chunks: list[str]) -> None:
+    def __init__(
+        self,
+        chunks: list[str],
+        messages: list[Any] | None = None,
+    ) -> None:
         self._chunks = chunks
+        self._messages = messages or ["user", "assistant"]
 
     async def stream_text(self, delta: bool = True):
         for chunk in self._chunks:
@@ -28,8 +33,8 @@ class _FakeResult:
     def usage(self) -> dict[str, int]:
         return {"total_tokens": 12}
 
-    def all_messages(self) -> list[str]:
-        return ["user", "assistant"]
+    def all_messages(self) -> list[Any]:
+        return self._messages
 
 
 class _FakeStreamContext:
@@ -44,11 +49,37 @@ class _FakeStreamContext:
 
 
 class _FakeAgent:
-    def __init__(self, chunks: list[str]) -> None:
+    def __init__(
+        self,
+        chunks: list[str],
+        messages: list[Any] | None = None,
+        fallback_output: str = "",
+        fallback_messages: list[Any] | None = None,
+    ) -> None:
         self._chunks = chunks
+        self._messages = messages
+        self._fallback_output = fallback_output
+        self._fallback_messages = fallback_messages or ["user", "assistant"]
+        self.run_called = False
 
     def run_stream(self, *args: Any, **kwargs: Any) -> _FakeStreamContext:
-        return _FakeStreamContext(_FakeResult(self._chunks))
+        return _FakeStreamContext(_FakeResult(self._chunks, self._messages))
+
+    async def run(self, *args: Any, **kwargs: Any) -> Any:
+        self.run_called = True
+        return SimpleNamespace(
+            output=self._fallback_output,
+            usage=lambda: {"total_tokens": 18},
+            all_messages=lambda: self._fallback_messages,
+        )
+
+
+def _fake_tool_call_message() -> Any:
+    return SimpleNamespace(parts=[SimpleNamespace(part_kind="tool-call")])
+
+
+def _fake_tool_return_message() -> Any:
+    return SimpleNamespace(parts=[SimpleNamespace(part_kind="tool-return")])
 
 
 def _build_deps(stream_sentence_mode: bool) -> AgentDependencies:
@@ -87,6 +118,29 @@ async def test_stream_sentence_mode_false_should_batch_after_complete(monkeypatc
     assert [event.content for event in content_events] == [sentence_1 + sentence_2, sentence_3]
     assert events[-1].metadata is not None
     assert events[-1].metadata.get("is_complete") is True
+
+
+async def test_tool_chain_incomplete_should_trigger_fallback_run(monkeypatch) -> None:
+    fake_agent = _FakeAgent(
+        chunks=["我来给你钻石。"],
+        messages=[_fake_tool_call_message()],
+        fallback_output="已执行命令: /give @p diamond",
+        fallback_messages=[
+            _fake_tool_call_message(),
+            _fake_tool_return_message(),
+        ],
+    )
+    monkeypatch.setattr(core, "chat_agent", fake_agent)
+
+    events = [event async for event in core.stream_chat("hi", _build_deps(False), model="fake")]
+    content_events = [event for event in events if event.content]
+
+    assert fake_agent.run_called is True
+    assert [event.content for event in content_events] == ["已执行命令: /give @p diamond"]
+    assert events[-1].metadata is not None
+    assert events[-1].metadata.get("tool_calls") == 1
+    assert events[-1].metadata.get("tool_returns") == 1
+    assert events[-1].metadata.get("tool_fallback_used") is True
 
 
 def test_iter_sentence_batches_should_fallback_for_long_sentence() -> None:
