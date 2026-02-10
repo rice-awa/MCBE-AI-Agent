@@ -7,7 +7,13 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ThinkingPart,
+    UserPromptPart,
+)
 
 from core.queue import MessageBroker
 from services.agent.worker import AgentWorker
@@ -78,3 +84,21 @@ def test_strip_reasoning_content_for_history() -> None:
     sanitized_node = sanitized_message.items[1]
     assert isinstance(sanitized_node, _ReasoningNode)
     assert sanitized_node.reasoning_content == ""
+
+
+def test_strip_reasoning_content_for_thinking_part() -> None:
+    message = ModelResponse(
+        parts=[ThinkingPart(content="hidden-thought"), TextPart(content="visible")]
+    )
+
+    sanitized, cleared_count = AgentWorker._strip_reasoning_content([message])
+
+    assert cleared_count == 1
+    assert message.parts[0].content == "hidden-thought"
+
+    sanitized_message = sanitized[0]
+    assert isinstance(sanitized_message, ModelResponse)
+    assert isinstance(sanitized_message.parts[0], ThinkingPart)
+    assert sanitized_message.parts[0].content == ""
+    assert isinstance(sanitized_message.parts[1], TextPart)
+    assert sanitized_message.parts[1].content == "visible"

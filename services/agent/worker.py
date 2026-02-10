@@ -2,11 +2,12 @@
 
 import asyncio
 import copy
+import dataclasses
 import time
 from uuid import UUID
 
 import httpx
-from pydantic_ai.messages import ModelMessage, ModelRequest
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ThinkingPart
 
 from core.queue import MessageBroker
 from services.agent.core import stream_chat
@@ -308,12 +309,59 @@ class AgentWorker:
         cls,
         messages: list[ModelMessage],
     ) -> tuple[list[ModelMessage], int]:
-        """深拷贝并清空历史中的 reasoning_content，减少后续请求带宽。"""
-        sanitized_messages = copy.deepcopy(messages)
+        """清空历史中的推理内容（ThinkingPart/content 与 reasoning_content），减少后续请求带宽。"""
+        sanitized_messages: list[ModelMessage] = []
         cleared_count = 0
-        for message in sanitized_messages:
-            cleared_count += cls._clear_reasoning_content_in_object(message)
+
+        for message in messages:
+            sanitized_message, message_cleared = cls._sanitize_model_message(message)
+            if sanitized_message is None:
+                sanitized_message = copy.deepcopy(message)
+                message_cleared = cls._clear_reasoning_content_in_object(sanitized_message)
+
+            sanitized_messages.append(sanitized_message)
+            cleared_count += message_cleared
+
         return sanitized_messages, cleared_count
+
+    @classmethod
+    def _sanitize_model_message(
+        cls,
+        message: ModelMessage,
+    ) -> tuple[ModelMessage | None, int]:
+        """优先走轻量路径处理标准 ModelMessage，避免整条历史深拷贝。"""
+        if not isinstance(message, ModelResponse):
+            return None, 0
+
+        updated_parts: list[object] | None = None
+        cleared_count = 0
+
+        for index, part in enumerate(message.parts):
+            updated_part = part
+
+            if isinstance(part, ThinkingPart) and part.content:
+                updated_part = dataclasses.replace(part, content="")
+                cleared_count += 1
+
+            if hasattr(updated_part, "reasoning_content"):
+                reasoning_content = getattr(updated_part, "reasoning_content", None)
+                if isinstance(reasoning_content, str) and reasoning_content:
+                    if dataclasses.is_dataclass(updated_part):
+                        updated_part = dataclasses.replace(updated_part, reasoning_content="")
+                    else:
+                        updated_part = copy.copy(updated_part)
+                        setattr(updated_part, "reasoning_content", "")
+                    cleared_count += 1
+
+            if updated_part is not part:
+                if updated_parts is None:
+                    updated_parts = list(message.parts)
+                updated_parts[index] = updated_part
+
+        if updated_parts is None:
+            return message, 0
+
+        return dataclasses.replace(message, parts=updated_parts), cleared_count
 
     @classmethod
     def _clear_reasoning_content_in_object(
