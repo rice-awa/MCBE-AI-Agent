@@ -1,5 +1,6 @@
 """流式输出模式测试"""
 
+import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -83,6 +84,10 @@ class _FakeAgent:
         )
 
 
+async def _collect_events(prompt: str, deps: AgentDependencies, model: str) -> list[Any]:
+    return [event async for event in core.stream_chat(prompt, deps, model=model)]
+
+
 def _fake_tool_call_message() -> Any:
     return SimpleNamespace(parts=[SimpleNamespace(part_kind="tool-call")])
 
@@ -102,10 +107,10 @@ def _build_deps(stream_sentence_mode: bool) -> AgentDependencies:
     )
 
 
-async def test_stream_sentence_mode_true_should_stream_by_sentence(monkeypatch) -> None:
+def test_stream_sentence_mode_true_should_stream_by_sentence(monkeypatch) -> None:
     monkeypatch.setattr(core, "chat_agent", _FakeAgent(["你好", "，世界。", "再见", "！"]))
 
-    events = [event async for event in core.stream_chat("hi", _build_deps(True), model="fake")]
+    events = asyncio.run(_collect_events("hi", _build_deps(True), model="fake"))
     content_events = [event for event in events if event.content]
 
     assert [event.content for event in content_events] == ["你好，世界。", "再见！"]
@@ -113,7 +118,7 @@ async def test_stream_sentence_mode_true_should_stream_by_sentence(monkeypatch) 
     assert events[-1].metadata.get("is_complete") is True
 
 
-async def test_stream_sentence_mode_false_should_batch_after_complete(monkeypatch) -> None:
+def test_stream_sentence_mode_false_should_batch_after_complete(monkeypatch) -> None:
     sentence_1 = ("甲" * 390) + "。"
     sentence_2 = ("乙" * 390) + "。"
     sentence_3 = ("丙" * 390) + "。"
@@ -121,7 +126,7 @@ async def test_stream_sentence_mode_false_should_batch_after_complete(monkeypatc
 
     monkeypatch.setattr(core, "chat_agent", _FakeAgent(chunks))
 
-    events = [event async for event in core.stream_chat("hi", _build_deps(False), model="fake")]
+    events = asyncio.run(_collect_events("hi", _build_deps(False), model="fake"))
     content_events = [event for event in events if event.content]
 
     assert [event.content for event in content_events] == [sentence_1 + sentence_2, sentence_3]
@@ -129,7 +134,7 @@ async def test_stream_sentence_mode_false_should_batch_after_complete(monkeypatc
     assert events[-1].metadata.get("is_complete") is True
 
 
-async def test_tool_chain_incomplete_should_trigger_fallback_run(monkeypatch) -> None:
+def test_tool_chain_incomplete_should_trigger_fallback_run(monkeypatch) -> None:
     fake_agent = _FakeAgent(
         chunks=["我来给你钻石。"],
         messages=[_fake_tool_call_message()],
@@ -141,7 +146,7 @@ async def test_tool_chain_incomplete_should_trigger_fallback_run(monkeypatch) ->
     )
     monkeypatch.setattr(core, "chat_agent", fake_agent)
 
-    events = [event async for event in core.stream_chat("hi", _build_deps(False), model="fake")]
+    events = asyncio.run(_collect_events("hi", _build_deps(False), model="fake"))
     content_events = [event for event in events if event.content]
 
     assert fake_agent.run_called is True
@@ -160,7 +165,7 @@ def test_iter_sentence_batches_should_fallback_for_long_sentence() -> None:
     assert "".join(batches) == long_sentence
 
 
-async def test_fallback_should_stream_remaining_text(monkeypatch) -> None:
+def test_fallback_should_stream_remaining_text(monkeypatch) -> None:
     fake_agent = _FakeAgent(
         chunks=["开始。"],
         messages=[_fake_tool_call_message()],
@@ -169,13 +174,13 @@ async def test_fallback_should_stream_remaining_text(monkeypatch) -> None:
     )
     monkeypatch.setattr(core, "chat_agent", fake_agent)
 
-    events = [event async for event in core.stream_chat("hi", _build_deps(True), model="fake")]
+    events = asyncio.run(_collect_events("hi", _build_deps(True), model="fake"))
     content_events = [event for event in events if event.content]
 
     assert [event.content for event in content_events] == ["开始。", "完成。"]
 
 
-async def test_tool_chain_should_retry_until_complete(monkeypatch) -> None:
+def test_tool_chain_should_retry_until_complete(monkeypatch) -> None:
     fake_agent = _FakeAgent(
         chunks=["我来给你钻石。"],
         messages=[_fake_tool_call_message()],
@@ -187,7 +192,7 @@ async def test_tool_chain_should_retry_until_complete(monkeypatch) -> None:
     )
     monkeypatch.setattr(core, "chat_agent", fake_agent)
 
-    events = [event async for event in core.stream_chat("hi", _build_deps(False), model="fake")]
+    events = asyncio.run(_collect_events("hi", _build_deps(False), model="fake"))
     content_events = [event for event in events if event.content]
 
     assert fake_agent.run_call_count == 2
