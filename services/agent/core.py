@@ -44,6 +44,8 @@ register_agent_tools(chat_agent)
 
 SENTENCE_END_PATTERN = re.compile(r"[。！？\n.!?]+")
 NON_STREAM_BATCH_MAX_CHARS = 800
+MAX_TOOL_FALLBACK_ATTEMPTS = 3
+TOOL_CHAIN_CONTINUE_PROMPT = "请继续完成工具调用链并给出最终回复。"
 
 
 def _serialize_usage(usage: Any | None) -> dict[str, Any] | None:
@@ -125,6 +127,20 @@ def _extract_complete_sentences(buffer: str) -> tuple[list[str], str]:
     return sentences, buffer[last_end:]
 
 
+def _append_sent_text(sent_text: str, new_text: str) -> str:
+    if not new_text:
+        return sent_text
+    return f"{sent_text}{new_text}"
+
+
+def _diff_fallback_text(fallback_text: str, sent_text: str) -> str:
+    if not sent_text:
+        return fallback_text
+    if fallback_text.startswith(sent_text):
+        return fallback_text[len(sent_text) :]
+    return ""
+
+
 def _iter_sentence_batches(text: str, max_chars: int = NON_STREAM_BATCH_MAX_CHARS) -> Iterator[str]:
     """按句子完整性分批，避免单次 WebSocket 发送过大。"""
     if not text:
@@ -180,6 +196,7 @@ async def stream_chat(
     use_stream_mode = deps.settings.stream_sentence_mode
     sentence_buffer = ""
     full_response_parts: list[str] = []
+    sent_text = ""
     emitted_content = False
     all_messages: list[ModelMessage] = []
     serialized_usage: dict[str, Any] | None = None
@@ -211,6 +228,7 @@ async def stream_chat(
                             sequence=sequence,
                         )
                         emitted_content = True
+                        sent_text = _append_sent_text(sent_text, sentence)
                         sequence += 1
 
             all_messages = _extract_all_messages(result)
@@ -223,49 +241,74 @@ async def stream_chat(
         # 用户指令 -> tool_call -> tool_response -> 再次请求模型 -> 最终响应。
         if tool_calls > tool_returns:
             fallback_used = True
-            logger.warning(
-                "tool_chain_incomplete_on_stream",
-                connection_id=str(deps.connection_id),
-                tool_calls=tool_calls,
-                tool_returns=tool_returns,
-            )
+            fallback_prompt = prompt
+            fallback_history = message_history
+            attempt = 0
+            while attempt < MAX_TOOL_FALLBACK_ATTEMPTS and tool_calls > tool_returns:
+                attempt += 1
+                logger.warning(
+                    "tool_chain_incomplete_on_stream",
+                    connection_id=str(deps.connection_id),
+                    tool_calls=tool_calls,
+                    tool_returns=tool_returns,
+                    attempt=attempt,
+                )
 
-            fallback_result = await chat_agent.run(
-                prompt,
-                deps=deps,
-                model=model,
-                message_history=message_history,
-            )
+                fallback_result = await chat_agent.run(
+                    fallback_prompt,
+                    deps=deps,
+                    model=model,
+                    message_history=fallback_history,
+                )
 
-            all_messages = _extract_all_messages(fallback_result)
-            serialized_usage = _serialize_usage(_extract_result_usage(fallback_result))
-            tool_calls, tool_returns = _count_tool_parts(all_messages)
+                all_messages = _extract_all_messages(fallback_result)
+                serialized_usage = _serialize_usage(_extract_result_usage(fallback_result))
+                tool_calls, tool_returns = _count_tool_parts(all_messages)
 
-            fallback_output = _extract_result_output(fallback_result)
-            # 若前面已推送过内容，避免重复回复；仅用 fallback 来补齐工具执行链路与上下文。
-            if fallback_output.strip() and not emitted_content:
-                if use_stream_mode:
-                    fallback_sentences, fallback_tail = _extract_complete_sentences(fallback_output)
-                    if fallback_tail.strip():
-                        fallback_sentences.append(fallback_tail)
+                fallback_output = _extract_result_output(fallback_result)
+                fallback_delta = _diff_fallback_text(fallback_output, sent_text)
+                if fallback_output.strip() and not fallback_delta:
+                    logger.warning(
+                        "tool_fallback_output_mismatch",
+                        connection_id=str(deps.connection_id),
+                        sent_text_length=len(sent_text),
+                        fallback_length=len(fallback_output),
+                    )
 
-                    for sentence in fallback_sentences:
-                        yield StreamEvent(
-                            event_type="content",
-                            content=sentence,
-                            sequence=sequence,
+                # 若前面已推送过内容，尽量只补齐剩余文本，避免重复回复。
+                if fallback_delta.strip():
+                    if use_stream_mode:
+                        fallback_sentences, fallback_tail = _extract_complete_sentences(
+                            fallback_delta
                         )
-                        emitted_content = True
-                        sequence += 1
-                else:
-                    for chunk in _iter_sentence_batches(fallback_output):
-                        yield StreamEvent(
-                            event_type="content",
-                            content=chunk,
-                            sequence=sequence,
-                        )
-                        emitted_content = True
-                        sequence += 1
+                        if fallback_tail.strip():
+                            fallback_sentences.append(fallback_tail)
+
+                        for sentence in fallback_sentences:
+                            yield StreamEvent(
+                                event_type="content",
+                                content=sentence,
+                                sequence=sequence,
+                            )
+                            emitted_content = True
+                            sent_text = _append_sent_text(sent_text, sentence)
+                            sequence += 1
+                    else:
+                        for chunk in _iter_sentence_batches(fallback_delta):
+                            yield StreamEvent(
+                                event_type="content",
+                                content=chunk,
+                                sequence=sequence,
+                            )
+                            emitted_content = True
+                            sent_text = _append_sent_text(sent_text, chunk)
+                            sequence += 1
+
+                if tool_calls <= tool_returns:
+                    break
+
+                fallback_prompt = TOOL_CHAIN_CONTINUE_PROMPT
+                fallback_history = all_messages
         else:
             if use_stream_mode and sentence_buffer.strip():
                 yield StreamEvent(
@@ -274,6 +317,7 @@ async def stream_chat(
                     sequence=sequence,
                 )
                 emitted_content = True
+                sent_text = _append_sent_text(sent_text, sentence_buffer)
                 sequence += 1
 
             if not use_stream_mode:
@@ -285,6 +329,7 @@ async def stream_chat(
                         sequence=sequence,
                     )
                     emitted_content = True
+                    sent_text = _append_sent_text(sent_text, chunk)
                     sequence += 1
 
         logger.debug(

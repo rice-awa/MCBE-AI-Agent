@@ -55,22 +55,31 @@ class _FakeAgent:
         messages: list[Any] | None = None,
         fallback_output: str = "",
         fallback_messages: list[Any] | None = None,
+        fallback_outputs: list[str] | None = None,
+        fallback_messages_list: list[list[Any]] | None = None,
     ) -> None:
         self._chunks = chunks
         self._messages = messages
-        self._fallback_output = fallback_output
-        self._fallback_messages = fallback_messages or ["user", "assistant"]
+        self._fallback_outputs = fallback_outputs or [fallback_output]
+        self._fallback_messages_list = fallback_messages_list or [
+            fallback_messages or ["user", "assistant"]
+        ]
         self.run_called = False
+        self.run_call_count = 0
 
     def run_stream(self, *args: Any, **kwargs: Any) -> _FakeStreamContext:
         return _FakeStreamContext(_FakeResult(self._chunks, self._messages))
 
     async def run(self, *args: Any, **kwargs: Any) -> Any:
         self.run_called = True
+        self.run_call_count += 1
+        index = min(self.run_call_count - 1, len(self._fallback_outputs) - 1)
         return SimpleNamespace(
-            output=self._fallback_output,
+            output=self._fallback_outputs[index],
             usage=lambda: {"total_tokens": 18},
-            all_messages=lambda: self._fallback_messages,
+            all_messages=lambda: self._fallback_messages_list[
+                min(index, len(self._fallback_messages_list) - 1)
+            ],
         )
 
 
@@ -149,3 +158,37 @@ def test_iter_sentence_batches_should_fallback_for_long_sentence() -> None:
 
     assert len(batches) == 3
     assert "".join(batches) == long_sentence
+
+
+async def test_fallback_should_stream_remaining_text(monkeypatch) -> None:
+    fake_agent = _FakeAgent(
+        chunks=["开始。"],
+        messages=[_fake_tool_call_message()],
+        fallback_output="开始。完成。",
+        fallback_messages=[_fake_tool_call_message(), _fake_tool_return_message()],
+    )
+    monkeypatch.setattr(core, "chat_agent", fake_agent)
+
+    events = [event async for event in core.stream_chat("hi", _build_deps(True), model="fake")]
+    content_events = [event for event in events if event.content]
+
+    assert [event.content for event in content_events] == ["开始。", "完成。"]
+
+
+async def test_tool_chain_should_retry_until_complete(monkeypatch) -> None:
+    fake_agent = _FakeAgent(
+        chunks=["我来给你钻石。"],
+        messages=[_fake_tool_call_message()],
+        fallback_outputs=["", "已执行命令: /give @p diamond"],
+        fallback_messages_list=[
+            [_fake_tool_call_message()],
+            [_fake_tool_call_message(), _fake_tool_return_message()],
+        ],
+    )
+    monkeypatch.setattr(core, "chat_agent", fake_agent)
+
+    events = [event async for event in core.stream_chat("hi", _build_deps(False), model="fake")]
+    content_events = [event for event in events if event.content]
+
+    assert fake_agent.run_call_count == 2
+    assert [event.content for event in content_events] == ["已执行命令: /give @p diamond"]
