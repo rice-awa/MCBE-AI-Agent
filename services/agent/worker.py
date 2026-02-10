@@ -1,11 +1,13 @@
 """Agent Worker - 从队列消费请求并处理"""
 
 import asyncio
+import copy
+import dataclasses
 import time
 from uuid import UUID
 
 import httpx
-from pydantic_ai.messages import ModelMessage, ModelRequest
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ThinkingPart
 
 from core.queue import MessageBroker
 from services.agent.core import stream_chat
@@ -134,12 +136,14 @@ class AgentWorker:
 
         message_history: list[ModelMessage] | None = None
         if request.use_context:
-            message_history = self.broker.get_conversation_history(connection_id)
+            raw_history = self.broker.get_conversation_history(connection_id)
+            message_history, cleared_count = self._strip_reasoning_content(raw_history)
             logger.debug(
                 "chat_history_loaded",
                 worker_id=self.worker_id,
                 connection_id=str(connection_id),
                 history_message_count=len(message_history),
+                cleared_reasoning_content_count=cleared_count,
             )
 
         # 构建依赖
@@ -201,6 +205,9 @@ class AgentWorker:
                                 all_messages,
                                 self.settings.max_history_turns,
                             )
+                            trimmed_history, cleared_count = self._strip_reasoning_content(
+                                trimmed_history
+                            )
                             self.broker.set_conversation_history(
                                 connection_id,
                                 trimmed_history,
@@ -210,6 +217,7 @@ class AgentWorker:
                                 worker_id=self.worker_id,
                                 connection_id=str(connection_id),
                                 history_message_count=len(trimmed_history),
+                                cleared_reasoning_content_count=cleared_count,
                             )
 
                     response_text = "".join(response_parts)
@@ -295,6 +303,116 @@ class AgentWorker:
                         return list(messages[start_idx:])
 
         return list(messages)
+
+    @classmethod
+    def _strip_reasoning_content(
+        cls,
+        messages: list[ModelMessage],
+    ) -> tuple[list[ModelMessage], int]:
+        """清空历史中的推理内容（ThinkingPart/content 与 reasoning_content），减少后续请求带宽。"""
+        sanitized_messages: list[ModelMessage] = []
+        cleared_count = 0
+
+        for message in messages:
+            sanitized_message, message_cleared = cls._sanitize_model_message(message)
+            if sanitized_message is None:
+                sanitized_message = copy.deepcopy(message)
+                message_cleared = cls._clear_reasoning_content_in_object(sanitized_message)
+
+            sanitized_messages.append(sanitized_message)
+            cleared_count += message_cleared
+
+        return sanitized_messages, cleared_count
+
+    @classmethod
+    def _sanitize_model_message(
+        cls,
+        message: ModelMessage,
+    ) -> tuple[ModelMessage | None, int]:
+        """优先走轻量路径处理标准 ModelMessage，避免整条历史深拷贝。"""
+        if not isinstance(message, ModelResponse):
+            return None, 0
+
+        updated_parts: list[object] | None = None
+        cleared_count = 0
+
+        for index, part in enumerate(message.parts):
+            updated_part = part
+
+            if isinstance(part, ThinkingPart) and part.content:
+                updated_part = dataclasses.replace(part, content="")
+                cleared_count += 1
+
+            if hasattr(updated_part, "reasoning_content"):
+                reasoning_content = getattr(updated_part, "reasoning_content", None)
+                if isinstance(reasoning_content, str) and reasoning_content:
+                    if dataclasses.is_dataclass(updated_part):
+                        updated_part = dataclasses.replace(updated_part, reasoning_content="")
+                    else:
+                        updated_part = copy.copy(updated_part)
+                        setattr(updated_part, "reasoning_content", "")
+                    cleared_count += 1
+
+            if updated_part is not part:
+                if updated_parts is None:
+                    updated_parts = list(message.parts)
+                updated_parts[index] = updated_part
+
+        if updated_parts is None:
+            return message, 0
+
+        return dataclasses.replace(message, parts=updated_parts), cleared_count
+
+    @classmethod
+    def _clear_reasoning_content_in_object(
+        cls,
+        obj: object,
+        visited: set[int] | None = None,
+    ) -> int:
+        """递归清空对象图中的 reasoning_content 字段。"""
+        if visited is None:
+            visited = set()
+
+        obj_id = id(obj)
+        if obj_id in visited:
+            return 0
+        visited.add(obj_id)
+
+        cleared_count = 0
+
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key == "reasoning_content" and isinstance(value, str) and value:
+                    obj[key] = ""
+                    cleared_count += 1
+                else:
+                    cleared_count += cls._clear_reasoning_content_in_object(value, visited)
+            return cleared_count
+
+        if isinstance(obj, list):
+            for item in obj:
+                cleared_count += cls._clear_reasoning_content_in_object(item, visited)
+            return cleared_count
+
+        if isinstance(obj, tuple):
+            for item in obj:
+                cleared_count += cls._clear_reasoning_content_in_object(item, visited)
+            return cleared_count
+
+        if hasattr(obj, "reasoning_content"):
+            value = getattr(obj, "reasoning_content", None)
+            if isinstance(value, str) and value:
+                try:
+                    setattr(obj, "reasoning_content", "")
+                    cleared_count += 1
+                except (AttributeError, TypeError, ValueError):
+                    pass
+
+        if hasattr(obj, "__dict__"):
+            for value in vars(obj).values():
+                cleared_count += cls._clear_reasoning_content_in_object(value, visited)
+
+        return cleared_count
 
     def _create_send_callback(self, connection_id: UUID):
         """创建发送消息到游戏的回调"""
