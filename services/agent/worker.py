@@ -1,6 +1,7 @@
 """Agent Worker - 从队列消费请求并处理"""
 
 import asyncio
+import copy
 import time
 from uuid import UUID
 
@@ -134,12 +135,14 @@ class AgentWorker:
 
         message_history: list[ModelMessage] | None = None
         if request.use_context:
-            message_history = self.broker.get_conversation_history(connection_id)
+            raw_history = self.broker.get_conversation_history(connection_id)
+            message_history, cleared_count = self._strip_reasoning_content(raw_history)
             logger.debug(
                 "chat_history_loaded",
                 worker_id=self.worker_id,
                 connection_id=str(connection_id),
                 history_message_count=len(message_history),
+                cleared_reasoning_content_count=cleared_count,
             )
 
         # 构建依赖
@@ -201,6 +204,9 @@ class AgentWorker:
                                 all_messages,
                                 self.settings.max_history_turns,
                             )
+                            trimmed_history, cleared_count = self._strip_reasoning_content(
+                                trimmed_history
+                            )
                             self.broker.set_conversation_history(
                                 connection_id,
                                 trimmed_history,
@@ -210,6 +216,7 @@ class AgentWorker:
                                 worker_id=self.worker_id,
                                 connection_id=str(connection_id),
                                 history_message_count=len(trimmed_history),
+                                cleared_reasoning_content_count=cleared_count,
                             )
 
                     response_text = "".join(response_parts)
@@ -295,6 +302,69 @@ class AgentWorker:
                         return list(messages[start_idx:])
 
         return list(messages)
+
+    @classmethod
+    def _strip_reasoning_content(
+        cls,
+        messages: list[ModelMessage],
+    ) -> tuple[list[ModelMessage], int]:
+        """深拷贝并清空历史中的 reasoning_content，减少后续请求带宽。"""
+        sanitized_messages = copy.deepcopy(messages)
+        cleared_count = 0
+        for message in sanitized_messages:
+            cleared_count += cls._clear_reasoning_content_in_object(message)
+        return sanitized_messages, cleared_count
+
+    @classmethod
+    def _clear_reasoning_content_in_object(
+        cls,
+        obj: object,
+        visited: set[int] | None = None,
+    ) -> int:
+        """递归清空对象图中的 reasoning_content 字段。"""
+        if visited is None:
+            visited = set()
+
+        obj_id = id(obj)
+        if obj_id in visited:
+            return 0
+        visited.add(obj_id)
+
+        cleared_count = 0
+
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key == "reasoning_content" and isinstance(value, str) and value:
+                    obj[key] = ""
+                    cleared_count += 1
+                else:
+                    cleared_count += cls._clear_reasoning_content_in_object(value, visited)
+            return cleared_count
+
+        if isinstance(obj, list):
+            for item in obj:
+                cleared_count += cls._clear_reasoning_content_in_object(item, visited)
+            return cleared_count
+
+        if isinstance(obj, tuple):
+            for item in obj:
+                cleared_count += cls._clear_reasoning_content_in_object(item, visited)
+            return cleared_count
+
+        if hasattr(obj, "reasoning_content"):
+            value = getattr(obj, "reasoning_content", None)
+            if isinstance(value, str) and value:
+                try:
+                    setattr(obj, "reasoning_content", "")
+                    cleared_count += 1
+                except (AttributeError, TypeError, ValueError):
+                    pass
+
+        if hasattr(obj, "__dict__"):
+            for value in vars(obj).values():
+                cleared_count += cls._clear_reasoning_content_in_object(value, visited)
+
+        return cleared_count
 
     def _create_send_callback(self, connection_id: UUID):
         """创建发送消息到游戏的回调"""
