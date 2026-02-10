@@ -281,7 +281,18 @@ class AgentWorker:
                 if has_user_prompt:
                     user_turns += 1
                     if user_turns > max_turns:
-                        return list(messages[idx + 1 :])
+                        start_idx = idx + 1
+                        while start_idx < len(messages):
+                            next_message = messages[start_idx]
+                            if isinstance(next_message, ModelRequest):
+                                has_next_prompt = any(
+                                    getattr(part, "part_kind", None) == "user-prompt"
+                                    for part in next_message.parts
+                                )
+                                if has_next_prompt:
+                                    break
+                            start_idx += 1
+                        return list(messages[start_idx:])
 
         return list(messages)
 
