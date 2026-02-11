@@ -7,7 +7,13 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ThinkingPart,
+    UserPromptPart,
+)
 
 from core.queue import MessageBroker
 from services.agent.worker import AgentWorker
@@ -47,3 +53,52 @@ def test_message_broker_history_lifecycle() -> None:
 
     broker.unregister_connection(connection_id)
     assert broker.get_conversation_history(connection_id) == []
+
+class _ReasoningNode:
+    def __init__(self, reasoning_content: str) -> None:
+        self.reasoning_content = reasoning_content
+        self.children: list[object] = []
+
+
+class _Container:
+    def __init__(self, items: list[object]) -> None:
+        self.items = items
+
+
+def test_strip_reasoning_content_for_history() -> None:
+    node = _ReasoningNode("hidden-thought")
+    nested = {"reasoning_content": "hidden-json", "child": node}
+    message = _Container([nested, node])
+
+    sanitized, cleared_count = AgentWorker._strip_reasoning_content([message])
+
+    assert cleared_count == 2
+    assert node.reasoning_content == "hidden-thought"
+
+    sanitized_message = sanitized[0]
+    assert isinstance(sanitized_message, _Container)
+    sanitized_nested = sanitized_message.items[0]
+    assert isinstance(sanitized_nested, dict)
+    assert sanitized_nested["reasoning_content"] == ""
+
+    sanitized_node = sanitized_message.items[1]
+    assert isinstance(sanitized_node, _ReasoningNode)
+    assert sanitized_node.reasoning_content == ""
+
+
+def test_strip_reasoning_content_for_thinking_part() -> None:
+    message = ModelResponse(
+        parts=[ThinkingPart(content="hidden-thought"), TextPart(content="visible")]
+    )
+
+    sanitized, cleared_count = AgentWorker._strip_reasoning_content([message])
+
+    assert cleared_count == 1
+    assert message.parts[0].content == "hidden-thought"
+
+    sanitized_message = sanitized[0]
+    assert isinstance(sanitized_message, ModelResponse)
+    assert isinstance(sanitized_message.parts[0], ThinkingPart)
+    assert sanitized_message.parts[0].content == ""
+    assert isinstance(sanitized_message.parts[1], TextPart)
+    assert sanitized_message.parts[1].content == "visible"
