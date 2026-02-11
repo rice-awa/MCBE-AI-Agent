@@ -62,8 +62,7 @@ mcbe_ai_agent/
 │   └── mcwiki/           # MCWiki 搜索服务
 │       └── search.py     # Wiki 搜索工具
 ├── storage/               # 存储层 (TODO)
-├── main.py               # 应用入口
-├── cli.py                # CLI 工具
+├── cli.py                # 应用入口与 CLI 工具
 └── pyproject.toml        # 项目配置
 ```
 
@@ -180,12 +179,6 @@ python cli.py test-provider deepseek
 ### 6. 启动服务器
 
 ```bash
-python main.py
-```
-
-或使用cli版：
-
-```bash
 python cli.py serve
 ```
 
@@ -247,13 +240,13 @@ ifconfig | grep inet
 
 ```bash
 # 启动服务器
-python main.py
+python cli.py serve
 
 # 或使用守护进程方式（使用 tmux 或 screen）
 pkg install tmux -y
 tmux new -s mcbe_agent
 source venv/bin/activate
-python main.py
+python cli.py serve
 # 按 Ctrl+B 然后按 D 分离会话
 ```
 
@@ -357,7 +350,7 @@ python main.py
 
 **使用 nohup**:
 ```bash
-nohup python main.py > mcbe.log 2>&1 &
+nohup python cli.py serve > mcbe.log 2>&1 &
 ```
 
 ## 配置说明
@@ -546,7 +539,7 @@ source ~/mcbe_ai_agent/venv/bin/activate
 
 # 启动服务
 cd ~/mcbe_ai_agent
-python main.py
+python cli.py serve
 
 # 设置可执行权限
 chmod +x termux_start.sh
