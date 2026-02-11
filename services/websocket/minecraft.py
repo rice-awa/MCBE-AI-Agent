@@ -12,20 +12,16 @@ from models.minecraft import (
 from models.messages import ChatRequest
 from services.websocket.connection import ConnectionState
 from config.logging import get_logger
+from config.settings import get_settings
 
 logger = get_logger(__name__)
 
-# 命令前缀定义
-COMMANDS = {
-    "#登录": "login",
-    "AGENT 聊天": "chat",
-    "AGENT 脚本": "chat_script",
-    "AGENT 保存": "save",
-    "AGENT 上下文": "context",
-    "运行命令": "run_command",
-    "切换模型": "switch_model",
-    "帮助": "help",
-}
+# 获取配置
+_settings = get_settings()
+_minecraft_config = _settings.minecraft
+
+# 命令前缀定义（从配置读取）
+COMMANDS = _minecraft_config.commands
 
 
 class MinecraftProtocolHandler:
@@ -45,15 +41,22 @@ class MinecraftProtocolHandler:
         context_enabled: bool,
     ) -> str:
         """创建欢迎消息"""
-        message = f"""-----------
-成功连接 MCBE AI Agent v2.0
-连接 ID: {connection_id[:8]}...
-当前模型: {provider}/{model}
-上下文: {'启用' if context_enabled else '关闭'}
------------
-使用 "帮助" 查看可用命令
-        """.strip()
-        return message
+        config = _minecraft_config
+        # 找到帮助命令的前缀
+        help_prefix = next(
+            (prefix for prefix, cmd in config.commands.items() if cmd == "help"),
+            "帮助"
+        )
+        context_status = (
+            config.context_enabled_text if context_enabled else config.context_disabled_text
+        )
+        return config.welcome_message_template.format(
+            connection_id=connection_id[:8],
+            provider=provider,
+            model=model,
+            context_status=context_status,
+            help_command=help_prefix,
+        )
 
     @staticmethod
     def parse_player_message(data: dict[str, Any]) -> PlayerMessageEvent | None:
@@ -131,35 +134,43 @@ class MinecraftProtocolHandler:
 
     @staticmethod
     def get_help_text() -> str:
-        """获取帮助文本"""
-        return """
-可用命令:
-• AGENT 聊天 <内容> - 与 AI 对话
-• AGENT 脚本 <内容> - 使用脚本事件发送
-• AGENT 上下文 <启用/关闭/状态> - 管理上下文
-• 切换模型 <provider> - 切换 LLM (deepseek/openai/anthropic/ollama)
-• AGENT 保存 - 保存对话历史
-• 运行命令 <命令> - 执行游戏命令
-• 帮助 - 显示此帮助
-        """.strip()
+        """获取帮助文本（根据命令前缀动态生成）"""
+        config = _minecraft_config
+        lines = ["可用命令:"]
+
+        # 根据 commands 顺序生成帮助文本
+        for prefix, cmd_type in config.commands.items():
+            if cmd_type == "login":
+                continue  # 登录命令不显示在帮助中
+            if cmd_type in config.command_help:
+                desc, usage = config.command_help[cmd_type]
+                if usage:
+                    lines.append(f"• {prefix} {usage} - {desc}")
+                else:
+                    lines.append(f"• {prefix} - {desc}")
+
+        return "\n".join(lines)
 
     @staticmethod
     def create_error_message(error: str) -> str:
         """创建错误消息"""
+        config = _minecraft_config
         return MinecraftCommand.create_tellraw(
-            f"❌ 错误: {error}", color="§c"
+            f"{config.error_prefix}{error}", color=config.error_color
         ).model_dump_json(exclude_none=True)
 
     @staticmethod
     def create_info_message(info: str) -> str:
         """创建信息消息"""
+        config = _minecraft_config
         return MinecraftCommand.create_tellraw(
-            f"ℹ️ {info}", color="§b"
+            f"{config.info_prefix}{info}", color=config.info_color
         ).model_dump_json(exclude_none=True)
 
     @staticmethod
     def create_success_message(message: str) -> str:
         """创建成功消息"""
+        config = _minecraft_config
         return MinecraftCommand.create_tellraw(
-            f"✅ {message}", color="§a"
+            f"{config.success_prefix}{message}", color=config.success_color
         ).model_dump_json(exclude_none=True)

@@ -7,6 +7,64 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+class MinecraftCommandConfig(BaseModel):
+    """Minecraft 命令配置"""
+
+    prefix: str
+    description: str
+    usage: str | None = None
+
+
+class MinecraftConfig(BaseModel):
+    """Minecraft 协议配置"""
+
+    # 命令前缀定义: {前缀: 命令类型}
+    commands: dict[str, str] = {
+        "#登录": "login",
+        "AGENT 聊天": "chat",
+        "AGENT 脚本": "chat_script",
+        "AGENT 保存": "save",
+        "AGENT 上下文": "context",
+        "运行命令": "run_command",
+        "切换模型": "switch_model",
+        "帮助": "help",
+    }
+
+    # 命令帮助信息: {命令类型: (描述, 用法)}
+    command_help: dict[str, tuple[str, str | None]] = {
+        "chat": ("与 AI 对话", "<内容>"),
+        "chat_script": ("使用脚本事件发送", "<内容>"),
+        "context": ("管理上下文", "<启用/关闭/状态>"),
+        "switch_model": ("切换 LLM", "<provider>"),
+        "save": ("保存对话历史", None),
+        "run_command": ("执行游戏命令", "<命令>"),
+        "help": ("显示此帮助", None),
+    }
+
+    # 欢迎消息模板
+    welcome_message_template: str = """-----------
+成功连接 MCBE AI Agent v2.0
+连接 ID: {connection_id}...
+当前模型: {provider}/{model}
+上下文: {context_status}
+-----------
+使用 "{help_command}" 查看可用命令"""
+
+    # 状态文本
+    context_enabled_text: str = "启用"
+    context_disabled_text: str = "关闭"
+
+    # 消息前缀
+    error_prefix: str = "❌ 错误: "
+    info_prefix: str = "ℹ "
+    success_prefix: str = "✅ "
+
+    # 颜色代码
+    error_color: str = "§c"
+    info_color: str = "§b"
+    success_color: str = "§a"
+
+
 class LLMProviderConfig(BaseModel):
     """LLM 提供商配置"""
 
@@ -74,6 +132,7 @@ class Settings(BaseSettings):
     max_history_turns: int = 20
     stream_sentence_mode: bool = Field(
         default=True,
+        alias="STREAM_SENTENCE_MODE",
         description="是否开启流式输出（True=开启并按完整句子输出，False=关闭流式并在完成后按句子分批输出）"
     )
     llm_warmup_enabled: bool = Field(
@@ -93,6 +152,9 @@ class Settings(BaseSettings):
 
     # WebSocket 配置
     websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
+
+    # Minecraft 配置
+    minecraft: MinecraftConfig = Field(default_factory=MinecraftConfig)
 
     # 日志配置
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
