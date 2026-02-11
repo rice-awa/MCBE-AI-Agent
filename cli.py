@@ -92,47 +92,28 @@ def test_provider(provider: str):
 
 
 @cli.command()
+
 def init():
     """初始化配置文件"""
     env_file = Path(".env")
+    env_example = Path(".env.example")
 
     if env_file.exists():
         click.confirm("配置文件已存在，是否覆盖?", abort=True)
 
-    env_template = """# MCBE AI Agent 配置
+    if not env_example.exists():
+        click.echo(f"❌ 找不到模板文件: {env_example.absolute()}", err=True)
+        sys.exit(1)
 
-# 服务器配置
-HOST=0.0.0.0
-PORT=8080
-
-# 认证配置
-SECRET_KEY=change-me-in-production
-WEBSOCKET_PASSWORD=123456
-
-# DeepSeek 配置
-DEEPSEEK_API_KEY=your-api-key-here
-
-# OpenAI 配置 (可选)
-# OPENAI_API_KEY=your-api-key-here
-
-# Anthropic 配置 (可选)
-# ANTHROPIC_API_KEY=your-api-key-here
-
-# 默认 LLM 提供商
-DEFAULT_PROVIDER=deepseek
-
-# Worker 配置
-LLM_WORKER_COUNT=2
-QUEUE_MAX_SIZE=100
-
-# 日志配置
-LOG_LEVEL=INFO
-ENABLE_FILE_LOGGING=true
-"""
-
-    env_file.write_text(env_template, encoding="utf-8")
-    click.echo(f"✅ 配置文件已创建: {env_file.absolute()}")
-    click.echo("\n请编辑 .env 文件并填入您的 API 密钥")
+    try:
+        # 复制 .env.example 到 .env
+        env_content = env_example.read_text(encoding="utf-8")
+        env_file.write_text(env_content, encoding="utf-8")
+        click.echo(f"✅ 配置文件已创建: {env_file.absolute()}")
+        click.echo("\n请编辑 .env 文件并填入您的 API 密钥")
+    except Exception as e:
+        click.echo(f"❌ 复制配置文件失败: {e}", err=True)
+        sys.exit(1)
 
 
 def main():
