@@ -74,6 +74,17 @@ def _extract_all_messages(result: Any) -> list[ModelMessage]:
     return []
 
 
+def _extract_new_messages(result: Any) -> list[ModelMessage]:
+    """兼容不同 pydantic-ai 版本，提取 new_messages（增量消息）。"""
+    new_messages_attr = getattr(result, "new_messages", None)
+    if callable(new_messages_attr):
+        messages = new_messages_attr()
+        if isinstance(messages, list):
+            return messages
+    # 回退到 all_messages
+    return _extract_all_messages(result)
+
+
 def _extract_result_usage(result: Any) -> Any | None:
     """兼容不同 pydantic-ai 版本，提取 usage。"""
     usage_attr = getattr(result, "usage", None)
@@ -233,6 +244,7 @@ async def stream_chat(
                         sent_text = _append_sent_text(sent_text, sentence)
                         sequence += 1
 
+                new_messages = _extract_new_messages(result)
                 all_messages = _extract_all_messages(result)
                 serialized_usage = _serialize_usage(_extract_result_usage(result))
         else:
@@ -244,6 +256,7 @@ async def stream_chat(
                 message_history=message_history,
             )
 
+            new_messages = _extract_new_messages(result)
             all_messages = _extract_all_messages(result)
             serialized_usage = _serialize_usage(_extract_result_usage(result))
 
@@ -268,14 +281,16 @@ async def stream_chat(
                 sequence += 1
                 # 添加延迟避免 MC 崩溃
                 await asyncio.sleep(NON_STREAM_SEND_DELAY)
-        
-        # DeepSeek 流式场景下可能出现"返回了 tool_call，但未继续执行工具链"的情况。
-        # 发现 tool_call/return 数不一致时，回退到非流式 run，确保链路完整：
+
+        # 处理工具链不完整的情况：
+        # 某些模型（如 DeepSeek）可能在流式模式下返回 tool_call 但未完成工具链执行。
+        # 发现 tool_call/return 数不一致时，使用非流式 run 完成链路：
         # 用户指令 -> tool_call -> tool_response -> 再次请求模型 -> 最终响应。
         if tool_calls > tool_returns:
             fallback_used = True
             fallback_prompt = prompt
-            fallback_history = message_history
+            # 使用原始 message_history 加上本轮的新消息作为回退历史
+            fallback_history = (message_history or []) + new_messages
             attempt = 0
             while attempt < MAX_TOOL_FALLBACK_ATTEMPTS and tool_calls > tool_returns:
                 attempt += 1
@@ -286,18 +301,19 @@ async def stream_chat(
                     tool_returns=tool_returns,
                     attempt=attempt,
                 )
-        
+
                 fallback_result = await chat_agent.run(
                     fallback_prompt,
                     deps=deps,
                     model=model,
                     message_history=fallback_history,
                 )
-        
+
+                fallback_new_messages = _extract_new_messages(fallback_result)
                 all_messages = _extract_all_messages(fallback_result)
                 serialized_usage = _serialize_usage(_extract_result_usage(fallback_result))
                 tool_calls, tool_returns = _count_tool_parts(all_messages)
-        
+
                 fallback_output = _extract_result_output(fallback_result)
                 fallback_delta = _diff_fallback_text(fallback_output, sent_text)
                 if fallback_output.strip() and not fallback_delta:
@@ -307,7 +323,7 @@ async def stream_chat(
                         sent_text_length=len(sent_text),
                         fallback_length=len(fallback_output),
                     )
-        
+
                 # 若前面已推送过内容，尽量只补齐剩余文本，避免重复回复。
                 if fallback_delta.strip():
                     if use_stream_mode:
@@ -316,7 +332,7 @@ async def stream_chat(
                         )
                         if fallback_tail.strip():
                             fallback_sentences.append(fallback_tail)
-        
+
                         for sentence in fallback_sentences:
                             yield StreamEvent(
                                 event_type="content",
@@ -338,12 +354,13 @@ async def stream_chat(
                             sequence += 1
                             # 添加延迟避免 MC 崩溃
                             await asyncio.sleep(NON_STREAM_SEND_DELAY)
-        
+
                 if tool_calls <= tool_returns:
                     break
-        
+
                 fallback_prompt = TOOL_CHAIN_CONTINUE_PROMPT
-                fallback_history = all_messages
+                # 累积新的消息到历史
+                fallback_history = fallback_history + fallback_new_messages
         else:
             # 流式模式下发送缓冲区剩余内容
             if use_stream_mode and sentence_buffer.strip():

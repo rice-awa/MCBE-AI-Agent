@@ -58,9 +58,16 @@ class _FakeAgent:
         fallback_messages: list[Any] | None = None,
         fallback_outputs: list[str] | None = None,
         fallback_messages_list: list[list[Any]] | None = None,
+        # 新增参数：区分第一次run和fallback run的返回
+        first_run_output: str | None = None,
+        first_run_messages: list[Any] | None = None,
     ) -> None:
         self._chunks = chunks
         self._messages = messages
+        # 第一次run的返回（非流式模式下首次调用）
+        self._first_run_output = first_run_output if first_run_output is not None else fallback_output
+        self._first_run_messages = first_run_messages if first_run_messages is not None else (fallback_messages or ["user", "assistant"])
+        # fallback run的返回
         self._fallback_outputs = fallback_outputs or [fallback_output]
         self._fallback_messages_list = fallback_messages_list or [
             fallback_messages or ["user", "assistant"]
@@ -74,7 +81,15 @@ class _FakeAgent:
     async def run(self, *args: Any, **kwargs: Any) -> Any:
         self.run_called = True
         self.run_call_count += 1
-        index = min(self.run_call_count - 1, len(self._fallback_outputs) - 1)
+        # 第一次调用使用 first_run 配置
+        if self.run_call_count == 1:
+            return SimpleNamespace(
+                output=self._first_run_output,
+                usage=lambda: {"total_tokens": 18},
+                all_messages=lambda: self._first_run_messages,
+            )
+        # 后续调用使用 fallback 配置
+        index = min(self.run_call_count - 2, len(self._fallback_outputs) - 1)
         return SimpleNamespace(
             output=self._fallback_outputs[index],
             usage=lambda: {"total_tokens": 18},
@@ -119,25 +134,32 @@ def test_stream_sentence_mode_true_should_stream_by_sentence(monkeypatch) -> Non
 
 
 def test_stream_sentence_mode_false_should_batch_after_complete(monkeypatch) -> None:
-    sentence_1 = ("甲" * 390) + "。"
-    sentence_2 = ("乙" * 390) + "。"
-    sentence_3 = ("丙" * 390) + "。"
-    chunks = [sentence_1[:120], sentence_1[120:] + sentence_2, sentence_3]
+    # 使用较短的句子（少于 NON_STREAM_BATCH_MAX_CHARS=200）
+    sentence_1 = ("甲" * 50) + "。"
+    sentence_2 = ("乙" * 50) + "。"
+    sentence_3 = ("丙" * 50) + "。"
+    full_response = sentence_1 + sentence_2 + sentence_3
 
-    monkeypatch.setattr(core, "chat_agent", _FakeAgent(chunks))
+    monkeypatch.setattr(core, "chat_agent", _FakeAgent([], fallback_output=full_response))
 
     events = asyncio.run(_collect_events("hi", _build_deps(False), model="fake"))
     content_events = [event for event in events if event.content]
 
-    assert [event.content for event in content_events] == [sentence_1 + sentence_2, sentence_3]
+    # 总长度153字符 < 200，作为一个批次发送
+    assert len(content_events) == 1
+    assert content_events[0].content == full_response
     assert events[-1].metadata is not None
     assert events[-1].metadata.get("is_complete") is True
 
 
 def test_tool_chain_incomplete_should_trigger_fallback_run(monkeypatch) -> None:
+    # 第一次run返回tool-call但不完整（没有tool-return）
+    # fallback run返回完整的tool-call + tool-return
     fake_agent = _FakeAgent(
         chunks=["我来给你钻石。"],
         messages=[_fake_tool_call_message()],
+        first_run_output="",  # 第一次run没有输出
+        first_run_messages=[_fake_tool_call_message()],  # 只有tool-call，没有tool-return
         fallback_output="已执行命令: /give @p diamond",
         fallback_messages=[
             _fake_tool_call_message(),
@@ -184,10 +206,12 @@ def test_tool_chain_should_retry_until_complete(monkeypatch) -> None:
     fake_agent = _FakeAgent(
         chunks=["我来给你钻石。"],
         messages=[_fake_tool_call_message()],
+        first_run_output="",  # 第一次run没有输出
+        first_run_messages=[_fake_tool_call_message()],  # 只有tool-call
         fallback_outputs=["", "已执行命令: /give @p diamond"],
         fallback_messages_list=[
-            [_fake_tool_call_message()],
-            [_fake_tool_call_message(), _fake_tool_return_message()],
+            [_fake_tool_call_message()],  # 第二次run仍然不完整
+            [_fake_tool_call_message(), _fake_tool_return_message()],  # 第三次run完整
         ],
     )
     monkeypatch.setattr(core, "chat_agent", fake_agent)
@@ -195,5 +219,5 @@ def test_tool_chain_should_retry_until_complete(monkeypatch) -> None:
     events = asyncio.run(_collect_events("hi", _build_deps(False), model="fake"))
     content_events = [event for event in events if event.content]
 
-    assert fake_agent.run_call_count == 2
+    assert fake_agent.run_call_count == 3  # 第一次 + 2次fallback
     assert [event.content for event in content_events] == ["已执行命令: /give @p diamond"]
