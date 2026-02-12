@@ -2,9 +2,10 @@
 
 import asyncio
 import sys
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, AsyncIterator
+from typing import Any
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +51,7 @@ def make_tool_part(
         tool_name=tool_name,
         tool_call_id="test_call_id",
         args=args or {"command": "give @s diamond"},
+        part_kind="tool-call",
     )
 
 
@@ -81,6 +83,12 @@ class MockRequestStream:
     def __init__(self, events: list[Any]):
         self._events = events
 
+    async def __aenter__(self) -> "MockRequestStream":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        pass
+
     async def __aiter__(self):
         for event in self._events:
             yield event
@@ -88,7 +96,7 @@ class MockRequestStream:
     async def stream_text(self, delta: bool = True) -> AsyncIterator[str]:
         """模拟 stream_text 方法"""
         for event in self._events:
-            if isinstance(event, MockPartDeltaEvent):
+            if hasattr(event, "delta") and hasattr(event.delta, "content_delta"):
                 yield event.delta.content_delta
 
 
@@ -97,6 +105,12 @@ class MockHandleStream:
 
     def __init__(self, events: list[Any]):
         self._events = events
+
+    async def __aenter__(self) -> "MockHandleStream":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        pass
 
     async def __aiter__(self):
         for event in self._events:
@@ -109,7 +123,7 @@ class MockModelRequestNode:
     def __init__(self, events: list[Any]):
         self._events = events
 
-    async def stream(self, ctx: Any) -> MockRequestStream:
+    def stream(self, ctx: Any) -> MockRequestStream:
         return MockRequestStream(self._events)
 
 
@@ -119,7 +133,7 @@ class MockCallToolsNode:
     def __init__(self, events: list[Any]):
         self._events = events
 
-    async def stream(self, ctx: Any) -> MockHandleStream:
+    def stream(self, ctx: Any) -> MockHandleStream:
         return MockHandleStream(self._events)
 
 
@@ -205,18 +219,22 @@ class MockAgent:
         tool_events: list[Any] = None,
         result_output: str = "",
         result_messages: list[Any] = None,
+        request_node_events: list[list[Any]] = None,
     ):
+
         """
         Args:
             text_chunks: 文本增量列表（用于流式模式）
             tool_events: 工具事件列表（用于 CallToolsNode）
             result_output: 最终输出文本
             result_messages: 最终消息列表
+            request_node_events: 多个 ModelRequestNode 的事件列表（用于测试跨节点缓冲）
         """
         self._text_chunks = text_chunks or []
         self._tool_events = tool_events or []
         self._result_output = result_output
         self._result_messages = result_messages or []
+        self._request_node_events = request_node_events
         self.run_called = False
         self.run_call_count = 0
 
@@ -234,14 +252,17 @@ class MockAgent:
         # 1. UserPromptNode
         nodes.append(MockUserPromptNode(prompt))
 
-        # 2. ModelRequestNode（如果有文本或工具）
-        if self._text_chunks or self._tool_events:
+        # 2. ModelRequestNode
+        if self._request_node_events is not None:
+            for events in self._request_node_events:
+                nodes.append(MockModelRequestNode(events))
+        elif self._text_chunks or self._tool_events:
             events = []
             # PartStartEvent（可能有初始内容）
-            events.append(MockPartStartEvent(0, ""))
+            events.append(make_part_start_event(0, ""))
             # PartDeltaEvent（文本增量）
             for i, chunk in enumerate(self._text_chunks):
-                events.append(MockPartDeltaEvent(0, chunk))
+                events.append(make_part_delta_event(0, chunk))
             nodes.append(MockModelRequestNode(events))
 
         # 3. CallToolsNode（如果有工具事件）
@@ -294,6 +315,7 @@ def _build_deps(stream_sentence_mode: bool) -> AgentDependencies:
 def _patch_isinstance_for_events(monkeypatch):
     """Patch isinstance to make mock events pass type checks"""
 
+    monkeypatch.setattr(core, "Agent", MockAgent)
     original_isinstance = isinstance
 
     def custom_isinstance(obj, classinfo):
@@ -323,7 +345,7 @@ def _patch_isinstance_for_events(monkeypatch):
 def test_stream_sentence_mode_true_should_stream_by_sentence(monkeypatch) -> None:
     """流式模式：按完整句子发送"""
     _patch_isinstance_for_events(monkeypatch)
-    
+
     mock_agent = MockAgent(
         text_chunks=["你好", "，世界。", "再见", "！"],
         result_output="你好，世界。再见！",
@@ -341,7 +363,7 @@ def test_stream_sentence_mode_true_should_stream_by_sentence(monkeypatch) -> Non
 def test_stream_sentence_mode_false_should_batch_after_complete(monkeypatch) -> None:
     """非流式模式：完整响应后分批发送"""
     _patch_isinstance_for_events(monkeypatch)
-    
+
     sentence_1 = ("甲" * 50) + "。"
     sentence_2 = ("乙" * 50) + "。"
     sentence_3 = ("丙" * 50) + "。"
@@ -353,9 +375,9 @@ def test_stream_sentence_mode_false_should_batch_after_complete(monkeypatch) -> 
     events = asyncio.run(_collect_events("hi", _build_deps(False), model="fake"))
     content_events = [event for event in events if event.content]
 
-    # 总长度 < 150，作为一个批次发送
-    assert len(content_events) == 1
-    assert content_events[0].content == full_response
+    # 总长度 > 150，将分成两个批次发送
+    assert len(content_events) == 2
+    assert "".join(event.content for event in content_events) == full_response
     assert events[-1].metadata is not None
     assert events[-1].metadata.get("is_complete") is True
 
@@ -363,7 +385,7 @@ def test_stream_sentence_mode_false_should_batch_after_complete(monkeypatch) -> 
 def test_tool_call_should_be_recorded_in_tool_events(monkeypatch) -> None:
     """工具调用事件应被记录在 tool_events 中"""
     _patch_isinstance_for_events(monkeypatch)
-    
+
     tool_events = [
         make_function_tool_call_event("run_minecraft_command", {"command": "give @s diamond"}),
         make_function_tool_result_event("test_call_id", "已执行命令: /give @s diamond"),
@@ -389,7 +411,7 @@ def test_tool_call_should_be_recorded_in_tool_events(monkeypatch) -> None:
 def test_tool_chain_no_longer_needs_manual_fallback(monkeypatch) -> None:
     """工具链不再需要手动回退（框架自动处理）"""
     _patch_isinstance_for_events(monkeypatch)
-    
+
     tool_events = [
         make_function_tool_call_event("run_minecraft_command", {"command": "give @s diamond"}),
         make_function_tool_result_event("test_call_id", "已执行命令: /give @s diamond"),
@@ -425,7 +447,7 @@ def test_iter_sentence_batches_should_fallback_for_long_sentence() -> None:
 def test_empty_text_chunks_should_not_yield_content_events(monkeypatch) -> None:
     """空文本列表不应产生内容事件"""
     _patch_isinstance_for_events(monkeypatch)
-    
+
     mock_agent = MockAgent(text_chunks=[], result_output="")
     monkeypatch.setattr(core, "chat_agent", mock_agent)
 
@@ -441,7 +463,7 @@ def test_empty_text_chunks_should_not_yield_content_events(monkeypatch) -> None:
 def test_non_stream_mode_uses_run_method(monkeypatch) -> None:
     """非流式模式应使用 run() 方法"""
     _patch_isinstance_for_events(monkeypatch)
-    
+
     mock_agent = MockAgent(result_output="这是一个测试响应。")
     monkeypatch.setattr(core, "chat_agent", mock_agent)
 
@@ -456,7 +478,7 @@ def test_non_stream_mode_uses_run_method(monkeypatch) -> None:
 def test_multiple_tool_calls_should_all_be_recorded(monkeypatch) -> None:
     """多个工具调用事件都应被记录"""
     _patch_isinstance_for_events(monkeypatch)
-    
+
     tool_events = [
         make_function_tool_call_event("run_minecraft_command", {"command": "give @s diamond"}),
         make_function_tool_result_event("test_call_id_1", "已执行命令: /give @s diamond"),
@@ -477,3 +499,47 @@ def test_multiple_tool_calls_should_all_be_recorded(monkeypatch) -> None:
     assert len(tool_events_list) == 2
     assert tool_events_list[0]["tool_name"] == "run_minecraft_command"
     assert tool_events_list[1]["tool_name"] == "send_game_message"
+
+
+def test_stream_sentence_mode_should_not_flush_incomplete_tail_between_request_nodes(monkeypatch) -> None:
+    """流式模式：跨 ModelRequestNode 的半句不应提前发送"""
+    _patch_isinstance_for_events(monkeypatch)
+
+    request_node_events = [
+        [make_part_start_event(0, ""), make_part_delta_event(0, "你好")],
+        [make_part_start_event(0, ""), make_part_delta_event(0, "，世界。")],
+    ]
+
+    mock_agent = MockAgent(
+        request_node_events=request_node_events,
+        result_output="你好，世界。",
+    )
+    monkeypatch.setattr(core, "chat_agent", mock_agent)
+
+    events = asyncio.run(_collect_events("hi", _build_deps(True), model="fake"))
+    content_events = [event for event in events if event.content]
+
+    assert [event.content for event in content_events] == ["你好，世界。"]
+
+
+def test_non_stream_mode_should_populate_tool_events_from_messages(monkeypatch) -> None:
+    """非流式模式：应从结果消息中回填工具调用元数据"""
+    _patch_isinstance_for_events(monkeypatch)
+
+    result_messages = [
+        SimpleNamespace(parts=[make_tool_part("run_minecraft_command", {"command": "time set day"})])
+    ]
+
+    mock_agent = MockAgent(
+        result_output="已将时间设置为白天。",
+        result_messages=result_messages,
+    )
+    monkeypatch.setattr(core, "chat_agent", mock_agent)
+
+    events = asyncio.run(_collect_events("把时间调成白天", _build_deps(False), model="fake"))
+
+    assert events[-1].metadata is not None
+    tool_events_list = events[-1].metadata.get("tool_events", [])
+    assert len(tool_events_list) == 1
+    assert tool_events_list[0]["tool_name"] == "run_minecraft_command"
+    assert tool_events_list[0]["args"] == {"command": "time set day"}

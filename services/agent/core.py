@@ -2,23 +2,24 @@
 
 import asyncio
 import re
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import asdict, dataclass, field, is_dataclass
-from typing import Any, AsyncIterator
+from typing import Any
 
-from pydantic_ai import Agent, RunContext
-from pydantic_ai.messages import ModelMessage
-from pydantic_ai.models import Model
 from pydantic_ai import (
+    Agent,
     FunctionToolCallEvent,
     FunctionToolResultEvent,
     PartDeltaEvent,
     PartStartEvent,
+    RunContext,
     TextPartDelta,
 )
+from pydantic_ai.messages import ModelMessage
+from pydantic_ai.models import Model
 
-from models.agent import AgentDependencies, StreamEvent
 from config.logging import get_logger
+from models.agent import AgentDependencies, StreamEvent
 from services.agent.tools import register_agent_tools
 
 logger = get_logger(__name__)
@@ -109,6 +110,34 @@ def _extract_result_output(result: Any) -> str:
                 return value
             return str(value)
     return ""
+
+
+def _extract_tool_events_from_messages(messages: list[ModelMessage]) -> list[dict[str, Any]]:
+    """从消息列表中提取工具调用事件（用于非流式模式回填元数据）。"""
+    tool_events: list[dict[str, Any]] = []
+
+    for message in messages:
+        parts = getattr(message, "parts", None)
+        if not parts:
+            continue
+
+        for part in parts:
+            if getattr(part, "part_kind", None) != "tool-call":
+                continue
+
+            tool_name = getattr(part, "tool_name", None)
+            if not tool_name:
+                continue
+
+            tool_events.append(
+                {
+                    "tool_name": tool_name,
+                    "tool_call_id": getattr(part, "tool_call_id", None),
+                    "args": getattr(part, "args", None),
+                }
+            )
+
+    return tool_events
 
 
 def _extract_complete_sentences(buffer: str) -> tuple[list[str], str]:
@@ -308,11 +337,6 @@ async def stream_response_handler(
                                                 ctx, sentence
                                             )
 
-                        # 节点流结束后，发送缓冲区剩余内容
-                        if ctx.sentence_buffer.strip():
-                            yield await _send_content_event(ctx, ctx.sentence_buffer)
-                            ctx.sentence_buffer = ""
-
                 # 处理工具调用节点 - 工具由框架自动执行
                 elif Agent.is_call_tools_node(node):
                     async with node.stream(run.ctx) as handle_stream:
@@ -344,6 +368,11 @@ async def stream_response_handler(
 
                 # 处理结束节点
                 elif Agent.is_end_node(node):
+                    # 仅在整个执行结束时再冲刷尾部 buffer，避免跨节点半句提前下发
+                    if ctx.sentence_buffer.strip():
+                        yield await _send_content_event(ctx, ctx.sentence_buffer)
+                        ctx.sentence_buffer = ""
+
                     # 从最终结果中提取信息
                     if run.result is not None:
                         ctx.all_messages = _extract_all_messages(run.result)
@@ -410,6 +439,7 @@ async def non_stream_response_handler(
         ctx.new_messages = _extract_new_messages(result)
         ctx.all_messages = _extract_all_messages(result)
         ctx.serialized_usage = _serialize_usage(_extract_result_usage(result))
+        ctx.tool_events = _extract_tool_events_from_messages(ctx.new_messages)
 
         # 提取完整响应文本
         full_response = _extract_result_output(result)
