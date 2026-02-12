@@ -28,6 +28,7 @@ class ConnectionState:
     context_enabled: bool = True
     response_queue: asyncio.Queue | None = None
     current_provider: str | None = None
+    pending_command_futures: dict[str, asyncio.Future[str]] = field(default_factory=dict)
 
 
 class ConnectionManager:
@@ -81,6 +82,11 @@ class ConnectionManager:
             connection_id: 连接 ID
         """
         if state := self._connections.pop(connection_id, None):
+            for future in state.pending_command_futures.values():
+                if not future.done():
+                    future.set_result("命令执行失败: 连接已关闭")
+            state.pending_command_futures.clear()
+
             # 取消响应发送任务
             if task := self._sender_tasks.pop(connection_id, None):
                 task.cancel()
@@ -211,7 +217,11 @@ class ConnectionManager:
             if msg_type == "game_message":
                 await self._send_game_message(state, response["content"])
             elif msg_type == "run_command":
-                await self._run_command(state, response["command"])
+                await self._run_command(
+                    state,
+                    response["command"],
+                    response.get("result_future"),
+                )
         else:
             logger.warning(
                 "unknown_response_type",
@@ -275,14 +285,24 @@ class ConnectionManager:
                 error=str(e),
             )
 
-    async def _run_command(self, state: ConnectionState, command: str) -> None:
+    async def _run_command(
+        self,
+        state: ConnectionState,
+        command: str,
+        result_future: asyncio.Future[str] | None = None,
+    ) -> None:
         """执行 Minecraft 命令"""
         if not state.websocket:
+            if result_future and not result_future.done():
+                result_future.set_result("命令执行失败: WebSocket 未连接")
             return
 
         try:
             cmd = MinecraftCommand.create_raw(command)
             payload = cmd.model_dump_json(exclude_none=True)
+            if result_future:
+                state.pending_command_futures[cmd.header.requestId] = result_future
+
             await state.websocket.send(payload)
             ws_raw_logger.info(
                 "websocket_response_sent",
@@ -295,8 +315,11 @@ class ConnectionManager:
                 "command_executed",
                 connection_id=str(state.id),
                 command=command,
+                request_id=cmd.header.requestId,
             )
         except Exception as e:
+            if result_future and not result_future.done():
+                result_future.set_result(f"命令执行失败: {str(e)}")
             logger.error(
                 "run_command_error",
                 connection_id=str(state.id),

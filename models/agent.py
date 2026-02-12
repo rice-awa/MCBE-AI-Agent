@@ -18,7 +18,7 @@ class AgentDependencies:
     settings: Settings
     http_client: httpx.AsyncClient
     send_to_game: Callable[[str], Awaitable[None]]
-    run_command: Callable[[str], Awaitable[None]]
+    run_command: Callable[[str], Awaitable[str]]
 
 
 @dataclass
