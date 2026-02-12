@@ -82,11 +82,6 @@ class ConnectionManager:
             connection_id: 连接 ID
         """
         if state := self._connections.pop(connection_id, None):
-            for future in state.pending_command_futures.values():
-                if not future.done():
-                    future.set_result("命令执行失败: 连接已关闭")
-            state.pending_command_futures.clear()
-
             # 取消响应发送任务
             if task := self._sender_tasks.pop(connection_id, None):
                 task.cancel()
@@ -94,6 +89,9 @@ class ConnectionManager:
                     await task
                 except asyncio.CancelledError:
                     pass
+
+            self._fail_pending_command_futures(state)
+            self._fail_queued_command_futures(state)
 
             # 从消息代理注销
             self.broker.unregister_connection(connection_id)
@@ -103,6 +101,34 @@ class ConnectionManager:
                 connection_id=str(connection_id),
                 remaining_connections=len(self._connections),
             )
+
+    def _fail_pending_command_futures(self, state: ConnectionState) -> None:
+        """完成已登记但未收到 commandResponse 的命令 future。"""
+        for future in state.pending_command_futures.values():
+            if not future.done():
+                future.set_result("命令执行失败: 连接已关闭")
+        state.pending_command_futures.clear()
+
+    def _fail_queued_command_futures(self, state: ConnectionState) -> None:
+        """完成仍滞留在响应队列中的 run_command future。"""
+        queue = state.response_queue
+        if queue is None:
+            return
+
+        while not queue.empty():
+            try:
+                response = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            if (
+                isinstance(response, dict)
+                and response.get("type") == "run_command"
+                and isinstance(response.get("result_future"), asyncio.Future)
+            ):
+                result_future = response["result_future"]
+                if not result_future.done():
+                    result_future.set_result("命令执行失败: 连接已关闭")
 
     def get_connection(self, connection_id: UUID) -> ConnectionState | None:
         """获取连接状态"""
