@@ -254,19 +254,54 @@ async def stream_response_handler(
                                     "agent_part_start",
                                     index=event.index,
                                     connection_id=str(deps.connection_id),
+                                    current_buffer=ctx.sentence_buffer,
                                 )
+                                # 重要：PartStartEvent.part 可能包含初始文本内容！
+                                # 如果是 TextPart 且有内容，需要处理
+                                part = event.part
+                                if hasattr(part, "content") and part.content:
+                                    logger.debug(
+                                        "agent_part_start_content",
+                                        index=event.index,
+                                        content=part.content,
+                                        connection_id=str(deps.connection_id),
+                                    )
+                                    # 将 PartStartEvent 中的初始内容添加到 buffer
+                                    ctx.sentence_buffer += part.content
+                                    sentences, ctx.sentence_buffer = (
+                                        _extract_complete_sentences(
+                                            ctx.sentence_buffer
+                                        )
+                                    )
+                                    for sentence in sentences:
+                                        yield await _send_content_event(
+                                            ctx, sentence
+                                        )
 
                             # 处理增量事件
                             elif isinstance(event, PartDeltaEvent):
                                 if isinstance(event.delta, TextPartDelta):
                                     # 文本增量 - 缓冲并按完整句子发送
                                     chunk = event.delta.content_delta
+                                    logger.debug(
+                                        "agent_text_delta",
+                                        chunk=chunk,
+                                        index=event.index,
+                                        connection_id=str(deps.connection_id),
+                                        buffer_before=ctx.sentence_buffer,
+                                    )
                                     if chunk:
                                         ctx.sentence_buffer += chunk
                                         sentences, ctx.sentence_buffer = (
                                             _extract_complete_sentences(
                                                 ctx.sentence_buffer
                                             )
+                                        )
+                                        logger.debug(
+                                            "agent_sentences_extracted",
+                                            sentences=sentences,
+                                            buffer_after=ctx.sentence_buffer,
+                                            connection_id=str(deps.connection_id),
                                         )
                                         for sentence in sentences:
                                             yield await _send_content_event(
