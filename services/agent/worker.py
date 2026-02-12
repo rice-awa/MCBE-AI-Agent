@@ -274,11 +274,20 @@ class AgentWorker:
         messages: list[ModelMessage],
         max_turns: int,
     ) -> list[ModelMessage]:
-        """按“用户轮次”裁剪历史，保留最近 N 轮对话。"""
+        """按"用户轮次"裁剪历史，保留最近 N 轮对话。
+
+        注意：确保工具调用链的完整性，不从中间切断 tool-call/tool-return 对。
+        """
         if max_turns <= 0:
             return []
 
+        if not messages:
+            return []
+
+        # 从后向前查找用户轮次
         user_turns = 0
+        cut_idx = 0
+
         for idx in range(len(messages) - 1, -1, -1):
             message = messages[idx]
             if isinstance(message, ModelRequest):
@@ -288,21 +297,43 @@ class AgentWorker:
                 )
                 if has_user_prompt:
                     user_turns += 1
-                    if user_turns > max_turns:
-                        start_idx = idx + 1
-                        while start_idx < len(messages):
-                            next_message = messages[start_idx]
-                            if isinstance(next_message, ModelRequest):
-                                has_next_prompt = any(
-                                    getattr(part, "part_kind", None) == "user-prompt"
-                                    for part in next_message.parts
-                                )
-                                if has_next_prompt:
-                                    break
-                            start_idx += 1
-                        return list(messages[start_idx:])
+                    if user_turns == max_turns:
+                        # 找到第 N 个用户轮次的起始位置
+                        cut_idx = idx
+                        break
 
-        return list(messages)
+        # 如果没有找到足够的轮次，保留全部
+        if user_turns < max_turns:
+            return list(messages)
+
+        # 确保不从 tool-call/tool-return 链中间切断
+        # 向前查找，确保包含完整的工具调用链
+        while cut_idx > 0:
+            prev_message = messages[cut_idx - 1]
+            # 检查前一个消息是否包含未完成的工具调用
+            if isinstance(prev_message, ModelResponse):
+                has_tool_call = any(
+                    getattr(part, "part_kind", None) == "tool-call"
+                    for part in prev_message.parts
+                )
+                if has_tool_call:
+                    # 需要包含这个响应，因为当前请求可能是对其的 tool-return
+                    cut_idx -= 1
+                    continue
+
+            # 检查是否是系统提示词
+            if isinstance(prev_message, ModelRequest):
+                has_system_prompt = any(
+                    getattr(part, "part_kind", None) == "system-prompt"
+                    for part in prev_message.parts
+                )
+                if has_system_prompt:
+                    cut_idx -= 1
+                    continue
+
+            break
+
+        return list(messages[cut_idx:])
 
     @classmethod
     def _strip_reasoning_content(

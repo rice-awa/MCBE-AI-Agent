@@ -1,16 +1,25 @@
 """PydanticAI Agent 核心定义"""
 
+import asyncio
 import re
-from collections.abc import Iterator
-from dataclasses import asdict, is_dataclass
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from dataclasses import asdict, dataclass, field, is_dataclass
+from typing import Any
 
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import (
+    Agent,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    PartDeltaEvent,
+    PartStartEvent,
+    RunContext,
+    TextPartDelta,
+)
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
 
-from models.agent import AgentDependencies, StreamEvent
 from config.logging import get_logger
+from models.agent import AgentDependencies, StreamEvent
 from services.agent.tools import register_agent_tools
 
 logger = get_logger(__name__)
@@ -43,9 +52,8 @@ register_agent_tools(chat_agent)
 
 
 SENTENCE_END_PATTERN = re.compile(r"[。！？\n.!?]+")
-NON_STREAM_BATCH_MAX_CHARS = 800
-MAX_TOOL_FALLBACK_ATTEMPTS = 3
-TOOL_CHAIN_CONTINUE_PROMPT = "请继续完成工具调用链并给出最终回复。"
+NON_STREAM_BATCH_MAX_CHARS = 150  # 减小批次大小，避免 MC 崩溃
+NON_STREAM_SEND_DELAY = 0.1  # 非流式模式下每个包之间的延迟（秒）
 
 
 def _serialize_usage(usage: Any | None) -> dict[str, Any] | None:
@@ -72,6 +80,17 @@ def _extract_all_messages(result: Any) -> list[ModelMessage]:
     return []
 
 
+def _extract_new_messages(result: Any) -> list[ModelMessage]:
+    """兼容不同 pydantic-ai 版本，提取 new_messages（增量消息）。"""
+    new_messages_attr = getattr(result, "new_messages", None)
+    if callable(new_messages_attr):
+        messages = new_messages_attr()
+        if isinstance(messages, list):
+            return messages
+    # 回退到 all_messages
+    return _extract_all_messages(result)
+
+
 def _extract_result_usage(result: Any) -> Any | None:
     """兼容不同 pydantic-ai 版本，提取 usage。"""
     usage_attr = getattr(result, "usage", None)
@@ -93,10 +112,9 @@ def _extract_result_output(result: Any) -> str:
     return ""
 
 
-def _count_tool_parts(messages: list[ModelMessage]) -> tuple[int, int]:
-    """统计消息链路中的 tool-call / tool-return 数量。"""
-    tool_calls = 0
-    tool_returns = 0
+def _extract_tool_events_from_messages(messages: list[ModelMessage]) -> list[dict[str, Any]]:
+    """从消息列表中提取工具调用事件（用于非流式模式回填元数据）。"""
+    tool_events: list[dict[str, Any]] = []
 
     for message in messages:
         parts = getattr(message, "parts", None)
@@ -104,13 +122,22 @@ def _count_tool_parts(messages: list[ModelMessage]) -> tuple[int, int]:
             continue
 
         for part in parts:
-            part_kind = getattr(part, "part_kind", None)
-            if part_kind == "tool-call":
-                tool_calls += 1
-            elif part_kind == "tool-return":
-                tool_returns += 1
+            if getattr(part, "part_kind", None) != "tool-call":
+                continue
 
-    return tool_calls, tool_returns
+            tool_name = getattr(part, "tool_name", None)
+            if not tool_name:
+                continue
+
+            tool_events.append(
+                {
+                    "tool_name": tool_name,
+                    "tool_call_id": getattr(part, "tool_call_id", None),
+                    "args": getattr(part, "args", None),
+                }
+            )
+
+    return tool_events
 
 
 def _extract_complete_sentences(buffer: str) -> tuple[list[str], str]:
@@ -131,14 +158,6 @@ def _append_sent_text(sent_text: str, new_text: str) -> str:
     if not new_text:
         return sent_text
     return f"{sent_text}{new_text}"
-
-
-def _diff_fallback_text(fallback_text: str, sent_text: str) -> str:
-    if not sent_text:
-        return fallback_text
-    if fallback_text.startswith(sent_text):
-        return fallback_text[len(sent_text) :]
-    return ""
 
 
 def _iter_sentence_batches(text: str, max_chars: int = NON_STREAM_BATCH_MAX_CHARS) -> Iterator[str]:
@@ -175,6 +194,276 @@ def _iter_sentence_batches(text: str, max_chars: int = NON_STREAM_BATCH_MAX_CHAR
         yield batch
 
 
+@dataclass
+class _HandlerContext:
+    """处理器上下文，用于跟踪处理状态"""
+
+    sequence: int = 0
+    sentence_buffer: str = ""
+    sent_text: str = ""
+    emitted_content: bool = False
+    all_messages: list[ModelMessage] = field(default_factory=list)
+    new_messages: list[ModelMessage] = field(default_factory=list)
+    serialized_usage: dict[str, Any] | None = None
+    tool_events: list[dict[str, Any]] = field(default_factory=list)  # 记录工具调用事件
+
+
+async def _send_content_event(
+    ctx: _HandlerContext,
+    content: str,
+    add_delay: bool = False,
+) -> StreamEvent:
+    """发送内容事件并更新上下文"""
+    event = StreamEvent(
+        event_type="content",
+        content=content,
+        sequence=ctx.sequence,
+    )
+    ctx.emitted_content = True
+    ctx.sent_text = _append_sent_text(ctx.sent_text, content)
+    ctx.sequence += 1
+    if add_delay:
+        await asyncio.sleep(NON_STREAM_SEND_DELAY)
+    return event
+
+
+async def stream_response_handler(
+    prompt: str,
+    deps: AgentDependencies,
+    model: Model | str | None = None,
+    message_history: list[ModelMessage] | None = None,
+    ctx: _HandlerContext | None = None,
+) -> AsyncIterator[StreamEvent]:
+    """
+    流式响应处理器（基于 agent.iter() 官方推荐方式）
+
+    处理流程：
+    1. 使用 agent.iter() 遍历执行节点
+    2. 在 ModelRequestNode 中流式输出文本
+    3. 在 CallToolsNode 中处理工具调用事件
+    4. 工具调用由 Pydantic AI 自动执行
+
+    Args:
+        prompt: 用户输入
+        deps: Agent 依赖
+        model: 可选的模型覆盖
+        message_history: 消息历史
+        ctx: 处理器上下文
+
+    Yields:
+        StreamEvent: 流式事件
+    """
+    if ctx is None:
+        ctx = _HandlerContext()
+
+    try:
+        # 使用 agent.iter() 进行细粒度节点控制
+        async with chat_agent.iter(
+            prompt,
+            deps=deps,
+            model=model,
+            message_history=message_history,
+        ) as run:
+            async for node in run:
+                # 处理用户提示节点
+                if Agent.is_user_prompt_node(node):
+                    logger.debug(
+                        "agent_user_prompt",
+                        prompt=node.user_prompt,
+                        connection_id=str(deps.connection_id),
+                    )
+
+                # 处理模型请求节点 - 流式输出文本
+                elif Agent.is_model_request_node(node):
+                    async with node.stream(run.ctx) as request_stream:
+                        async for event in request_stream:
+                            # 处理部分开始事件
+                            if isinstance(event, PartStartEvent):
+                                logger.debug(
+                                    "agent_part_start",
+                                    index=event.index,
+                                    connection_id=str(deps.connection_id),
+                                    current_buffer=ctx.sentence_buffer,
+                                )
+                                # 重要：PartStartEvent.part 可能包含初始文本内容！
+                                # 如果是 TextPart 且有内容，需要处理
+                                part = event.part
+                                if hasattr(part, "content") and part.content:
+                                    logger.debug(
+                                        "agent_part_start_content",
+                                        index=event.index,
+                                        content=part.content,
+                                        connection_id=str(deps.connection_id),
+                                    )
+                                    # 将 PartStartEvent 中的初始内容添加到 buffer
+                                    ctx.sentence_buffer += part.content
+                                    sentences, ctx.sentence_buffer = (
+                                        _extract_complete_sentences(
+                                            ctx.sentence_buffer
+                                        )
+                                    )
+                                    for sentence in sentences:
+                                        yield await _send_content_event(
+                                            ctx, sentence
+                                        )
+
+                            # 处理增量事件
+                            elif isinstance(event, PartDeltaEvent):
+                                if isinstance(event.delta, TextPartDelta):
+                                    # 文本增量 - 缓冲并按完整句子发送
+                                    chunk = event.delta.content_delta
+                                    logger.debug(
+                                        "agent_text_delta",
+                                        chunk=chunk,
+                                        index=event.index,
+                                        connection_id=str(deps.connection_id),
+                                        buffer_before=ctx.sentence_buffer,
+                                    )
+                                    if chunk:
+                                        ctx.sentence_buffer += chunk
+                                        sentences, ctx.sentence_buffer = (
+                                            _extract_complete_sentences(
+                                                ctx.sentence_buffer
+                                            )
+                                        )
+                                        logger.debug(
+                                            "agent_sentences_extracted",
+                                            sentences=sentences,
+                                            buffer_after=ctx.sentence_buffer,
+                                            connection_id=str(deps.connection_id),
+                                        )
+                                        for sentence in sentences:
+                                            yield await _send_content_event(
+                                                ctx, sentence
+                                            )
+
+                # 处理工具调用节点 - 工具由框架自动执行
+                elif Agent.is_call_tools_node(node):
+                    async with node.stream(run.ctx) as handle_stream:
+                        async for event in handle_stream:
+                            # 工具调用事件
+                            if isinstance(event, FunctionToolCallEvent):
+                                tool_info = {
+                                    "tool_name": event.part.tool_name,
+                                    "tool_call_id": event.part.tool_call_id,
+                                    "args": event.part.args,
+                                }
+                                ctx.tool_events.append(tool_info)
+                                logger.info(
+                                    "agent_tool_call",
+                                    tool=event.part.tool_name,
+                                    args=event.part.args,
+                                    tool_call_id=event.part.tool_call_id,
+                                    connection_id=str(deps.connection_id),
+                                )
+
+                            # 工具返回事件
+                            elif isinstance(event, FunctionToolResultEvent):
+                                logger.info(
+                                    "agent_tool_result",
+                                    tool_call_id=event.tool_call_id,
+                                    result_preview=str(event.result.content)[:100],
+                                    connection_id=str(deps.connection_id),
+                                )
+
+                # 处理结束节点
+                elif Agent.is_end_node(node):
+                    # 仅在整个执行结束时再冲刷尾部 buffer，避免跨节点半句提前下发
+                    if ctx.sentence_buffer.strip():
+                        yield await _send_content_event(ctx, ctx.sentence_buffer)
+                        ctx.sentence_buffer = ""
+
+                    # 从最终结果中提取信息
+                    if run.result is not None:
+                        ctx.all_messages = _extract_all_messages(run.result)
+                        ctx.new_messages = _extract_new_messages(run.result)
+                        ctx.serialized_usage = _serialize_usage(
+                            _extract_result_usage(run.result)
+                        )
+                    logger.debug(
+                        "agent_run_complete",
+                        connection_id=str(deps.connection_id),
+                        tool_events_count=len(ctx.tool_events),
+                    )
+
+    except Exception as e:
+        logger.error(
+            "stream_response_handler_error",
+            error=str(e),
+            connection_id=str(deps.connection_id),
+        )
+        yield StreamEvent(
+            event_type="error",
+            content=f"流式响应处理错误: {str(e)}",
+            sequence=ctx.sequence,
+        )
+
+
+async def non_stream_response_handler(
+    prompt: str,
+    deps: AgentDependencies,
+    model: Model | str | None = None,
+    message_history: list[ModelMessage] | None = None,
+    ctx: _HandlerContext | None = None,
+) -> AsyncIterator[StreamEvent]:
+    """
+    非流式响应处理器
+
+    处理流程：
+    1. 使用 run 获取完整响应（工具调用由框架自动处理）
+    2. 使用 _extract_complete_sentences 匹配完整句子
+    3. 逐一发送完整句子（带延迟以避免 MC 崩溃）
+
+    Args:
+        prompt: 用户输入
+        deps: Agent 依赖
+        model: 可选的模型覆盖
+        message_history: 消息历史
+        ctx: 处理器上下文
+
+    Yields:
+        StreamEvent: 流式事件
+    """
+    if ctx is None:
+        ctx = _HandlerContext()
+
+    try:
+        result = await chat_agent.run(
+            prompt,
+            deps=deps,
+            model=model,
+            message_history=message_history,
+        )
+
+        # 提取处理结果
+        ctx.new_messages = _extract_new_messages(result)
+        ctx.all_messages = _extract_all_messages(result)
+        ctx.serialized_usage = _serialize_usage(_extract_result_usage(result))
+        ctx.tool_events = _extract_tool_events_from_messages(ctx.new_messages)
+
+        # 提取完整响应文本
+        full_response = _extract_result_output(result)
+        if not full_response:
+            return
+
+        # 使用 _extract_complete_sentences 提取完整句子
+        # 为了保持 max_chars 限制，使用 _iter_sentence_batches
+        for chunk in _iter_sentence_batches(full_response):
+            yield await _send_content_event(ctx, chunk, add_delay=True)
+
+    except Exception as e:
+        logger.error(
+            "non_stream_response_handler_error",
+            error=str(e),
+            connection_id=str(deps.connection_id),
+        )
+        yield StreamEvent(
+            event_type="error",
+            content=f"非流式响应处理错误: {str(e)}",
+            sequence=ctx.sequence,
+        )
+
+
 async def stream_chat(
     prompt: str,
     deps: AgentDependencies,
@@ -182,176 +471,60 @@ async def stream_chat(
     message_history: list[ModelMessage] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """
-    流式聊天处理
+    流式聊天处理主调度函数
+
+    根据 stream_sentence_mode 配置选择对应的处理器。
+    工具调用由 Pydantic AI 框架自动处理，无需手动回退。
 
     Args:
         prompt: 用户输入
         deps: Agent 依赖
         model: 可选的模型覆盖
+        message_history: 消息历史
 
     Yields:
         StreamEvent: 流式事件
     """
-    sequence = 0
     use_stream_mode = deps.settings.stream_sentence_mode
-    sentence_buffer = ""
-    full_response_parts: list[str] = []
-    sent_text = ""
-    emitted_content = False
-    all_messages: list[ModelMessage] = []
-    serialized_usage: dict[str, Any] | None = None
-    tool_calls = 0
-    tool_returns = 0
-    fallback_used = False
+    ctx = _HandlerContext()
 
     try:
-        # 使用 run_stream 进行流式处理
-        async with chat_agent.run_stream(
-            prompt,
-            deps=deps,
-            model=model,
-            message_history=message_history,
-        ) as result:
-            # 流式输出文本内容
-            async for chunk in result.stream_text(delta=True):
-                full_response_parts.append(chunk)
-
-                if use_stream_mode:
-                    # 流式模式：缓冲并按完整句子发送
-                    sentence_buffer += chunk
-                    sentences, sentence_buffer = _extract_complete_sentences(sentence_buffer)
-
-                    for sentence in sentences:
-                        yield StreamEvent(
-                            event_type="content",
-                            content=sentence,
-                            sequence=sequence,
-                        )
-                        emitted_content = True
-                        sent_text = _append_sent_text(sent_text, sentence)
-                        sequence += 1
-
-            all_messages = _extract_all_messages(result)
-            serialized_usage = _serialize_usage(_extract_result_usage(result))
-
-        tool_calls, tool_returns = _count_tool_parts(all_messages)
-
-        # DeepSeek 流式场景下可能出现“返回了 tool_call，但未继续执行工具链”的情况。
-        # 发现 tool_call/return 数不一致时，回退到非流式 run，确保链路完整：
-        # 用户指令 -> tool_call -> tool_response -> 再次请求模型 -> 最终响应。
-        if tool_calls > tool_returns:
-            fallback_used = True
-            fallback_prompt = prompt
-            fallback_history = message_history
-            attempt = 0
-            while attempt < MAX_TOOL_FALLBACK_ATTEMPTS and tool_calls > tool_returns:
-                attempt += 1
-                logger.warning(
-                    "tool_chain_incomplete_on_stream",
-                    connection_id=str(deps.connection_id),
-                    tool_calls=tool_calls,
-                    tool_returns=tool_returns,
-                    attempt=attempt,
-                )
-
-                fallback_result = await chat_agent.run(
-                    fallback_prompt,
-                    deps=deps,
-                    model=model,
-                    message_history=fallback_history,
-                )
-
-                all_messages = _extract_all_messages(fallback_result)
-                serialized_usage = _serialize_usage(_extract_result_usage(fallback_result))
-                tool_calls, tool_returns = _count_tool_parts(all_messages)
-
-                fallback_output = _extract_result_output(fallback_result)
-                fallback_delta = _diff_fallback_text(fallback_output, sent_text)
-                if fallback_output.strip() and not fallback_delta:
-                    logger.warning(
-                        "tool_fallback_output_mismatch",
-                        connection_id=str(deps.connection_id),
-                        sent_text_length=len(sent_text),
-                        fallback_length=len(fallback_output),
-                    )
-
-                # 若前面已推送过内容，尽量只补齐剩余文本，避免重复回复。
-                if fallback_delta.strip():
-                    if use_stream_mode:
-                        fallback_sentences, fallback_tail = _extract_complete_sentences(
-                            fallback_delta
-                        )
-                        if fallback_tail.strip():
-                            fallback_sentences.append(fallback_tail)
-
-                        for sentence in fallback_sentences:
-                            yield StreamEvent(
-                                event_type="content",
-                                content=sentence,
-                                sequence=sequence,
-                            )
-                            emitted_content = True
-                            sent_text = _append_sent_text(sent_text, sentence)
-                            sequence += 1
-                    else:
-                        for chunk in _iter_sentence_batches(fallback_delta):
-                            yield StreamEvent(
-                                event_type="content",
-                                content=chunk,
-                                sequence=sequence,
-                            )
-                            emitted_content = True
-                            sent_text = _append_sent_text(sent_text, chunk)
-                            sequence += 1
-
-                if tool_calls <= tool_returns:
-                    break
-
-                fallback_prompt = TOOL_CHAIN_CONTINUE_PROMPT
-                fallback_history = all_messages
+        # 根据模式选择处理器
+        if use_stream_mode:
+            # 流式模式处理
+            async for event in stream_response_handler(
+                prompt, deps, model, message_history, ctx
+            ):
+                if event.event_type == "error":
+                    yield event
+                    return
+                yield event
         else:
-            if use_stream_mode and sentence_buffer.strip():
-                yield StreamEvent(
-                    event_type="content",
-                    content=sentence_buffer,
-                    sequence=sequence,
-                )
-                emitted_content = True
-                sent_text = _append_sent_text(sent_text, sentence_buffer)
-                sequence += 1
-
-            if not use_stream_mode:
-                full_response = "".join(full_response_parts)
-                for chunk in _iter_sentence_batches(full_response):
-                    yield StreamEvent(
-                        event_type="content",
-                        content=chunk,
-                        sequence=sequence,
-                    )
-                    emitted_content = True
-                    sent_text = _append_sent_text(sent_text, chunk)
-                    sequence += 1
+            # 非流式模式处理
+            async for event in non_stream_response_handler(
+                prompt, deps, model, message_history, ctx
+            ):
+                if event.event_type == "error":
+                    yield event
+                    return
+                yield event
 
         logger.debug(
-            "tool_chain_status",
+            "chat_complete",
             connection_id=str(deps.connection_id),
-            tool_calls=tool_calls,
-            tool_returns=tool_returns,
-            fallback_used=fallback_used,
+            tool_events_count=len(ctx.tool_events),
         )
 
         # 发送完成事件
         yield StreamEvent(
             event_type="content",
             content="",
-            sequence=sequence,
+            sequence=ctx.sequence,
             metadata={
                 "is_complete": True,
-                "usage": serialized_usage,
-                "all_messages": all_messages,
-                "tool_calls": tool_calls,
-                "tool_returns": tool_returns,
-                "tool_fallback_used": fallback_used,
+                "usage": ctx.serialized_usage,
+                "all_messages": ctx.all_messages,
+                "tool_events": ctx.tool_events,
             },
         )
 
@@ -364,5 +537,5 @@ async def stream_chat(
         yield StreamEvent(
             event_type="error",
             content=f"聊天处理错误: {str(e)}",
-            sequence=sequence,
+            sequence=ctx.sequence,
         )
