@@ -44,8 +44,8 @@ register_agent_tools(chat_agent)
 
 
 SENTENCE_END_PATTERN = re.compile(r"[。！？\n.!?]+")
-NON_STREAM_BATCH_MAX_CHARS = 200  # 减小批次大小，避免 MC 崩溃
-NON_STREAM_SEND_DELAY = 0.05  # 非流式模式下每个包之间的延迟（秒）
+NON_STREAM_BATCH_MAX_CHARS = 150  # 减小批次大小，避免 MC 崩溃
+NON_STREAM_SEND_DELAY = 0.1  # 非流式模式下每个包之间的延迟（秒）
 MAX_TOOL_FALLBACK_ATTEMPTS = 3
 TOOL_CHAIN_CONTINUE_PROMPT = "请继续完成工具调用链并给出最终回复。"
 
