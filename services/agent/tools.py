@@ -45,8 +45,8 @@ def register_agent_tools(chat_agent: Agent[AgentDependencies, str]) -> None:
         )
 
         try:
-            await ctx.deps.run_command(command)
-            return f"已执行命令: /{command}"
+            result = await ctx.deps.run_command(command)
+            return f"已执行命令: /{command}\n命令响应: {result}"
         except Exception as e:
             logger.error(
                 "agent_tool_error",

@@ -151,6 +151,9 @@ class WebSocketServer:
 
             data = json.loads(message)
 
+            if self._handle_command_response(state, data):
+                return
+
             # 解析玩家消息
             player_event = self.protocol_handler.parse_player_message(data)
             if not player_event:
@@ -190,6 +193,49 @@ class WebSocketServer:
                 error=str(e),
                 exc_info=True,
             )
+
+    def _handle_command_response(self, state: Any, data: dict[str, Any]) -> bool:
+        """处理 Minecraft commandResponse，回传给等待中的 Agent 工具。"""
+        header = data.get("header", {})
+        if header.get("messagePurpose") != "commandResponse":
+            return False
+
+        request_id = header.get("requestId")
+        if not request_id:
+            return True
+
+        future = state.pending_command_futures.pop(request_id, None)
+        if not future:
+            logger.debug(
+                "command_response_untracked",
+                connection_id=str(state.id),
+                request_id=request_id,
+            )
+            return True
+
+        body = data.get("body", {})
+        status_code = body.get("statusCode")
+        status_message = body.get("statusMessage") or ""
+
+        if status_code == 0:
+            result = status_message or "命令执行成功"
+        else:
+            result = (
+                f"命令执行失败(statusCode={status_code}): {status_message}"
+                if status_message
+                else f"命令执行失败(statusCode={status_code})"
+            )
+
+        if not future.done():
+            future.set_result(result)
+
+        logger.info(
+            "command_response_tracked",
+            connection_id=str(state.id),
+            request_id=request_id,
+            status_code=status_code,
+        )
+        return True
 
     async def handle_command(
         self, state: Any, cmd_type: str, content: str
