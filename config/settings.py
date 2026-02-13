@@ -167,6 +167,18 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     enable_file_logging: bool = True
 
+    # 原始日志开关配置
+    enable_ws_raw_log: bool = Field(
+        default=True,
+        alias="ENABLE_WS_RAW_LOG",
+        description="是否启用 WebSocket 原始请求/响应日志"
+    )
+    enable_llm_raw_log: bool = Field(
+        default=True,
+        alias="ENABLE_LLM_RAW_LOG",
+        description="是否启用 LLM 请求/响应日志"
+    )
+
     def get_provider_config(self, provider_name: str | None = None) -> LLMProviderConfig:
         """获取指定提供商的配置"""
         name = provider_name or self.default_provider
