@@ -151,6 +151,10 @@ class WebSocketServer:
 
             data = json.loads(message)
 
+            # 去重逻辑：排除 sender 为"外部"且 eventName 为 "PlayerMessage" 的消息
+            if self._is_external_duplicate_message(data):
+                return
+
             if self._handle_command_response(state, data):
                 return
 
@@ -236,6 +240,39 @@ class WebSocketServer:
             status_code=status_code,
         )
         return True
+
+    def _is_external_duplicate_message(self, data: dict[str, Any]) -> bool:
+        """
+        检查是否为需要排除的外部重复消息
+
+        当 sender 为"外部"且 eventName 为"PlayerMessage"时，
+        该消息是由 send_game_message 产生的重复响应，需要排除
+        """
+        # 检查去重功能是否启用
+        if not self.settings.dedup_external_messages:
+            return False
+
+        header = data.get("header", {})
+        event_name = header.get("eventName")
+
+        # 只关注 PlayerMessage 事件
+        if event_name != "PlayerMessage":
+            return False
+
+        body = data.get("body", {})
+        sender = body.get("sender")
+
+        # 排除 sender 为"外部"的消息
+        if sender == "外部":
+            logger.debug(
+                "external_duplicate_message_filtered",
+                connection_id=data.get("header", {}).get("requestId", "unknown"),
+                sender=sender,
+                event_name=event_name,
+            )
+            return True
+
+        return False
 
     async def handle_command(
         self, state: Any, cmd_type: str, content: str
