@@ -82,6 +82,9 @@ class ConnectionManager:
             connection_id: 连接 ID
         """
         if state := self._connections.pop(connection_id, None):
+            self._fail_pending_command_futures(state)
+            self._fail_queued_command_futures(state)
+
             # 取消响应发送任务
             if task := self._sender_tasks.pop(connection_id, None):
                 task.cancel()
@@ -193,6 +196,7 @@ class ConnectionManager:
         )
 
         while state.id in self._connections:
+            response = None
             try:
                 # 使用超时避免永久阻塞（缩短超时时间以便更快响应关闭）
                 response = await asyncio.wait_for(
@@ -206,6 +210,10 @@ class ConnectionManager:
                 # 超时是正常的，继续循环
                 continue
             except asyncio.CancelledError:
+                self._resolve_run_command_future(
+                    response,
+                    failure_message="命令执行失败: 连接已关闭",
+                )
                 logger.info(
                     "response_sender_cancelled",
                     connection_id=str(state.id),
@@ -224,6 +232,19 @@ class ConnectionManager:
             "response_sender_stopped",
             connection_id=str(state.id),
         )
+
+    def _resolve_run_command_future(
+        self, response: any, failure_message: str
+    ) -> None:
+        """从 run_command 响应对象中提取并完成 result_future。"""
+        if (
+            isinstance(response, dict)
+            and response.get("type") == "run_command"
+            and isinstance(response.get("result_future"), asyncio.Future)
+        ):
+            result_future = response["result_future"]
+            if not result_future.done():
+                result_future.set_result(failure_message)
 
     async def _handle_response(
         self, state: ConnectionState, response: any
@@ -327,7 +348,16 @@ class ConnectionManager:
             cmd = MinecraftCommand.create_raw(command)
             payload = cmd.model_dump_json(exclude_none=True)
             if result_future:
-                state.pending_command_futures[cmd.header.requestId] = result_future
+                request_id = cmd.header.requestId
+                state.pending_command_futures[request_id] = result_future
+
+                def _cleanup_cancelled_future(
+                    future: asyncio.Future[str],
+                ) -> None:
+                    if future.cancelled():
+                        state.pending_command_futures.pop(request_id, None)
+
+                result_future.add_done_callback(_cleanup_cancelled_future)
 
             await state.websocket.send(payload)
             ws_raw_logger.info(
@@ -345,6 +375,16 @@ class ConnectionManager:
             )
         except Exception as e:
             if result_future and not result_future.done():
+                request_id = next(
+                    (
+                        req_id
+                        for req_id, future in state.pending_command_futures.items()
+                        if future is result_future
+                    ),
+                    None,
+                )
+                if request_id is not None:
+                    state.pending_command_futures.pop(request_id, None)
                 result_future.set_result(f"命令执行失败: {str(e)}")
             logger.error(
                 "run_command_error",
