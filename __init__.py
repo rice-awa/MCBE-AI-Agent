@@ -1,6 +1,6 @@
 """MCBE AI Agent - 现代化异步 AI Agent 框架"""
 
-__version__ = "2.0.0"
+__version__ = "2.2.0"
 
 from config.settings import Settings, get_settings
 from core.queue import MessageBroker

@@ -36,7 +36,7 @@ class Application:
         """启动应用"""
         logger.info(
             "application_starting",
-            version="2.0.0",
+            version="2.2.0",
             host=self.settings.host,
             port=self.settings.port,
             default_provider=self.settings.default_provider,
@@ -115,7 +115,7 @@ async def run_application() -> None:
 
 
 @click.group()
-@click.version_option(version="2.0.0", prog_name="mcbe-AI-agent")
+@click.version_option(version="2.2.0", prog_name="mcbe-AI-agent")
 def cli():
     """MCBE AI Agent - Minecraft Bedrock Edition AI 聊天服务器"""
     pass
