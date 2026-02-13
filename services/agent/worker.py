@@ -460,12 +460,26 @@ class AgentWorker:
     def _create_command_callback(self, connection_id: UUID):
         """创建执行命令的回调"""
 
-        async def run_command(command: str) -> None:
-            # 发送到响应队列，由 WebSocket Handler 处理
-            await self.broker.send_response(
+        async def run_command(command: str) -> str:
+            # 发送到响应队列，由 WebSocket Handler 处理并等待命令结果
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[str] = loop.create_future()
+            sent = await self.broker.send_response(
                 connection_id,
-                {"type": "run_command", "command": command},
+                {
+                    "type": "run_command",
+                    "command": command,
+                    "result_future": future,
+                },
             )
+
+            if not sent:
+                return "命令执行失败: 连接不存在"
+
+            try:
+                return await asyncio.wait_for(future, timeout=10.0)
+            except asyncio.TimeoutError:
+                return "命令执行超时: 未收到游戏侧 commandResponse"
 
         return run_command
 

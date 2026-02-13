@@ -43,7 +43,7 @@ class MinecraftConfig(BaseModel):
 
     # 欢迎消息模板
     welcome_message_template: str = """-----------
-成功连接 MCBE AI Agent v2.0
+成功连接 MCBE AI Agent v2.2.0
 连接 ID: {connection_id}...
 当前模型: {provider}/{model}
 上下文: {context_status}
@@ -144,6 +144,13 @@ class Settings(BaseSettings):
     mcwiki_base_url: str = Field(
         default="https://mcwiki.rice-awa.top",
         alias="MCWIKI_BASE_URL",
+    )
+
+    # WebSocket 消息去重配置
+    dedup_external_messages: bool = Field(
+        default=True,
+        alias="DEDUP_EXTERNAL_MESSAGES",
+        description="是否排除sender为外部且事件为PlayerMessage的重复消息"
     )
 
     # 队列配置

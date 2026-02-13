@@ -151,6 +151,13 @@ class WebSocketServer:
 
             data = json.loads(message)
 
+            # 去重逻辑：排除 sender 为"外部"且 eventName 为 "PlayerMessage" 的消息
+            if self._is_external_duplicate_message(data):
+                return
+
+            if self._handle_command_response(state, data):
+                return
+
             # 解析玩家消息
             player_event = self.protocol_handler.parse_player_message(data)
             if not player_event:
@@ -190,6 +197,82 @@ class WebSocketServer:
                 error=str(e),
                 exc_info=True,
             )
+
+    def _handle_command_response(self, state: Any, data: dict[str, Any]) -> bool:
+        """处理 Minecraft commandResponse，回传给等待中的 Agent 工具。"""
+        header = data.get("header", {})
+        if header.get("messagePurpose") != "commandResponse":
+            return False
+
+        request_id = header.get("requestId")
+        if not request_id:
+            return True
+
+        future = state.pending_command_futures.pop(request_id, None)
+        if not future:
+            logger.debug(
+                "command_response_untracked",
+                connection_id=str(state.id),
+                request_id=request_id,
+            )
+            return True
+
+        body = data.get("body", {})
+        status_code = body.get("statusCode")
+        status_message = body.get("statusMessage") or ""
+
+        if status_code == 0:
+            result = status_message or "命令执行成功"
+        else:
+            result = (
+                f"命令执行失败(statusCode={status_code}): {status_message}"
+                if status_message
+                else f"命令执行失败(statusCode={status_code})"
+            )
+
+        if not future.done():
+            future.set_result(result)
+
+        logger.info(
+            "command_response_tracked",
+            connection_id=str(state.id),
+            request_id=request_id,
+            status_code=status_code,
+        )
+        return True
+
+    def _is_external_duplicate_message(self, data: dict[str, Any]) -> bool:
+        """
+        检查是否为需要排除的外部重复消息
+
+        当 sender 为"外部"且 eventName 为"PlayerMessage"时，
+        该消息是由 send_game_message 产生的重复响应，需要排除
+        """
+        # 检查去重功能是否启用
+        if not self.settings.dedup_external_messages:
+            return False
+
+        header = data.get("header", {})
+        event_name = header.get("eventName")
+
+        # 只关注 PlayerMessage 事件
+        if event_name != "PlayerMessage":
+            return False
+
+        body = data.get("body", {})
+        sender = body.get("sender")
+
+        # 排除 sender 为"外部"的消息
+        if sender == "外部":
+            logger.debug(
+                "external_duplicate_message_filtered",
+                connection_id=data.get("header", {}).get("requestId", "unknown"),
+                sender=sender,
+                event_name=event_name,
+            )
+            return True
+
+        return False
 
     async def handle_command(
         self, state: Any, cmd_type: str, content: str
