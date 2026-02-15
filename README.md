@@ -53,17 +53,19 @@ MCBE-AI-Agent/
 │   │   ├── core.py       # PydanticAI Agent
 │   │   ├── providers.py  # LLM Provider 注册表
 │   │   ├── worker.py     # Agent Worker
-│   │   └── tools.py      # Agent 工具定义
+│   │   ├── tools.py      # Agent 工具定义
+│   │   └── mcwiki.py     # MCWiki 搜索工具
 │   ├── websocket/        # WebSocket 服务
 │   │   ├── server.py     # WS 服务器
 │   │   ├── connection.py # 连接管理
 │   │   └── minecraft.py  # MC 协议处理
-│   ├── auth/             # 认证服务
-│   │   └── jwt_handler.py
-│   └── mcwiki/           # MCWiki 搜索服务
-│       └── search.py     # Wiki 搜索工具
+│   └── auth/             # 认证服务
+│       └── jwt_handler.py
 ├── storage/               # 存储层 (TODO)
-├── cli.py                # 应用入口与 CLI 工具
+├── tests/                 # 测试用例
+├── docs/                  # 文档
+├── data/                  # 数据文件
+├── cli.py                 # 应用入口与 CLI 工具
 └── pyproject.toml        # 项目配置
 ```
 
@@ -80,14 +82,14 @@ MCBE-AI-Agent/
 │  Handler    │          │ Response Q   │         │   Stream    │
 └─────────────┘          └──────────────┘         └─────────────┘
      │                         │                         │
-     │  非阻塞提交请求          │                         │
+     │  非阻塞提交请求           │                         │
      ├────────────────────────▶│                         │
-     │                         │   Worker 消费请求        │
+     │                         │   Worker 消费请求        │ 
      │                         ├────────────────────────▶│
      │                         │                         │
-     │                         │  ◀───── 流式响应 ───────│
-     │  ◀────── 响应队列 ──────│                         │
-     │  独立发送协程            │                         │
+     │                         │  ◀───── 流式响应 ─────── │
+     │  ◀────── 响应队列 ────── │                         │
+     │  独立发送协程             │                         │
      └────────────────────────▶MC (tellraw)
 ```
 
