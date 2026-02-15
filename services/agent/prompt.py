@@ -315,10 +315,9 @@ async def build_dynamic_prompt(ctx: RunContext) -> str:
     provider = ctx.deps.provider or "deepseek"
     model = ctx.deps.settings.get_provider_config(provider).model if provider else "deepseek-chat"
 
-    # 获取上下文长度
+    # context_length 暂时无法在系统提示词中获取，因为 message_history
+    # 是在 agent.run() 调用时传入的，而不是 deps 的一部分
     context_length = 0
-    if ctx.deps.message_history:
-        context_length = len(ctx.deps.message_history) // 2
 
     return manager.build_system_prompt(
         connection_id=connection_id,
