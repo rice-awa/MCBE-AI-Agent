@@ -91,6 +91,8 @@ async def run_application() -> None:
     setup_logging(
         log_level=settings.log_level,
         enable_file_logging=settings.enable_file_logging,
+        enable_ws_raw_log=settings.enable_ws_raw_log,
+        enable_llm_raw_log=settings.enable_llm_raw_log,
     )
 
     # 创建应用
