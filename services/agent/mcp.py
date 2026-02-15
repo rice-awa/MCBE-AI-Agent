@@ -1,5 +1,6 @@
 """MCP 客户端 - 使用官方 Model Context Protocol Python SDK"""
 
+from contextlib import AsyncExitStack
 import os
 from typing import Any
 
@@ -21,6 +22,7 @@ class MCPClient:
         self._session: ClientSession | None = None
         self._read: Any = None
         self._write: Any = None
+        self._exit_stack: AsyncExitStack | None = None
 
     async def start(self) -> bool:
         """启动 MCP 服务器连接
@@ -29,18 +31,22 @@ class MCPClient:
             是否启动成功
         """
         try:
+            if self._session:
+                return True
+
+            self._exit_stack = AsyncExitStack()
+
             if self._config.url:
                 # 远程 MCP 服务器 - 使用 streamable_http
                 # 注意: 需要 mcp.client.streamable_http
                 from mcp.client.streamable_http import streamable_http_client
 
-                async with streamable_http_client(self._config.url) as (
-                    self._read,
-                    self._write,
-                ):
-                    self._session = ClientSession(self._read, self._write)
-                    await self._session.initialize()
-                    logger.info("mcp_client_started", server=self._config.name, mode="http")
+                self._read, self._write = await self._exit_stack.enter_async_context(
+                    streamable_http_client(self._config.url)
+                )
+                self._session = ClientSession(self._read, self._write)
+                await self._session.initialize()
+                logger.info("mcp_client_started", server=self._config.name, mode="http")
             else:
                 # 本地 MCP 服务器 - 使用 stdio
                 server_params = StdioServerParameters(
@@ -48,16 +54,19 @@ class MCPClient:
                     args=self._config.args,
                     env={**os.environ, **self._config.env},
                 )
-                async with stdio_client(server_params) as (self._read, self._write):
-                    self._session = ClientSession(self._read, self._write)
-                    await self._session.initialize()
-                    logger.info(
-                        "mcp_client_started",
-                        server=self._config.name,
-                        mode="stdio",
-                    )
+                self._read, self._write = await self._exit_stack.enter_async_context(
+                    stdio_client(server_params)
+                )
+                self._session = ClientSession(self._read, self._write)
+                await self._session.initialize()
+                logger.info(
+                    "mcp_client_started",
+                    server=self._config.name,
+                    mode="stdio",
+                )
             return True
         except Exception as e:
+            await self.stop()
             logger.error(
                 "mcp_client_start_failed",
                 server=self._config.name,
@@ -70,6 +79,13 @@ class MCPClient:
         if self._session:
             await self._session.close()
             self._session = None
+
+        if self._exit_stack:
+            await self._exit_stack.aclose()
+            self._exit_stack = None
+
+        self._read = None
+        self._write = None
         logger.info("mcp_client_stopped", server=self._config.name)
 
     async def list_tools(self) -> list[types.Tool]:

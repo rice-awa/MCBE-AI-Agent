@@ -301,8 +301,8 @@ class Settings(BaseSettings):
                 # 记录警告但继续使用默认配置
                 import logging
                 logging.getLogger(__name__).warning(
-                    "invalid_minecraft_commands_json",
-                    error=str(e)
+                    "invalid_minecraft_commands_json: %s",
+                    str(e),
                 )
         return self
 
@@ -318,8 +318,8 @@ class Settings(BaseSettings):
             except (json.JSONDecodeError, ValueError) as e:
                 import logging
                 logging.getLogger(__name__).warning(
-                    "invalid_mcp_servers_json",
-                    error=str(e)
+                    "invalid_mcp_servers_json: %s",
+                    str(e),
                 )
         # 如果设置了 mcp_enabled 环境变量，也启用 MCP
         if self.mcp_enabled:

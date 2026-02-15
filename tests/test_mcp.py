@@ -119,3 +119,15 @@ class TestGetMCPManager:
         manager2 = get_mcp_manager()
         assert manager1 is manager2
         assert isinstance(manager1, MCPManager)
+
+
+def test_invalid_minecraft_commands_json_should_not_raise(caplog):
+    """测试非法命令 JSON 只记录警告不抛异常"""
+    settings = Settings(minecraft_commands_json="{invalid")
+    assert settings.minecraft.commands
+
+
+def test_invalid_mcp_servers_json_should_not_raise(caplog):
+    """测试非法 MCP servers JSON 只记录警告不抛异常"""
+    settings = Settings(mcp_servers_json="{invalid")
+    assert settings.mcp.enabled is False

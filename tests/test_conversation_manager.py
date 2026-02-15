@@ -427,3 +427,25 @@ if __name__ == "__main__":
     run_async_tests()
 
     print("\n所有测试通过!")
+
+
+def test_session_path_rejects_path_traversal():
+    """测试会话 ID 路径穿越防护"""
+    settings = Settings()
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+
+    with pytest.raises(ValueError):
+        manager._get_session_file_path("../escape")
+
+
+@pytest.mark.asyncio
+async def test_delete_conversation_rejects_invalid_session_id():
+    """测试删除会话时拒绝非法会话 ID"""
+    settings = Settings()
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+
+    success, msg = await manager.delete_conversation("../escape")
+    assert success is False
+    assert "非法会话 ID" in msg
