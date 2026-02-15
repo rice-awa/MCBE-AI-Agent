@@ -11,6 +11,7 @@ from models.minecraft import (
 )
 from models.messages import ChatRequest
 from services.websocket.connection import ConnectionState
+from services.websocket.command import CommandRegistry
 from config.logging import get_logger
 from config.settings import get_settings
 
@@ -22,6 +23,9 @@ _minecraft_config = _settings.minecraft
 
 # 命令前缀定义（从配置读取）
 COMMANDS = _minecraft_config.commands
+
+# 创建命令注册表
+_command_registry = CommandRegistry(COMMANDS)
 
 
 class MinecraftProtocolHandler:
@@ -43,10 +47,7 @@ class MinecraftProtocolHandler:
         """创建欢迎消息"""
         config = _minecraft_config
         # 找到帮助命令的前缀
-        help_prefix = next(
-            (prefix for prefix, cmd in config.commands.items() if cmd == "help"),
-            "帮助"
-        )
+        help_prefix = _command_registry.get_command_prefix("help") or "帮助"
         context_status = (
             config.context_enabled_text if context_enabled else config.context_disabled_text
         )
@@ -98,12 +99,8 @@ class MinecraftProtocolHandler:
         Returns:
             (命令类型, 内容) 元组
         """
-        for cmd_prefix, cmd_type in COMMANDS.items():
-            if message.startswith(cmd_prefix):
-                content = message[len(cmd_prefix) :].strip()
-                return cmd_type, content
-
-        return None, message
+        # 使用 CommandRegistry 进行命令解析（支持别名）
+        return _command_registry.resolve(message)
 
     @staticmethod
     def create_chat_request(
@@ -138,16 +135,17 @@ class MinecraftProtocolHandler:
         config = _minecraft_config
         lines = ["可用命令:"]
 
-        # 根据 commands 顺序生成帮助文本
-        for prefix, cmd_type in config.commands.items():
+        # 使用 CommandRegistry 获取命令列表
+        for prefix, cmd_type, aliases in _command_registry.list_all_commands():
             if cmd_type == "login":
                 continue  # 登录命令不显示在帮助中
-            if cmd_type in config.command_help:
-                desc, usage = config.command_help[cmd_type]
-                if usage:
-                    lines.append(f"• {prefix} {usage} - {desc}")
-                else:
-                    lines.append(f"• {prefix} - {desc}")
+
+            # 从命令配置中获取描述和用法
+            cmd_desc, usage = config.get_command_description(cmd_type)
+            if usage:
+                lines.append(f"• {prefix} {usage} - {cmd_desc}")
+            else:
+                lines.append(f"• {prefix} - {cmd_desc}")
 
         return "\n".join(lines)
 
