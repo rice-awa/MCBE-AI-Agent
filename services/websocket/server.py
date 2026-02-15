@@ -303,6 +303,10 @@ class WebSocketServer:
             await self.handle_chat(state, content, delivery="scriptevent")
         elif cmd_type == "context":
             await self.handle_context(state, content)
+        elif cmd_type == "template":
+            await self.handle_template(state, content)
+        elif cmd_type == "setting":
+            await self.handle_setting(state, content)
         elif cmd_type == "switch_model":
             await self.handle_switch_model(state, content)
         elif cmd_type == "help":
@@ -406,6 +410,116 @@ class WebSocketServer:
             )
 
         await self._send_ws_payload(state, msg, source="switch_model")
+
+    async def handle_template(self, state: Any, content: str) -> None:
+        """处理模板管理"""
+        from services.agent.prompt import get_prompt_manager
+
+        manager = get_prompt_manager()
+        connection_id = str(state.id)
+
+        if not content or content.strip() == "":
+            # 显示当前模板
+            current = manager.get_connection_template(connection_id)
+            template = manager.get_template(current)
+            if template:
+                msg = self.protocol_handler.create_info_message(
+                    f"当前模板: {template.name} - {template.description}"
+                )
+            else:
+                msg = self.protocol_handler.create_info_message(f"当前模板: {current}")
+        elif content.strip() == "list":
+            # 列出所有模板
+            templates = manager.list_templates()
+            current = manager.get_connection_template(connection_id)
+            lines = ["可用模板:"]
+            for name in templates:
+                template = manager.get_template(name)
+                marker = " *" if name == current else ""
+                desc = template.description if template else ""
+                lines.append(f"• {name}{marker} - {desc}")
+            msg = self.protocol_handler.create_info_message("\n".join(lines))
+        else:
+            # 切换模板
+            template_name = content.strip()
+            if manager.set_connection_template(connection_id, template_name):
+                # 同时更新 ConnectionState 的模板状态
+                state.current_template = template_name
+                state.custom_variables = manager.get_connection_variables(connection_id)
+                template = manager.get_template(template_name)
+                desc = template.description if template else ""
+                msg = self.protocol_handler.create_success_message(
+                    f"已切换到模板: {template_name} ({desc})"
+                )
+            else:
+                templates = ", ".join(manager.list_templates())
+                msg = self.protocol_handler.create_error_message(
+                    f"模板不存在: {template_name}\n可用: {templates}"
+                )
+
+        await self._send_ws_payload(state, msg, source="template")
+
+    async def handle_setting(self, state: Any, content: str) -> None:
+        """处理设置管理"""
+        from services.agent.prompt import get_prompt_manager
+
+        manager = get_prompt_manager()
+        connection_id = str(state.id)
+
+        if not content:
+            msg = self.protocol_handler.create_error_message("请输入设置项")
+            await self._send_ws_payload(state, msg, source="setting")
+            return
+
+        parts = content.strip().split(None, 1)
+        if len(parts) < 2:
+            msg = self.protocol_handler.create_error_message(
+                "用法: AGENT 设置 变量 <名称> <值>\n      AGENT 设置 别名 <名称> <别名>"
+            )
+            await self._send_ws_payload(state, msg, source="setting")
+            return
+
+        setting_type = parts[0]
+        rest = parts[1]
+
+        if setting_type == "变量":
+            # 设置自定义变量
+            # 支持格式: "变量 <名称> <值>" 或 "变量 <名称>=<值>"
+            if "=" in rest:
+                # 格式: 变量 name=value
+                name_val = rest.split("=", 1)
+                name = name_val[0].strip()
+                value = name_val[1].strip()
+            else:
+                # 格式: 变量 name value
+                var_parts = rest.split(None, 1)
+                if len(var_parts) < 2:
+                    msg = self.protocol_handler.create_error_message(
+                        "用法: AGENT 设置 变量 <名称> <值>"
+                    )
+                    await self._send_ws_payload(state, msg, source="setting")
+                    return
+                name = var_parts[0]
+                value = var_parts[1]
+
+            # PromptManager.set_connection_variable 会自动添加 custom_ 前缀
+            manager.set_connection_variable(connection_id, name, value)
+            state.custom_variables = manager.get_connection_variables(connection_id)
+
+            # 显示带前缀的名称
+            display_name = f"custom_{name}" if not name.startswith("custom_") else name
+            msg = self.protocol_handler.create_success_message(
+                f"已设置变量: {display_name} = {value}"
+            )
+        elif setting_type == "别名":
+            # 别名管理（暂时未实现）
+            msg = self.protocol_handler.create_info_message("别名管理功能开发中")
+        else:
+            msg = self.protocol_handler.create_error_message(
+                "未知的设置类型，请使用: 变量"
+            )
+
+        await self._send_ws_payload(state, msg, source="setting")
 
     async def handle_help(self, state: Any) -> None:
         """显示帮助"""

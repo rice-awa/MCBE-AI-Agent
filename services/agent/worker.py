@@ -154,6 +154,7 @@ class AgentWorker:
             http_client=self._http_client,  # type: ignore
             send_to_game=self._create_send_callback(connection_id),
             run_command=self._create_command_callback(connection_id),
+            provider=request.provider or self.settings.default_provider,
         )
 
         # 获取模型

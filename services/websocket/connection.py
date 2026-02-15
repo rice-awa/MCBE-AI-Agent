@@ -29,6 +29,8 @@ class ConnectionState:
     response_queue: asyncio.Queue | None = None
     current_provider: str | None = None
     pending_command_futures: dict[str, asyncio.Future[str]] = field(default_factory=dict)
+    current_template: str = "default"  # 当前使用的提示词模板
+    custom_variables: dict[str, str] = field(default_factory=dict)  # 自定义变量
 
 
 class ConnectionManager:

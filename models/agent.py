@@ -19,6 +19,7 @@ class AgentDependencies:
     http_client: httpx.AsyncClient
     send_to_game: Callable[[str], Awaitable[None]]
     run_command: Callable[[str], Awaitable[str]]
+    provider: str | None = None  # 当前使用的 LLM 提供商
 
 
 @dataclass

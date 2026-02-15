@@ -21,6 +21,7 @@ from pydantic_ai.models import Model
 from config.logging import get_logger
 from models.agent import AgentDependencies, StreamEvent
 from services.agent.tools import register_agent_tools
+from services.agent.prompt import build_dynamic_prompt
 
 logger = get_logger(__name__)
 
@@ -42,10 +43,8 @@ chat_agent = Agent[AgentDependencies, str](
 
 @chat_agent.system_prompt
 async def dynamic_system_prompt(ctx: RunContext[AgentDependencies]) -> str:
-    """动态系统提示词"""
-    base_prompt = ctx.deps.settings.system_prompt
-    player_info = f"\n\n当前玩家: {ctx.deps.player_name}"
-    return f"{base_prompt}\n\n{TOOL_USAGE_GUIDE}{player_info}"
+    """动态系统提示词 - 使用 PromptManager 构建"""
+    return await build_dynamic_prompt(ctx)
 
 
 register_agent_tools(chat_agent)
