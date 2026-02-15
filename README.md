@@ -36,7 +36,7 @@
 ## 项目结构
 
 ```
-mcbe_ai_agent/
+MCBE-AI-Agent/
 ├── config/                 # 配置管理
 │   ├── settings.py        # Pydantic Settings
 │   └── logging.py         # 日志配置
@@ -147,7 +147,7 @@ source venv/bin/activate
 ### 2. 安装依赖
 
 ```bash
-cd mcbe_ai_agent
+cd MCBE-AI-Agent
 pip install -r requirements.txt
 ```
 
@@ -341,7 +341,7 @@ pkg install tmux -y
 tmux new -s mcbe_agent
 
 # 在会话中启动
-cd ~/mcbe_ai_agent
+cd ~/MCBE-AI-Agent
 source venv/bin/activate
 python cli.py serve
 
@@ -371,6 +371,8 @@ nohup python cli.py serve > mcbe.log 2>&1 &
 | `LLM_WORKER_COUNT` | Worker 数量 | `2` |
 | `STREAM_SENTENCE_MODE` | true=流式按句输出，false=关闭流式并在完成后按句子分批输出 | `true` |
 | `LOG_LEVEL` | 日志级别 | `INFO` |
+| `ENABLE_WS_RAW_LOG` | WebSocket 原始日志开关 | `true` |
+| `ENABLE_LLM_RAW_LOG` | LLM 原始日志开关 | `true` |
 
 ### Settings 配置
 
@@ -536,10 +538,10 @@ ln -s /storage/emulated/0/Download/mcbe_data ./data
 #!/data/data/com.termux/files/usr/bin/bash
 
 # 激活虚拟环境
-source ~/mcbe_ai_agent/venv/bin/activate
+source ~/MCBE-AI-Agent/venv/bin/activate
 
 # 启动服务
-cd ~/mcbe_ai_agent
+cd ~/MCBE-AI-Agent
 python cli.py serve
 
 # 设置可执行权限
@@ -627,7 +629,7 @@ python cli.py test-provider deepseek
 
 检查日志：
 ```bash
-tail -f logs/mcbe_ai_agent.log
+tail -f logs/MCBE-AI-Agent.log
 ```
 
 ### 3. 内存问题
@@ -694,6 +696,10 @@ pip install --prefer-binary -r requirements.txt
 
 ## 更新日志
 
+### v2.2.1 (2026-02-15)
+- 🔧 **日志控制优化**: 新增 WebSocket 和 LLM 原始日志开关配置，支持按需启用
+- ⚙️ **环境变量支持**: 添加 `ENABLE_WS_RAW_LOG` 和 `ENABLE_LLM_RAW_LOG` 环境变量
+
 ### v2.2.0 (2026-02-13)
 - ✨ **WebSocket run_command 响应回传**: Agent 执行命令后自动回传 commandResponse，提升工具调用体验
 - 🔧 **断线时队列处理优化**: 断线时自动完成队列中的 run_command futures，避免请求卡死
@@ -754,7 +760,7 @@ pip install --prefer-binary -r requirements.txt
 
 ---
 
-**版本**: 2.2.0
-**最后更新**: 2026-02-13
+**版本**: 2.2.1
+**最后更新**: 2026-02-15
 **架构**: 现代化异步 + PydanticAI
 **平台支持**: Windows, Linux, macOS, Termux (Android)
