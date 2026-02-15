@@ -10,6 +10,15 @@ from config.settings import Settings
 
 
 @dataclass
+class ContextInfo:
+    """上下文使用信息"""
+
+    message_count: int  # 消息数量
+    estimated_tokens: int  # 估计的 token 数
+    max_tokens: int | None  # 模型最大上下文
+
+
+@dataclass
 class AgentDependencies:
     """Agent 运行时依赖注入"""
 
@@ -20,6 +29,8 @@ class AgentDependencies:
     send_to_game: Callable[[str], Awaitable[None]]
     run_command: Callable[[str], Awaitable[str]]
     provider: str | None = None  # 当前使用的 LLM 提供商
+    # 获取上下文使用信息的回调，返回 (消息数, 估计token数, 最大token数)
+    get_context_info: Callable[[], ContextInfo | None] | None = None
 
 
 @dataclass

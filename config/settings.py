@@ -156,6 +156,33 @@ class LLMProviderConfig(BaseModel):
     model: str
     enabled: bool = True
     timeout: int = 60
+    # 模型最大上下文窗口（token 数），用于计算上下文使用率
+    context_window: int | None = None
+
+
+# 常用模型的上下文窗口大小（单位：tokens）
+MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    # DeepSeek
+    "deepseek-chat": 128000,
+    "deepseek-coder": 128000,
+    # OpenAI
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "gpt-4-turbo": 128000,
+    "gpt-4": 8192,
+    "gpt-3.5-turbo": 16385,
+    # Anthropic
+    "claude-sonnet-4-20250514": 200000,
+    "claude-opus-4-20250514": 200000,
+    "claude-3-5-sonnet-20240620": 200000,
+    "claude-3-opus-20240229": 200000,
+    "claude-3-haiku-20240307": 200000,
+    # Ollama (本地模型，默认 4k)
+    "llama3": 4096,
+    "llama3.1": 128000,
+    "mistral": 8192,
+    "codellama": 16384,
+}
 
 
 class WebSocketConfig(BaseModel):
@@ -346,6 +373,10 @@ class Settings(BaseSettings):
         """获取指定提供商的配置"""
         name = provider_name or self.default_provider
 
+        # 获取模型的上下文窗口大小
+        def get_context_window(model: str) -> int | None:
+            return MODEL_CONTEXT_WINDOWS.get(model)
+
         if name == "deepseek":
             return LLMProviderConfig(
                 name="deepseek",
@@ -353,6 +384,7 @@ class Settings(BaseSettings):
                 base_url=self.deepseek_base_url,
                 model=self.deepseek_model,
                 enabled=self.deepseek_api_key is not None,
+                context_window=get_context_window(self.deepseek_model),
             )
         elif name == "openai":
             return LLMProviderConfig(
@@ -361,6 +393,7 @@ class Settings(BaseSettings):
                 base_url=self.openai_base_url,
                 model=self.openai_model,
                 enabled=self.openai_api_key is not None,
+                context_window=get_context_window(self.openai_model),
             )
         elif name == "anthropic":
             return LLMProviderConfig(
@@ -368,6 +401,7 @@ class Settings(BaseSettings):
                 api_key=self.anthropic_api_key,
                 model=self.anthropic_model,
                 enabled=self.anthropic_api_key is not None,
+                context_window=get_context_window(self.anthropic_model),
             )
         elif name == "ollama":
             return LLMProviderConfig(
@@ -375,6 +409,7 @@ class Settings(BaseSettings):
                 base_url=self.ollama_base_url,
                 model=self.ollama_model,
                 enabled=True,  # Ollama 不需要 API key
+                context_window=get_context_window(self.ollama_model),
             )
         else:
             raise ValueError(f"未知的提供商: {name}")

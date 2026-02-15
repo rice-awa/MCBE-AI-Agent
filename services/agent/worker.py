@@ -13,7 +13,7 @@ from core.queue import MessageBroker
 from services.agent.core import stream_chat
 from services.agent.providers import ProviderRegistry
 from models.messages import ChatRequest, StreamChunk
-from models.agent import AgentDependencies
+from models.agent import AgentDependencies, ContextInfo
 from config.settings import Settings
 from config.logging import get_logger
 
@@ -146,6 +146,27 @@ class AgentWorker:
                 cleared_reasoning_content_count=cleared_count,
             )
 
+        # 构建获取上下文信息的回调
+        def get_context_info() -> ContextInfo | None:
+            """获取当前对话的上下文使用信息"""
+            if not request.use_context:
+                return None
+
+            history = self.broker.get_conversation_history(connection_id)
+            message_count = len(history) if history else 0
+            # 简单估算：平均每条消息 100 tokens
+            estimated_tokens = message_count * 100
+            # 获取模型最大上下文
+            provider_name = request.provider or self.settings.default_provider
+            provider_config = self.settings.get_provider_config(provider_name)
+            max_tokens = provider_config.context_window
+
+            return ContextInfo(
+                message_count=message_count,
+                estimated_tokens=estimated_tokens,
+                max_tokens=max_tokens,
+            )
+
         # 构建依赖
         deps = AgentDependencies(
             connection_id=connection_id,
@@ -155,6 +176,7 @@ class AgentWorker:
             send_to_game=self._create_send_callback(connection_id),
             run_command=self._create_command_callback(connection_id),
             provider=request.provider or self.settings.default_provider,
+            get_context_info=get_context_info,
         )
 
         # 获取模型

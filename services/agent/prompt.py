@@ -59,7 +59,8 @@ BUILTIN_TEMPLATES: dict[str, PromptTemplate] = {
 当前玩家: {player_name}
 模型: {provider}/{model}
 服务器时间: {server_time}
-会话长度: {context_length} 轮""",
+会话长度: {context_length} 轮
+上下文使用: {context_usage}""",
     ),
 }
 
@@ -219,6 +220,7 @@ class PromptManager:
         provider: str,
         model: str,
         context_length: int = 0,
+        context_usage: str = "",
     ) -> str:
         """
         构建系统提示词
@@ -229,6 +231,7 @@ class PromptManager:
             provider: LLM 提供商
             model: 模型名称
             context_length: 上下文长度
+            context_usage: 上下文使用情况（如 "20% 35.1k/200k"）
 
         Returns:
             完整的系统提示词
@@ -252,6 +255,7 @@ class PromptManager:
             "model": model or "deepseek-chat",
             "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "context_length": str(context_length),
+            "context_usage": context_usage,
             "tool_usage": TOOL_USAGE_GUIDE,
         }
 
@@ -315,14 +319,24 @@ async def build_dynamic_prompt(ctx: RunContext) -> str:
     provider = ctx.deps.provider or "deepseek"
     model = ctx.deps.settings.get_provider_config(provider).model if provider else "deepseek-chat"
 
-    # context_length 暂时无法在系统提示词中获取，因为 message_history
-    # 是在 agent.run() 调用时传入的，而不是 deps 的一部分
-    context_length = 0
+    # 获取上下文使用信息
+    context_info = None
+    if ctx.deps.get_context_info:
+        context_info = ctx.deps.get_context_info()
+
+    # 计算上下文使用情况字符串
+    context_usage = ""
+    if context_info and context_info.max_tokens:
+        usage_percent = (context_info.estimated_tokens / context_info.max_tokens) * 100
+        context_usage = f"{usage_percent:.1f}% {context_info.estimated_tokens}/{context_info.max_tokens}"
+    elif context_info:
+        context_usage = f"{context_info.estimated_tokens} tokens"
 
     return manager.build_system_prompt(
         connection_id=connection_id,
         player_name=player_name,
         provider=provider,
         model=model,
-        context_length=context_length,
+        context_length=context_info.message_count if context_info else 0,
+        context_usage=context_usage,
     )

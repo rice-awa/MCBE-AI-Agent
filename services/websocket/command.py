@@ -46,7 +46,7 @@ class CommandRegistry:
             for alias in cmd_config.aliases:
                 self._alias_map[alias] = prefix
 
-        logger.debug(
+        logger.info(
             "command_registry_loaded",
             command_count=len(self._commands),
             alias_count=len(self._alias_map),
