@@ -168,6 +168,24 @@ class WebSocketConfig(BaseModel):
     max_queue: int = 32
 
 
+class MCPServerConfig(BaseModel):
+    """单个 MCP 服务器配置"""
+
+    name: str  # 服务器名称
+    command: str  # 启动命令 (如 "npx", "python")
+    args: list[str] = []  # 命令参数
+    env: dict[str, str] = {}  # 环境变量
+    auto_start: bool = True  # 是否自动启动
+    url: str | None = None  # 远程服务器 URL (用于 http 模式)
+
+
+class MCPConfig(BaseModel):
+    """MCP 服务器配置"""
+
+    enabled: bool = False
+    servers: list[MCPServerConfig] = []
+
+
 class Settings(BaseSettings):
     """应用主配置"""
 
@@ -245,6 +263,19 @@ class Settings(BaseSettings):
     # Minecraft 配置
     minecraft: MinecraftConfig = Field(default_factory=MinecraftConfig)
 
+    # MCP 配置
+    mcp: MCPConfig = Field(default_factory=MCPConfig)
+    mcp_enabled: bool = Field(
+        default=False,
+        alias="MCP_ENABLED",
+        description="是否启用 MCP 服务器集成"
+    )
+    mcp_servers_json: str | None = Field(
+        default=None,
+        alias="MCP_SERVERS",
+        description="MCP 服务器配置 JSON 字符串"
+    )
+
     # 命令配置 (通过环境变量覆盖)
     minecraft_commands_json: str | None = Field(
         default=None,
@@ -273,6 +304,26 @@ class Settings(BaseSettings):
                     "invalid_minecraft_commands_json",
                     error=str(e)
                 )
+        return self
+
+    @model_validator(mode="after")
+    def merge_mcp_config(self) -> "Settings":
+        """合并 MCP 配置"""
+        # 如果显式设置了 mcp_servers_json，解析并覆盖
+        if self.mcp_servers_json:
+            try:
+                servers_data: list[dict] = json.loads(self.mcp_servers_json)
+                self.mcp.servers = [MCPServerConfig(**s) for s in servers_data]
+                self.mcp.enabled = True
+            except (json.JSONDecodeError, ValueError) as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "invalid_mcp_servers_json",
+                    error=str(e)
+                )
+        # 如果设置了 mcp_enabled 环境变量，也启用 MCP
+        if self.mcp_enabled:
+            self.mcp.enabled = True
         return self
 
     # 日志配置
