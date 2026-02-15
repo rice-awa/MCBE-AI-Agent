@@ -360,6 +360,19 @@ class ConversationManager:
             )
             return False, f"保存失败: {str(e)}"
 
+    def _get_session_file_path(self, session_id: str) -> Path:
+        """安全解析会话文件路径，防止路径穿越。"""
+        normalized = Path(session_id)
+        if normalized.name != session_id or normalized.suffix:
+            raise ValueError(f"非法会话 ID: {session_id}")
+
+        file_path = (self._storage_dir / f"{session_id}.json").resolve()
+        storage_root = self._storage_dir.resolve()
+        if storage_root not in file_path.parents:
+            raise ValueError(f"非法会话 ID: {session_id}")
+
+        return file_path
+
     async def load_conversation(
         self,
         session_id: str,
@@ -373,7 +386,10 @@ class ConversationManager:
         Returns:
             (是否成功, 对话历史或错误消息)
         """
-        file_path = self._storage_dir / f"{session_id}.json"
+        try:
+            file_path = self._get_session_file_path(session_id)
+        except ValueError as e:
+            return False, str(e)
 
         if not file_path.exists():
             return False, f"会话不存在: {session_id}"
@@ -489,7 +505,10 @@ class ConversationManager:
         Returns:
             (是否成功, 消息)
         """
-        file_path = self._storage_dir / f"{session_id}.json"
+        try:
+            file_path = self._get_session_file_path(session_id)
+        except ValueError as e:
+            return False, str(e)
 
         if not file_path.exists():
             return False, f"会话不存在: {session_id}"
