@@ -85,7 +85,7 @@ class MinecraftConfig(BaseModel):
     command_help: dict[str, tuple[str, str | None]] = {
         "chat": ("与 AI 对话", "<内容>"),
         "chat_script": ("使用脚本事件发送", "<内容>"),
-        "context": ("管理上下文", "<启用/关闭/状态>"),
+        "context": ("管理上下文", "<启用/关闭/状态/压缩/保存/恢复/列表/删除>"),
         "switch_model": ("切换 LLM", "<provider>"),
         "save": ("保存对话历史", None),
         "run_command": ("执行游戏命令", "<命令>"),

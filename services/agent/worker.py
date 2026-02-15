@@ -221,6 +221,19 @@ class AgentWorker:
                                 cleared_reasoning_content_count=cleared_count,
                             )
 
+                            # 自动压缩检查：当对话历史超过阈值的 80% 时自动压缩
+                            from core.conversation import get_conversation_manager
+
+                            conv_manager = get_conversation_manager(self.broker, self.settings)
+                            compressed, msg = await conv_manager.check_and_compress(connection_id)
+                            if compressed:
+                                logger.debug(
+                                    "auto_compression_triggered",
+                                    worker_id=self.worker_id,
+                                    connection_id=str(connection_id),
+                                    message=msg,
+                                )
+
                     response_text = "".join(response_parts)
                     reasoning_text = "".join(reasoning_parts)
                     duration_ms = int((time.monotonic() - start_time) * 1000)

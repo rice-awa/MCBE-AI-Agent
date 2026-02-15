@@ -376,22 +376,100 @@ class WebSocketServer:
 
     async def handle_context(self, state: Any, option: str) -> None:
         """处理上下文管理"""
-        if option == "启用":
+        # 导入对话管理器
+        from core.conversation import get_conversation_manager
+
+        conv_manager = get_conversation_manager(self.broker, self.settings)
+
+        # 解析选项
+        parts = option.strip().split(None, 1) if option.strip() else []
+        action = parts[0] if parts else ""
+        arg = parts[1] if len(parts) > 1 else ""
+
+        if action == "启用":
             state.context_enabled = True
             msg = self.protocol_handler.create_success_message("上下文已启用")
-        elif option == "关闭":
+        elif action == "关闭":
             state.context_enabled = False
             self.broker.clear_conversation_history(state.id)
             msg = self.protocol_handler.create_success_message("上下文已关闭")
-        elif option == "状态":
+        elif action == "状态":
             status = "启用" if state.context_enabled else "关闭"
-            msg = self.protocol_handler.create_info_message(f"上下文状态: {status}")
+            history = self.broker.get_conversation_history(state.id)
+            turns = self._count_conversation_turns(history)
+            msg = self.protocol_handler.create_info_message(
+                f"上下文状态: {status}\n当前对话轮数: {turns}/{self.settings.max_history_turns}"
+            )
+        elif action == "压缩":
+            # 手动触发压缩
+            success, result = await conv_manager.check_and_compress(state.id, force=True)
+            if success:
+                msg = self.protocol_handler.create_success_message(result)
+            else:
+                msg = self.protocol_handler.create_info_message(result)
+        elif action == "保存":
+            # 保存当前对话
+            success, result = await conv_manager.save_conversation(
+                connection_id=state.id,
+                player_name=state.player_name,
+                provider=state.current_provider or self.settings.default_provider,
+                template=state.current_template,
+                custom_variables=state.custom_variables,
+            )
+            if success:
+                msg = self.protocol_handler.create_success_message(f"对话已保存: {result}")
+            else:
+                msg = self.protocol_handler.create_error_message(result)
+        elif action == "恢复":
+            # 恢复对话
+            if not arg:
+                msg = self.protocol_handler.create_error_message(
+                    "请指定要恢复的会话 ID\n用法: AGENT 上下文 恢复 <ID>"
+                )
+            else:
+                success, result = await conv_manager.restore_conversation(state.id, arg)
+                if success:
+                    msg = self.protocol_handler.create_success_message(result)
+                else:
+                    msg = self.protocol_handler.create_error_message(result)
+        elif action == "列表":
+            # 列出保存的对话
+            conversations = await conv_manager.list_conversations()
+            list_text = conv_manager.format_conversation_list(conversations)
+            msg = self.protocol_handler.create_info_message(list_text)
+        elif action == "删除":
+            # 删除对话
+            if not arg:
+                msg = self.protocol_handler.create_error_message(
+                    "请指定要删除的会话 ID\n用法: AGENT 上下文 删除 <ID>"
+                )
+            else:
+                success, result = await conv_manager.delete_conversation(arg)
+                if success:
+                    msg = self.protocol_handler.create_success_message(result)
+                else:
+                    msg = self.protocol_handler.create_error_message(result)
+        elif action == "清除":
+            # 清除对话历史
+            self.broker.clear_conversation_history(state.id)
+            msg = self.protocol_handler.create_success_message("对话历史已清除")
         else:
             msg = self.protocol_handler.create_error_message(
-                "无效选项，请使用: 启用/关闭/状态"
+                "无效选项，请使用: 启用/关闭/状态/压缩/保存/恢复 <ID>/列表/删除 <ID>/清除"
             )
 
         await self._send_ws_payload(state, msg, source="context")
+
+    def _count_conversation_turns(self, history: list) -> int:
+        """计算对话轮次"""
+        turns = 0
+        for message in history:
+            if hasattr(message, "parts"):
+                for part in message.parts:
+                    if getattr(part, "part_kind", None) == "user-prompt":
+                        turns += 1
+                        break
+        return turns
 
     async def handle_switch_model(self, state: Any, provider: str) -> None:
         """处理模型切换"""
