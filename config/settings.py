@@ -357,6 +357,13 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     enable_file_logging: bool = True
 
+    # 开发模式配置
+    dev_mode: bool = Field(
+        default=False,
+        alias="DEV_MODE",
+        description="开发模式 - 跳过身份验证，仅用于本地开发调试"
+    )
+
     # 原始日志开关配置
     enable_ws_raw_log: bool = Field(
         default=True,
