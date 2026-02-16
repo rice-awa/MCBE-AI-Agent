@@ -196,21 +196,20 @@ class WebSocketConfig(BaseModel):
 
 
 class MCPServerConfig(BaseModel):
-    """单个 MCP 服务器配置"""
+    """单个 MCP 服务器配置 - 兼容 PydanticAI 官方格式"""
 
-    name: str  # 服务器名称
-    command: str  # 启动命令 (如 "npx", "python")
+    command: str | None = None  # 启动命令 (如 "npx", "python", "uvx")
     args: list[str] = []  # 命令参数
     env: dict[str, str] = {}  # 环境变量
-    auto_start: bool = True  # 是否自动启动
-    url: str | None = None  # 远程服务器 URL (用于 http 模式)
+    url: str | None = None  # 远程服务器 URL (用于 HTTP 模式)
+    timeout: int = 10  # 超时时间（秒）
 
 
 class MCPConfig(BaseModel):
-    """MCP 服务器配置"""
+    """MCP 服务器配置 - 使用 mcpServers 字典格式"""
 
     enabled: bool = False
-    servers: list[MCPServerConfig] = []
+    servers: dict[str, MCPServerConfig] = {}  # 服务器名称 -> 配置
 
 
 class Settings(BaseSettings):
@@ -335,13 +334,20 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def merge_mcp_config(self) -> "Settings":
-        """合并 MCP 配置"""
+        """合并 MCP 配置 - 使用官方 mcpServers 字典格式"""
         # 如果显式设置了 mcp_servers_json，解析并覆盖
         if self.mcp_servers_json:
             try:
-                servers_data: list[dict] = json.loads(self.mcp_servers_json)
-                self.mcp.servers = [MCPServerConfig(**s) for s in servers_data]
-                self.mcp.enabled = True
+                config_data: dict[str, Any] = json.loads(self.mcp_servers_json)
+                # 支持两种格式：
+                # 1. 官方格式: {"mcpServers": {"server-name": {...}}}
+                # 2. 简化格式: {"server-name": {...}}
+                servers_data = config_data.get("mcpServers", config_data)
+                if isinstance(servers_data, dict):
+                    for server_name, server_config in servers_data.items():
+                        if isinstance(server_config, dict):
+                            self.mcp.servers[server_name] = MCPServerConfig(**server_config)
+                    self.mcp.enabled = True
             except (json.JSONDecodeError, ValueError) as e:
                 import logging
                 logging.getLogger(__name__).warning(
