@@ -338,6 +338,7 @@ class _HandlerContext:
     new_messages: list[ModelMessage] = field(default_factory=list)
     serialized_usage: dict[str, Any] | None = None
     tool_events: list[dict[str, Any]] = field(default_factory=list)  # 记录工具调用事件
+    tool_results: dict[str, str] = field(default_factory=dict)  # 记录工具返回结果，key=tool_call_id
 
 
 async def _send_content_event(
@@ -493,15 +494,40 @@ async def stream_response_handler(
                                     tool_call_id=event.part.tool_call_id,
                                     connection_id=str(deps.connection_id),
                                 )
+                                # 发送工具调用事件
+                                yield StreamEvent(
+                                    event_type="tool_call",
+                                    content=event.part.tool_name,
+                                    sequence=ctx.sequence,
+                                    metadata={
+                                        "tool_name": event.part.tool_name,
+                                        "tool_call_id": event.part.tool_call_id,
+                                        "args": event.part.args,
+                                    },
+                                )
+                                ctx.sequence += 1
 
                             # 工具返回事件
                             elif isinstance(event, FunctionToolResultEvent):
+                                result_content = str(event.result.content)
+                                ctx.tool_results[event.tool_call_id] = result_content
                                 logger.info(
                                     "agent_tool_result",
                                     tool_call_id=event.tool_call_id,
-                                    result_preview=str(event.result.content)[:100],
+                                    result_preview=result_content[:100],
                                     connection_id=str(deps.connection_id),
                                 )
+                                # 发送工具返回事件
+                                yield StreamEvent(
+                                    event_type="tool_result",
+                                    content=result_content,
+                                    sequence=ctx.sequence,
+                                    metadata={
+                                        "tool_call_id": event.tool_call_id,
+                                        "tool_name": event.tool_call_id.split("_")[0] if "_" in event.tool_call_id else None,
+                                    },
+                                )
+                                ctx.sequence += 1
 
                 # 处理结束节点
                 elif Agent.is_end_node(node):
