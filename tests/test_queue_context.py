@@ -102,3 +102,57 @@ def test_strip_reasoning_content_for_thinking_part() -> None:
     assert sanitized_message.parts[0].content == ""
     assert isinstance(sanitized_message.parts[1], TextPart)
     assert sanitized_message.parts[1].content == "visible"
+
+
+def test_worker_tool_events_should_not_be_sent_twice(monkeypatch) -> None:
+    """工具事件应仅发送格式化消息一次，避免重复发送原始事件。"""
+
+    import asyncio
+    from types import SimpleNamespace
+
+    from config.settings import Settings
+    from models.messages import ChatRequest
+
+    broker = MessageBroker()
+    connection_id = uuid4()
+    broker.register_connection(connection_id)
+
+    worker = AgentWorker(broker=broker, settings=Settings(), worker_id=1)
+
+    class _FakeManager:
+        def get_agent(self):
+            return object()
+
+    async def _fake_stream_chat(*args, **kwargs):
+        yield SimpleNamespace(
+            event_type="tool_call",
+            content='{"command":"say hi"}',
+            metadata={"tool_name": "run_minecraft_command", "args": {"command": "say hi"}},
+        )
+        yield SimpleNamespace(
+            event_type="tool_result",
+            content="ok",
+            metadata={"tool_name": "run_minecraft_command"},
+        )
+        yield SimpleNamespace(
+            event_type="content",
+            content="完成",
+            metadata={"is_complete": False},
+        )
+
+    monkeypatch.setattr("services.agent.worker.stream_chat", _fake_stream_chat)
+    monkeypatch.setattr("services.agent.core.get_agent_manager", lambda: _FakeManager())
+    monkeypatch.setattr("services.agent.worker.ProviderRegistry.get_model", lambda *_: object())
+
+    request = ChatRequest(connection_id=connection_id, content="test", use_context=False)
+    asyncio.run(worker._process_request_locked(request, connection_id))
+
+    queue = broker.get_response_queue(connection_id)
+    assert queue is not None
+
+    chunks = []
+    while not queue.empty():
+        chunks.append(queue.get_nowait())
+
+    assert [chunk.chunk_type for chunk in chunks] == ["tool_call", "tool_result", "content"]
+    assert [chunk.sequence for chunk in chunks] == [0, 1, 2]

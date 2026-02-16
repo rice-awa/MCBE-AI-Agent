@@ -336,16 +336,17 @@ class AgentWorker:
                         response_length=len(response_text),
                     )
 
-                chunk = StreamChunk(
-                    connection_id=connection_id,
-                    chunk_type=event.event_type,  # type: ignore
-                    content=event.content,
-                    sequence=sequence,
-                    delivery=request.delivery,
-                )
+                if event.event_type not in {"tool_call", "tool_result"}:
+                    chunk = StreamChunk(
+                        connection_id=connection_id,
+                        chunk_type=event.event_type,  # type: ignore
+                        content=event.content,
+                        sequence=sequence,
+                        delivery=request.delivery,
+                    )
 
-                await self.broker.send_response(connection_id, chunk)
-                sequence += 1
+                    await self.broker.send_response(connection_id, chunk)
+                    sequence += 1
 
         except Exception as e:
             logger.error(
