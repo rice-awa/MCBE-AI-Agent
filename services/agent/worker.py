@@ -13,7 +13,15 @@ from core.queue import MessageBroker
 from services.agent.core import stream_chat
 from services.agent.providers import ProviderRegistry
 from models.messages import ChatRequest, StreamChunk
-from models.agent import AgentDependencies, ContextInfo
+from models.agent import (
+    AgentDependencies,
+    ContextInfo,
+    MCColor,
+    MCPrefix,
+    truncate_text,
+    format_tool_call_message,
+    format_tool_result_message,
+)
 from config.settings import Settings
 from config.logging import get_logger
 
@@ -225,6 +233,44 @@ class AgentWorker:
                     response_parts.append(event.content)
                 elif event.event_type == "reasoning" and event.content:
                     reasoning_parts.append(event.content)
+
+                # 处理工具调用事件 - 发送到游戏显示
+                elif event.event_type == "tool_call":
+                    tool_name = event.metadata.get("tool_name", "unknown") if event.metadata else "unknown"
+                    tool_args = event.metadata.get("args") if event.metadata else None
+                    tool_msg = format_tool_call_message(tool_name, tool_args)
+                    tool_chunk = StreamChunk(
+                        connection_id=connection_id,
+                        chunk_type="tool_call",
+                        content=tool_msg,
+                        sequence=sequence,
+                        delivery=request.delivery,
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                    )
+                    await self.broker.send_response(connection_id, tool_chunk)
+                    sequence += 1
+
+                # 处理工具返回事件 - 发送到游戏显示
+                elif event.event_type == "tool_result":
+                    tool_name = event.metadata.get("tool_name") if event.metadata else None
+                    result_content = event.content
+                    tool_result_msg = format_tool_result_message(
+                        tool_name or "tool",
+                        result_content,
+                        max_length=80,
+                    )
+                    result_chunk = StreamChunk(
+                        connection_id=connection_id,
+                        chunk_type="tool_result",
+                        content=tool_result_msg,
+                        sequence=sequence,
+                        delivery=request.delivery,
+                        tool_name=tool_name,
+                        tool_result_preview=truncate_text(result_content, 80),
+                    )
+                    await self.broker.send_response(connection_id, result_chunk)
+                    sequence += 1
 
                 if event.metadata and event.metadata.get("is_complete"):
                     all_messages = event.metadata.get("all_messages")

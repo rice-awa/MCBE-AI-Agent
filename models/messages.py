@@ -40,10 +40,18 @@ class StreamChunk(BaseMessage):
     """流式响应块"""
 
     type: Literal["stream_chunk"] = "stream_chunk"
-    chunk_type: Literal["reasoning", "content", "error", "thinking_start", "thinking_end"]
+    chunk_type: Literal[
+        "reasoning", "content", "error",
+        "thinking_start", "thinking_end",
+        "tool_call", "tool_result"
+    ]
     content: str
     sequence: int
     delivery: Literal["tellraw", "scriptevent"] = "tellraw"
+    # 工具相关元数据
+    tool_name: str | None = None
+    tool_args: dict | None = None
+    tool_result_preview: str | None = None
 
 
 class SystemNotification(BaseMessage):
