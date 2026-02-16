@@ -10,7 +10,7 @@ import httpx
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ThinkingPart
 
 from core.queue import MessageBroker
-from services.agent.core import stream_chat
+from services.agent.core import stream_chat, _extract_exception_details
 from services.agent.providers import ProviderRegistry
 from models.messages import ChatRequest, StreamChunk
 from models.agent import (
@@ -348,14 +348,15 @@ class AgentWorker:
                 sequence += 1
 
         except Exception as e:
+            error_detail = _extract_exception_details(e)
             logger.error(
                 "stream_processing_error",
                 worker_id=self.worker_id,
                 connection_id=str(connection_id),
-                error=str(e),
+                error=error_detail,
                 exc_info=True,
             )
-            await self._send_error_chunk(connection_id, str(e), sequence)
+            await self._send_error_chunk(connection_id, error_detail, sequence)
 
     @staticmethod
     def _trim_history(

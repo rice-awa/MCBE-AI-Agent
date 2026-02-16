@@ -61,6 +61,12 @@ class MinecraftConfig(BaseModel):
             "description": "设置管理",
             "usage": "<变量/别名> <子命令>"
         },
+        "AGENT MCP": {
+            "type": "mcp",
+            "aliases": ["AGENT mcp"],
+            "description": "MCP 服务器管理",
+            "usage": "<list/status/reload>"
+        },
         "运行命令": {
             "type": "run_command",
             "aliases": ["runcmd", "cmd"],
@@ -335,6 +341,11 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def merge_mcp_config(self) -> "Settings":
         """合并 MCP 配置 - 使用官方 mcpServers 字典格式"""
+        # 只有在 MCP 启用时才解析和加载 MCP 服务器配置
+        if not self.mcp_enabled:
+            # 即使配置了 MCP_SERVERS，如果没有明确启用也不加载
+            return self
+
         # 如果显式设置了 mcp_servers_json，解析并覆盖
         if self.mcp_servers_json:
             try:
@@ -354,7 +365,7 @@ class Settings(BaseSettings):
                     "invalid_mcp_servers_json: %s",
                     str(e),
                 )
-        # 如果设置了 mcp_enabled 环境变量，也启用 MCP
+        # 如果设置了 mcp_enabled 环境变量，启用 MCP
         if self.mcp_enabled:
             self.mcp.enabled = True
         return self
