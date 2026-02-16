@@ -50,13 +50,22 @@ class ChatAgentManager:
         self._initialized = False
         self._settings: Settings | None = None
 
-    def _create_base_agent(self) -> Agent[AgentDependencies, str]:
-        """创建基础 Agent 实例（不包含 MCP 工具）"""
+    def _create_agent(
+        self,
+        toolsets: list[Any] | None = None,
+    ) -> Agent[AgentDependencies, str]:
+        """
+        创建 Agent 实例
+
+        Args:
+            toolsets: MCP 工具集列表
+        """
         agent = Agent[AgentDependencies, str](
             "deepseek:deepseek-chat",  # 默认模型，运行时可覆盖
             deps_type=AgentDependencies,
             output_type=str,
             retries=2,
+            toolsets=toolsets,
         )
 
         @agent.system_prompt
@@ -83,24 +92,11 @@ class ChatAgentManager:
 
         # 加载 MCP 工具集
         from services.agent.mcp import load_mcp_toolsets
+
         self._mcp_toolsets = load_mcp_toolsets(self._settings)
 
         # 创建带有 MCP 工具集的 Agent
-        self._agent = Agent[AgentDependencies, str](
-            "deepseek:deepseek-chat",
-            deps_type=AgentDependencies,
-            output_type=str,
-            retries=2,
-            toolsets=self._mcp_toolsets if self._mcp_toolsets else None,
-        )
-
-        @self._agent.system_prompt
-        async def dynamic_system_prompt(ctx: RunContext[AgentDependencies]) -> str:
-            """动态系统提示词"""
-            return await build_dynamic_prompt(ctx)
-
-        # 注册基础工具
-        register_agent_tools(self._agent)
+        self._agent = self._create_agent(toolsets=self._mcp_toolsets if self._mcp_toolsets else None)
 
         self._initialized = True
         logger.info(
@@ -112,14 +108,33 @@ class ChatAgentManager:
         """
         获取 Agent 实例
 
-        如果尚未初始化，会先进行同步初始化（不加载 MCP）
+        如果尚未初始化，会自动进行懒初始化（包含 MCP 工具）
 
         Returns:
             Agent 实例
         """
         if self._agent is None:
-            self._agent = self._create_base_agent()
-            logger.info("chat_agent_created_sync")
+            # 懒初始化：自动加载 MCP 工具集
+            if not self._initialized:
+                import inspect
+
+                # 检查是否在异步上下文中
+                try:
+                    loop = asyncio.get_running_loop()
+                    # 如果在异步上下文中，使用 ensure_future 延迟初始化
+                    # 但为简化逻辑，这里直接同步初始化（第一次调用时）
+                except RuntimeError:
+                    pass
+
+                # 执行懒初始化
+                self._settings = get_settings()
+                from services.agent.mcp import load_mcp_toolsets
+
+                self._mcp_toolsets = load_mcp_toolsets(self._settings)
+                self._agent = self._create_agent(toolsets=self._mcp_toolsets if self._mcp_toolsets else None)
+                self._initialized = True
+                logger.info("chat_agent_created_lazy", mcp_toolsets_count=len(self._mcp_toolsets))
+
         return self._agent
 
     @property
@@ -145,25 +160,27 @@ def get_agent_manager() -> ChatAgentManager:
     return _agent_manager
 
 
-# 为了向后兼容，保留 chat_agent 变量（但推荐使用 get_agent_manager）
-# 注意：这个变量在首次访问时会创建 Agent，但不包含 MCP 工具
-# 如需 MCP 工具，请使用 get_agent_manager().get_agent() 或先调用 initialize
-chat_agent = Agent[AgentDependencies, str](
-    "deepseek:deepseek-chat",
-    deps_type=AgentDependencies,
-    output_type=str,
-    retries=2,
-)
+# 为了向后兼容，保留 chat_agent 变量（推荐使用 get_agent_manager）
+# 通过懒加载方式获取 Agent，确保 MCP 工具被正确加载
 
 
-@chat_agent.system_prompt
-async def _legacy_system_prompt(ctx: RunContext[AgentDependencies]) -> str:
-    """动态系统提示词"""
-    return await build_dynamic_prompt(ctx)
+def _get_legacy_chat_agent() -> Agent[AgentDependencies, str]:
+    """获取兼容性 Agent 实例（懒加载）"""
+    return get_agent_manager().get_agent()
 
 
-# 注册基础工具到兼容性 Agent
-register_agent_tools(chat_agent)
+class _LegacyChatAgentProxy:
+    """兼容性代理，支持直接访问 Agent 属性和方法"""
+
+    def __getattr__(self, name: str):
+        return getattr(_get_legacy_chat_agent(), name)
+
+    def __call__(self, *args, **kwargs):
+        return _get_legacy_chat_agent()(*args, **kwargs)
+
+
+# 使用代理对象，保持向后兼容
+chat_agent = _LegacyChatAgentProxy()  # type: ignore[assignment]
 
 
 SENTENCE_END_PATTERN = re.compile(r"[。！？\n.!?]+")
