@@ -41,6 +41,7 @@ class Application:
             port=self.settings.port,
             default_provider=self.settings.default_provider,
             worker_count=self.settings.llm_worker_count,
+            dev_mode=self.settings.dev_mode,
         )
 
         # 预热 LLM 模型
@@ -127,7 +128,8 @@ def cli():
 @click.option("--host", default=None, help="服务器地址")
 @click.option("--port", default=None, type=int, help="服务器端口")
 @click.option("--log-level", default=None, help="日志级别 (DEBUG/INFO/WARNING/ERROR)")
-def serve(host: str | None, port: int | None, log_level: str | None):
+@click.option("--dev", is_flag=True, default=False, help="启用开发模式 (跳过身份验证，仅用于本地调试)")
+def serve(host: str | None, port: int | None, log_level: str | None, dev: bool):
     """启动 WebSocket 服务器"""
     # 加载设置
     settings = get_settings()
@@ -139,6 +141,12 @@ def serve(host: str | None, port: int | None, log_level: str | None):
         settings.port = port
     if log_level:
         settings.log_level = log_level  # type: ignore
+    if dev:
+        settings.dev_mode = True
+
+    # 开发模式警告
+    if settings.dev_mode:
+        click.echo("⚠️  警告: 开发模式已启用 - 身份验证已跳过，仅用于本地开发调试！\n")
 
     # 运行应用
     try:
@@ -158,6 +166,7 @@ def info():
     click.echo(f"Worker 数量: {settings.llm_worker_count}")
     click.echo(f"队列大小: {settings.queue_max_size}")
     click.echo(f"JWT 过期时间: {settings.jwt_expiration}s")
+    click.echo(f"开发模式: {'已启用 ⚠️' if settings.dev_mode else '未启用'}")
     click.echo(f"\n可用的 LLM 提供商:")
 
     for provider in settings.list_available_providers():

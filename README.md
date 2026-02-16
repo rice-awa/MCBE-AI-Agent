@@ -185,6 +185,34 @@ python cli.py test-provider deepseek
 python cli.py serve
 ```
 
+### 开发模式
+
+开发模式适用于本地开发和调试，启用后会跳过身份验证步骤。
+
+**启用方式：**
+
+方式一：命令行参数
+```bash
+python cli.py serve --dev
+```
+
+方式二：环境变量
+```bash
+# 在 .env 文件中设置
+DEV_MODE=true
+```
+
+**开发模式特性：**
+- 跳过 WebSocket 连接的身份验证
+- 连接时自动认证，无需执行 `#登录` 命令
+- 启动时显示明确的警告信息
+- 日志中标记 `dev_mode=true`
+
+**⚠️ 安全警告：**
+- 开发模式**仅用于本地开发和调试**
+- **切勿在生产环境中启用**，否则任何人都可以连接服务器
+- 启用时会在控制台和日志中显示警告信息
+
 ## Termux 部署指南
 
 ### 1. 准备工作
@@ -375,6 +403,7 @@ nohup python cli.py serve > mcbe.log 2>&1 &
 | `LOG_LEVEL` | 日志级别 | `INFO` |
 | `ENABLE_WS_RAW_LOG` | WebSocket 原始日志开关 | `true` |
 | `ENABLE_LLM_RAW_LOG` | LLM 原始日志开关 | `true` |
+| `DEV_MODE` | 开发模式 (跳过身份验证) | `false` |
 
 ### Settings 配置
 
@@ -698,6 +727,11 @@ pip install --prefer-binary -r requirements.txt
 
 ## 更新日志
 
+### v2.3.0 (2026-02-16)
+- ✨ **开发模式**: 新增开发模式功能，支持跳过身份验证用于本地开发调试
+- 🔧 支持通过 `--dev` 命令行参数或 `DEV_MODE` 环境变量启用
+- ⚠️ 开发模式下会显示明确的安全警告
+
 ### v2.2.1 (2026-02-15)
 - 🔧 **日志控制优化**: 新增 WebSocket 和 LLM 原始日志开关配置，支持按需启用
 - ⚙️ **环境变量支持**: 添加 `ENABLE_WS_RAW_LOG` 和 `ENABLE_LLM_RAW_LOG` 环境变量
@@ -762,7 +796,7 @@ pip install --prefer-binary -r requirements.txt
 
 ---
 
-**版本**: 2.2.1
-**最后更新**: 2026-02-15
+**版本**: 2.3.0
+**最后更新**: 2026-02-16
 **架构**: 现代化异步 + PydanticAI
 **平台支持**: Windows, Linux, macOS, Termux (Android)

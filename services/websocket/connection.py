@@ -43,8 +43,9 @@ class ConnectionManager:
     - 启动独立的响应发送协程
     """
 
-    def __init__(self, broker: MessageBroker):
+    def __init__(self, broker: MessageBroker, dev_mode: bool = False):
         self.broker = broker
+        self.dev_mode = dev_mode
         self._connections: dict[UUID, ConnectionState] = {}
         self._sender_tasks: dict[UUID, asyncio.Task] = {}
 
@@ -72,6 +73,7 @@ class ConnectionManager:
             "connection_registered",
             connection_id=str(state.id),
             total_connections=len(self._connections),
+            dev_mode=self.dev_mode,
         )
 
         return state
