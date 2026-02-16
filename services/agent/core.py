@@ -234,24 +234,58 @@ def _is_mcp_timeout_error(exc: BaseException) -> bool:
     Returns:
         是否是 MCP 超时错误
     """
+    import traceback
+
     error_str = str(exc).lower()
     error_detail = _extract_exception_details(exc).lower()
 
-    # 检查是否是超时错误
+    # 获取完整的堆栈跟踪信息
+    tb_str = ""
+    try:
+        tb_str = traceback.format_exc().lower()
+    except Exception:
+        pass
+
+    # 检查是否是超时错误 - 更宽松的检查
     is_timeout = (
         "timeout" in error_detail
+        or "timeout" in error_str
+        or "timeouterror" in error_detail
         or "deadline exceeded" in error_detail
+        or "deadline exceeded" in error_str
         or "cancelled" in error_detail
+        or "cancelled" in error_str
     )
 
-    # 检查是否涉及 MCP
+    # 检查是否涉及 MCP（在错误详情、错误字符串或堆栈跟踪中）
     is_mcp_related = (
         "mcp" in error_detail
+        or "mcp" in error_str
+        or "mcp" in tb_str
         or "pydantic_ai.mcp" in error_detail
+        or "pydantic_ai.mcp" in tb_str
         or "stdio_client" in error_detail
+        or "stdio_client" in tb_str
+        or "mcpserverstdio" in tb_str
     )
 
-    return is_timeout and is_mcp_related
+    # 如果异常类型是 ExceptionGroup 且包含 TimeoutError，很可能是 MCP 问题
+    # 因为 MCP 使用 TaskGroup 来管理连接
+    is_exception_group_with_timeout = (
+        isinstance(exc, ExceptionGroup)
+        and "timeout" in error_detail
+    )
+
+    logger.debug(
+        "mcp_timeout_check",
+        is_timeout=is_timeout,
+        is_mcp_related=is_mcp_related,
+        is_exception_group_with_timeout=is_exception_group_with_timeout,
+        error_type=type(exc).__name__,
+        error_detail_preview=error_detail[:200] if error_detail else "",
+    )
+
+    return (is_timeout and is_mcp_related) or is_exception_group_with_timeout
 
 
 # 缓存降级 Agent 实例
@@ -270,7 +304,9 @@ def _create_fallback_agent() -> Agent[AgentDependencies, str]:
     global _fallback_agent
     if _fallback_agent is None:
         logger.info("creating_fallback_agent_without_mcp")
-        _fallback_agent = ChatAgentManager()._create_agent(toolsets=None)
+        # 使用 get_agent_manager() 获取单例，避免创建新实例
+        agent_manager = get_agent_manager()
+        _fallback_agent = agent_manager._create_agent(toolsets=None)
     return _fallback_agent
 
 

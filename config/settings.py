@@ -208,7 +208,7 @@ class MCPServerConfig(BaseModel):
     args: list[str] = []  # 命令参数
     env: dict[str, str] = {}  # 环境变量
     url: str | None = None  # 远程服务器 URL (用于 HTTP 模式)
-    timeout: int = 60  # 初始化超时时间（秒），npx 首次下载需要较长时间
+    timeout: int = 5  # 初始化超时时间（秒），npx 首次下载需要较长时间
 
 
 class MCPConfig(BaseModel):
