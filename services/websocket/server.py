@@ -426,20 +426,19 @@ class WebSocketServer:
 
             # 获取上下文使用信息
             context_usage = ""
-            if history:
-                try:
-                    # 使用当前提供商或默认提供商
-                    provider = state.current_provider or self.settings.default_provider
-                    provider_config = self.settings.get_provider_config(provider)
-                    message_count = len(history)
-                    estimated_tokens = message_count * 100  # 简单估算
-                    if provider_config.context_window:
-                        usage_percent = (estimated_tokens / provider_config.context_window) * 100
-                        context_usage = f"\n上下文使用: {usage_percent:.1f}% {estimated_tokens}/{provider_config.context_window}"
-                    else:
-                        context_usage = f"\n上下文使用: ~{estimated_tokens} tokens (模型上下文窗口未知)"
-                except Exception:
-                    pass
+            try:
+                # 使用当前提供商或默认提供商
+                provider = state.current_provider or self.settings.default_provider
+                provider_config = self.settings.get_provider_config(provider)
+                message_count = len(history)
+                estimated_tokens = message_count * 100  # 简单估算
+                if provider_config.context_window:
+                    usage_percent = (estimated_tokens / provider_config.context_window) * 100
+                    context_usage = f"\n上下文使用: {usage_percent:.1f}% ({estimated_tokens}/{provider_config.context_window} tokens)"
+                else:
+                    context_usage = f"\n上下文使用: ~{estimated_tokens} tokens (模型上下文窗口未知)"
+            except Exception:
+                pass
 
             msg = self.protocol_handler.create_info_message(
                 f"上下文状态: {status}\n当前对话轮数: {turns}/{self.settings.max_history_turns}{context_usage}"
