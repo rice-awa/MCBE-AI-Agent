@@ -47,6 +47,15 @@ class Application:
         # 预热 LLM 模型
         await ProviderRegistry.warmup_models(self.settings)
 
+        # 初始化 Agent 管理器（加载 MCP 工具集）
+        from services.agent.core import get_agent_manager
+        agent_manager = get_agent_manager()
+        await agent_manager.initialize(self.settings)
+        logger.info(
+            "agent_manager_initialized",
+            mcp_toolsets_count=len(agent_manager.mcp_toolsets),
+        )
+
         # 启动 Agent Workers
         for i in range(self.settings.llm_worker_count):
             worker = AgentWorker(self.broker, self.settings, worker_id=i)

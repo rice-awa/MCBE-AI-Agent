@@ -1,251 +1,181 @@
-"""MCP 客户端 - 使用官方 Model Context Protocol Python SDK"""
+"""MCP 工具集管理 - 使用 PydanticAI 官方 MCP 客户端"""
 
-from contextlib import AsyncExitStack
-import os
 from typing import Any
 
-import mcp.types as types
-from mcp.client.session import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
+from pydantic_ai.mcp import MCPServerStdio, MCPServerStreamableHTTP
 
 from config.logging import get_logger
-from config.settings import MCPServerConfig, Settings, get_settings
+from config.settings import Settings, MCPServerConfig, get_settings
 
 logger = get_logger(__name__)
 
 
-class MCPClient:
-    """MCP 协议客户端 - 使用官方 SDK"""
+def create_mcp_toolset(
+    server_name: str,
+    config: MCPServerConfig,
+) -> MCPServerStdio | MCPServerStreamableHTTP | None:
+    """
+    根据配置创建 MCP 工具集
 
-    def __init__(self, config: MCPServerConfig):
-        self._config = config
-        self._session: ClientSession | None = None
-        self._read: Any = None
-        self._write: Any = None
-        self._exit_stack: AsyncExitStack | None = None
+    Args:
+        server_name: 服务器名称
+        config: MCP 服务器配置
 
-    async def start(self) -> bool:
-        """启动 MCP 服务器连接
-
-        Returns:
-            是否启动成功
-        """
-        try:
-            if self._session:
-                return True
-
-            self._exit_stack = AsyncExitStack()
-
-            if self._config.url:
-                # 远程 MCP 服务器 - 使用 streamable_http
-                # 注意: 需要 mcp.client.streamable_http
-                from mcp.client.streamable_http import streamable_http_client
-
-                self._read, self._write = await self._exit_stack.enter_async_context(
-                    streamable_http_client(self._config.url)
-                )
-                self._session = ClientSession(self._read, self._write)
-                await self._session.initialize()
-                logger.info("mcp_client_started", server=self._config.name, mode="http")
-            else:
-                # 本地 MCP 服务器 - 使用 stdio
-                server_params = StdioServerParameters(
-                    command=self._config.command,
-                    args=self._config.args,
-                    env={**os.environ, **self._config.env},
-                )
-                self._read, self._write = await self._exit_stack.enter_async_context(
-                    stdio_client(server_params)
-                )
-                self._session = ClientSession(self._read, self._write)
-                await self._session.initialize()
+    Returns:
+        MCP 工具集实例，配置无效时返回 None
+    """
+    try:
+        # HTTP 模式（通过 URL 配置）
+        if config.url:
+            # 判断是 SSE 还是 Streamable HTTP
+            if config.url.endswith("/sse"):
+                from pydantic_ai.mcp import MCPServerSSE
                 logger.info(
-                    "mcp_client_started",
-                    server=self._config.name,
-                    mode="stdio",
+                    "mcp_server_created",
+                    server=server_name,
+                    mode="sse",
+                    url=config.url,
                 )
-            return True
-        except Exception as e:
-            await self.stop()
-            logger.error(
-                "mcp_client_start_failed",
-                server=self._config.name,
-                error=str(e),
+                return MCPServerSSE(config.url)
+            else:
+                logger.info(
+                    "mcp_server_created",
+                    server=server_name,
+                    mode="streamable-http",
+                    url=config.url,
+                )
+                return MCPServerStreamableHTTP(config.url)
+
+        # Stdio 模式（通过命令配置）
+        if config.command:
+            logger.info(
+                "mcp_server_created",
+                server=server_name,
+                mode="stdio",
+                command=config.command,
+                args=config.args,
             )
-            return False
+            return MCPServerStdio(
+                command=config.command,
+                args=config.args,
+                env=config.env if config.env else None,
+                timeout=config.timeout,
+            )
 
-    async def stop(self) -> None:
-        """停止 MCP 服务器连接"""
-        if self._session:
-            await self._session.close()
-            self._session = None
-
-        if self._exit_stack:
-            await self._exit_stack.aclose()
-            self._exit_stack = None
-
-        self._read = None
-        self._write = None
-        logger.info("mcp_client_stopped", server=self._config.name)
-
-    async def list_tools(self) -> list[types.Tool]:
-        """获取可用工具列表
-
-        Returns:
-            工具列表
-        """
-        if not self._session:
-            raise RuntimeError(f"MCP client not started: {self._config.name}")
-
-        result = await self._session.list_tools()
-        return result.tools
-
-    async def call_tool(
-        self, name: str, arguments: dict[str, Any]
-    ) -> types.CallToolResult:
-        """调用 MCP 工具
-
-        Args:
-            name: 工具名称
-            arguments: 工具参数
-
-        Returns:
-            工具调用结果
-        """
-        if not self._session:
-            raise RuntimeError(f"MCP client not started: {self._config.name}")
-
-        result = await self._session.call_tool(name, arguments)
-        return result
-
-    async def list_prompts(self) -> list[types.Prompt]:
-        """获取可用提示模板
-
-        Returns:
-            提示模板列表
-        """
-        if not self._session:
-            raise RuntimeError(f"MCP client not started: {self._config.name}")
-
-        result = await self._session.list_prompts()
-        return result.prompts
-
-    async def list_resources(self) -> list[types.Resource]:
-        """获取可用资源
-
-        Returns:
-            资源列表
-        """
-        if not self._session:
-            raise RuntimeError(f"MCP client not started: {self._config.name}")
-
-        result = await self._session.list_resources()
-        return result.resources
-
-
-class MCPToolAdapter:
-    """MCP 工具适配器 - 转换为 PydanticAI 工具"""
-
-    def __init__(self, client: MCPClient):
-        self._client = client
-        self._tools: list[types.Tool] = []
-
-    async def load_tools(self) -> list[types.Tool]:
-        """加载 MCP 工具
-
-        Returns:
-            工具列表
-        """
-        self._tools = await self._client.list_tools()
-        logger.info(
-            "mcp_tools_loaded",
-            server=self._client._config.name,
-            count=len(self._tools),
+        logger.warning(
+            "mcp_server_config_invalid",
+            server=server_name,
+            message="既没有配置 URL 也没有配置命令",
         )
-        return self._tools
+        return None
 
-    def get_tools(self) -> list[types.Tool]:
-        """获取已加载的工具列表"""
-        return self._tools
+    except Exception as e:
+        logger.error(
+            "mcp_server_creation_failed",
+            server=server_name,
+            error=str(e),
+        )
+        return None
 
 
+def load_mcp_toolsets(settings: Settings | None = None) -> list[Any]:
+    """
+    从配置加载 MCP 工具集
+
+    Args:
+        settings: 应用配置，不传则使用全局配置
+
+    Returns:
+        MCP 工具集列表，可直接传给 Agent 的 toolsets 参数
+    """
+    settings = settings or get_settings()
+    toolsets: list[Any] = []
+
+    mcp_config = settings.mcp
+    if not mcp_config.enabled:
+        logger.info("mcp_disabled")
+        return toolsets
+
+    for server_name, server_config in mcp_config.servers.items():
+        toolset = create_mcp_toolset(server_name, server_config)
+        if toolset:
+            toolsets.append(toolset)
+
+    logger.info(
+        "mcp_toolsets_loaded",
+        count=len(toolsets),
+        servers=list(mcp_config.servers.keys()),
+    )
+    return toolsets
+
+
+def load_mcp_toolsets_from_dict(config_dict: dict[str, Any]) -> list[Any]:
+    """
+    从字典配置加载 MCP 工具集
+
+    支持两种格式：
+    1. 官方格式: {"mcpServers": {"server-name": {...}}}
+    2. 简化格式: {"server-name": {...}}
+
+    Args:
+        config_dict: MCP 配置字典
+
+    Returns:
+        MCP 工具集列表
+    """
+    toolsets: list[Any] = []
+
+    # 提取 mcpServers 部分
+    servers_data = config_dict.get("mcpServers", config_dict)
+    if not isinstance(servers_data, dict):
+        logger.warning("mcp_config_invalid_format")
+        return toolsets
+
+    for server_name, server_config in servers_data.items():
+        if not isinstance(server_config, dict):
+            continue
+
+        config = MCPServerConfig(**server_config)
+        toolset = create_mcp_toolset(server_name, config)
+        if toolset:
+            toolsets.append(toolset)
+
+    logger.info("mcp_toolsets_loaded_from_dict", count=len(toolsets))
+    return toolsets
+
+
+# 为了向后兼容，保留 MCPManager 类的简化版本
 class MCPManager:
-    """MCP 管理器 - 管理多个 MCP 服务器连接"""
+    """MCP 管理器 - 简化版，主要用于兼容旧代码"""
 
     def __init__(self, settings: Settings | None = None):
         self._settings = settings or get_settings()
-        self._clients: dict[str, MCPClient] = {}
-        self._adapters: dict[str, MCPToolAdapter] = {}
+        self._toolsets: list[Any] = []
         self._initialized = False
 
     async def initialize(self) -> bool:
-        """初始化 MCP 服务器连接
-
-        Returns:
-            是否初始化成功
-        """
+        """初始化 MCP 工具集"""
         if self._initialized:
             return True
 
-        mcp_config = self._settings.mcp
-        if not mcp_config.enabled:
-            logger.info("mcp_disabled")
-            return True
-
-        success = True
-        for server_config in mcp_config.servers:
-            client = MCPClient(server_config)
-            adapter = MCPToolAdapter(client)
-
-            if server_config.auto_start:
-                started = await client.start()
-                if started:
-                    # 加载工具
-                    try:
-                        await adapter.load_tools()
-                    except Exception as e:
-                        logger.warning(
-                            "mcp_tool_load_failed",
-                            server=server_config.name,
-                            error=str(e),
-                        )
-                else:
-                    success = False
-
-            self._clients[server_config.name] = client
-            self._adapters[server_config.name] = adapter
-
+        self._toolsets = load_mcp_toolsets(self._settings)
         self._initialized = True
         logger.info(
             "mcp_initialized",
-            server_count=len(self._clients),
-            success=success,
+            toolset_count=len(self._toolsets),
         )
-        return success
+        return True
+
+    def get_toolsets(self) -> list[Any]:
+        """获取所有 MCP 工具集"""
+        return self._toolsets
 
     async def shutdown(self) -> None:
-        """关闭所有 MCP 服务器连接"""
-        for client in self._clients.values():
-            await client.stop()
-        self._clients.clear()
-        self._adapters.clear()
+        """关闭 MCP 连接"""
+        # PydanticAI 的 MCP toolsets 会在 agent 运行结束后自动清理
+        self._toolsets.clear()
         self._initialized = False
         logger.info("mcp_shutdown")
-
-    def get_adapter(self, server_name: str) -> MCPToolAdapter | None:
-        """获取指定服务器的适配器"""
-        return self._adapters.get(server_name)
-
-    def get_all_adapters(self) -> dict[str, MCPToolAdapter]:
-        """获取所有服务器适配器"""
-        return self._adapters.copy()
-
-    def get_all_tools(self) -> list[types.Tool]:
-        """获取所有 MCP 服务器的工具"""
-        tools = []
-        for adapter in self._adapters.values():
-            tools.extend(adapter.get_tools())
-        return tools
 
 
 # 全局单例

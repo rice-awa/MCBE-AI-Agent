@@ -207,12 +207,18 @@ class AgentWorker:
         response_parts: list[str] = []
         reasoning_parts: list[str] = []
         start_time = time.monotonic()
+
+        # 获取已初始化的 Agent 实例（带有 MCP 工具集）
+        from services.agent.core import get_agent_manager
+        agent = get_agent_manager().get_agent()
+
         try:
             async for event in stream_chat(
                 request.content,
                 deps,
                 model,
                 message_history=message_history,
+                agent=agent,
             ):
                 event_count += 1
                 if event.event_type == "content" and event.content:

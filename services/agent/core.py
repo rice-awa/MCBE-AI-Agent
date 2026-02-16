@@ -19,6 +19,7 @@ from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
 
 from config.logging import get_logger
+from config.settings import Settings, get_settings
 from models.agent import AgentDependencies, StreamEvent
 from services.agent.tools import register_agent_tools
 from services.agent.prompt import build_dynamic_prompt
@@ -27,14 +28,128 @@ logger = get_logger(__name__)
 
 TOOL_USAGE_GUIDE = """
 你可以使用工具与 Minecraft 交互。
-- 当用户要求“执行命令/给物品/发送消息/发标题/查询 Wiki”等可操作任务时，优先调用对应工具执行，而不是只解释步骤。
-- 不要在有对应工具时直接说“我做不到”；若执行失败，要返回失败原因与下一步建议。
+- 当用户要求"执行命令/给物品/发送消息/发标题/查询 Wiki"等可操作任务时，优先调用对应工具执行，而不是只解释步骤。
+- 不要在有对应工具时直接说"我做不到"；若执行失败，要返回失败原因与下一步建议。
 - 对于纯问答类问题，可直接回答。
 """.strip()
 
-# 创建主聊天 Agent
+
+class ChatAgentManager:
+    """
+    聊天 Agent 管理器
+
+    负责：
+    - 管理 Agent 实例的生命周期
+    - 延迟加载 MCP 工具集
+    - 提供 Agent 实例给业务代码使用
+    """
+
+    def __init__(self):
+        self._agent: Agent[AgentDependencies, str] | None = None
+        self._mcp_toolsets: list[Any] = []
+        self._initialized = False
+        self._settings: Settings | None = None
+
+    def _create_base_agent(self) -> Agent[AgentDependencies, str]:
+        """创建基础 Agent 实例（不包含 MCP 工具）"""
+        agent = Agent[AgentDependencies, str](
+            "deepseek:deepseek-chat",  # 默认模型，运行时可覆盖
+            deps_type=AgentDependencies,
+            output_type=str,
+            retries=2,
+        )
+
+        @agent.system_prompt
+        async def dynamic_system_prompt(ctx: RunContext[AgentDependencies]) -> str:
+            """动态系统提示词 - 使用 PromptManager 构建"""
+            return await build_dynamic_prompt(ctx)
+
+        # 注册基础工具
+        register_agent_tools(agent)
+
+        return agent
+
+    async def initialize(self, settings: Settings | None = None) -> None:
+        """
+        初始化 Agent 管理器
+
+        Args:
+            settings: 应用配置，不传则使用全局配置
+        """
+        if self._initialized:
+            return
+
+        self._settings = settings or get_settings()
+
+        # 加载 MCP 工具集
+        from services.agent.mcp import load_mcp_toolsets
+        self._mcp_toolsets = load_mcp_toolsets(self._settings)
+
+        # 创建带有 MCP 工具集的 Agent
+        self._agent = Agent[AgentDependencies, str](
+            "deepseek:deepseek-chat",
+            deps_type=AgentDependencies,
+            output_type=str,
+            retries=2,
+            toolsets=self._mcp_toolsets if self._mcp_toolsets else None,
+        )
+
+        @self._agent.system_prompt
+        async def dynamic_system_prompt(ctx: RunContext[AgentDependencies]) -> str:
+            """动态系统提示词"""
+            return await build_dynamic_prompt(ctx)
+
+        # 注册基础工具
+        register_agent_tools(self._agent)
+
+        self._initialized = True
+        logger.info(
+            "chat_agent_initialized",
+            mcp_toolsets_count=len(self._mcp_toolsets),
+        )
+
+    def get_agent(self) -> Agent[AgentDependencies, str]:
+        """
+        获取 Agent 实例
+
+        如果尚未初始化，会先进行同步初始化（不加载 MCP）
+
+        Returns:
+            Agent 实例
+        """
+        if self._agent is None:
+            self._agent = self._create_base_agent()
+            logger.info("chat_agent_created_sync")
+        return self._agent
+
+    @property
+    def mcp_toolsets(self) -> list[Any]:
+        """获取 MCP 工具集列表"""
+        return self._mcp_toolsets
+
+    @property
+    def is_initialized(self) -> bool:
+        """是否已初始化"""
+        return self._initialized
+
+
+# 全局 Agent 管理器实例
+_agent_manager: ChatAgentManager | None = None
+
+
+def get_agent_manager() -> ChatAgentManager:
+    """获取 Agent 管理器单例"""
+    global _agent_manager
+    if _agent_manager is None:
+        _agent_manager = ChatAgentManager()
+    return _agent_manager
+
+
+# 为了向后兼容，保留 chat_agent 变量（但推荐使用 get_agent_manager）
+# 注意：这个变量在首次访问时会创建 Agent，但不包含 MCP 工具
+# 如需 MCP 工具，请使用 get_agent_manager().get_agent() 或先调用 initialize
 chat_agent = Agent[AgentDependencies, str](
-    "deepseek:deepseek-chat",  # 默认模型，运行时可覆盖
+    "deepseek:deepseek-chat",
     deps_type=AgentDependencies,
     output_type=str,
     retries=2,
@@ -42,11 +157,12 @@ chat_agent = Agent[AgentDependencies, str](
 
 
 @chat_agent.system_prompt
-async def dynamic_system_prompt(ctx: RunContext[AgentDependencies]) -> str:
-    """动态系统提示词 - 使用 PromptManager 构建"""
+async def _legacy_system_prompt(ctx: RunContext[AgentDependencies]) -> str:
+    """动态系统提示词"""
     return await build_dynamic_prompt(ctx)
 
 
+# 注册基础工具到兼容性 Agent
 register_agent_tools(chat_agent)
 
 
@@ -232,6 +348,7 @@ async def stream_response_handler(
     model: Model | str | None = None,
     message_history: list[ModelMessage] | None = None,
     ctx: _HandlerContext | None = None,
+    agent: Agent[AgentDependencies, str] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """
     流式响应处理器（基于 agent.iter() 官方推荐方式）
@@ -248,6 +365,7 @@ async def stream_response_handler(
         model: 可选的模型覆盖
         message_history: 消息历史
         ctx: 处理器上下文
+        agent: 可选的 Agent 实例，不传则使用管理器中的 Agent
 
     Yields:
         StreamEvent: 流式事件
@@ -255,9 +373,12 @@ async def stream_response_handler(
     if ctx is None:
         ctx = _HandlerContext()
 
+    # 使用传入的 agent 或从管理器获取
+    active_agent = agent or get_agent_manager().get_agent()
+
     try:
         # 使用 agent.iter() 进行细粒度节点控制
-        async with chat_agent.iter(
+        async with active_agent.iter(
             prompt,
             deps=deps,
             model=model,
@@ -404,6 +525,7 @@ async def non_stream_response_handler(
     model: Model | str | None = None,
     message_history: list[ModelMessage] | None = None,
     ctx: _HandlerContext | None = None,
+    agent: Agent[AgentDependencies, str] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """
     非流式响应处理器
@@ -419,6 +541,7 @@ async def non_stream_response_handler(
         model: 可选的模型覆盖
         message_history: 消息历史
         ctx: 处理器上下文
+        agent: 可选的 Agent 实例，不传则使用管理器中的 Agent
 
     Yields:
         StreamEvent: 流式事件
@@ -426,8 +549,11 @@ async def non_stream_response_handler(
     if ctx is None:
         ctx = _HandlerContext()
 
+    # 使用传入的 agent 或从管理器获取
+    active_agent = agent or get_agent_manager().get_agent()
+
     try:
-        result = await chat_agent.run(
+        result = await active_agent.run(
             prompt,
             deps=deps,
             model=model,
@@ -468,6 +594,7 @@ async def stream_chat(
     deps: AgentDependencies,
     model: Model | str | None = None,
     message_history: list[ModelMessage] | None = None,
+    agent: Agent[AgentDependencies, str] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """
     流式聊天处理主调度函数
@@ -480,6 +607,7 @@ async def stream_chat(
         deps: Agent 依赖
         model: 可选的模型覆盖
         message_history: 消息历史
+        agent: 可选的 Agent 实例，不传则使用管理器中的 Agent
 
     Yields:
         StreamEvent: 流式事件
@@ -492,7 +620,7 @@ async def stream_chat(
         if use_stream_mode:
             # 流式模式处理
             async for event in stream_response_handler(
-                prompt, deps, model, message_history, ctx
+                prompt, deps, model, message_history, ctx, agent
             ):
                 if event.event_type == "error":
                     yield event
@@ -501,7 +629,7 @@ async def stream_chat(
         else:
             # 非流式模式处理
             async for event in non_stream_response_handler(
-                prompt, deps, model, message_history, ctx
+                prompt, deps, model, message_history, ctx, agent
             ):
                 if event.event_type == "error":
                     yield event
