@@ -56,7 +56,7 @@ class Application:
         logger.info(
             "mcp_initialization_complete",
             enabled=mcp_status["enabled"],
-            connected=mcp_status["connected_servers"],
+            connected=mcp_status["active_servers"],
             total=mcp_status["total_servers"],
         )
 

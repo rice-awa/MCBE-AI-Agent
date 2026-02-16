@@ -445,6 +445,8 @@ class WebSocketServer:
             msg = self.protocol_handler.create_info_message(
                 f"上下文状态: {status}\n当前对话轮数: {turns}/{self.settings.max_history_turns}{context_usage}"
             )
+            await self._send_ws_payload(state, msg, source="context")
+            return
         elif action == "压缩":
             # 手动触发压缩
             success, result = await conv_manager.check_and_compress(state.id, force=True)

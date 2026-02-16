@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -111,11 +112,14 @@ class MCPManager:
             "servers": servers_summary,
         }
 
-    async def initialize(self) -> bool:
+    async def initialize(self, test_connections: bool = False) -> bool:
         """
         初始化 MCP 管理器
 
         创建 MCP 工具集配置。注意：实际的 MCP 连接发生在 agent.run() 时。
+
+        Args:
+            test_connections: 是否在初始化时测试连接（默认 False，避免阻塞启动）
 
         Returns:
             是否至少有一个有效的服务器配置
@@ -146,6 +150,10 @@ class MCPManager:
                     status=status,
                 )
 
+                # 可选：在初始化时测试连接
+                if test_connections and toolset:
+                    await self._test_server_connection(server_name)
+
             self._initialized = True
 
             active_count = sum(
@@ -160,6 +168,48 @@ class MCPManager:
             )
 
             return active_count > 0
+
+    async def _test_server_connection(self, server_name: str) -> bool:
+        """
+        测试指定服务器的连接
+
+        Args:
+            server_name: 服务器名称
+
+        Returns:
+            连接是否成功
+        """
+        info = self._servers.get(server_name)
+        if not info or not info.toolset:
+            return False
+
+        try:
+            logger.debug("mcp_testing_connection", server=server_name)
+            # 使用较短超时测试连接
+            async with info.toolset:
+                pass  # 只是测试连接是否可建立
+            info.status = MCPConnectionStatus.ACTIVE
+            info.last_run_success = True
+            logger.info("mcp_connection_test_success", server=server_name)
+            return True
+        except TimeoutError as e:
+            info.status = MCPConnectionStatus.ERROR
+            info.last_error = f"连接超时: {str(e)}"
+            logger.warning(
+                "mcp_connection_test_timeout",
+                server=server_name,
+                error=str(e),
+            )
+            return False
+        except Exception as e:
+            info.status = MCPConnectionStatus.ERROR
+            info.last_error = str(e)
+            logger.warning(
+                "mcp_connection_test_failed",
+                server=server_name,
+                error=str(e),
+            )
+            return False
 
     def _create_toolset(
         self,
@@ -207,10 +257,15 @@ class MCPManager:
                     command=config.command,
                     args=config.args,
                 )
+                # 合并环境变量：继承父进程环境 + 用户配置的环境变量
+                merged_env = dict(os.environ)
+                if config.env:
+                    merged_env.update(config.env)
+                
                 return MCPServerStdio(
                     command=config.command,
                     args=config.args,
-                    env=config.env if config.env else None,
+                    env=merged_env,
                     timeout=config.timeout,
                 )
 
@@ -312,6 +367,75 @@ class MCPManager:
         if not toolsets:
             logger.debug("mcp_no_active_toolsets")
         return toolsets
+
+    def get_healthy_toolsets(self) -> list[Any]:
+        """
+        获取健康的 MCP 工具集列表
+
+        只返回状态为 PENDING 或 ACTIVE 的工具集，
+        排除已标记为 ERROR 或 DISABLED 的服务器。
+
+        Returns:
+            健康的 MCP 工具集列表
+        """
+        healthy_toolsets = []
+        for info in self._servers.values():
+            if info.status in (MCPConnectionStatus.PENDING, MCPConnectionStatus.ACTIVE):
+                if info.toolset:
+                    healthy_toolsets.append(info.toolset)
+            elif info.status == MCPConnectionStatus.ERROR:
+                # 记录跳过的错误服务器
+                logger.debug(
+                    "mcp_skipping_unhealthy_server",
+                    server=info.name,
+                    status=info.status.value,
+                    error=info.last_error,
+                )
+
+        if not healthy_toolsets:
+            logger.debug("mcp_no_healthy_toolsets_available")
+
+        return healthy_toolsets
+
+    def mark_server_failed(self, server_name: str, error: str) -> None:
+        """
+        标记服务器为失败状态
+
+        当检测到某个 MCP 服务器连接失败时调用，
+        避免后续请求继续尝试使用该服务器。
+
+        Args:
+            server_name: 服务器名称
+            error: 错误信息
+        """
+        info = self._servers.get(server_name)
+        if info and info.status != MCPConnectionStatus.DISABLED:
+            info.status = MCPConnectionStatus.ERROR
+            info.last_error = error
+            info.last_run_success = False
+            logger.warning(
+                "mcp_server_marked_failed",
+                server=server_name,
+                error=error,
+            )
+
+    def disable_unhealthy_servers(self) -> list[str]:
+        """
+        禁用所有不健康的服务器
+
+        将状态为 ERROR 的服务器标记为 DISABLED，
+        防止它们被继续使用。
+
+        Returns:
+            被禁用的服务器名称列表
+        """
+        disabled_servers = []
+        for name, info in self._servers.items():
+            if info.status == MCPConnectionStatus.ERROR:
+                info.status = MCPConnectionStatus.DISABLED
+                disabled_servers.append(name)
+                logger.info("mcp_server_disabled", server=name, error=info.last_error)
+        return disabled_servers
 
     def get_toolset_by_name(self, name: str) -> Any | None:
         """
@@ -417,10 +541,15 @@ def create_mcp_toolset(
                 command=config.command,
                 args=config.args,
             )
+            # 合并环境变量：继承父进程环境 + 用户配置的环境变量
+            merged_env = dict(os.environ)
+            if config.env:
+                merged_env.update(config.env)
+            
             return MCPServerStdio(
                 command=config.command,
                 args=config.args,
-                env=config.env if config.env else None,
+                env=merged_env,
                 timeout=config.timeout,
             )
 

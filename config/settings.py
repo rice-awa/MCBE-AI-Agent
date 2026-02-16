@@ -27,43 +27,43 @@ class MinecraftConfig(BaseModel):
         "#登录": "login",
         "AGENT 聊天": {
             "type": "chat",
-            "aliases": ["AGENT chat", "AI 聊天", "AI 对话"],
+            "aliases": ["AGENT chat", "AI 聊天", "AI chat"],
             "description": "与 AI 对话",
             "usage": "<内容>"
         },
         "AGENT 脚本": {
             "type": "chat_script",
-            "aliases": ["AGENT script", "AI 脚本"],
+            "aliases": ["AGENT script", "AI 脚本", "AI script"],
             "description": "使用脚本事件发送",
             "usage": "<内容>"
         },
         "AGENT 保存": {
             "type": "save",
-            "aliases": ["AGENT save"],
+            "aliases": ["AGENT save", "AI save"],
             "description": "保存对话历史",
             "usage": None
         },
         "AGENT 上下文": {
             "type": "context",
-            "aliases": ["AGENT context", "AI 上下文"],
+            "aliases": ["AGENT context", "AI 上下文", "AI context"],
             "description": "管理上下文",
             "usage": "<启用/关闭/状态/清除/压缩/保存/恢复/列表/删除>"
         },
         "AGENT 模板": {
             "type": "template",
-            "aliases": ["AGENT template", "AI 模板"],
+            "aliases": ["AGENT template", "AI 模板", "AI template"],
             "description": "切换提示词模板",
             "usage": "<模板名/list>"
         },
         "AGENT 设置": {
             "type": "setting",
-            "aliases": ["AGENT setting", "AI 设置"],
+            "aliases": ["AGENT setting", "AI 设置", "AI setting"],
             "description": "设置管理",
             "usage": "<变量/别名> <子命令>"
         },
         "AGENT MCP": {
             "type": "mcp",
-            "aliases": ["AGENT mcp"],
+            "aliases": ["AGENT mcp","AI MCP","AI mcp"],
             "description": "MCP 服务器管理",
             "usage": "<list/status/reload>"
         },
@@ -208,7 +208,7 @@ class MCPServerConfig(BaseModel):
     args: list[str] = []  # 命令参数
     env: dict[str, str] = {}  # 环境变量
     url: str | None = None  # 远程服务器 URL (用于 HTTP 模式)
-    timeout: int = 10  # 超时时间（秒）
+    timeout: int = 60  # 初始化超时时间（秒），npx 首次下载需要较长时间
 
 
 class MCPConfig(BaseModel):

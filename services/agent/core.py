@@ -219,6 +219,61 @@ def _serialize_usage(usage: Any | None) -> dict[str, Any] | None:
     return {"value": str(usage)}
 
 
+def _is_mcp_timeout_error(exc: BaseException) -> bool:
+    """
+    检查异常是否是 MCP 连接超时错误
+
+    MCP 超时错误的特征：
+    - 包含 TimeoutError
+    - 错误信息中包含 "deadline exceeded" 或 "timeout"
+    - 堆栈中包含 mcp 或 pydantic_ai.mcp 相关模块
+
+    Args:
+        exc: 异常对象
+
+    Returns:
+        是否是 MCP 超时错误
+    """
+    error_str = str(exc).lower()
+    error_detail = _extract_exception_details(exc).lower()
+
+    # 检查是否是超时错误
+    is_timeout = (
+        "timeout" in error_detail
+        or "deadline exceeded" in error_detail
+        or "cancelled" in error_detail
+    )
+
+    # 检查是否涉及 MCP
+    is_mcp_related = (
+        "mcp" in error_detail
+        or "pydantic_ai.mcp" in error_detail
+        or "stdio_client" in error_detail
+    )
+
+    return is_timeout and is_mcp_related
+
+
+# 缓存降级 Agent 实例
+_fallback_agent: Agent[AgentDependencies, str] | None = None
+
+
+def _create_fallback_agent() -> Agent[AgentDependencies, str]:
+    """
+    创建无 MCP 工具集的降级 Agent
+
+    当 MCP 连接失败时，使用此 Agent 继续处理请求。
+
+    Returns:
+        无 MCP 工具集的 Agent 实例
+    """
+    global _fallback_agent
+    if _fallback_agent is None:
+        logger.info("creating_fallback_agent_without_mcp")
+        _fallback_agent = ChatAgentManager()._create_agent(toolsets=None)
+    return _fallback_agent
+
+
 def _extract_exception_details(exc: BaseException) -> str:
     """
     提取异常详情，包括 ExceptionGroup 中的子异常。
@@ -420,6 +475,7 @@ async def stream_response_handler(
     2. 在 ModelRequestNode 中流式输出文本
     3. 在 CallToolsNode 中处理工具调用事件
     4. 工具调用由 Pydantic AI 自动执行
+    5. MCP 连接失败时自动降级到无工具集模式
 
     Args:
         prompt: 用户输入
@@ -595,6 +651,22 @@ async def stream_response_handler(
 
     except Exception as e:
         error_detail = _extract_exception_details(e)
+
+        # 检查是否是 MCP 连接超时错误
+        if _is_mcp_timeout_error(e):
+            logger.warning(
+                "mcp_connection_timeout_fallback",
+                error=error_detail,
+                connection_id=str(deps.connection_id),
+            )
+            # 降级到无 MCP 工具集的模式
+            fallback_agent = _create_fallback_agent()
+            async for event in stream_response_handler(
+                prompt, deps, model, message_history, ctx, fallback_agent
+            ):
+                yield event
+            return
+
         logger.error(
             "stream_response_handler_error",
             error=error_detail,
@@ -667,6 +739,22 @@ async def non_stream_response_handler(
 
     except Exception as e:
         error_detail = _extract_exception_details(e)
+
+        # 检查是否是 MCP 连接超时错误
+        if _is_mcp_timeout_error(e):
+            logger.warning(
+                "mcp_connection_timeout_fallback_non_stream",
+                error=error_detail,
+                connection_id=str(deps.connection_id),
+            )
+            # 降级到无 MCP 工具集的模式
+            fallback_agent = _create_fallback_agent()
+            async for event in non_stream_response_handler(
+                prompt, deps, model, message_history, ctx, fallback_agent
+            ):
+                yield event
+            return
+
         logger.error(
             "non_stream_response_handler_error",
             error=error_detail,
