@@ -35,3 +35,11 @@
 
 ## Agent-Specific Instructions
 - 交流与文档统一使用中文。
+
+## Research & Documentation Guidelines
+- 如果用户要求添加新功能或修复 bug，**必须先使用现有工具获取相关文档**，了解最佳实践后再进行实现。
+- 优先使用 MCP 工具获取最新文档：
+  - `context7` - 获取库/框架的官方文档和代码示例
+  - `firecrawl` - 获取网页内容、搜索信息
+  - `WebSearch` - 搜索最新技术和解决方案
+- 避免盲目实现，确保代码符合框架/库的最佳实践。

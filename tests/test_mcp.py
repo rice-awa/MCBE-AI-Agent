@@ -7,43 +7,42 @@ from config.settings import MCPServerConfig, MCPConfig, Settings
 class TestMCPConfig:
     """MCP 配置测试"""
 
-    def test_mcp_server_config_creation(self):
-        """测试 MCP 服务器配置创建"""
+    def test_mcp_server_config_creation_stdio(self):
+        """测试 MCP 服务器配置创建（stdio 模式）"""
         config = MCPServerConfig(
-            name="test-server",
             command="npx",
             args=["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
             env={"DEBUG": "true"},
-            auto_start=True,
         )
-        assert config.name == "test-server"
         assert config.command == "npx"
         assert len(config.args) == 3
-        assert config.auto_start is True
+        assert config.env == {"DEBUG": "true"}
+        assert config.url is None
+        assert config.timeout == 10
 
-    def test_mcp_server_config_with_url(self):
-        """测试带 URL 的 MCP 服务器配置"""
+    def test_mcp_server_config_creation_http(self):
+        """测试 MCP 服务器配置创建（HTTP 模式）"""
         config = MCPServerConfig(
-            name="remote-server",
-            command="http",
             url="http://localhost:3000/mcp",
+            timeout=30,
         )
-        assert config.name == "remote-server"
         assert config.url == "http://localhost:3000/mcp"
+        assert config.command is None
+        assert config.timeout == 30
 
     def test_mcp_config_creation(self):
-        """测试 MCP 配置创建"""
+        """测试 MCP 配置创建（字典格式）"""
         config = MCPConfig(
             enabled=True,
-            servers=[
-                MCPServerConfig(
-                    name="filesystem",
+            servers={
+                "filesystem": MCPServerConfig(
                     command="npx",
                     args=["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
                 )
-            ],
+            },
         )
         assert config.enabled is True
+        assert "filesystem" in config.servers
         assert len(config.servers) == 1
 
     def test_mcp_config_default(self):
@@ -53,31 +52,80 @@ class TestMCPConfig:
         assert len(config.servers) == 0
 
 
-class TestMCPClient:
-    """MCP 客户端测试"""
+class TestMCPToolsetCreation:
+    """MCP 工具集创建测试"""
 
-    def test_mcp_client_init(self):
-        """测试 MCP 客户端初始化"""
-        from services.agent.mcp import MCPClient
+    def test_create_stdio_toolset(self):
+        """测试创建 stdio 工具集"""
+        from services.agent.mcp import create_mcp_toolset
 
         config = MCPServerConfig(
-            name="test",
             command="echo",
             args=["hello"],
         )
-        client = MCPClient(config)
-        assert client._config.name == "test"
-        assert client._session is None
+        toolset = create_mcp_toolset("test-server", config)
+        assert toolset is not None
 
-    def test_mcp_adapter_init(self):
-        """测试 MCP 适配器初始化"""
-        from services.agent.mcp import MCPToolAdapter, MCPClient
+    def test_create_http_toolset(self):
+        """测试创建 HTTP 工具集"""
+        from services.agent.mcp import create_mcp_toolset
 
-        config = MCPServerConfig(name="test", command="echo")
-        client = MCPClient(config)
-        adapter = MCPToolAdapter(client)
-        assert adapter._client is client
-        assert len(adapter._tools) == 0
+        config = MCPServerConfig(
+            url="http://localhost:8000/mcp",
+        )
+        toolset = create_mcp_toolset("test-server", config)
+        assert toolset is not None
+
+    def test_create_sse_toolset(self):
+        """测试创建 SSE 工具集"""
+        from services.agent.mcp import create_mcp_toolset
+
+        config = MCPServerConfig(
+            url="http://localhost:3001/sse",
+        )
+        toolset = create_mcp_toolset("test-server", config)
+        assert toolset is not None
+
+
+class TestLoadMCPToolsets:
+    """MCP 工具集加载测试"""
+
+    def test_load_mcp_toolsets_disabled(self):
+        """测试 MCP 禁用时不加载工具集"""
+        from services.agent.mcp import load_mcp_toolsets
+
+        settings = Settings()
+        settings.mcp.enabled = False
+        toolsets = load_mcp_toolsets(settings)
+        assert len(toolsets) == 0
+
+    def test_load_mcp_toolsets_from_dict(self):
+        """测试从字典加载 MCP 工具集"""
+        from services.agent.mcp import load_mcp_toolsets_from_dict
+
+        config = {
+            "mcpServers": {
+                "test-server": {
+                    "command": "echo",
+                    "args": ["hello"],
+                }
+            }
+        }
+        toolsets = load_mcp_toolsets_from_dict(config)
+        assert len(toolsets) == 1
+
+    def test_load_mcp_toolsets_simple_format(self):
+        """测试简化格式加载 MCP 工具集"""
+        from services.agent.mcp import load_mcp_toolsets_from_dict
+
+        config = {
+            "test-server": {
+                "command": "echo",
+                "args": ["hello"],
+            }
+        }
+        toolsets = load_mcp_toolsets_from_dict(config)
+        assert len(toolsets) == 1
 
 
 class TestMCPManager:
@@ -89,23 +137,15 @@ class TestMCPManager:
 
         manager = MCPManager()
         assert manager._initialized is False
-        assert len(manager._clients) == 0
+        assert len(manager._toolsets) == 0
 
-    def test_mcp_manager_get_adapter(self):
-        """测试获取 MCP 适配器"""
+    def test_mcp_manager_get_toolsets(self):
+        """测试获取 MCP 工具集"""
         from services.agent.mcp import MCPManager
 
         manager = MCPManager()
-        adapter = manager.get_adapter("nonexistent")
-        assert adapter is None
-
-    def test_mcp_manager_get_all_tools(self):
-        """测试获取所有工具"""
-        from services.agent.mcp import MCPManager
-
-        manager = MCPManager()
-        tools = manager.get_all_tools()
-        assert isinstance(tools, list)
+        toolsets = manager.get_toolsets()
+        assert isinstance(toolsets, list)
 
 
 class TestGetMCPManager:
@@ -121,13 +161,46 @@ class TestGetMCPManager:
         assert isinstance(manager1, MCPManager)
 
 
-def test_invalid_minecraft_commands_json_should_not_raise(caplog):
-    """测试非法命令 JSON 只记录警告不抛异常"""
-    settings = Settings(minecraft_commands_json="{invalid")
-    assert settings.minecraft.commands
+class TestSettingsMCPIntegration:
+    """Settings MCP 集成测试"""
 
+    def test_invalid_minecraft_commands_json_should_not_raise(caplog):
+        """测试非法命令 JSON 只记录警告不抛异常"""
+        settings = Settings(minecraft_commands_json="{invalid")
+        assert settings.minecraft.commands
 
-def test_invalid_mcp_servers_json_should_not_raise(caplog):
-    """测试非法 MCP servers JSON 只记录警告不抛异常"""
-    settings = Settings(mcp_servers_json="{invalid")
-    assert settings.mcp.enabled is False
+    def test_invalid_mcp_servers_json_should_not_raise(caplog):
+        """测试非法 MCP servers JSON 只记录警告不抛异常"""
+        settings = Settings(mcp_servers_json="{invalid")
+        assert settings.mcp.enabled is False
+
+    def test_mcp_servers_json_official_format(self):
+        """测试官方格式 MCP servers JSON"""
+        import json
+        settings = Settings(
+            mcp_servers_json=json.dumps({
+                "mcpServers": {
+                    "filesystem": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+                    }
+                }
+            })
+        )
+        assert settings.mcp.enabled is True
+        assert "filesystem" in settings.mcp.servers
+        assert settings.mcp.servers["filesystem"].command == "npx"
+
+    def test_mcp_servers_json_simple_format(self):
+        """测试简化格式 MCP servers JSON"""
+        import json
+        settings = Settings(
+            mcp_servers_json=json.dumps({
+                "filesystem": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+                }
+            })
+        )
+        assert settings.mcp.enabled is True
+        assert "filesystem" in settings.mcp.servers

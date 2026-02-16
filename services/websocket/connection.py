@@ -10,6 +10,7 @@ from websockets.server import WebSocketServerProtocol
 from core.queue import MessageBroker
 from models.messages import StreamChunk
 from models.minecraft import MinecraftCommand
+from models.agent import MCColor, MCPrefix
 from config.logging import get_logger
 
 logger = get_logger(__name__)
@@ -43,8 +44,9 @@ class ConnectionManager:
     - 启动独立的响应发送协程
     """
 
-    def __init__(self, broker: MessageBroker):
+    def __init__(self, broker: MessageBroker, dev_mode: bool = False):
         self.broker = broker
+        self.dev_mode = dev_mode
         self._connections: dict[UUID, ConnectionState] = {}
         self._sender_tasks: dict[UUID, asyncio.Task] = {}
 
@@ -72,6 +74,7 @@ class ConnectionManager:
             "connection_registered",
             connection_id=str(state.id),
             total_connections=len(self._connections),
+            dev_mode=self.dev_mode,
         )
 
         return state
@@ -281,20 +284,37 @@ class ConnectionManager:
     async def _send_stream_chunk(
         self, state: ConnectionState, chunk: StreamChunk
     ) -> None:
-        """发送流式响应块到 Minecraft"""
+        """发送流式响应块到 Minecraft（根据类型应用颜色和前缀）"""
+        # 根据不同的 chunk_type 确定颜色和消息格式
         if chunk.chunk_type == "thinking_start":
-            message = "|think-start|\n"
+            message = f"{MCColor.GRAY}{MCPrefix.THINKING}思考中..."
+            color = MCColor.GRAY
         elif chunk.chunk_type == "thinking_end":
-            message = "|think-end|\n"
+            message = ""  # 不发送结束标记
+            color = MCColor.GRAY
         elif chunk.chunk_type == "content":
+            # LLM 主要输出内容 - 绿色
             message = chunk.content
+            color = MCColor.GREEN
         elif chunk.chunk_type == "reasoning":
-            # DeepSeek reasoning content
+            # DeepSeek reasoning content - 灰色带前缀
+            message = f"{MCPrefix.THINKING}{chunk.content}"
+            color = MCColor.GRAY
+        elif chunk.chunk_type == "tool_call":
+            # 工具调用信息 - 黄色
             message = chunk.content
+            color = MCColor.YELLOW
+        elif chunk.chunk_type == "tool_result":
+            # 工具返回结果 - 黄色（或可用不同颜色区分）
+            message = chunk.content
+            color = MCColor.YELLOW
         elif chunk.chunk_type == "error":
-            message = f"❌ {chunk.content}"
+            # 错误信息 - 红色
+            message = f"{MCPrefix.ERROR}{chunk.content}"
+            color = MCColor.RED
         else:
             message = chunk.content
+            color = MCColor.GREEN
 
         if not message:
             return
@@ -302,17 +322,23 @@ class ConnectionManager:
         if chunk.delivery == "scriptevent":
             await self._send_script_event(state, message)
         else:
-            await self._send_game_message(state, message)
+            await self._send_game_message_with_color(state, message, color)
 
     async def _send_game_message(
         self, state: ConnectionState, message: str
     ) -> None:
-        """向游戏发送消息（使用 tellraw）"""
+        """向游戏发送消息（使用默认绿色）"""
+        await self._send_game_message_with_color(state, message, MCColor.GREEN)
+
+    async def _send_game_message_with_color(
+        self, state: ConnectionState, message: str, color: str
+    ) -> None:
+        """向游戏发送消息（使用指定颜色）"""
         if not state.websocket:
             return
 
         try:
-            command = MinecraftCommand.create_tellraw(message, color="§a")
+            command = MinecraftCommand.create_tellraw(message, color=color)
             payload = command.model_dump_json(exclude_none=True)
             await state.websocket.send(payload)
             ws_raw_logger.info(
@@ -326,6 +352,7 @@ class ConnectionManager:
                 "game_message_sent",
                 connection_id=str(state.id),
                 message_length=len(message),
+                color=color,
             )
         except Exception as e:
             logger.error(

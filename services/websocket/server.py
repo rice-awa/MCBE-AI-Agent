@@ -38,13 +38,21 @@ class WebSocketServer:
         self.broker = broker
         self.settings = settings
         self.jwt_handler = jwt_handler
-        self.connection_manager = ConnectionManager(broker)
+        self.dev_mode = settings.dev_mode
+        self.connection_manager = ConnectionManager(broker, dev_mode=self.dev_mode)
         self.protocol_handler = MinecraftProtocolHandler()
         self._server: Any = None
 
     async def start(self) -> None:
         """启动 WebSocket 服务器"""
         ws_config = self.settings.websocket
+
+        # 开发模式警告
+        if self.dev_mode:
+            logger.warning(
+                "dev_mode_enabled",
+                message="⚠️  开发模式已启用 - 身份验证已跳过，仅用于本地开发调试！",
+            )
 
         self._server = await serve(
             self.handle_connection,
@@ -61,6 +69,7 @@ class WebSocketServer:
             "websocket_server_started",
             host=self.settings.host,
             port=self.settings.port,
+            dev_mode=self.dev_mode,
         )
 
     async def stop(self) -> None:
@@ -86,6 +95,15 @@ class WebSocketServer:
         """
         # 注册连接
         state = await self.connection_manager.register(websocket)
+
+        # 开发模式下自动认证
+        if self.dev_mode:
+            state.authenticated = True
+            logger.info(
+                "dev_mode_auto_auth",
+                connection_id=str(state.id),
+                message="开发模式: 自动认证",
+            )
 
         try:
             # 发送初始化消息
@@ -290,8 +308,8 @@ class WebSocketServer:
             await self.handle_login(state, content)
             return
 
-        # 其他命令需要认证
-        if not await self.check_auth(state):
+        # 其他命令需要认证（开发模式下跳过）
+        if not self.dev_mode and not await self.check_auth(state):
             error_msg = self.protocol_handler.create_error_message("请先登录")
             await self._send_ws_payload(state, error_msg, source="auth")
             return
@@ -318,6 +336,14 @@ class WebSocketServer:
 
     async def handle_login(self, state: Any, password: str) -> None:
         """处理登录"""
+        # 开发模式下跳过登录验证
+        if self.dev_mode:
+            msg = self.protocol_handler.create_info_message(
+                "开发模式: 无需登录，已自动认证"
+            )
+            await self._send_ws_payload(state, msg, source="login")
+            return
+
         if self.jwt_handler.verify_password(password):
             # 检查是否已有有效 token
             if self.jwt_handler.is_token_valid(str(state.id)):
@@ -400,20 +426,19 @@ class WebSocketServer:
 
             # 获取上下文使用信息
             context_usage = ""
-            if history:
-                try:
-                    # 使用当前提供商或默认提供商
-                    provider = state.current_provider or self.settings.default_provider
-                    provider_config = self.settings.get_provider_config(provider)
-                    message_count = len(history)
-                    estimated_tokens = message_count * 100  # 简单估算
-                    if provider_config.context_window:
-                        usage_percent = (estimated_tokens / provider_config.context_window) * 100
-                        context_usage = f"\n上下文使用: {usage_percent:.1f}% {estimated_tokens}/{provider_config.context_window}"
-                    else:
-                        context_usage = f"\n上下文使用: ~{estimated_tokens} tokens (模型上下文窗口未知)"
-                except Exception:
-                    pass
+            try:
+                # 使用当前提供商或默认提供商
+                provider = state.current_provider or self.settings.default_provider
+                provider_config = self.settings.get_provider_config(provider)
+                message_count = len(history)
+                estimated_tokens = message_count * 100  # 简单估算
+                if provider_config.context_window:
+                    usage_percent = (estimated_tokens / provider_config.context_window) * 100
+                    context_usage = f"\n上下文使用: {usage_percent:.1f}% ({estimated_tokens}/{provider_config.context_window} tokens)"
+                else:
+                    context_usage = f"\n上下文使用: ~{estimated_tokens} tokens (模型上下文窗口未知)"
+            except Exception:
+                pass
 
             msg = self.protocol_handler.create_info_message(
                 f"上下文状态: {status}\n当前对话轮数: {turns}/{self.settings.max_history_turns}{context_usage}"

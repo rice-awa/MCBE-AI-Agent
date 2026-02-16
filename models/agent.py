@@ -9,6 +9,86 @@ import httpx
 from config.settings import Settings
 
 
+# Minecraft 颜色代码常量
+class MCColor:
+    """Minecraft 颜色代码常量"""
+
+    GREEN = "§a"  # LLM 主要输出内容
+    YELLOW = "§e"  # 工具调用信息
+    GRAY = "§7"  # 思考内容
+    RED = "§c"  # 错误信息
+    WHITE = "§f"  # 默认白色
+    AQUA = "§b"  # 信息提示
+    GOLD = "§6"  # 强调信息
+    DARK_GRAY = "§8"  # 次要信息
+
+
+# 消息前缀常量
+class MCPrefix:
+    """消息前缀常量"""
+
+    TOOL_CALL = "● "  # 工具调用前缀
+    THINKING = "✻ "  # 思考内容前缀
+    ERROR = "✖ "  # 错误前缀
+    SUCCESS = "✓ "  # 成功前缀
+
+
+def truncate_text(text: str, max_length: int = 100, suffix: str = "...") -> str:
+    """
+    截断文本，保留前 max_length 个字符并添加后缀
+
+    Args:
+        text: 原始文本
+        max_length: 最大长度
+        suffix: 截断后添加的后缀
+
+    Returns:
+        截断后的文本
+    """
+    if len(text) <= max_length:
+        return text
+    return text[:max_length] + suffix
+
+
+def format_tool_call_message(tool_name: str, args: dict[str, Any] | None = None) -> str:
+    """
+    格式化工具调用消息
+
+    Args:
+        tool_name: 工具名称
+        args: 工具参数
+
+    Returns:
+        格式化后的消息
+    """
+    if args:
+        # 提取关键参数进行显示
+        key_args = []
+        for key, value in list(args.items())[:3]:  # 最多显示3个参数
+            if isinstance(value, str) and len(value) > 20:
+                value = value[:20] + "..."
+            key_args.append(f"{key}={repr(value)}")
+        args_str = ", ".join(key_args)
+        return f"{MCPrefix.TOOL_CALL}{tool_name}({args_str})"
+    return f"{MCPrefix.TOOL_CALL}{tool_name}"
+
+
+def format_tool_result_message(tool_name: str, result: str, max_length: int = 80) -> str:
+    """
+    格式化工具返回消息
+
+    Args:
+        tool_name: 工具名称
+        result: 工具返回结果
+        max_length: 结果最大显示长度
+
+    Returns:
+        格式化后的消息
+    """
+    truncated = truncate_text(result, max_length)
+    return f"{MCPrefix.TOOL_CALL}{tool_name}: {truncated}"
+
+
 @dataclass
 class ContextInfo:
     """上下文使用信息"""
@@ -48,7 +128,7 @@ class AgentResponse:
 class StreamEvent:
     """流式事件"""
 
-    event_type: str  # "reasoning", "content", "tool_call", "error"
+    event_type: str  # "reasoning", "content", "tool_call", "tool_result", "error"
     content: str
     sequence: int
     metadata: dict[str, Any] | None = None
