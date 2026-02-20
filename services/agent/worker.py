@@ -350,17 +350,32 @@ class AgentWorker:
                         response=response_text,
                         response_length=len(response_text),
                     )
+                    # 错误事件需要发送到游戏
+                    chunk = StreamChunk(
+                        connection_id=connection_id,
+                        chunk_type=event.event_type,  # type: ignore
+                        content=event.content,
+                        sequence=sequence,
+                        delivery=request.delivery,
+                    )
+                    await self.broker.send_response(connection_id, chunk)
+                    sequence += 1
 
-                chunk = StreamChunk(
-                    connection_id=connection_id,
-                    chunk_type=event.event_type,  # type: ignore
-                    content=event.content,
-                    sequence=sequence,
-                    delivery=request.delivery,
-                )
-
-                await self.broker.send_response(connection_id, chunk)
-                sequence += 1
+                # content 和 reasoning 事件需要发送到游戏
+                elif event.event_type in ("content", "reasoning"):
+                    if event.content:
+                        chunk = StreamChunk(
+                            connection_id=connection_id,
+                            chunk_type=event.event_type,  # type: ignore
+                            content=event.content,
+                            sequence=sequence,
+                            delivery=request.delivery,
+                        )
+                        await self.broker.send_response(connection_id, chunk)
+                        sequence += 1
+                # tool_call 事件已在上面处理并发送
+                # tool_result 事件已根据配置决定是否发送
+                # is_complete 事件不需要发送到游戏
 
         except Exception as e:
             error_detail = _extract_exception_details(e)
