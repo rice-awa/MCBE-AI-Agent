@@ -264,26 +264,28 @@ class AgentWorker:
                     await self.broker.send_response(connection_id, tool_chunk)
                     sequence += 1
 
-                # 处理工具返回事件 - 发送到游戏显示
+                # 处理工具返回事件 - 根据配置决定是否发送到游戏显示
                 elif event.event_type == "tool_result":
-                    tool_name = event.metadata.get("tool_name") if event.metadata else None
-                    result_content = event.content
-                    tool_result_msg = format_tool_result_message(
-                        tool_name or "tool",
-                        result_content,
-                        max_length=80,
-                    )
-                    result_chunk = StreamChunk(
-                        connection_id=connection_id,
-                        chunk_type="tool_result",
-                        content=tool_result_msg,
-                        sequence=sequence,
-                        delivery=request.delivery,
-                        tool_name=tool_name,
-                        tool_result_preview=truncate_text(result_content, 80),
-                    )
-                    await self.broker.send_response(connection_id, result_chunk)
-                    sequence += 1
+                    # 只有在 tool_response_verbose 为 True 时才显示工具返回结果
+                    if self.settings.tool_response_verbose:
+                        tool_name = event.metadata.get("tool_name") if event.metadata else None
+                        result_content = event.content
+                        tool_result_msg = format_tool_result_message(
+                            tool_name or "tool",
+                            result_content,
+                            max_length=80,
+                        )
+                        result_chunk = StreamChunk(
+                            connection_id=connection_id,
+                            chunk_type="tool_result",
+                            content=tool_result_msg,
+                            sequence=sequence,
+                            delivery=request.delivery,
+                            tool_name=tool_name,
+                            tool_result_preview=truncate_text(result_content, 80),
+                        )
+                        await self.broker.send_response(connection_id, result_chunk)
+                        sequence += 1
 
                 if event.metadata and event.metadata.get("is_complete"):
                     all_messages = event.metadata.get("all_messages")

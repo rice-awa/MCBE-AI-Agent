@@ -46,7 +46,9 @@ def register_agent_tools(chat_agent: Agent[AgentDependencies, str]) -> None:
 
         try:
             result = await ctx.deps.run_command(command)
-            return f"已执行命令: /{command}\n命令响应: {result}"
+            # 简化返回：仅返回游戏原始响应，避免重复显示命令
+            # 工具调用名称和参数已通过 tool_call 事件显示
+            return result if result else "命令执行成功"
         except Exception as e:
             logger.error(
                 "agent_tool_error",

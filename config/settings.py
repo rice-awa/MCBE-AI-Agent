@@ -393,6 +393,13 @@ class Settings(BaseSettings):
         description="是否启用 LLM 请求/响应日志"
     )
 
+    # 工具调用响应显示配置
+    tool_response_verbose: bool = Field(
+        default=False,
+        alias="TOOL_RESPONSE_VERBOSE",
+        description="是否在游戏内显示工具调用的返回结果（False=仅显示工具名称和参数，True=显示完整返回内容）"
+    )
+
     def get_provider_config(self, provider_name: str | None = None) -> LLMProviderConfig:
         """获取指定提供商的配置"""
         name = provider_name or self.default_provider
