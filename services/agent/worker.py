@@ -244,6 +244,13 @@ class AgentWorker:
                 elif event.event_type == "tool_call":
                     tool_name = event.metadata.get("tool_name", "unknown") if event.metadata else "unknown"
                     tool_args = event.metadata.get("args") if event.metadata else None
+                    # 确保 tool_args 是字典类型（Pydantic AI 有时会返回 JSON 字符串）
+                    if isinstance(tool_args, str):
+                        import json
+                        try:
+                            tool_args = json.loads(tool_args)
+                        except json.JSONDecodeError:
+                            tool_args = {"raw": tool_args}
                     tool_msg = format_tool_call_message(tool_name, tool_args)
                     tool_chunk = StreamChunk(
                         connection_id=connection_id,

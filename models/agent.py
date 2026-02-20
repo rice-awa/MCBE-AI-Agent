@@ -1,5 +1,7 @@
 """Agent 相关模型"""
 
+import json
+
 from dataclasses import dataclass
 from typing import Any, Callable, Awaitable
 from uuid import UUID
@@ -50,26 +52,36 @@ def truncate_text(text: str, max_length: int = 100, suffix: str = "...") -> str:
     return text[:max_length] + suffix
 
 
-def format_tool_call_message(tool_name: str, args: dict[str, Any] | None = None) -> str:
+def format_tool_call_message(tool_name: str, args: dict[str, Any] | str | None = None) -> str:
     """
     格式化工具调用消息
 
     Args:
         tool_name: 工具名称
-        args: 工具参数
+        args: 工具参数（字典或 JSON 字符串）
 
     Returns:
         格式化后的消息
     """
-    if args:
-        # 提取关键参数进行显示
-        key_args = []
-        for key, value in list(args.items())[:3]:  # 最多显示3个参数
-            if isinstance(value, str) and len(value) > 20:
-                value = value[:20] + "..."
-            key_args.append(f"{key}={repr(value)}")
-        args_str = ", ".join(key_args)
-        return f"{MCPrefix.TOOL_CALL}{tool_name}({args_str})"
+    # 处理 args 可能是字符串的情况
+    if args is not None:
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                # 如果不是有效的 JSON，直接显示原始字符串
+                return f"{MCPrefix.TOOL_CALL}{tool_name}({args})"
+        
+        if isinstance(args, dict) and args:
+            # 提取关键参数进行显示
+            key_args = []
+            for key, value in list(args.items())[:3]:  # 最多显示3个参数
+                if isinstance(value, str) and len(value) > 20:
+                    value = value[:20] + "..."
+                key_args.append(f"{key}={repr(value)}")
+            args_str = ", ".join(key_args)
+            return f"{MCPrefix.TOOL_CALL}{tool_name}({args_str})"
+    
     return f"{MCPrefix.TOOL_CALL}{tool_name}"
 
 
