@@ -325,6 +325,8 @@ class WebSocketServer:
             await self.handle_template(state, content)
         elif cmd_type == "setting":
             await self.handle_setting(state, content)
+        elif cmd_type == "mcp":
+            await self.handle_mcp(state, content)
         elif cmd_type == "switch_model":
             await self.handle_switch_model(state, content)
         elif cmd_type == "help":
@@ -443,6 +445,8 @@ class WebSocketServer:
             msg = self.protocol_handler.create_info_message(
                 f"上下文状态: {status}\n当前对话轮数: {turns}/{self.settings.max_history_turns}{context_usage}"
             )
+            await self._send_ws_payload(state, msg, source="context")
+            return
         elif action == "压缩":
             # 手动触发压缩
             success, result = await conv_manager.check_and_compress(state.id, force=True)
@@ -675,6 +679,97 @@ class WebSocketServer:
             connection_id=str(state.id),
             command=command,
         )
+
+    async def handle_mcp(self, state: Any, content: str) -> None:
+        """处理 MCP 服务器管理命令"""
+        from services.agent.mcp import get_mcp_manager, MCPConnectionStatus
+
+        manager = get_mcp_manager()
+        parts = content.strip().split(None, 1) if content.strip() else []
+        action = parts[0] if parts else ""
+        arg = parts[1] if len(parts) > 1 else ""
+
+        if action == "list":
+            # 列出所有 MCP 服务器
+            if not self.settings.mcp.enabled:
+                msg = self.protocol_handler.create_info_message("MCP 功能未启用")
+            elif not self.settings.mcp.servers:
+                msg = self.protocol_handler.create_info_message("未配置 MCP 服务器")
+            else:
+                lines = [f"MCP 服务器 ({len(self.settings.mcp.servers)}):"]
+                for name, config in self.settings.mcp.servers.items():
+                    info = manager.get_server_info(name)
+                    if info:
+                        status_icon = {
+                            MCPConnectionStatus.PENDING: "⏳",
+                            MCPConnectionStatus.ACTIVE: "✅",
+                            MCPConnectionStatus.ERROR: "❌",
+                            MCPConnectionStatus.DISABLED: "⛔",
+                        }.get(info.status, "❓")
+                        lines.append(f"  {status_icon} {name}: {info.status.value}")
+                    else:
+                        lines.append(f"  ⚪ {name}: 未初始化")
+                msg = self.protocol_handler.create_info_message("\n".join(lines))
+
+        elif action == "status":
+            # 显示详细状态
+            if not manager.is_initialized:
+                msg = self.protocol_handler.create_info_message(
+                    "MCP 管理器尚未初始化\n请等待服务启动完成"
+                )
+            else:
+                status = manager.get_status_summary()
+                lines = [
+                    f"MCP 状态概览:",
+                    f"  已启用: {'是' if status['enabled'] else '否'}",
+                    f"  活跃服务器: {status['active_servers']}/{status['total_servers']}",
+                ]
+                for name, info in status["servers"].items():
+                    lines.append(f"\n  {name}:")
+                    lines.append(f"    状态: {info['status']}")
+                    if info.get("last_error"):
+                        lines.append(f"    错误: {info['last_error']}")
+                    if info.get("last_run_time"):
+                        lines.append(f"    上次运行: {info['last_run_time']}")
+                msg = self.protocol_handler.create_info_message("\n".join(lines))
+
+        elif action == "reload":
+            # 重新加载指定服务器的配置
+            if not manager.is_initialized:
+                msg = self.protocol_handler.create_error_message(
+                    "MCP 管理器尚未初始化"
+                )
+            elif arg:
+                # 重载指定服务器
+                if arg not in manager.servers:
+                    msg = self.protocol_handler.create_error_message(
+                        f"未找到服务器: {arg}"
+                    )
+                else:
+                    success = manager.reload_toolset(arg)
+                    if success:
+                        msg = self.protocol_handler.create_success_message(
+                            f"服务器 {arg} 配置已重新加载"
+                        )
+                    else:
+                        msg = self.protocol_handler.create_error_message(
+                            f"服务器 {arg} 配置重载失败"
+                        )
+            else:
+                msg = self.protocol_handler.create_error_message(
+                    "请指定服务器名称: AGENT MCP reload <名称>"
+                )
+
+        else:
+            # 显示帮助
+            msg = self.protocol_handler.create_info_message(
+                "MCP 管理命令:\n"
+                "  list - 列出所有服务器\n"
+                "  status - 显示详细状态\n"
+                "  reload <名称> - 重新加载服务器配置"
+            )
+
+        await self._send_ws_payload(state, msg, source="mcp")
 
     async def _send_ws_payload(self, state: Any, payload: str, source: str) -> None:
         """统一发送 WebSocket 响应并记录原始输出。"""

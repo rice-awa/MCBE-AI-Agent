@@ -10,7 +10,7 @@ import httpx
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ThinkingPart
 
 from core.queue import MessageBroker
-from services.agent.core import stream_chat
+from services.agent.core import stream_chat, _extract_exception_details
 from services.agent.providers import ProviderRegistry
 from models.messages import ChatRequest, StreamChunk
 from models.agent import (
@@ -217,8 +217,14 @@ class AgentWorker:
         start_time = time.monotonic()
 
         # 获取已初始化的 Agent 实例（带有 MCP 工具集）
-        from services.agent.core import get_agent_manager
-        agent = get_agent_manager().get_agent()
+        from services.agent.core import get_agent_manager, _is_mcp_timeout_error
+        from services.agent.mcp import get_mcp_manager
+
+        agent_manager = get_agent_manager()
+        agent = agent_manager.get_agent()
+
+        # 尝试获取 MCP 管理器以跟踪服务器状态
+        mcp_manager = get_mcp_manager()
 
         try:
             async for event in stream_chat(
@@ -336,27 +342,41 @@ class AgentWorker:
                         response_length=len(response_text),
                     )
 
-                if event.event_type not in {"tool_call", "tool_result"}:
-                    chunk = StreamChunk(
-                        connection_id=connection_id,
-                        chunk_type=event.event_type,  # type: ignore
-                        content=event.content,
-                        sequence=sequence,
-                        delivery=request.delivery,
-                    )
+                chunk = StreamChunk(
+                    connection_id=connection_id,
+                    chunk_type=event.event_type,  # type: ignore
+                    content=event.content,
+                    sequence=sequence,
+                    delivery=request.delivery,
+                )
 
-                    await self.broker.send_response(connection_id, chunk)
-                    sequence += 1
+                await self.broker.send_response(connection_id, chunk)
+                sequence += 1
 
         except Exception as e:
+            error_detail = _extract_exception_details(e)
+
+            # 检查是否是 MCP 超时错误，如果是则更新 MCP 服务器状态
+            if _is_mcp_timeout_error(e):
+                logger.warning(
+                    "mcp_timeout_detected_in_worker",
+                    worker_id=self.worker_id,
+                    connection_id=str(connection_id),
+                    error=error_detail,
+                )
+                # 标记所有 MCP 服务器为失败（因为我们不知道具体是哪个）
+                for server_name in mcp_manager.servers.keys():
+                    mcp_manager.mark_server_failed(server_name, f"连接超时: {error_detail}")
+                # 注意：core.py 中的降级机制会自动重试，这里不需要额外处理
+
             logger.error(
                 "stream_processing_error",
                 worker_id=self.worker_id,
                 connection_id=str(connection_id),
-                error=str(e),
+                error=error_detail,
                 exc_info=True,
             )
-            await self._send_error_chunk(connection_id, str(e), sequence)
+            await self._send_error_chunk(connection_id, error_detail, sequence)
 
     @staticmethod
     def _trim_history(

@@ -27,39 +27,45 @@ class MinecraftConfig(BaseModel):
         "#登录": "login",
         "AGENT 聊天": {
             "type": "chat",
-            "aliases": ["AGENT chat", "AI 聊天", "AI 对话"],
+            "aliases": ["AGENT chat", "AI 聊天", "AI chat"],
             "description": "与 AI 对话",
             "usage": "<内容>"
         },
         "AGENT 脚本": {
             "type": "chat_script",
-            "aliases": ["AGENT script", "AI 脚本"],
+            "aliases": ["AGENT script", "AI 脚本", "AI script"],
             "description": "使用脚本事件发送",
             "usage": "<内容>"
         },
         "AGENT 保存": {
             "type": "save",
-            "aliases": ["AGENT save"],
+            "aliases": ["AGENT save", "AI save"],
             "description": "保存对话历史",
             "usage": None
         },
         "AGENT 上下文": {
             "type": "context",
-            "aliases": ["AGENT context", "AI 上下文"],
+            "aliases": ["AGENT context", "AI 上下文", "AI context"],
             "description": "管理上下文",
             "usage": "<启用/关闭/状态/清除/压缩/保存/恢复/列表/删除>"
         },
         "AGENT 模板": {
             "type": "template",
-            "aliases": ["AGENT template", "AI 模板"],
+            "aliases": ["AGENT template", "AI 模板", "AI template"],
             "description": "切换提示词模板",
             "usage": "<模板名/list>"
         },
         "AGENT 设置": {
             "type": "setting",
-            "aliases": ["AGENT setting", "AI 设置"],
+            "aliases": ["AGENT setting", "AI 设置", "AI setting"],
             "description": "设置管理",
             "usage": "<变量/别名> <子命令>"
+        },
+        "AGENT MCP": {
+            "type": "mcp",
+            "aliases": ["AGENT mcp","AI MCP","AI mcp"],
+            "description": "MCP 服务器管理",
+            "usage": "<list/status/reload>"
         },
         "运行命令": {
             "type": "run_command",
@@ -202,7 +208,7 @@ class MCPServerConfig(BaseModel):
     args: list[str] = []  # 命令参数
     env: dict[str, str] = {}  # 环境变量
     url: str | None = None  # 远程服务器 URL (用于 HTTP 模式)
-    timeout: int = 10  # 超时时间（秒）
+    timeout: int = 5  # 初始化超时时间（秒），npx 首次下载需要较长时间
 
 
 class MCPConfig(BaseModel):
@@ -335,6 +341,11 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def merge_mcp_config(self) -> "Settings":
         """合并 MCP 配置 - 使用官方 mcpServers 字典格式"""
+        # 只有在 MCP 启用时才解析和加载 MCP 服务器配置
+        if not self.mcp_enabled:
+            # 即使配置了 MCP_SERVERS，如果没有明确启用也不加载
+            return self
+
         # 如果显式设置了 mcp_servers_json，解析并覆盖
         if self.mcp_servers_json:
             try:
@@ -354,7 +365,7 @@ class Settings(BaseSettings):
                     "invalid_mcp_servers_json: %s",
                     str(e),
                 )
-        # 如果设置了 mcp_enabled 环境变量，也启用 MCP
+        # 如果设置了 mcp_enabled 环境变量，启用 MCP
         if self.mcp_enabled:
             self.mcp.enabled = True
         return self
