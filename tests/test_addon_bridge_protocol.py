@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -19,6 +20,12 @@ def test_encode_bridge_request_should_use_namespaced_message_id() -> None:
         payload={"target": "@a"},
     )
     assert command.startswith("scriptevent mcbeai:bridge_request ")
+    payload = json.loads(command.removeprefix("scriptevent mcbeai:bridge_request "))
+    assert payload == {
+        "request_id": "req-1",
+        "capability": "get_player_snapshot",
+        "payload": {"target": "@a"},
+    }
 
 
 def test_reassemble_bridge_chunks_should_restore_payload() -> None:
