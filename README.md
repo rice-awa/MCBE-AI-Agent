@@ -213,6 +213,90 @@ DEV_MODE=true
 - **切勿在生产环境中启用**，否则任何人都可以连接服务器
 - 启用时会在控制台和日志中显示警告信息
 
+## Addon Bridge 联调
+
+当前仓库已经接入一条可用的 Python <-> Addon <-> 游戏桥接链路，用于让 Agent 通过 Addon 获取更稳定的游戏内上下文。联调时建议优先使用开发模式启动 Python 服务。
+
+### Python 服务启动
+
+```bash
+python cli.py serve --dev
+```
+
+如需验证配置是否已生效，可先执行：
+
+```bash
+python cli.py info
+```
+
+### Addon 安装、构建与部署
+
+Addon 工程位于 `MCBE-AI-Agent-addon/`，本地联调前至少执行一次依赖安装、测试、构建和本地部署。
+
+```bash
+cd MCBE-AI-Agent-addon
+npm install
+npm test
+npm run build
+npm run local-deploy
+```
+
+说明：
+- `npm install`：安装 `@minecraft/server`、`@minecraft/server-ui` 与构建依赖。
+- `npm test`：运行桥接协议、路由与 UI 状态容器相关测试。
+- `npm run build`：构建行为包脚本。
+- `npm run local-deploy`：将本地构建结果部署到 Minecraft 本地开发目录。
+
+### 联调步骤
+
+1. 启动 Python 服务：`python cli.py serve --dev`。
+2. 在 `MCBE-AI-Agent-addon/` 下执行 `npm run local-deploy`，确保最新脚本已部署。
+3. 进入启用了对应开发包的世界，等待 Addon 初始化。
+4. 在游戏内确认模拟玩家 `MCBEAI_TOOL` 已生成。
+5. 使用 `/wsserver <服务器IP>:8080` 连接 Python 服务；开发模式下会自动跳过 `#登录`。
+6. 执行一次正常聊天命令，例如 `AGENT 聊天 读取一下我当前附近的实体`，观察 Python 日志与游戏内行为。
+
+### 如何验证桥接链路
+
+当前桥接方向是 `Python -> scriptevent -> Addon -> 模拟玩家聊天分片 -> Python`。建议按下面的方式确认链路完整：
+
+1. 先确认 `MCBEAI_TOOL` 存在。
+2. 触发一个会调用 Addon 能力的 Agent 请求，例如：
+
+```text
+AGENT 聊天 请读取我的玩家状态并告诉我当前位置
+```
+
+3. Python 侧应向游戏发送 `scriptevent mcbeai:bridge_request <json>`。
+4. Addon 侧处理后，会驱动 `MCBEAI_TOOL` 以聊天分片形式回传 `MCBEAI|RESP|...`。
+5. Python 侧会在 WebSocket `PlayerMessage` 事件流中拦截这些分片并完成重组，最终把工具结果继续交给 Agent。
+
+如果第 3 步已发出但最终超时，通常表示：
+- Addon 未正确部署或世界未启用最新行为包。
+- `MCBEAI_TOOL` 未生成或被移除。
+- 聊天分片没有成功回到 Python 所连接的 WebSocket 事件流。
+
+### 当前桥接能力
+
+- `get_player_snapshot`：获取目标玩家基础快照，包括位置、维度、朝向和基础状态。
+- `get_inventory_snapshot`：获取目标玩家背包槽位与物品快照。
+- `find_entities`：按类型、名称、标签、距离等条件查找实体。
+- `run_world_command`：由 Addon 在世界侧执行命令并返回结果。
+
+### 聊天命令与 UI 共存说明
+
+当前 UI 实现仅为最小预留层，不替代现有聊天命令入口。也就是说：
+- 现有 `AGENT 聊天`、`AGENT 上下文`、`切换模型`、`运行命令` 等聊天命令仍然是主入口。
+- Addon 中仅补了状态容器与 `ActionFormData` / `ModalFormData` 的最小骨架，便于后续扩展交互面板。
+- 由于当前本地 `@minecraft/server-ui` 类型能力限制，未落地完整 DDUI 响应式方案，文档和代码都不应视其为已完成特性。
+
+### 当前限制
+
+- Addon -> Python 的响应回传依赖模拟玩家 `MCBEAI_TOOL` 发送聊天分片，不是独立的回传通道。
+- Python 侧通过 WebSocket `PlayerMessage` 事件流拦截桥接分片，因此桥接能力依赖聊天事件正常上送。
+- `run_world_command` 在当前本地依赖版本下基于同步 `runCommand` 实现，不是异步命令管线。
+- UI 目前仅为后续扩展预留，不代表完整 DDUI 已完成。
+
 ## Termux 部署指南
 
 ### 1. 准备工作
