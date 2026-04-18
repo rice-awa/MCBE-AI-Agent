@@ -7,6 +7,7 @@ from models.addon_bridge import AddonBridgeChunk, AddonBridgeResponse
 
 BRIDGE_MESSAGE_ID = "mcbeai:bridge_request"
 BRIDGE_PREFIX = "MCBEAI|RESP"
+BRIDGE_TOOL_PLAYER_NAME = "MCBEAI_TOOL"
 
 
 def encode_bridge_request(request_id: str, capability: str, payload: dict) -> str:

@@ -8,6 +8,7 @@ import websockets
 from websockets.server import WebSocketServerProtocol, serve
 
 from core.queue import MessageBroker
+from services.addon.service import get_addon_bridge_service
 from services.websocket.connection import ConnectionManager
 from services.websocket.minecraft import MinecraftProtocolHandler
 from services.auth.jwt_handler import JWTHandler
@@ -41,6 +42,7 @@ class WebSocketServer:
         self.dev_mode = settings.dev_mode
         self.connection_manager = ConnectionManager(broker, dev_mode=self.dev_mode)
         self.protocol_handler = MinecraftProtocolHandler()
+        self.addon_bridge_service = get_addon_bridge_service()
         self._server: Any = None
 
     async def start(self) -> None:
@@ -149,6 +151,7 @@ class WebSocketServer:
                 exc_info=True,
             )
         finally:
+            self.addon_bridge_service.close_connection(state.id)
             # 注销连接
             await self.connection_manager.unregister(state.id)
 
@@ -179,6 +182,17 @@ class WebSocketServer:
             # 解析玩家消息
             player_event = self.protocol_handler.parse_player_message(data)
             if not player_event:
+                return
+
+            if self.addon_bridge_service.is_bridge_chat_message(
+                player_event.sender,
+                player_event.message,
+            ):
+                self.addon_bridge_service.handle_player_message(
+                    state.id,
+                    player_event.sender,
+                    player_event.message,
+                )
                 return
 
             # 更新玩家名称
