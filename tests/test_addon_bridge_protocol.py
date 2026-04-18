@@ -37,6 +37,11 @@ def test_decode_bridge_chat_chunk_should_reject_invalid_namespace_prefix() -> No
         decode_bridge_chat_chunk("WRONG|RESP|req-1|1/1|{\"ok\":true}")
 
 
+def test_decode_bridge_chat_chunk_should_reject_invalid_response_prefix() -> None:
+    with pytest.raises(ValueError, match="Invalid bridge chunk prefix"):
+        decode_bridge_chat_chunk("MCBEAI|BAD|req-1|1/1|{\"ok\":true}")
+
+
 def test_reassemble_bridge_chunks_should_reject_empty_list() -> None:
     with pytest.raises(ValueError, match="must not be empty"):
         reassemble_bridge_chunks([])
@@ -50,4 +55,32 @@ def test_decode_bridge_chat_chunk_should_reject_invalid_part_metadata() -> None:
 def test_reassemble_bridge_chunks_should_reject_invalid_json_payload() -> None:
     chunks = [decode_bridge_chat_chunk("MCBEAI|RESP|req-1|1/1|{\"ok\":}")]
     with pytest.raises(ValueError, match="Invalid bridge payload JSON"):
+        reassemble_bridge_chunks(chunks)
+
+
+def test_reassemble_bridge_chunks_should_reject_request_id_mismatch() -> None:
+    chunks = [
+        decode_bridge_chat_chunk("MCBEAI|RESP|req-1|1/2|{\"ok\":true,"),
+        decode_bridge_chat_chunk("MCBEAI|RESP|req-2|2/2|\"value\":1}"),
+    ]
+    with pytest.raises(ValueError, match="Bridge chunks request_id mismatch"):
+        reassemble_bridge_chunks(chunks)
+
+
+def test_reassemble_bridge_chunks_should_reject_total_chunks_mismatch() -> None:
+    chunks = [
+        decode_bridge_chat_chunk("MCBEAI|RESP|req-1|1/2|{\"ok\":true,"),
+        decode_bridge_chat_chunk("MCBEAI|RESP|req-1|2/3|\"value\":1}"),
+    ]
+    with pytest.raises(ValueError, match="Bridge chunks total_chunks mismatch"):
+        reassemble_bridge_chunks(chunks)
+
+
+def test_reassemble_bridge_chunks_should_reject_incomplete_or_duplicate_chunks() -> None:
+    chunks = [
+        decode_bridge_chat_chunk("MCBEAI|RESP|req-1|1/3|{\"ok\":"),
+        decode_bridge_chat_chunk("MCBEAI|RESP|req-1|2/3|true,"),
+        decode_bridge_chat_chunk("MCBEAI|RESP|req-1|2/3|\"value\":1}"),
+    ]
+    with pytest.raises(ValueError, match="Bridge chunks are incomplete or out of sequence"):
         reassemble_bridge_chunks(chunks)
