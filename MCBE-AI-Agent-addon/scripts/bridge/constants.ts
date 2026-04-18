@@ -1,0 +1,1 @@
+export const BRIDGE_RESPONSE_PREFIX = "MCBEAI|RESP";
