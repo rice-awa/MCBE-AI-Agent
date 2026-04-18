@@ -13,6 +13,10 @@
 # logs
 logs/*
 
+# addon local artifacts
+MCBE-AI-Agent-addon/node_modules/
+MCBE-AI-Agent-addon/dist/
+MCBE-AI-Agent-addon/GPTaddon.1.21.23(old)/
 
 # 忽略 Python 缓存文件
 **/__pycache__

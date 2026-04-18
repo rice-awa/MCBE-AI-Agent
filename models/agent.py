@@ -3,7 +3,7 @@
 import json
 
 from dataclasses import dataclass
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable, Protocol
 from uuid import UUID
 
 import httpx
@@ -110,6 +110,13 @@ class ContextInfo:
     max_tokens: int | None  # 模型最大上下文
 
 
+class AddonBridgeClient(Protocol):
+    """Addon 桥接客户端协议。"""
+
+    async def request(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """向 addon 请求能力结果。"""
+
+
 @dataclass
 class AgentDependencies:
     """Agent 运行时依赖注入"""
@@ -120,6 +127,7 @@ class AgentDependencies:
     http_client: httpx.AsyncClient
     send_to_game: Callable[[str], Awaitable[None]]
     run_command: Callable[[str], Awaitable[str]]
+    addon_bridge: AddonBridgeClient | None = None
     provider: str | None = None  # 当前使用的 LLM 提供商
     # 获取上下文使用信息的回调，返回 (消息数, 估计token数, 最大token数)
     get_context_info: Callable[[], ContextInfo | None] | None = None

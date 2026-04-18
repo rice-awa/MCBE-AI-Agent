@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from pydantic_ai import Agent, RunContext
@@ -448,6 +449,88 @@ def register_agent_tools(chat_agent: Agent[AgentDependencies, str]) -> None:
         """
         providers = ctx.deps.settings.list_available_providers()
         return "可用 Provider: " + ", ".join(providers)
+
+    @chat_agent.tool
+    async def get_player_snapshot(
+        ctx: RunContext[AgentDependencies],
+        target: str = "@a",
+    ) -> str:
+        """通过 addon 桥接获取玩家快照。"""
+        if ctx.deps.addon_bridge is None:
+            return "Addon 桥接不可用"
+
+        try:
+            result = await ctx.deps.addon_bridge.request(
+                "get_player_snapshot",
+                {"target": target},
+            )
+            return json.dumps(result.get("payload", result), ensure_ascii=False)
+        except Exception as e:
+            logger.error("agent_tool_error", tool="get_player_snapshot", error=str(e))
+            return f"获取玩家快照失败: {str(e)}"
+
+    @chat_agent.tool
+    async def get_inventory_snapshot(
+        ctx: RunContext[AgentDependencies],
+        target: str = "@a",
+    ) -> str:
+        """通过 addon 桥接获取背包快照。"""
+        if ctx.deps.addon_bridge is None:
+            return "Addon 桥接不可用"
+
+        try:
+            result = await ctx.deps.addon_bridge.request(
+                "get_inventory_snapshot",
+                {"target": target},
+            )
+            return json.dumps(result.get("payload", result), ensure_ascii=False)
+        except Exception as e:
+            logger.error("agent_tool_error", tool="get_inventory_snapshot", error=str(e))
+            return f"获取背包快照失败: {str(e)}"
+
+    @chat_agent.tool
+    async def find_entities(
+        ctx: RunContext[AgentDependencies],
+        entity_type: str,
+        radius: int = 32,
+        target: str = "@s",
+    ) -> str:
+        """通过 addon 桥接查询实体快照。"""
+        if ctx.deps.addon_bridge is None:
+            return "Addon 桥接不可用"
+
+        try:
+            result = await ctx.deps.addon_bridge.request(
+                "find_entities",
+                {
+                    "entity_type": entity_type,
+                    "radius": radius,
+                    "target": target,
+                },
+            )
+            return json.dumps(result.get("payload", result), ensure_ascii=False)
+        except Exception as e:
+            logger.error("agent_tool_error", tool="find_entities", error=str(e))
+            return f"查询实体失败: {str(e)}"
+
+    @chat_agent.tool
+    async def run_world_command(
+        ctx: RunContext[AgentDependencies],
+        command: str,
+    ) -> str:
+        """通过 addon 桥接受控执行世界命令。"""
+        if ctx.deps.addon_bridge is None:
+            return "Addon 桥接不可用"
+
+        try:
+            result = await ctx.deps.addon_bridge.request(
+                "run_world_command",
+                {"command": command},
+            )
+            return json.dumps(result.get("payload", result), ensure_ascii=False)
+        except Exception as e:
+            logger.error("agent_tool_error", tool="run_world_command", error=str(e))
+            return f"执行世界命令失败: {str(e)}"
 
 
 def escape_command_text(text: str) -> str:

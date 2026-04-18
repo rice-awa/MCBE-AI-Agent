@@ -12,6 +12,7 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, Thin
 from core.queue import MessageBroker
 from services.agent.core import stream_chat, _extract_exception_details
 from services.agent.providers import ProviderRegistry
+from services.addon.service import get_addon_bridge_service
 from models.messages import ChatRequest, StreamChunk
 from models.agent import (
     AgentDependencies,
@@ -183,6 +184,7 @@ class AgentWorker:
             http_client=self._http_client,  # type: ignore
             send_to_game=self._create_send_callback(connection_id),
             run_command=self._create_command_callback(connection_id),
+            addon_bridge=self._create_addon_bridge_client(connection_id),
             provider=request.provider or self.settings.default_provider,
             get_context_info=get_context_info,
         )
@@ -615,6 +617,14 @@ class AgentWorker:
                 return "命令执行超时: 未收到游戏侧 commandResponse"
 
         return run_command
+
+    def _create_addon_bridge_client(self, connection_id: UUID):
+        """创建 addon 桥接客户端。"""
+        service = get_addon_bridge_service()
+        return service.create_client(
+            connection_id=connection_id,
+            send_command=self._create_command_callback(connection_id),
+        )
 
     async def _send_error_chunk(
         self, connection_id: UUID, error: str, sequence: int
