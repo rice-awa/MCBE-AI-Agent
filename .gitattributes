@@ -1,0 +1,43 @@
+# 锁定所有文本文件的换行符为 LF，防止 CRLF 转换问题
+*               text=auto
+
+# 强制所有文本文件使用 LF
+*.py            text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf
+*.json          text eol=lf
+*.toml          text eol=lf
+*.cfg           text eol=lf
+*.ini           text eol=lf
+*.sh            text eol=lf
+*.bash          text eol=lf
+*.zsh           text eol=lf
+*.fish          text eol=lf
+*.ps1           text eol=lf
+*.bat           text eol=lf
+*.cmd           text eol=lf
+*.make          text eol=lf
+*.dockerfile    text eol=lf
+
+# 二进制文件不转换
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.pdf           binary
+*.zip           binary
+*.tar           binary
+*.gz            binary
+*.ttf           binary
+*.otf           binary
+*.woff          binary
+*.woff2         binary
+*.mp3           binary
+*.mp4           binary
+*.wav           binary
+*.exe           binary
+*.dll           binary
+*.so            binary
