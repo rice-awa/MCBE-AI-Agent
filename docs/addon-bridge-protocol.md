@@ -33,6 +33,25 @@ MCBEAI|RESP|req-1|1/2|{"ok":true,
 MCBEAI|RESP|req-1|2/2|"players":["Steve"]}
 ```
 
+## 能力清单（任务 1 基线）
+
+- `get_player_snapshot`：获取玩家快照（位置、维度、朝向、基础状态）
+- `get_inventory_snapshot`：获取背包快照（槽位、物品、数量、附加数据）
+- `find_entities`：按条件筛选实体（类型、名称、标签、距离）
+- `run_world_command`：受控执行世界命令并返回结果
+
+## 错误码（协议级）
+
+- `BRIDGE_INVALID_NAMESPACE`：分片命名空间不是 `MCBEAI`
+- `BRIDGE_INVALID_PREFIX`：分片类型前缀不是 `RESP`
+- `BRIDGE_INVALID_CHUNK_FORMAT`：分片字段数量错误
+- `BRIDGE_INVALID_CHUNK_METADATA`：分片元数据非法（索引/总数/请求 ID）
+- `BRIDGE_EMPTY_CHUNKS`：重组时分片列表为空
+- `BRIDGE_CHUNK_SEQUENCE_ERROR`：分片序号缺失、重复或顺序不一致
+- `BRIDGE_CHUNK_REQUEST_MISMATCH`：同一批分片出现不同 `request_id`
+- `BRIDGE_CHUNK_TOTAL_MISMATCH`：同一批分片出现不同 `total_chunks`
+- `BRIDGE_INVALID_JSON_PAYLOAD`：重组后的 JSON 反序列化失败
+
 ## 约束与设计依据
 
 - `/scriptevent <messageId> <message>` 中 `message` 最大 2048 字符，超长消息必须分片。

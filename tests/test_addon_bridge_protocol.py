@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.addon.protocol import (
@@ -28,3 +30,24 @@ def test_reassemble_bridge_chunks_should_restore_payload() -> None:
     response = reassemble_bridge_chunks(parsed)
     assert response.request_id == "req-1"
     assert response.payload["players"] == ["Steve"]
+
+
+def test_decode_bridge_chat_chunk_should_reject_invalid_namespace_prefix() -> None:
+    with pytest.raises(ValueError, match="Invalid bridge chunk namespace"):
+        decode_bridge_chat_chunk("WRONG|RESP|req-1|1/1|{\"ok\":true}")
+
+
+def test_reassemble_bridge_chunks_should_reject_empty_list() -> None:
+    with pytest.raises(ValueError, match="must not be empty"):
+        reassemble_bridge_chunks([])
+
+
+def test_decode_bridge_chat_chunk_should_reject_invalid_part_metadata() -> None:
+    with pytest.raises(ValueError, match="Invalid bridge chunk metadata"):
+        decode_bridge_chat_chunk("MCBEAI|RESP|req-1|x/2|{\"ok\":true}")
+
+
+def test_reassemble_bridge_chunks_should_reject_invalid_json_payload() -> None:
+    chunks = [decode_bridge_chat_chunk("MCBEAI|RESP|req-1|1/1|{\"ok\":}")]
+    with pytest.raises(ValueError, match="Invalid bridge payload JSON"):
+        reassemble_bridge_chunks(chunks)
