@@ -12,6 +12,30 @@ export type EntitySnapshot = {
   dimension?: string;
 };
 
+type QueryAnchor = {
+  dimension: { getEntities(options?: object): Entity[] };
+  location: { x: number; y: number; z: number };
+};
+
+function isPlayerNameTarget(target: string | undefined): target is string {
+  if (!target) {
+    return false;
+  }
+
+  return !target.trim().startsWith("@");
+}
+
+function resolveQueryAnchor(event: {
+  sourceEntity?: QueryAnchor;
+  sourceBlock?: QueryAnchor;
+}): QueryAnchor | undefined {
+  if (event.sourceEntity) {
+    return event.sourceEntity;
+  }
+
+  return event.sourceBlock;
+}
+
 export function normalizeEntitySnapshot(entity: Pick<Entity, "id" | "typeId" | "location"> & {
   nameTag?: string;
   dimension?: { id: string };
@@ -31,23 +55,32 @@ export function normalizeEntitySnapshot(entity: Pick<Entity, "id" | "typeId" | "
 
 export function handleFindEntities(
   event: {
-    sourceEntity?: {
-      dimension: { getEntities(options?: object): Entity[] };
-      location: { x: number; y: number; z: number };
-    };
+    sourceEntity?: QueryAnchor;
+    sourceBlock?: QueryAnchor;
   },
   payload: { entity_type: string; radius?: number; target?: string },
 ): { ok: true; payload: { entities: EntitySnapshot[] } } {
-  const sourceEntity = event.sourceEntity;
-  if (!sourceEntity) {
+  const queryAnchor = resolveQueryAnchor(event);
+  if (!queryAnchor) {
     return { ok: true, payload: { entities: [] } };
   }
 
-  const entities = sourceEntity.dimension.getEntities({
+  const options: {
+    type: string;
+    location: { x: number; y: number; z: number };
+    maxDistance: number;
+    name?: string;
+  } = {
     type: payload.entity_type,
-    location: sourceEntity.location,
+    location: queryAnchor.location,
     maxDistance: payload.radius ?? 32,
-  });
+  };
+
+  if (isPlayerNameTarget(payload.target)) {
+    options.name = payload.target.trim();
+  }
+
+  const entities = queryAnchor.dimension.getEntities(options);
 
   return {
     ok: true,

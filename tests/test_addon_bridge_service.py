@@ -17,7 +17,6 @@ async def _send_successful_command(command: str) -> str:
     assert command.startswith("scriptevent mcbeai:bridge_request ")
     return "命令执行成功"
 
-
 @pytest.mark.asyncio
 async def test_send_request_should_complete_after_chunk_reassembly() -> None:
     service = AddonBridgeService(timeout_seconds=1.0)
@@ -51,7 +50,6 @@ async def test_send_request_should_complete_after_chunk_reassembly() -> None:
     result = await task
     assert result["payload"]["name"] == "Steve"
 
-
 @pytest.mark.asyncio
 async def test_request_capability_should_timeout_when_no_response_arrives() -> None:
     service = AddonBridgeService(timeout_seconds=0.01)
@@ -63,7 +61,6 @@ async def test_request_capability_should_timeout_when_no_response_arrives() -> N
             payload={"target": "@a"},
             send_command=_send_successful_command,
         )
-
 
 @pytest.mark.asyncio
 async def test_handle_player_message_should_isolate_concurrent_connections() -> None:
@@ -116,3 +113,39 @@ def test_is_bridge_chat_message_should_match_tool_player_and_prefix() -> None:
     assert service.is_bridge_chat_message("Steve", "MCBEAI|RESP|req-1|1/1|{}") is False
     assert service.is_bridge_chat_message("MCBEAI_TOOL", "hello") is False
 
+
+@pytest.mark.asyncio
+async def test_handle_player_message_should_ignore_duplicate_chunk_indexes() -> None:
+    service = AddonBridgeService(timeout_seconds=1.0)
+    connection_id = uuid4()
+
+    task = asyncio.create_task(
+        service.request_capability(
+            connection_id=connection_id,
+            capability="get_player_snapshot",
+            payload={"target": "Steve"},
+            send_command=_send_successful_command,
+        )
+    )
+
+    await asyncio.sleep(0)
+    request_id = next(iter(service._sessions[connection_id]._pending_requests))
+
+    assert service.handle_player_message(
+        connection_id,
+        "MCBEAI_TOOL",
+        f'MCBEAI|RESP|{request_id}|1/2|{{"ok":true,',
+    )
+    assert service.handle_player_message(
+        connection_id,
+        "MCBEAI_TOOL",
+        f'MCBEAI|RESP|{request_id}|1/2|{{"ok":true,',
+    )
+    assert service.handle_player_message(
+        connection_id,
+        "MCBEAI_TOOL",
+        f'MCBEAI|RESP|{request_id}|2/2|"payload":{{"name":"Steve"}}}}',
+    )
+
+    result = await task
+    assert result["payload"]["name"] == "Steve"

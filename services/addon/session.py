@@ -26,7 +26,7 @@ class AddonBridgeSession:
 
     def __init__(self) -> None:
         self._pending_requests: dict[str, PendingAddonRequest] = {}
-        self._chunk_buffers: dict[str, list[AddonBridgeChunk]] = {}
+        self._chunk_buffers: dict[str, dict[int, AddonBridgeChunk]] = {}
 
     def create_request(
         self,
@@ -51,13 +51,18 @@ class AddonBridgeSession:
         if chunk.request_id not in self._pending_requests:
             return False
 
-        buffer = self._chunk_buffers.setdefault(chunk.request_id, [])
-        buffer.append(chunk)
+        buffer = self._chunk_buffers.setdefault(chunk.request_id, {})
+        buffer[chunk.chunk_index] = chunk
 
         if len(buffer) < chunk.total_chunks:
             return True
 
-        response = reassemble_bridge_chunks(buffer)
+        try:
+            response = reassemble_bridge_chunks(list(buffer.values()))
+        except ValueError:
+            self._chunk_buffers.pop(chunk.request_id, None)
+            return True
+
         request = self._pending_requests.pop(chunk.request_id)
         self._chunk_buffers.pop(chunk.request_id, None)
         if not request.future.done():
@@ -76,4 +81,3 @@ class AddonBridgeSession:
         pending_ids = list(self._pending_requests)
         for request_id in pending_ids:
             self.fail_request(request_id, reason)
-
