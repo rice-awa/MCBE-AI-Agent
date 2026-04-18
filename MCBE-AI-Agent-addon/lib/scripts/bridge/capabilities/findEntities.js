@@ -1,3 +1,15 @@
+function isPlayerNameTarget(target) {
+    if (!target) {
+        return false;
+    }
+    return !target.trim().startsWith("@");
+}
+function resolveQueryAnchor(event) {
+    if (event.sourceEntity) {
+        return event.sourceEntity;
+    }
+    return event.sourceBlock;
+}
 export function normalizeEntitySnapshot(entity) {
     var _a;
     return {
@@ -14,15 +26,19 @@ export function normalizeEntitySnapshot(entity) {
 }
 export function handleFindEntities(event, payload) {
     var _a;
-    const sourceEntity = event.sourceEntity;
-    if (!sourceEntity) {
+    const queryAnchor = resolveQueryAnchor(event);
+    if (!queryAnchor) {
         return { ok: true, payload: { entities: [] } };
     }
-    const entities = sourceEntity.dimension.getEntities({
+    const options = {
         type: payload.entity_type,
-        location: sourceEntity.location,
+        location: queryAnchor.location,
         maxDistance: (_a = payload.radius) !== null && _a !== void 0 ? _a : 32,
-    });
+    };
+    if (isPlayerNameTarget(payload.target)) {
+        options.name = payload.target.trim();
+    }
+    const entities = queryAnchor.dimension.getEntities(options);
     return {
         ok: true,
         payload: {

@@ -1,8 +1,8 @@
 {
   "format_version": 2,
   "header": {
-    "name": "My resource pack",
-    "description": "My resource pack description",
+    "name": "MCBE AI Agent Addon",
+    "description": "Script bridge and in-game UI for MCBE AI Agent",
     "uuid": "2d7ed858-97eb-48a0-b180-7c80d1ce9a48",
     "version": [
       1,

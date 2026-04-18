@@ -1,7 +1,7 @@
 import { world } from "@minecraft/server";
-const COMMAND_DENYLIST = ["stop", "reload", "kick", "op", "deop"];
+import { findDeniedCommand } from "./commandSafety";
 export function handleRunWorldCommand(payload) {
-    var _a, _b, _c, _d;
+    var _a, _b;
     const command = (_b = (_a = payload.command) === null || _a === void 0 ? void 0 : _a.trim()) !== null && _b !== void 0 ? _b : "";
     if (!command) {
         return {
@@ -9,11 +9,11 @@ export function handleRunWorldCommand(payload) {
             payload: { output: "命令不能为空", successCount: 0 },
         };
     }
-    const keyword = (_d = (_c = command.split(/\s+/, 1)[0]) === null || _c === void 0 ? void 0 : _c.toLowerCase()) !== null && _d !== void 0 ? _d : "";
-    if (COMMAND_DENYLIST.includes(keyword)) {
+    const deniedCommand = findDeniedCommand(command);
+    if (deniedCommand) {
         return {
             ok: false,
-            payload: { output: `命令 ${keyword} 不允许通过 addon 执行`, successCount: 0 },
+            payload: { output: `命令 ${deniedCommand} 不允许通过 addon 执行`, successCount: 0 },
         };
     }
     try {
