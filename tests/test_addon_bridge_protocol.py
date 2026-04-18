@@ -65,6 +65,12 @@ def test_reassemble_bridge_chunks_should_reject_invalid_json_payload() -> None:
         reassemble_bridge_chunks(chunks)
 
 
+def test_reassemble_bridge_chunks_should_reject_non_object_json_payload() -> None:
+    chunks = [decode_bridge_chat_chunk('MCBEAI|RESP|req-1|1/1|["not","an","object"]')]
+    with pytest.raises(ValueError, match="Invalid bridge payload JSON"):
+        reassemble_bridge_chunks(chunks)
+
+
 def test_reassemble_bridge_chunks_should_reject_request_id_mismatch() -> None:
     chunks = [
         decode_bridge_chat_chunk("MCBEAI|RESP|req-1|1/2|{\"ok\":true,"),

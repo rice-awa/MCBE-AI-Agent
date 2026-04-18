@@ -76,5 +76,7 @@ def reassemble_bridge_chunks(chunks: list[AddonBridgeChunk]) -> AddonBridgeRespo
         payload = json.loads(content)
     except JSONDecodeError as exc:
         raise ValueError("Invalid bridge payload JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid bridge payload JSON")
 
     return AddonBridgeResponse(request_id=request_id, payload=payload)
