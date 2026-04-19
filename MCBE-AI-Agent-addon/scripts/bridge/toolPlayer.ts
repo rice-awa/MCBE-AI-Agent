@@ -52,9 +52,9 @@ export function initializeToolPlayer(): void {
     return;
   }
 
+  ensureToolPlayer();
   isToolPlayerInitialized = true;
 
-  ensureToolPlayer();
   system.runInterval(() => {
     ensureToolPlayer();
   }, TOOL_PLAYER_CHECK_INTERVAL_TICKS);
