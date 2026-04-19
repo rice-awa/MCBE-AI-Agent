@@ -1,0 +1,90 @@
+name: CI Build
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - 'MCBE-AI-Agent-addon/**'
+      - '.github/workflows/ci-build.yml'
+  pull_request:
+    branches: [main, master, develop]
+    paths:
+      - 'MCBE-AI-Agent-addon/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Package
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./MCBE-AI-Agent-addon
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: ./MCBE-AI-Agent-addon/pnpm-lock.yaml
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Run linter
+        run: pnpm lint
+
+      - name: Build addon
+        run: pnpm build
+        env:
+          PROJECT_NAME: MCBE-AI-Agent
+
+      - name: Package mcaddon
+        run: pnpm mcaddon
+        env:
+          PROJECT_NAME: MCBE-AI-Agent
+
+      - name: Get version from package.json
+        id: get_version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: MCBE-AI-Agent-v${{ steps.get_version.outputs.version }}-${{ github.sha }}
+          path: |
+            MCBE-AI-Agent-addon/dist/packages/*.mcaddon
+            MCBE-AI-Agent-addon/dist/scripts/*.js
+          retention-days: 30
+          compression-level: 9
+
+      - name: Upload behavior pack
+        uses: actions/upload-artifact@v4
+        with:
+          name: behavior-pack-v${{ steps.get_version.outputs.version }}
+          path: MCBE-AI-Agent-addon/behavior_packs/
+          retention-days: 30
+
+      - name: Upload resource pack
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-pack-v${{ steps.get_version.outputs.version }}
+          path: MCBE-AI-Agent-addon/resource_packs/
+          retention-days: 30
