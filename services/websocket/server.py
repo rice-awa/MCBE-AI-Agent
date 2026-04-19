@@ -344,6 +344,13 @@ class WebSocketServer:
         # 路由到具体处理器
         if cmd_type == "chat":
             await self.handle_chat(state, content, delivery="tellraw")
+            # 聊天框用户消息同步到 Addon UI 历史记录
+            await self.broker.send_response(state.id, {
+                "type": "ai_response_sync",
+                "player_name": state.player_name or "Player",
+                "role": "user",
+                "text": content,
+            })
         elif cmd_type == "chat_script":
             await self.handle_chat(state, content, delivery="scriptevent")
         elif cmd_type == "context":

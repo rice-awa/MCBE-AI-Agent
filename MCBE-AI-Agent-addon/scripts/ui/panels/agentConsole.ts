@@ -66,7 +66,5 @@ function createSummary(uiState: AgentUiState): string {
     `最近响应: ${lastResponse}`,
     `历史条数: ${uiState.history.length}`,
     `发送次数: ${uiState.stats.sentCount}`,
-    "",
-    "第一阶段使用传统表单；响应同步尚未启用。",
   ].join("\n");
 }

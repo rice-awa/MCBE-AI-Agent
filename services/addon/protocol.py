@@ -10,6 +10,9 @@ BRIDGE_PREFIX = "MCBEAI|RESP"
 UI_CHAT_PREFIX = "MCBEAI|UI_CHAT"
 BRIDGE_TOOL_PLAYER_NAME = "MCBEAI_TOOL"
 
+AI_RESP_MESSAGE_ID = "mcbeai:ai_resp"
+AI_RESP_MAX_CHUNK_LENGTH = 200
+
 
 def encode_bridge_request(request_id: str, capability: str, payload: dict) -> str:
     """编码桥接请求为 scriptevent 命令字符串。"""
@@ -82,6 +85,48 @@ def reassemble_bridge_chunks(chunks: list[AddonBridgeChunk]) -> AddonBridgeRespo
         raise ValueError("Invalid bridge payload JSON")
 
     return AddonBridgeResponse(request_id=request_id, payload=payload)
+
+
+def encode_ai_response_chunks(
+    player_name: str,
+    role: str,
+    text: str,
+    max_chunk_length: int = AI_RESP_MAX_CHUNK_LENGTH,
+) -> list[str]:
+    """将 AI 响应编码为 scriptevent 分片命令列表。
+
+    每个分片格式: scriptevent mcbeai:ai_resp {JSON}
+    JSON 载荷: {"id":"...","i":1,"n":3,"p":"Steve","r":"assistant","c":"..."}
+    """
+    import uuid
+
+    msg_id = f"resp-{uuid.uuid4().hex[:8]}"
+    chunks: list[str] = []
+
+    if max_chunk_length <= 0:
+        max_chunk_length = AI_RESP_MAX_CHUNK_LENGTH
+
+    # 将文本分片
+    text_parts: list[str] = []
+    for i in range(0, len(text), max_chunk_length):
+        text_parts.append(text[i : i + max_chunk_length])
+
+    total = len(text_parts) if text_parts else 1
+    safe_parts = text_parts if text_parts else [""]
+
+    for idx, content in enumerate(safe_parts, start=1):
+        payload = {
+            "id": msg_id,
+            "i": idx,
+            "n": total,
+            "p": player_name,
+            "r": role,
+            "c": content,
+        }
+        command = f"scriptevent {AI_RESP_MESSAGE_ID} {json.dumps(payload, ensure_ascii=False)}"
+        chunks.append(command)
+
+    return chunks
 
 
 def decode_ui_chat_chunk(chunk: str) -> UiChatChunk:

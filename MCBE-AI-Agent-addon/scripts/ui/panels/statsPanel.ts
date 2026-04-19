@@ -49,7 +49,7 @@ function createStatsBody(uiState: AgentUiState): string {
     `打开面板次数: ${uiState.stats.openCount}`,
     `发送消息次数: ${uiState.stats.sentCount}`,
     `本地历史条数: ${uiState.history.length}`,
-    `响应片段数: ${uiState.stats.responseChunkCount}（响应同步未启用）`,
+    `响应片段数: ${uiState.stats.responseChunkCount}（响应同步已启用）`,
     `最近打开: ${formatTimestamp(uiState.stats.lastOpenedAt)}`,
     `最近发送: ${formatTimestamp(uiState.stats.lastSentAt)}`,
   ].join("\n");

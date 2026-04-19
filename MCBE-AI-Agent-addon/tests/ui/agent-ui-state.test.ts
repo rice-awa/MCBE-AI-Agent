@@ -129,8 +129,8 @@ describe("agent ui state", () => {
     const rawValue = player.getDynamicProperty("mcbeai:ui_state");
     const persisted = JSON.parse(String(rawValue));
     expect(persisted.version).toBe(1);
-    expect(persisted.history).toHaveLength(10);
-    expect(persisted.history[0].id).toBe("item-2");
+    expect(persisted.history).toHaveLength(12);
+    expect(persisted.history[0].id).toBe("item-0");
   });
 });
 

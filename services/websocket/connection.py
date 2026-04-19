@@ -11,6 +11,7 @@ from core.queue import MessageBroker
 from models.messages import StreamChunk
 from models.minecraft import MinecraftCommand
 from models.agent import MCColor, MCPrefix
+from services.addon.protocol import encode_ai_response_chunks
 from config.logging import get_logger
 
 logger = get_logger(__name__)
@@ -274,6 +275,8 @@ class ConnectionManager:
                     response["command"],
                     response.get("result_future"),
                 )
+            elif msg_type == "ai_response_sync":
+                await self._sync_response_to_addon(state, response)
         else:
             logger.warning(
                 "unknown_response_type",
@@ -419,6 +422,35 @@ class ConnectionManager:
                 "run_command_error",
                 connection_id=str(state.id),
                 command=command,
+                error=str(e),
+            )
+
+    async def _sync_response_to_addon(
+        self, state: ConnectionState, response: dict
+    ) -> None:
+        """将 AI 响应/用户消息同步到 Addon UI 历史记录。"""
+        player_name = response.get("player_name", "Player")
+        role = response.get("role", "assistant")
+        text = response.get("text", "")
+
+        if not text:
+            return
+
+        try:
+            commands = encode_ai_response_chunks(player_name, role, text)
+            for command in commands:
+                await self._run_command(state, command)
+            logger.debug(
+                "ai_response_sync_sent",
+                connection_id=str(state.id),
+                player_name=player_name,
+                role=role,
+                chunk_count=len(commands),
+            )
+        except Exception as e:
+            logger.error(
+                "ai_response_sync_error",
+                connection_id=str(state.id),
                 error=str(e),
             )
 

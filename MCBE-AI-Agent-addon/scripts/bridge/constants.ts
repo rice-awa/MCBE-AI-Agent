@@ -3,3 +3,4 @@ export const BRIDGE_UI_CHAT_PREFIX = "MCBEAI|UI_CHAT";
 export const BRIDGE_MESSAGE_ID = "mcbeai:bridge_request";
 export const TOOL_PLAYER_NAME = "MCBEAI_TOOL";
 export const BRIDGE_MAX_CHUNK_CONTENT_LENGTH = 256;
+export const AI_RESP_MESSAGE_ID = "mcbeai:ai_resp";
