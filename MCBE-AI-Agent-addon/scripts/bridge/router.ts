@@ -1,4 +1,5 @@
 import type { ScriptEventCommandMessageAfterEvent } from "@minecraft/server";
+import { system } from "@minecraft/server";
 
 import { BRIDGE_MESSAGE_ID } from "./constants";
 
@@ -9,10 +10,6 @@ type BridgeCapabilityHandler = (
   event: ScriptEventCommandMessageAfterEvent,
   payload: Record<string, unknown>,
 ) => Record<string, unknown>;
-
-function loadServerModule(): Promise<typeof import("@minecraft/server")> {
-  return (0, eval)('import("@minecraft/server")') as Promise<typeof import("@minecraft/server")>;
-}
 
 async function loadCapabilityHandlers(): Promise<Record<string, BridgeCapabilityHandler>> {
   const [
@@ -80,13 +77,11 @@ export function registerBridgeRouter(): void {
 
   isBridgeRouterRegistered = true;
 
-  void loadServerModule().then(({ system }) => {
-    system.afterEvents.scriptEventReceive.subscribe((event) => {
-      if (!shouldHandleScriptEvent(event.id)) {
-        return;
-      }
+  system.afterEvents.scriptEventReceive.subscribe((event) => {
+    if (!shouldHandleScriptEvent(event.id)) {
+      return;
+    }
 
-      void handleBridgeScriptEvent(event);
-    });
+    void handleBridgeScriptEvent(event);
   });
 }

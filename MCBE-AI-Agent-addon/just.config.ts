@@ -26,7 +26,7 @@ const isProduction = argv()['production'];
 
 const bundleTaskOptions: BundleTaskParameters = {
   entryPoint: path.join(__dirname, "./scripts/main.ts"),
-  external: ["@minecraft/server", "@minecraft/server-ui"],
+  external: ["@minecraft/server", "@minecraft/server-ui", "@minecraft/server-gametest"],
   outfile: path.resolve(__dirname, "./dist/scripts/main.js"),
   minifyWhitespace: false,
   sourcemap: true,

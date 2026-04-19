@@ -42,6 +42,5 @@
       "uuid": "450332ea-6755-48b6-ab7f-36843065edd1",
       "version": [1, 0, 0]
     }
-  ],
-  "capabilities": ["script_eval"]
+  ]
 }
