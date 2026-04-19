@@ -518,7 +518,7 @@ def register_agent_tools(chat_agent: Agent[AgentDependencies, str]) -> None:
         ctx: RunContext[AgentDependencies],
         command: str,
     ) -> str:
-        """通过 addon 桥接受控执行世界命令。"""
+        """通过 addon 桥接受控执行世界命令。(仅当run_minecraft_command工具无法使用才用)"""
         if ctx.deps.addon_bridge is None:
             return "Addon 桥接不可用"
 
