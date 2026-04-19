@@ -1,0 +1,148 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 0.1.0) - leave empty to use package.json version'
+        required: false
+        default: ''
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      draft:
+        description: 'Create as draft release'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./MCBE-AI-Agent-addon
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: ./MCBE-AI-Agent-addon/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Run linter
+        run: pnpm lint
+
+      - name: Determine version
+        id: get_version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag_name=v$VERSION" >> $GITHUB_OUTPUT
+          echo "Using version: $VERSION"
+
+      - name: Build addon (production)
+        run: pnpm build:production
+        env:
+          PROJECT_NAME: MCBE-AI-Agent
+
+      - name: Package mcaddon (production)
+        run: pnpm mcaddon:production
+        env:
+          PROJECT_NAME: MCBE-AI-Agent
+
+      - name: Rename mcaddon with version
+        run: |
+          mkdir -p dist/release
+          cp "dist/packages/MCBE-AI-Agent.mcaddon" "dist/release/MCBE-AI-Agent-v${{ steps.get_version.outputs.version }}.mcaddon"
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get the last tag or use empty if none exists
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          
+          if [ -n "$LAST_TAG" ]; then
+            echo "changes<<EOF" >> $GITHUB_OUTPUT
+            echo "## Changes since $LAST_TAG" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            git log --pretty=format:"- %s (%h)" "$LAST_TAG"..HEAD -- MCBE-AI-Agent-addon/ >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "changes<<EOF" >> $GITHUB_OUTPUT
+            echo "## Initial Release" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            git log --pretty=format:"- %s (%h)" -- MCBE-AI-Agent-addon/ >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_version.outputs.tag_name }}
+          name: MCBE AI Agent v${{ steps.get_version.outputs.version }}
+          body: |
+            ${{ steps.changelog.outputs.changes }}
+
+            ## Installation
+            1. Download the `.mcaddon` file
+            2. Double-click to import into Minecraft Bedrock Edition
+            3. Enable the behavior pack and resource pack in your world settings
+
+            ## Files
+            - `MCBE-AI-Agent-v${{ steps.get_version.outputs.version }}.mcaddon` - Full addon package
+          files: |
+            MCBE-AI-Agent-addon/dist/release/*.mcaddon
+          draft: ${{ github.event.inputs.draft == 'true' }}
+          prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-v${{ steps.get_version.outputs.version }}
+          path: |
+            MCBE-AI-Agent-addon/dist/release/*.mcaddon
+          retention-days: 90
