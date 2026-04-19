@@ -25,3 +25,5 @@ MCBE-AI-Agent-addon/GPTaddon.1.21.23(old)/
 *$py.class
 
 data/*
+
+.pytest_cache
