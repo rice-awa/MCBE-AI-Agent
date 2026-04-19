@@ -10,12 +10,14 @@ from uuid import UUID
 from services.addon.protocol import (
     BRIDGE_PREFIX,
     BRIDGE_TOOL_PLAYER_NAME,
+    UI_CHAT_PREFIX,
     encode_bridge_request,
 )
 from services.addon.session import AddonBridgeSession
 
 
 CommandSender = Callable[[str], Awaitable[str]]
+UiChatCallback = Callable[[UUID, str, str], Awaitable[None]]
 
 
 class AddonBridgeClient(Protocol):
@@ -46,6 +48,7 @@ class AddonBridgeService:
     def __init__(self, timeout_seconds: float = 5.0) -> None:
         self._sessions: dict[UUID, AddonBridgeSession] = {}
         self._timeout_seconds = timeout_seconds
+        self._ui_chat_callback: UiChatCallback | None = None
 
     def create_client(
         self,
@@ -89,16 +92,35 @@ class AddonBridgeService:
         """判断玩家聊天消息是否为 addon 回传分片。"""
         return sender == BRIDGE_TOOL_PLAYER_NAME and message.startswith(BRIDGE_PREFIX)
 
+    def is_ui_chat_message(self, sender: str, message: str) -> bool:
+        """判断玩家聊天消息是否为 UI 聊天分片。"""
+        return sender == BRIDGE_TOOL_PLAYER_NAME and message.startswith(UI_CHAT_PREFIX)
+
     def handle_player_message(self, connection_id: UUID, sender: str, message: str) -> bool:
         """处理来自模拟玩家的回传消息。"""
-        if not self.is_bridge_chat_message(sender, message):
-            return False
+        if self.is_bridge_chat_message(sender, message):
+            session = self._sessions.get(connection_id)
+            if session is None:
+                return False
 
-        session = self._sessions.get(connection_id)
-        if session is None:
-            return False
+            return session.handle_chat_chunk(message)
 
-        return session.handle_chat_chunk(message)
+        if self.is_ui_chat_message(sender, message):
+            session = self._session_for(connection_id)
+
+            result = session.handle_ui_chat_chunk(message)
+            if result is not None and self._ui_chat_callback is not None:
+                player_name, chat_message = result
+                asyncio.create_task(
+                    self._ui_chat_callback(connection_id, player_name, chat_message)
+                )
+            return True
+
+        return False
+
+    def set_ui_chat_callback(self, callback: UiChatCallback) -> None:
+        """注册 UI 聊天消息回调。"""
+        self._ui_chat_callback = callback
 
     def close_connection(self, connection_id: UUID) -> None:
         """在连接关闭时清理关联会话。"""

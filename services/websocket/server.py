@@ -3,6 +3,7 @@
 import asyncio
 import json
 from typing import Any
+from uuid import UUID
 
 import websockets
 from websockets.server import WebSocketServerProtocol, serve
@@ -43,6 +44,7 @@ class WebSocketServer:
         self.connection_manager = ConnectionManager(broker, dev_mode=self.dev_mode)
         self.protocol_handler = MinecraftProtocolHandler()
         self.addon_bridge_service = get_addon_bridge_service()
+        self.addon_bridge_service.set_ui_chat_callback(self._handle_ui_chat_message)
         self._server: Any = None
 
     async def start(self) -> None:
@@ -784,6 +786,31 @@ class WebSocketServer:
             )
 
         await self._send_ws_payload(state, msg, source="mcp")
+
+    async def _handle_ui_chat_message(
+        self, connection_id: UUID, player_name: str, message: str
+    ) -> None:
+        """处理从 addon UI 发来的聊天消息。"""
+        state = self.connection_manager.get_connection(connection_id)
+        if not state:
+            logger.warning(
+                "ui_chat_connection_not_found",
+                connection_id=str(connection_id),
+            )
+            return
+
+        # 更新玩家名称
+        if player_name and not state.player_name:
+            state.player_name = player_name
+
+        logger.info(
+            "ui_chat_received",
+            connection_id=str(state.id),
+            player=player_name,
+            content_length=len(message),
+        )
+
+        await self.handle_chat(state, message, delivery="tellraw")
 
     async def _send_ws_payload(self, state: Any, payload: str, source: str) -> None:
         """统一发送 WebSocket 响应并记录原始输出。"""

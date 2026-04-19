@@ -3,10 +3,11 @@
 import json
 from json import JSONDecodeError
 
-from models.addon_bridge import AddonBridgeChunk, AddonBridgeResponse
+from models.addon_bridge import AddonBridgeChunk, AddonBridgeResponse, UiChatChunk, UiChatMessage
 
 BRIDGE_MESSAGE_ID = "mcbeai:bridge_request"
 BRIDGE_PREFIX = "MCBEAI|RESP"
+UI_CHAT_PREFIX = "MCBEAI|UI_CHAT"
 BRIDGE_TOOL_PLAYER_NAME = "MCBEAI_TOOL"
 
 
@@ -81,3 +82,71 @@ def reassemble_bridge_chunks(chunks: list[AddonBridgeChunk]) -> AddonBridgeRespo
         raise ValueError("Invalid bridge payload JSON")
 
     return AddonBridgeResponse(request_id=request_id, payload=payload)
+
+
+def decode_ui_chat_chunk(chunk: str) -> UiChatChunk:
+    """解析聊天中的 UI 聊天分片。"""
+    parts = chunk.split("|", 4)
+    if len(parts) != 5:
+        raise ValueError("Invalid UI chat chunk format")
+
+    namespace, prefix, msg_id, part, content = parts
+    if namespace != "MCBEAI":
+        raise ValueError("Invalid UI chat chunk namespace")
+    if prefix != "UI_CHAT":
+        raise ValueError("Invalid UI chat chunk prefix")
+
+    if not msg_id:
+        raise ValueError("Invalid UI chat chunk metadata")
+
+    try:
+        index_str, total_str = part.split("/", 1)
+        chunk_index = int(index_str)
+        total_chunks = int(total_str)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Invalid UI chat chunk metadata") from exc
+
+    if chunk_index <= 0 or total_chunks <= 0 or chunk_index > total_chunks:
+        raise ValueError("Invalid UI chat chunk metadata")
+
+    return UiChatChunk(
+        msg_id=msg_id,
+        chunk_index=chunk_index,
+        total_chunks=total_chunks,
+        content=content,
+    )
+
+
+def reassemble_ui_chat_chunks(chunks: list[UiChatChunk]) -> UiChatMessage:
+    """重组 UI 聊天分片并解析 JSON payload。"""
+    if not chunks:
+        raise ValueError("UI chat chunks must not be empty")
+
+    sorted_chunks = sorted(chunks, key=lambda item: item.chunk_index)
+    msg_id = sorted_chunks[0].msg_id
+    total_chunks = sorted_chunks[0].total_chunks
+
+    if any(chunk.msg_id != msg_id for chunk in sorted_chunks):
+        raise ValueError("UI chat chunks msg_id mismatch")
+    if any(chunk.total_chunks != total_chunks for chunk in sorted_chunks):
+        raise ValueError("UI chat chunks total_chunks mismatch")
+
+    expected_indexes = list(range(1, total_chunks + 1))
+    actual_indexes = [chunk.chunk_index for chunk in sorted_chunks]
+    if actual_indexes != expected_indexes:
+        raise ValueError("UI chat chunks are incomplete or out of sequence")
+
+    content = "".join(chunk.content for chunk in sorted_chunks)
+    try:
+        payload = json.loads(content)
+    except JSONDecodeError as exc:
+        raise ValueError("Invalid UI chat payload JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid UI chat payload JSON")
+
+    player_name = payload.get("player", "")
+    message = payload.get("message", "")
+    if not message:
+        raise ValueError("Invalid UI chat payload: missing message")
+
+    return UiChatMessage(msg_id=msg_id, player_name=player_name, message=message)

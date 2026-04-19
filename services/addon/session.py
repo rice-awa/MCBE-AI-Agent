@@ -7,8 +7,13 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-from models.addon_bridge import AddonBridgeChunk
-from services.addon.protocol import decode_bridge_chat_chunk, reassemble_bridge_chunks
+from models.addon_bridge import AddonBridgeChunk, UiChatChunk
+from services.addon.protocol import (
+    decode_bridge_chat_chunk,
+    decode_ui_chat_chunk,
+    reassemble_bridge_chunks,
+    reassemble_ui_chat_chunks,
+)
 
 
 @dataclass
@@ -27,6 +32,7 @@ class AddonBridgeSession:
     def __init__(self) -> None:
         self._pending_requests: dict[str, PendingAddonRequest] = {}
         self._chunk_buffers: dict[str, dict[int, AddonBridgeChunk]] = {}
+        self._ui_chat_chunk_buffers: dict[str, dict[int, UiChatChunk]] = {}
 
     def create_request(
         self,
@@ -81,3 +87,24 @@ class AddonBridgeSession:
         pending_ids = list(self._pending_requests)
         for request_id in pending_ids:
             self.fail_request(request_id, reason)
+        self._ui_chat_chunk_buffers.clear()
+
+    def handle_ui_chat_chunk(self, chunk_message: str) -> tuple[str, str] | None:
+        """消费单条 UI 聊天分片，若完成重组则返回 (player_name, message)。"""
+        chunk = decode_ui_chat_chunk(chunk_message)
+
+        buffer = self._ui_chat_chunk_buffers.setdefault(chunk.msg_id, {})
+        buffer[chunk.chunk_index] = chunk
+
+        if len(buffer) < chunk.total_chunks:
+            return None
+
+        try:
+            ui_msg = reassemble_ui_chat_chunks(list(buffer.values()))
+        except ValueError:
+            self._ui_chat_chunk_buffers.pop(chunk.msg_id, None)
+            return None
+        finally:
+            self._ui_chat_chunk_buffers.pop(chunk.msg_id, None)
+
+        return (ui_msg.player_name, ui_msg.message)
