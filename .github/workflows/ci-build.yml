@@ -46,7 +46,7 @@ jobs:
       - name: Run tests
         run: pnpm test
 
-
+      - name: Build addon
         run: pnpm build
         env:
           PROJECT_NAME: MCBE-AI-Agent
