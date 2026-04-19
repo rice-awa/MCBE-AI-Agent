@@ -17,8 +17,14 @@ type DduiDropdownOption<T> = {
 export type DduiCustomForm = {
   divider(): DduiCustomForm;
   label(text: string | DduiObservable<string>): DduiCustomForm;
+  textField(
+    label: string,
+    value: DduiObservable<string>,
+    options?: { description?: string },
+  ): DduiCustomForm;
   spacer(): DduiCustomForm;
   closeButton(): DduiCustomForm;
+  close(): void;
   toggle(
     label: string,
     value: DduiObservable<boolean>,
@@ -31,10 +37,10 @@ export type DduiCustomForm = {
     max: number,
     options?: { description?: string; step?: number },
   ): DduiCustomForm;
-  dropdown<T>(
+  dropdown(
     label: string,
-    value: DduiObservable<T>,
-    options: DduiDropdownOption<T>[],
+    value: DduiObservable<number>,
+    options: DduiDropdownOption<number>[],
   ): DduiCustomForm;
   button(
     label: string,

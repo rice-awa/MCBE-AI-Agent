@@ -21,7 +21,8 @@ export async function showSettingsPanel(
     const maxHistoryItems = createDduiObservable(uiState.settings.maxHistoryItems);
     const showToolEvents = createDduiObservable(uiState.settings.showToolEvents);
     const responsePreviewLength = createDduiObservable(uiState.settings.responsePreviewLength);
-    const defaultDelivery = createDduiObservable<AgentUiDelivery>(uiState.settings.defaultDelivery);
+    const defaultDeliveryIndex = Math.max(0, DELIVERY_OPTIONS.indexOf(uiState.settings.defaultDelivery));
+    const defaultDelivery = createDduiObservable(defaultDeliveryIndex);
     let didSave = false;
 
     const form = createCustomForm(player, "MCBE AI Agent 设置")
@@ -35,7 +36,7 @@ export async function showSettingsPanel(
       .dropdown(
         "默认响应方式",
         defaultDelivery,
-        DELIVERY_OPTIONS.map((option) => ({ label: option, value: option })),
+        DELIVERY_OPTIONS.map((option, index) => ({ label: option, value: index })),
       )
       .spacer()
       .button("保存", () => {
@@ -44,7 +45,7 @@ export async function showSettingsPanel(
           maxHistoryItems: clampToStep(maxHistoryItems.getData(), 10, 50, 5),
           showToolEvents: showToolEvents.getData(),
           responsePreviewLength: clampToStep(responsePreviewLength.getData(), 60, 240, 20),
-          defaultDelivery: defaultDelivery.getData(),
+          defaultDelivery: DELIVERY_OPTIONS[defaultDelivery.getData()] ?? "tellraw",
         };
         uiState.history = uiState.history.slice(-uiState.settings.maxHistoryItems);
         uiState.stats.localHistoryCount = uiState.history.length;
@@ -56,6 +57,7 @@ export async function showSettingsPanel(
             ? "MCBE AI Agent: 设置已保存。"
             : "MCBE AI Agent: 设置保存失败，本次仅内存生效。",
         );
+        form.close();
       });
 
     const shown = await showCustomFormSafely(player, form);

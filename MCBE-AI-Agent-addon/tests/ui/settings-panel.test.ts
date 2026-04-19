@@ -18,12 +18,13 @@ describe("settings panel", () => {
   it("saves updated settings through the DDUI save action", async () => {
     __setNextCustomFormInteraction({
       clickButtonLabel: "保存",
+      autoCloseAfterButtonClick: true,
       fieldValues: {
         "自动保存历史": false,
         "历史保留条数": 10,
         "显示工具事件": false,
         "响应预览长度": 60,
-        "默认响应方式": "scriptevent",
+        "默认响应方式": 1,
       },
     });
 

@@ -6,6 +6,7 @@ type CustomFormInteraction = {
   failOnCustomFormCreate?: boolean;
   failOnObservableCreate?: boolean;
   failOnShow?: boolean;
+  autoCloseAfterButtonClick?: boolean;
   fieldValues?: Record<string, unknown>;
 };
 
@@ -16,6 +17,7 @@ export function __resetDduiMock(): void {
   nextInteraction.failOnCustomFormCreate = false;
   nextInteraction.failOnObservableCreate = false;
   nextInteraction.failOnShow = false;
+  nextInteraction.autoCloseAfterButtonClick = false;
   nextInteraction.fieldValues = undefined;
 }
 
@@ -24,6 +26,7 @@ export function __setNextCustomFormInteraction(interaction: CustomFormInteractio
   nextInteraction.failOnCustomFormCreate = interaction.failOnCustomFormCreate ?? false;
   nextInteraction.failOnObservableCreate = interaction.failOnObservableCreate ?? false;
   nextInteraction.failOnShow = interaction.failOnShow ?? false;
+  nextInteraction.autoCloseAfterButtonClick = interaction.autoCloseAfterButtonClick ?? false;
   nextInteraction.fieldValues = interaction.fieldValues;
 }
 
@@ -102,7 +105,9 @@ class MockCustomForm {
       if (nextInteraction.clickButtonLabel) {
         this.#buttons.get(nextInteraction.clickButtonLabel)?.();
       }
-      this.#showing = false;
+      if (nextInteraction.autoCloseAfterButtonClick) {
+        this.#showing = false;
+      }
     });
   }
 
