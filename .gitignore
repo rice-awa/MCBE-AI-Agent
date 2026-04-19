@@ -10,6 +10,7 @@
 .kiro
 .vscode
 .cursor
+.worktrees
 
 # logs
 logs/*
