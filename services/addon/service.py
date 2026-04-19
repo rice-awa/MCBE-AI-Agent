@@ -14,6 +14,9 @@ from services.addon.protocol import (
     encode_bridge_request,
 )
 from services.addon.session import AddonBridgeSession
+from config.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 CommandSender = Callable[[str], Awaitable[str]]
@@ -101,18 +104,43 @@ class AddonBridgeService:
         if self.is_bridge_chat_message(sender, message):
             session = self._sessions.get(connection_id)
             if session is None:
+                logger.warning(
+                    "bridge_chat_no_session",
+                    connection_id=str(connection_id),
+                    sender=sender,
+                    message_prefix=message[:50] if message else "",
+                )
                 return False
 
             return session.handle_chat_chunk(message)
 
         if self.is_ui_chat_message(sender, message):
+            logger.debug(
+                "ui_chat_chunk_received",
+                connection_id=str(connection_id),
+                sender=sender,
+                message_prefix=message[:50] if message else "",
+            )
             session = self._session_for(connection_id)
 
             result = session.handle_ui_chat_chunk(message)
             if result is not None and self._ui_chat_callback is not None:
                 player_name, chat_message = result
+                logger.info(
+                    "ui_chat_reassembled",
+                    connection_id=str(connection_id),
+                    player=player_name,
+                    message_length=len(chat_message),
+                    callback_registered=self._ui_chat_callback is not None,
+                )
                 asyncio.create_task(
                     self._ui_chat_callback(connection_id, player_name, chat_message)
+                )
+            elif result is None:
+                logger.debug(
+                    "ui_chat_chunk_buffered",
+                    connection_id=str(connection_id),
+                    message_prefix=message[:50] if message else "",
                 )
             return True
 

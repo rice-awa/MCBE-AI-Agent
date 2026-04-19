@@ -14,6 +14,9 @@ from services.addon.protocol import (
     reassemble_bridge_chunks,
     reassemble_ui_chat_chunks,
 )
+from config.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -96,15 +99,35 @@ class AddonBridgeSession:
         buffer = self._ui_chat_chunk_buffers.setdefault(chunk.msg_id, {})
         buffer[chunk.chunk_index] = chunk
 
+        logger.debug(
+            "ui_chat_chunk_buffered",
+            msg_id=chunk.msg_id,
+            chunk_index=chunk.chunk_index,
+            total_chunks=chunk.total_chunks,
+            buffered=len(buffer),
+        )
+
         if len(buffer) < chunk.total_chunks:
             return None
 
         try:
             ui_msg = reassemble_ui_chat_chunks(list(buffer.values()))
-        except ValueError:
+        except ValueError as e:
             self._ui_chat_chunk_buffers.pop(chunk.msg_id, None)
+            logger.warning(
+                "ui_chat_reassemble_failed",
+                msg_id=chunk.msg_id,
+                error=str(e),
+            )
             return None
         finally:
             self._ui_chat_chunk_buffers.pop(chunk.msg_id, None)
+
+        logger.info(
+            "ui_chat_reassemble_success",
+            msg_id=ui_msg.msg_id,
+            player=ui_msg.player_name,
+            message_length=len(ui_msg.message),
+        )
 
         return (ui_msg.player_name, ui_msg.message)

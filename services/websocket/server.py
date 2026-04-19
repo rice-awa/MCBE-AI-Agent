@@ -186,14 +186,25 @@ class WebSocketServer:
             if not player_event:
                 return
 
+            # 检查是否为 addon 桥接消息（RESP 或 UI_CHAT）
             if self.addon_bridge_service.is_bridge_chat_message(
                 player_event.sender,
                 player_event.message,
+            ) or self.addon_bridge_service.is_ui_chat_message(
+                player_event.sender,
+                player_event.message,
             ):
-                self.addon_bridge_service.handle_player_message(
+                handled = self.addon_bridge_service.handle_player_message(
                     state.id,
                     player_event.sender,
                     player_event.message,
+                )
+                logger.debug(
+                    "addon_bridge_message_handled",
+                    connection_id=str(state.id),
+                    sender=player_event.sender,
+                    message_prefix=player_event.message[:30] if player_event.message else "",
+                    handled=handled,
                 )
                 return
 
