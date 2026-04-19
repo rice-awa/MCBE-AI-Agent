@@ -9,14 +9,14 @@ importers:
   .:
     dependencies:
       '@minecraft/server':
-        specifier: ^2.0.0
-        version: 2.6.0(@minecraft/common@1.2.0)(@minecraft/vanilla-data@1.26.13)
+        specifier: 2.8.0-beta.1.26.20-preview.28
+        version: 2.8.0-beta.1.26.20-preview.28(@minecraft/common@1.2.0)(@minecraft/vanilla-data@1.26.13)
       '@minecraft/server-gametest':
         specifier: 1.0.0-beta.1.26.20-preview.28
-        version: 1.0.0-beta.1.26.20-preview.28(@minecraft/common@1.2.0)(@minecraft/server@2.6.0(@minecraft/common@1.2.0)(@minecraft/vanilla-data@1.26.13))
+        version: 1.0.0-beta.1.26.20-preview.28(@minecraft/common@1.2.0)(@minecraft/server@2.8.0-beta.1.26.20-preview.28(@minecraft/common@1.2.0)(@minecraft/vanilla-data@1.26.13))
       '@minecraft/server-ui':
-        specifier: ^2.0.0
-        version: 2.0.0(@minecraft/vanilla-data@1.26.13)
+        specifier: 2.1.0-beta.1.26.20-preview.28
+        version: 2.1.0-beta.1.26.20-preview.28(@minecraft/common@1.2.0)(@minecraft/server@2.8.0-beta.1.26.20-preview.28(@minecraft/common@1.2.0)(@minecraft/vanilla-data@1.26.13))
     devDependencies:
       '@minecraft/core-build-tasks':
         specifier: ^5.7.0
@@ -589,14 +589,17 @@ packages:
       '@minecraft/common': ^1.0.0
       '@minecraft/server': ^1.17.0 || ^2.0.0 || ^2.8.0-beta.1.26.20-preview.28
 
-  '@minecraft/server-ui@2.0.0':
-    resolution: {integrity: sha512-K1xFK1OEJSNfIgyRElaoxDTW/nbEqjBp1YnUdyPCs4kGDglwoXNyFz3wzMOkvT04CJXSifZGcTJeWda4C6OkXw==}
+  '@minecraft/server-ui@2.1.0-beta.1.26.20-preview.28':
+    resolution: {integrity: sha512-adC073R7JjbJ+5qRfHoZfWdQ63Zsq8QSBTBoYvbFFZMitmDqCAu54cMgGDUdD/FkRCNhy+mGs/yppKWwDBAC1Q==}
+    peerDependencies:
+      '@minecraft/common': ^1.0.0
+      '@minecraft/server': ^2.0.0 || ^2.8.0-beta.1.26.20-preview.28
 
-  '@minecraft/server@2.6.0':
-    resolution: {integrity: sha512-/l1gbUHcTl/3gb3cB7Ilb8pfW1QytoAc+iMXUPSzvv8cxGluf6M635jl29P8Bid3iVmUB9hWyCUZtRUVVlk5ew==}
+  '@minecraft/server@2.8.0-beta.1.26.20-preview.28':
+    resolution: {integrity: sha512-ceS1YyU8sbTJZbw3kuVlwknP52zGW6Tl9TQtbxBH/Om6qlIZIpn6rGvXN3r+79chmXGVyOPalPgodbw3COS6YA==}
     peerDependencies:
       '@minecraft/common': ^1.2.0
-      '@minecraft/vanilla-data': '>=1.20.70'
+      '@minecraft/vanilla-data': '>=1.20.70 || 1.26.20-preview.28'
 
   '@minecraft/vanilla-data@1.26.13':
     resolution: {integrity: sha512-Mll1g5vX84iJ2PjJM5KKJ9V9gH8haJtIhSqywn/FlZN9IN0fn4MFWyjC43xNLh/COWgZfVgB7XAA7fGsEt60MQ==}
@@ -2254,19 +2257,17 @@ snapshots:
       - tsx
       - yaml
 
-  '@minecraft/server-gametest@1.0.0-beta.1.26.20-preview.28(@minecraft/common@1.2.0)(@minecraft/server@2.6.0(@minecraft/common@1.2.0)(@minecraft/vanilla-data@1.26.13))':
+  '@minecraft/server-gametest@1.0.0-beta.1.26.20-preview.28(@minecraft/common@1.2.0)(@minecraft/server@2.8.0-beta.1.26.20-preview.28(@minecraft/common@1.2.0)(@minecraft/vanilla-data@1.26.13))':
     dependencies:
       '@minecraft/common': 1.2.0
-      '@minecraft/server': 2.6.0(@minecraft/common@1.2.0)(@minecraft/vanilla-data@1.26.13)
+      '@minecraft/server': 2.8.0-beta.1.26.20-preview.28(@minecraft/common@1.2.0)(@minecraft/vanilla-data@1.26.13)
 
-  '@minecraft/server-ui@2.0.0(@minecraft/vanilla-data@1.26.13)':
+  '@minecraft/server-ui@2.1.0-beta.1.26.20-preview.28(@minecraft/common@1.2.0)(@minecraft/server@2.8.0-beta.1.26.20-preview.28(@minecraft/common@1.2.0)(@minecraft/vanilla-data@1.26.13))':
     dependencies:
       '@minecraft/common': 1.2.0
-      '@minecraft/server': 2.6.0(@minecraft/common@1.2.0)(@minecraft/vanilla-data@1.26.13)
-    transitivePeerDependencies:
-      - '@minecraft/vanilla-data'
+      '@minecraft/server': 2.8.0-beta.1.26.20-preview.28(@minecraft/common@1.2.0)(@minecraft/vanilla-data@1.26.13)
 
-  '@minecraft/server@2.6.0(@minecraft/common@1.2.0)(@minecraft/vanilla-data@1.26.13)':
+  '@minecraft/server@2.8.0-beta.1.26.20-preview.28(@minecraft/common@1.2.0)(@minecraft/vanilla-data@1.26.13)':
     dependencies:
       '@minecraft/common': 1.2.0
       '@minecraft/vanilla-data': 1.26.13
