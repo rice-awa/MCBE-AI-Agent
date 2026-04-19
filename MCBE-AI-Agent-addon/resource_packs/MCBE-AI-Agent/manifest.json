@@ -3,7 +3,7 @@
   "header": {
     "name": "MCBE AI Agent Addon",
     "description": "Script bridge and in-game UI for MCBE AI Agent",
-    "uuid": "2d7ed858-97eb-48a0-b180-7c80d1ce9a48",
+    "uuid": "450332ea-6755-48b6-ab7f-36843065edd1",
     "version": [
       1,
       0,
@@ -11,25 +11,15 @@
     ],
     "min_engine_version": [
       1,
-      20,
-      30
+      21,
+      80
     ]
   },
   "modules": [
     {
-      "description": "My Resource Pack",
+      "description": "Resource Pack",
       "type": "resources",
-      "uuid": "503fe660-142b-46a2-8fec-34a54e944720",
-      "version": [
-        1,
-        0,
-        0
-      ]
-    }
-  ],
-  "dependencies": [
-    {
-      "uuid": "14e467b4-e3aa-49d3-8352-f8439fd7b2ee",
+      "uuid": "3b1513ae-0aa2-4ca5-bb33-4cfbac9b5870",
       "version": [
         1,
         0,

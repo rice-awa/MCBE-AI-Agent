@@ -1,8 +1,8 @@
 {
   "name": "MCBE-AI-Agent",
   "version": "0.1.0",
-  "productName": "Minecraft TypeScript Starter Project",
-  "description": "Minecraft TypeScript Starter Project",
+  "productName": "MCBE-AI-Agent",
+  "description": "Script bridge and in-game UI for MCBE AI Agent",
   "private": true,
   "devDependencies": {
     "@types/node": "^22.10.1",
