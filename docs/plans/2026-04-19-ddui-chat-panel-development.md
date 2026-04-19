@@ -46,20 +46,26 @@ DDUI 文档里的关键 API 是：
 
 `ActionFormData.show(player)` 和 `ModalFormData.show(player)` 不能在 read-only mode 调用。
 
-`world.beforeEvents.chatSend` 可用于拦截聊天入口命令，但该事件回调处于 read-only mode。正确做法是：
+本方案不使用 `chatSend` 监听作为 UI 入口，原因如下：
+
+- `chatSend` 属于测试版接口，不适合作为稳定功能入口。
+- 聊天监听会侵入并破坏现有聊天链路，与本项目「不影响原有聊天命令」的目标冲突。
+
+第一阶段改为使用 `world.afterEvents.itemUse` 监听玩家使用物品事件，并先绑定为原版命令方块物品 `minecraft:command_block` 打开 UI 菜单。
+
+推荐写法：
 
 ```ts
-world.beforeEvents.chatSend.subscribe((event) => {
-  if (!isUiOpenCommand(event.message)) {
+world.afterEvents.itemUse.subscribe((event) => {
+  if (event.itemStack.typeId !== "minecraft:command_block") {
     return;
   }
 
-  event.cancel = true;
-  system.run(() => {
-    void openAgentUi(event.sender);
-  });
+  void openAgentUi(event.source);
 });
 ```
+
+如果后续出现重复触发或误触问题，再补充简单节流或 Sneak 条件判断，但第一版先保持最小实现。
 
 ---
 
@@ -117,7 +123,7 @@ Python 侧通过 Minecraft WebSocket 订阅 `PlayerMessage`，解析聊天命令
 
 ### 3.1 必须实现
 
-- 玩家可以在游戏内通过聊天命令打开面板。
+- 玩家可以在游戏内通过使用原版命令方块物品打开面板。
 - 面板可以输入并发送 AI 聊天消息。
 - 面板可以查看最近聊天记录。
 - 面板可以查看基础统计信息。
@@ -137,7 +143,7 @@ Python 侧通过 Minecraft WebSocket 订阅 `PlayerMessage`，解析聊天命令
 ### 3.3 成功标准
 
 - `cd MCBE-AI-Agent-addon && pnpm build` 通过。
-- 游戏内输入入口命令后能打开主面板。
+- 游戏内手持原版命令方块并使用后能打开主面板。
 - 通过面板发送消息后，Python 侧能收到等价于 `AGENT 聊天 <消息>` 的请求。
 - 聊天记录页面能看到 UI 发出的消息和本地记录。
 - 设置页面保存后，再次打开面板能读取保存值。
@@ -148,9 +154,10 @@ Python 侧通过 Minecraft WebSocket 订阅 `PlayerMessage`，解析聊天命令
 ## 4. 总体架构
 
 ```text
-玩家聊天入口
-  -> world.beforeEvents.chatSend
-  -> system.run(openAgentUi)
+玩家物品使用入口
+  -> world.afterEvents.itemUse
+  -> 判断 itemStack.typeId === "minecraft:command_block"
+  -> openAgentUi
   -> UI 主面板
   -> 发送消息 / 历史记录 / 设置 / 统计
 
@@ -179,8 +186,8 @@ Python 侧通过 Minecraft WebSocket 订阅 `PlayerMessage`，解析聊天命令
 修改：
 
 - `MCBE-AI-Agent-addon/scripts/ui/entry.ts`
-  - 注册 UI 入口命令。
-  - 负责从聊天事件进入 UI。
+  - 注册 UI 入口物品事件。
+  - 负责从 `itemUse` 事件进入 UI。
   - 不承载具体面板逻辑。
 
 - `MCBE-AI-Agent-addon/scripts/ui/state.ts`
@@ -195,7 +202,7 @@ Python 侧通过 Minecraft WebSocket 订阅 `PlayerMessage`，解析聊天命令
 创建：
 
 - `MCBE-AI-Agent-addon/scripts/ui/commands.ts`
-  - 判断 UI 入口命令。
+  - 判断 UI 入口物品。
   - 构造发送给现有聊天链路的命令文本。
 
 - `MCBE-AI-Agent-addon/scripts/ui/storage.ts`
@@ -497,7 +504,7 @@ export type PersistedAgentUiData = {
 
 ## 10. 开发任务拆分
 
-### 任务 1：注册 UI 入口命令
+### 任务 1：注册 UI 入口物品
 
 文件：
 
@@ -506,13 +513,13 @@ export type PersistedAgentUiData = {
 
 步骤：
 
-- [ ] 增加 `isUiOpenCommand(message: string): boolean`。
-- [ ] 支持 `AGENT UI`、`AGENT 面板`、`AI UI`、`AI 面板`。
-- [ ] 在 `registerUiEntry()` 中订阅 `world.beforeEvents.chatSend`。
-- [ ] 命中入口命令时 `event.cancel = true`。
-- [ ] 使用 `system.run()` 调用 `openAgentUi(event.sender)`。
+- [ ] 增加 `isUiTriggerItem(itemTypeId: string): boolean`。
+- [ ] 第一阶段只匹配原版命令方块 `minecraft:command_block`。
+- [ ] 在 `registerUiEntry()` 中订阅 `world.afterEvents.itemUse`。
+- [ ] 命中目标物品时调用 `openAgentUi(event.source)`。
+- [ ] 如有必要，补充简单节流，避免长按或连点导致重复打开。
 - [ ] 执行 `cd MCBE-AI-Agent-addon && pnpm build`。
-- [ ] 进入游戏输入 `AGENT UI`，确认能打开当前面板。
+- [ ] 进入游戏后手持原版命令方块并使用，确认能打开当前面板。
 
 ### 任务 2：扩展 UI 状态和持久化
 
@@ -630,7 +637,7 @@ export type PersistedAgentUiData = {
 
 步骤：
 
-- [ ] 补充 UI 入口命令。
+- [ ] 补充 UI 入口物品说明。
 - [ ] 补充第一阶段能力边界。
 - [ ] 补充游戏内验证步骤。
 - [ ] 补充 DDUI API 当前不可直接使用的说明。
@@ -684,7 +691,7 @@ pytest tests/test_addon_bridge_protocol.py tests/test_addon_bridge_service.py -v
 
 - [ ] 启动 Python 服务。
 - [ ] 进入 Minecraft 世界并连接 WebSocket。
-- [ ] 输入 `AGENT UI`，确认主面板打开。
+- [ ] 手持原版命令方块并使用，确认主面板打开。
 - [ ] 点击「发送消息」，输入「你好」。
 - [ ] 确认聊天命令链路或降级提示可见。
 - [ ] 打开「聊天记录」，确认消息已记录。
@@ -702,11 +709,11 @@ pytest tests/test_addon_bridge_protocol.py tests/test_addon_bridge_service.py -v
 
 处理：第一阶段只用 `ActionFormData` / `ModalFormData`。所有业务面板通过 `formAdapter.ts` 使用表单能力，等待官方类型可用后再替换适配层。
 
-### 12.2 表单在 read-only mode 打开失败
+### 12.2 入口事件选择不当导致 UI 或聊天链路异常
 
-风险：在 `beforeEvents.chatSend` 中直接调用 `form.show(player)` 会抛错。
+风险：如果继续使用 `chatSend` 作为入口，会引入测试版接口依赖，并破坏现有聊天链路；如果在 read-only 上下文直接打开表单，也可能报错。
 
-处理：聊天事件中只取消事件和延迟调度，实际打开 UI 放进 `system.run()`。
+处理：第一阶段只使用 `world.afterEvents.itemUse` 监听原版命令方块物品，不再把 UI 打开逻辑绑定到聊天事件。
 
 ### 12.3 UI 发送消息无法模拟真实聊天
 
@@ -784,7 +791,7 @@ git commit -m "docs(addon-ui): 补充 DDUI 面板联调说明"
 
 第一检查点：入口可打开。
 
-- `AGENT UI` 能打开主面板。
+- 手持原版命令方块并使用，能打开主面板。
 - 旧聊天命令不受影响。
 
 第二检查点：本地状态可用。
@@ -800,6 +807,5 @@ git commit -m "docs(addon-ui): 补充 DDUI 面板联调说明"
 
 第四检查点：文档完成。
 
-- README 有入口命令和限制说明。
+- README 有入口物品和限制说明。
 - 本文档风险项与实际实现一致。
-
