@@ -255,6 +255,8 @@ npm run local-deploy
 4. 在游戏内确认模拟玩家 `MCBEAI_TOOL` 已生成。
 5. 使用 `/wsserver <服务器IP>:8080` 连接 Python 服务；开发模式下会自动跳过 `#登录`。
 6. 执行一次正常聊天命令，例如 `AGENT 聊天 读取一下我当前附近的实体`，观察 Python 日志与游戏内行为。
+7. 手持原版命令方块 `minecraft:command_block` 并使用，确认游戏内聊天面板可以打开。
+8. 在面板中发送一条消息，确认本地历史、统计信息和设置保存行为正常；如果 Python 未收到 UI 消息，请按面板提示在聊天框手动发送等价的 `AGENT 聊天 <消息>`。
 
 ### 如何验证桥接链路
 
@@ -285,17 +287,20 @@ AGENT 聊天 请读取我的玩家状态并告诉我当前位置
 
 ### 聊天命令与 UI 共存说明
 
-当前 UI 实现仅为最小预留层，不替代现有聊天命令入口。也就是说：
+当前 UI 实现为第一阶段游戏内聊天面板，不替代现有聊天命令入口。也就是说：
 - 现有 `AGENT 聊天`、`AGENT 上下文`、`切换模型`、`运行命令` 等聊天命令仍然是主入口。
-- Addon 中仅补了状态容器与 `ActionFormData` / `ModalFormData` 的最小骨架，便于后续扩展交互面板。
-- 由于当前本地 `@minecraft/server-ui` 类型能力限制，未落地完整 DDUI 响应式方案，文档和代码都不应视其为已完成特性。
+- 面板入口绑定为使用原版命令方块物品 `minecraft:command_block`，避免抢占聊天监听。
+- 面板支持发送消息、本地聊天记录、设置保存和统计信息；发送消息会记录本地历史，并提示等价的 `AGENT 聊天 <消息>`。
+- 当前本地 `@minecraft/server-ui` 类型只暴露 `ActionFormData` / `ModalFormData`，暂不能直接使用官方 DDUI `CustomForm` / `Observable`。
+- 后续如果类型和运行时支持真正 DDUI，可在 Addon 的表单适配层中替换实现，而不重写业务状态。
 
 ### 当前限制
 
 - Addon -> Python 的响应回传依赖模拟玩家 `MCBEAI_TOOL` 发送聊天分片，不是独立的回传通道。
 - Python 侧通过 WebSocket `PlayerMessage` 事件流拦截桥接分片，因此桥接能力依赖聊天事件正常上送。
 - `run_world_command` 在当前本地依赖版本下基于同步 `runCommand` 实现，不是异步命令管线。
-- UI 目前仅为后续扩展预留，不代表完整 DDUI 已完成。
+- 第一阶段 UI 不新增 Addon -> Python 专用上行协议，也不伪造真实玩家聊天事件；如果 UI 消息没有进入 Python，请按面板提示手动发送等价聊天命令。
+- 响应同步尚未启用，统计中的响应片段数会保持为 0；后续可通过 `scriptevent mcbeai:ui_event <json>` 接入 Python -> Addon UI 同步。
 
 ## Termux 部署指南
 
