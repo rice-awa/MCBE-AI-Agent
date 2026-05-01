@@ -1,7 +1,6 @@
 """Addon 桥接协议编解码函数。"""
 
 import json
-import re
 from json import JSONDecodeError
 
 from models.addon_bridge import AddonBridgeChunk, AddonBridgeResponse, UiChatChunk, UiChatMessage
@@ -96,87 +95,18 @@ def encode_ai_response_chunks(
 ) -> list[str]:
     """将 AI 响应编码为 scriptevent 分片命令列表。
 
-    优先按句子分割（句号、问号、感叹号、换行），再按 max_chunk_length 截断。
+    委托给 FlowControlMiddleware 统一处理，保持向后兼容。
     每个分片格式: scriptevent mcbeai:ai_resp {JSON}
     JSON 载荷: {"id":"...","i":1,"n":3,"p":"Steve","r":"assistant","c":"..."}
     """
-    import uuid
-
-    msg_id = f"resp-{uuid.uuid4().hex[:8]}"
+    from services.websocket.flow_control import FlowControlMiddleware
 
     if max_chunk_length <= 0:
         max_chunk_length = AI_RESP_MAX_CHUNK_LENGTH
 
-    text_parts = _split_by_sentences(text, max_chunk_length)
-
-    total = len(text_parts) if text_parts else 1
-    safe_parts = text_parts if text_parts else [""]
-
-    chunks: list[str] = []
-    for idx, content in enumerate(safe_parts, start=1):
-        payload = {
-            "id": msg_id,
-            "i": idx,
-            "n": total,
-            "p": player_name,
-            "r": role,
-            "c": content,
-        }
-        command = f"scriptevent {AI_RESP_MESSAGE_ID} {json.dumps(payload, ensure_ascii=False)}"
-        chunks.append(command)
-
-    return chunks
-
-
-# 句子分隔符：中英文句号、问号、感叹号、换行
-_SENTENCE_DELIMITER_RE = re.compile(r"([。！？.!?\n])")
-
-
-def _split_by_sentences(text: str, max_chunk_length: int) -> list[str]:
-    """按句子分割文本，保留分隔符。短句合并，超长句截断。"""
-    if not text:
-        return [""]
-
-    # 按分隔符拆分，保留分隔符
-    parts = _SENTENCE_DELIMITER_RE.split(text)
-
-    # 将文本段与后续分隔符重新组合
-    sentences: list[str] = []
-    i = 0
-    while i < len(parts):
-        segment = parts[i]
-        delimiter = (
-            parts[i + 1]
-            if i + 1 < len(parts) and _SENTENCE_DELIMITER_RE.match(parts[i + 1])
-            else ""
-        )
-        combined = segment + delimiter if delimiter else segment
-        i += 2 if delimiter else 1
-        if combined:
-            sentences.append(combined)
-
-    if not sentences:
-        return [""]
-
-    # 合并短句（不超过 max_chunk_length），超长句截断
-    merged: list[str] = []
-    buffer = ""
-    for sentence in sentences:
-        if len(buffer) + len(sentence) <= max_chunk_length:
-            buffer += sentence
-        else:
-            if buffer:
-                merged.append(buffer)
-            if len(sentence) > max_chunk_length:
-                for j in range(0, len(sentence), max_chunk_length):
-                    merged.append(sentence[j : j + max_chunk_length])
-                buffer = ""
-            else:
-                buffer = sentence
-    if buffer:
-        merged.append(buffer)
-
-    return merged if merged else [""]
+    return FlowControlMiddleware.chunk_ai_response(
+        player_name, role, text, max_length=max_chunk_length
+    )
 
 
 def decode_ui_chat_chunk(chunk: str) -> UiChatChunk:
