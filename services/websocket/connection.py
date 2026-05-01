@@ -11,7 +11,7 @@ from core.queue import MessageBroker
 from models.messages import StreamChunk
 from models.minecraft import MinecraftCommand
 from models.agent import MCColor, MCPrefix
-from services.addon.protocol import encode_ai_response_chunks
+from services.websocket.flow_control import FlowControlMiddleware
 from config.logging import get_logger
 
 logger = get_logger(__name__)
@@ -341,21 +341,25 @@ class ConnectionManager:
             return
 
         try:
-            command = MinecraftCommand.create_tellraw(message, color=color)
-            payload = command.model_dump_json(exclude_none=True)
-            await state.websocket.send(payload)
-            ws_raw_logger.info(
-                "websocket_response_sent",
-                connection_id=str(state.id),
-                source="stream_tellraw",
-                payload=payload,
-            )
+            payloads = FlowControlMiddleware.chunk_tellraw(message, color=color)
+            for payload in payloads:
+                await state.websocket.send(payload)
+                ws_raw_logger.info(
+                    "websocket_response_sent",
+                    connection_id=str(state.id),
+                    source="stream_tellraw",
+                    payload=payload,
+                )
+                # 分片间插入微小延迟，避免命令洪泛触发看门狗
+                if len(payloads) > 1:
+                    await asyncio.sleep(0.05)
 
             logger.debug(
                 "game_message_sent",
                 connection_id=str(state.id),
                 message_length=len(message),
                 color=color,
+                chunk_count=len(payloads),
             )
         except Exception as e:
             logger.error(
@@ -445,11 +449,19 @@ class ConnectionManager:
             if role == "assistant":
                 await asyncio.sleep(0.5)
 
-            commands = encode_ai_response_chunks(player_name, role, text)
-            for command in commands:
-                await self._run_command(state, command)
+            payloads = FlowControlMiddleware.chunk_ai_response(
+                player_name, role, text
+            )
+            for payload in payloads:
+                await state.websocket.send(payload)
+                ws_raw_logger.info(
+                    "websocket_response_sent",
+                    connection_id=str(state.id),
+                    source="ai_response_sync",
+                    payload=payload,
+                )
                 # 分片间延迟，避免看门狗超时
-                if len(commands) > 1:
+                if len(payloads) > 1:
                     await asyncio.sleep(0.15)
 
             logger.debug(
@@ -457,7 +469,7 @@ class ConnectionManager:
                 connection_id=str(state.id),
                 player_name=player_name,
                 role=role,
-                chunk_count=len(commands),
+                chunk_count=len(payloads),
             )
         except Exception as e:
             logger.error(
@@ -477,20 +489,26 @@ class ConnectionManager:
             return
 
         try:
-            command = MinecraftCommand.create_scriptevent(message, message_id)
-            payload = command.model_dump_json(exclude_none=True)
-            await state.websocket.send(payload)
-            ws_raw_logger.info(
-                "websocket_response_sent",
-                connection_id=str(state.id),
-                source="stream_scriptevent",
-                payload=payload,
+            payloads = FlowControlMiddleware.chunk_scriptevent(
+                message, message_id
             )
+            for payload in payloads:
+                await state.websocket.send(payload)
+                ws_raw_logger.info(
+                    "websocket_response_sent",
+                    connection_id=str(state.id),
+                    source="stream_scriptevent",
+                    payload=payload,
+                )
+                # 分片间插入微小延迟，避免命令洪泛触发看门狗
+                if len(payloads) > 1:
+                    await asyncio.sleep(0.05)
 
             logger.debug(
                 "script_event_sent",
                 connection_id=str(state.id),
                 message_length=len(message),
+                chunk_count=len(payloads),
             )
         except Exception as e:
             logger.error(
