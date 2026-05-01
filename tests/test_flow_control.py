@@ -193,12 +193,16 @@ class TestChunkAiResponse:
         assert inner["n"] == 1
 
     def test_long_ai_response_chunks(self):
-        """长文本生成多条 payload。"""
+        """长文本生成多条 payload。
+
+        ai_response 包装开销较大（~130 B），文本预算 ≈ 331 B，
+        因此 1000 字符 ASCII 会被切成 4 片而不是字符级的 3 片。
+        """
         text = "X" * 1000
         payloads = FlowControlMiddleware.chunk_ai_response(
             "Steve", "assistant", text
         )
-        assert len(payloads) == 3
+        assert len(payloads) == 4
         for idx, payload in enumerate(payloads, start=1):
             data = json.loads(payload)
             cmd_line = data["body"]["commandLine"]
@@ -207,7 +211,7 @@ class TestChunkAiResponse:
             assert inner["p"] == "Steve"
             assert inner["r"] == "assistant"
             assert inner["i"] == idx
-            assert inner["n"] == 3
+            assert inner["n"] == 4
 
     def test_ai_response_same_message_id(self):
         """同一批分片应共享相同的 message id。"""

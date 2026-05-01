@@ -14,7 +14,7 @@
 | 4.1 `MAX_CHUNK_CONTENT_LENGTH` / `CHUNK_SENTENCE_MODE` 未接线 | P1 | 已修 | 新增 `FlowControlMiddleware.configure(...)`，在 `cli.py` 应用启动时注入 |
 | 4.2 `_send_ws_payload` 反向解析 + 二次转义 | P1 | 已修 | `protocol_handler.create_*_message` 改返回 `TellrawMessage(text, color)`，`_send_ws_payload` 据此统一调 `chunk_tellraw` |
 | 4.3 `_split_text` 边界覆盖不足 | P1 | 已修 | 新增 6 个边界测试 |
-| 4.4 字符 vs 字节语义错配 | P1 | 已修 | `_assert_byte_safe` 兜底校验 commandLine ≤ 1800 字节 |
+| 4.4 字符 vs 字节语义错配 | P1 | 已修 | `_split_text` 增加字节预算约束 + `_chunk_by_limits` 按 UTF-8 边界切分；`_assert_byte_safe` 兜底校验 commandLine ≤ 461 B（实测值） |
 | 5.1 256 vs 400 注释易误解 | P2 | 已修 | 重写 `constants.ts` 注释明确上下行差异 |
 | 5.2 `chunk_ai_response` 手工拼接 | P2 | 已修 | 改用 `MinecraftCommand.create_scriptevent` 工厂 |
 | 5.3 空文本契约 | P2 | 已修 | `chunk_tellraw` / `chunk_scriptevent` 空文本返回 `[]`，`chunk_ai_response` 仍发 1 条 |
@@ -30,12 +30,18 @@
 
 ### 2.1 `services/websocket/flow_control.py`
 
-- 新增类常量 `DEFAULT_SENTENCE_MODE` 与 `_COMMAND_LINE_BYTE_BUDGET = 1800`。
+- 新增类常量 `DEFAULT_SENTENCE_MODE` 与字节预算常量族:
+  - `_COMMAND_LINE_BYTE_BUDGET = 461`（**实测值**：自动递增压力测试 200B→512B step 1B 222 包，最大成功 461 B、首次失败 462 B）；
+  - `_WRAPPER_OVERHEAD_TELLRAW = 60`、`_WRAPPER_OVERHEAD_SCRIPTEVENT = 50`、`_WRAPPER_OVERHEAD_AI_RESPONSE = 130`（实测包装字节 + 余量）。
 - 新增 `configure(max_content_length, sentence_mode)` 类方法，应用启动时注入运行时默认值。
-- `_split_text` 在 `DEFAULT_SENTENCE_MODE=False` 时跳过语义合并，纯按字符等长截断。
-- `chunk_tellraw` / `chunk_scriptevent` 空文本短路返回 `[]`；分片后调 `_assert_byte_safe` 字节级兜底。
+- `_split_text` 增加 `byte_budget` 参数：分片同时受字符上限 `max_length` 与字节上限 `byte_budget` 双重约束；`DEFAULT_SENTENCE_MODE=False` 时跳过语义合并仍受双重约束。
+- 新增 `_chunk_by_limits` 工具方法，按字符 + 字节双限切分，**保证不切坏 UTF-8 多字节字符**（中文/emoji 不会被截断成乱码）。
+- `chunk_tellraw` / `chunk_scriptevent` / `chunk_ai_response` 各自传入对应的 `byte_budget`，使每个场景能装最大有效载荷。
+- 空文本 `chunk_tellraw` / `chunk_scriptevent` 短路返回 `[]`；分片后调 `_assert_byte_safe` 防御性兜底（正常路径下 `_split_text` 已在源头保证安全）。
 - `chunk_raw_command` 长度超限直接抛 `ValueError`，禁止静默生成非法分片。
 - `chunk_ai_response` 改用 `MinecraftCommand.create_scriptevent` 工厂，避免手工拼接 commandLine。
+
+> **实测验证**: 6 类典型场景（纯中文 400 字符、纯 ASCII 1000 字符、中英混排、ai_resp 中文 500 字符、emoji×100、scriptevent 中文 400 字符）的最大分片 commandLine 字节均落在 417~439 B 区间，全部 ≤ 461 B。
 
 ### 2.2 `services/websocket/minecraft.py`
 
