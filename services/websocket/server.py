@@ -829,6 +829,12 @@ class WebSocketServer:
             content_length=len(message),
         )
 
+        # 与普通聊天命令保持一致：非开发模式必须先通过登录认证
+        if not self.dev_mode and not await self.check_auth(state):
+            error_msg = self.protocol_handler.create_error_message("请先登录")
+            await self._send_ws_payload(state, error_msg, source="auth")
+            return
+
         await self.handle_chat(state, message, delivery="tellraw")
 
     async def _send_ws_payload(
