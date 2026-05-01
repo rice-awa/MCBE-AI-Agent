@@ -847,13 +847,16 @@ class WebSocketServer:
             payloads = FlowControlMiddleware.chunk_tellraw(
                 payload.text, color=payload.color
             )
-            for p in payloads:
+            chunk_delay = FlowControlMiddleware.chunk_delay_for("tellraw")
+            for idx, p in enumerate(payloads):
                 await state.websocket.send(p)
                 self._log_ws_send(
                     state,
                     p,
                     source=f"{source}_chunked" if len(payloads) > 1 else source,
                 )
+                if len(payloads) > 1 and idx < len(payloads) - 1:
+                    await asyncio.sleep(chunk_delay)
             return
 
         await state.websocket.send(payload)

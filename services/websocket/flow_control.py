@@ -33,6 +33,25 @@ class FlowControlMiddleware:
     DEFAULT_MAX_CONTENT_LENGTH = 400
     DEFAULT_SENTENCE_MODE = True
 
+    # 分片间延迟策略：避免命令洪泛触发 MCBE 看门狗。
+    # 数值与历史 connection.py 的硬编码保持一致，集中在此便于统一调优。
+    _CHUNK_DELAYS: dict[str, float] = {
+        "tellraw": 0.05,
+        "scriptevent": 0.05,
+        "ai_resp": 0.15,
+        # AI 响应同步前置等待：tellraw 流式发送完毕再发 scriptevent
+        "ai_resp_prelude": 0.5,
+    }
+
+    @classmethod
+    def chunk_delay_for(cls, kind: str) -> float:
+        """返回指定分片场景的分片间延迟（秒）。
+
+        kind: "tellraw" | "scriptevent" | "ai_resp" | "ai_resp_prelude"
+        未知 kind 返回 0.0（不延迟），调用方自行决定是否报错。
+        """
+        return cls._CHUNK_DELAYS.get(kind, 0.0)
+
     @classmethod
     def configure(
         cls,

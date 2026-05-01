@@ -1,6 +1,7 @@
 """WebSocket 连接管理"""
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -327,6 +328,27 @@ class ConnectionManager:
         else:
             await self._send_game_message_with_color(state, message, color)
 
+    def _log_ws_send(
+        self, state: ConnectionState, payload: str, source: str
+    ) -> None:
+        """记录 ws 发送，附带 commandLine 字节长度便于观察分片命中率。"""
+        command_line_bytes = 0
+        try:
+            data = json.loads(payload)
+            command_line_bytes = len(
+                data.get("body", {}).get("commandLine", "").encode("utf-8")
+            )
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
+        ws_raw_logger.info(
+            "websocket_response_sent",
+            connection_id=str(state.id),
+            source=source,
+            payload=payload,
+            command_line_bytes=command_line_bytes,
+        )
+
     async def _send_game_message(
         self, state: ConnectionState, message: str
     ) -> None:
@@ -342,17 +364,13 @@ class ConnectionManager:
 
         try:
             payloads = FlowControlMiddleware.chunk_tellraw(message, color=color)
+            chunk_delay = FlowControlMiddleware.chunk_delay_for("tellraw")
             for payload in payloads:
                 await state.websocket.send(payload)
-                ws_raw_logger.info(
-                    "websocket_response_sent",
-                    connection_id=str(state.id),
-                    source="stream_tellraw",
-                    payload=payload,
-                )
+                self._log_ws_send(state, payload, source="stream_tellraw")
                 # 分片间插入微小延迟，避免命令洪泛触发看门狗
                 if len(payloads) > 1:
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(chunk_delay)
 
             logger.debug(
                 "game_message_sent",
@@ -396,12 +414,7 @@ class ConnectionManager:
                 result_future.add_done_callback(_cleanup_cancelled_future)
 
             await state.websocket.send(payload)
-            ws_raw_logger.info(
-                "websocket_response_sent",
-                connection_id=str(state.id),
-                source="stream_run_command",
-                payload=payload,
-            )
+            self._log_ws_send(state, payload, source="stream_run_command")
 
             logger.debug(
                 "command_executed",
@@ -447,22 +460,20 @@ class ConnectionManager:
         try:
             # assistant 响应：等 tellraw 流式发送完毕后再发 scriptevent
             if role == "assistant":
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(
+                    FlowControlMiddleware.chunk_delay_for("ai_resp_prelude")
+                )
 
             payloads = FlowControlMiddleware.chunk_ai_response(
                 player_name, role, text
             )
+            chunk_delay = FlowControlMiddleware.chunk_delay_for("ai_resp")
             for payload in payloads:
                 await state.websocket.send(payload)
-                ws_raw_logger.info(
-                    "websocket_response_sent",
-                    connection_id=str(state.id),
-                    source="ai_response_sync",
-                    payload=payload,
-                )
+                self._log_ws_send(state, payload, source="ai_response_sync")
                 # 分片间延迟，避免看门狗超时
                 if len(payloads) > 1:
-                    await asyncio.sleep(0.15)
+                    await asyncio.sleep(chunk_delay)
 
             logger.debug(
                 "ai_response_sync_sent",
@@ -492,17 +503,13 @@ class ConnectionManager:
             payloads = FlowControlMiddleware.chunk_scriptevent(
                 message, message_id
             )
+            chunk_delay = FlowControlMiddleware.chunk_delay_for("scriptevent")
             for payload in payloads:
                 await state.websocket.send(payload)
-                ws_raw_logger.info(
-                    "websocket_response_sent",
-                    connection_id=str(state.id),
-                    source="stream_scriptevent",
-                    payload=payload,
-                )
+                self._log_ws_send(state, payload, source="stream_scriptevent")
                 # 分片间插入微小延迟，避免命令洪泛触发看门狗
                 if len(payloads) > 1:
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(chunk_delay)
 
             logger.debug(
                 "script_event_sent",

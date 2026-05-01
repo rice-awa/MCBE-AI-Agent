@@ -11,7 +11,21 @@ UI_CHAT_PREFIX = "MCBEAI|UI_CHAT"
 BRIDGE_TOOL_PLAYER_NAME = "MCBEAI_TOOL"
 
 AI_RESP_MESSAGE_ID = "mcbeai:ai_resp"
-AI_RESP_MAX_CHUNK_LENGTH = 400  # 按句子分割后的单分片字符上限
+
+
+def _default_ai_resp_chunk_length() -> int:
+    """单分片字符上限默认值，按需读取 FlowControlMiddleware 的运行时配置。
+
+    使用函数而非模块常量，避免在 import 期固化值，让 .env 注入的
+    MAX_CHUNK_CONTENT_LENGTH 在 configure() 之后真正生效。
+    """
+    from services.websocket.flow_control import FlowControlMiddleware
+
+    return FlowControlMiddleware.DEFAULT_MAX_CONTENT_LENGTH
+
+
+# 向后兼容：保留旧名，但仅作为 import 期快照，避免新代码引用此常量
+AI_RESP_MAX_CHUNK_LENGTH = 400
 
 
 def encode_bridge_request(request_id: str, capability: str, payload: dict) -> str:
@@ -91,18 +105,17 @@ def encode_ai_response_chunks(
     player_name: str,
     role: str,
     text: str,
-    max_chunk_length: int = AI_RESP_MAX_CHUNK_LENGTH,
+    max_chunk_length: int | None = None,
 ) -> list[str]:
     """将 AI 响应编码为 scriptevent 分片命令列表。
 
     委托给 FlowControlMiddleware 统一处理，保持向后兼容。
     每个分片格式: scriptevent mcbeai:ai_resp {JSON}
     JSON 载荷: {"id":"...","i":1,"n":3,"p":"Steve","r":"assistant","c":"..."}
+
+    max_chunk_length 为 None 或 ≤ 0 时使用 FlowControlMiddleware 的运行时默认。
     """
     from services.websocket.flow_control import FlowControlMiddleware
-
-    if max_chunk_length <= 0:
-        max_chunk_length = AI_RESP_MAX_CHUNK_LENGTH
 
     return FlowControlMiddleware.chunk_ai_response(
         player_name, role, text, max_length=max_chunk_length

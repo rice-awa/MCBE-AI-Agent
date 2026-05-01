@@ -327,3 +327,96 @@ class TestConfigureRuntime:
         assert FlowControlMiddleware.DEFAULT_MAX_CONTENT_LENGTH == original
         FlowControlMiddleware.configure(max_content_length=-1)
         assert FlowControlMiddleware.DEFAULT_MAX_CONTENT_LENGTH == original
+
+
+class TestChunkDelayFor:
+    """chunk_delay_for: 分片间延迟策略集中化。"""
+
+    def test_known_kinds(self):
+        assert FlowControlMiddleware.chunk_delay_for("tellraw") == 0.05
+        assert FlowControlMiddleware.chunk_delay_for("scriptevent") == 0.05
+        assert FlowControlMiddleware.chunk_delay_for("ai_resp") == 0.15
+        assert FlowControlMiddleware.chunk_delay_for("ai_resp_prelude") == 0.5
+
+    def test_unknown_kind_returns_zero(self):
+        """未知 kind 返回 0.0，不抛异常，避免阻塞调用方。"""
+        assert FlowControlMiddleware.chunk_delay_for("unknown") == 0.0
+        assert FlowControlMiddleware.chunk_delay_for("") == 0.0
+
+
+class TestByteSafetyAssertion:
+    """字节兜底校验：分片后 commandLine 字节数必须 ≤ 461 B。"""
+
+    def test_pure_chinese_no_overflow(self):
+        """纯中文文本（每字符 3 字节）应被字节预算约束，不会超出 461 B。"""
+        text = "中" * 1000
+        payloads = FlowControlMiddleware.chunk_tellraw(text)
+        for payload in payloads:
+            data = json.loads(payload)
+            byte_len = len(data["body"]["commandLine"].encode("utf-8"))
+            assert byte_len <= 461, f"commandLine {byte_len} B exceeds budget"
+
+    def test_mixed_emoji_no_overflow(self):
+        """含 emoji（4 字节代理对）的文本仍应受字节预算约束。"""
+        text = "你好🌍" * 200
+        payloads = FlowControlMiddleware.chunk_scriptevent(text, "mcbeai:test")
+        for payload in payloads:
+            data = json.loads(payload)
+            byte_len = len(data["body"]["commandLine"].encode("utf-8"))
+            assert byte_len <= 461
+
+    def test_ai_response_byte_budget(self):
+        """ai_response 包装开销最大，更需要字节预算保护。"""
+        text = "中" * 500
+        payloads = FlowControlMiddleware.chunk_ai_response(
+            "Steve", "assistant", text
+        )
+        for payload in payloads:
+            data = json.loads(payload)
+            byte_len = len(data["body"]["commandLine"].encode("utf-8"))
+            assert byte_len <= 461
+
+
+class TestEndToEndConnectionFlow:
+    """e2e 风格：通过 ConnectionManager 走 mock websocket 验证分片实际落地。"""
+
+    @pytest.mark.asyncio
+    async def test_send_game_message_chunks_long_chinese(self):
+        """长中文文本通过 connection 出口应被分片，每片均合法 JSON。"""
+        from unittest.mock import AsyncMock, MagicMock
+        from services.websocket.connection import ConnectionManager, ConnectionState
+
+        broker = MagicMock()
+        manager = ConnectionManager(broker=broker, dev_mode=True)
+
+        ws = AsyncMock()
+        state = ConnectionState(websocket=ws)
+
+        await manager._send_game_message_with_color(state, "中" * 500, "§a")
+
+        assert ws.send.await_count >= 2
+        for call in ws.send.await_args_list:
+            payload = call.args[0]
+            data = json.loads(payload)
+            cmd_line = data["body"]["commandLine"]
+            assert "tellraw" in cmd_line
+            assert len(cmd_line.encode("utf-8")) <= 461
+
+    @pytest.mark.asyncio
+    async def test_run_command_does_not_chunk(self):
+        """原始命令不应被分片：只发送 1 条 commandRequest。"""
+        from unittest.mock import AsyncMock, MagicMock
+        from services.websocket.connection import ConnectionManager, ConnectionState
+
+        broker = MagicMock()
+        manager = ConnectionManager(broker=broker, dev_mode=True)
+
+        ws = AsyncMock()
+        state = ConnectionState(websocket=ws)
+
+        await manager._run_command(state, "say hi", result_future=None)
+
+        assert ws.send.await_count == 1
+        payload = ws.send.await_args.args[0]
+        data = json.loads(payload)
+        assert data["body"]["commandLine"] == "say hi"
