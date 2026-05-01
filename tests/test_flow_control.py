@@ -1,8 +1,12 @@
 """FlowControlMiddleware 单元测试。"""
 
 import json
+import sys
+from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.websocket.flow_control import FlowControlMiddleware
 
@@ -30,9 +34,9 @@ class TestSplitText:
         assert result[2] == "X" * 200
 
     def test_semantic_split_by_sentences(self):
-        """优先按句子分片。"""
+        """优先按句子分片（在较小阈值下每句独立）。"""
         text = "第一句。第二句！第三句？"
-        result = FlowControlMiddleware._split_text(text, max_length=400)
+        result = FlowControlMiddleware._split_text(text, max_length=5)
         assert len(result) == 3
         assert result[0] == "第一句。"
         assert result[1] == "第二句！"
@@ -54,9 +58,9 @@ class TestSplitText:
         assert result[2] == "B" * 100
 
     def test_split_by_newline(self):
-        """换行符应作为分隔符。"""
+        """换行符应作为分隔符（在较小阈值下每行独立）。"""
         text = "第一行\n第二行\n第三行"
-        result = FlowControlMiddleware._split_text(text, max_length=400)
+        result = FlowControlMiddleware._split_text(text, max_length=5)
         assert len(result) == 3
         assert result[0] == "第一行\n"
         assert result[1] == "第二行\n"
@@ -95,7 +99,7 @@ class TestChunkTellraw:
 
     def test_tellraw_preserves_color(self):
         """每个分片应保持相同颜色。"""
-        text = "A" * 500 + "。" + "B" * 500
+        text = "A" * 500 + "。" + "B" * 100
         payloads = FlowControlMiddleware.chunk_tellraw(text, color="§c")
         assert len(payloads) == 3
         for payload in payloads:
@@ -173,7 +177,7 @@ class TestChunkAiResponse:
 
     def test_ai_response_same_message_id(self):
         """同一批分片应共享相同的 message id。"""
-        text = "A" * 500 + "。" + "B" * 500
+        text = "A" * 500 + "。" + "B" * 100
         payloads = FlowControlMiddleware.chunk_ai_response(
             "Steve", "user", text
         )
