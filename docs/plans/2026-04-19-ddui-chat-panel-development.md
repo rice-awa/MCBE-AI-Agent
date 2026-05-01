@@ -504,6 +504,14 @@ export type PersistedAgentUiData = {
 
 ## 10. 开发任务拆分
 
+当前追踪状态（2026-04-19）：
+
+- 代码实现：已完成。
+- Addon 构建：已通过 `cd MCBE-AI-Agent-addon && npm exec -- pnpm -- build`。
+- Addon 测试：已通过 `cd MCBE-AI-Agent-addon && npm exec -- pnpm -- test`，共 22 个用例。
+- 规格审查：已通过子代理静态规格审查。
+- 游戏内手测：尚未执行，所有实机验证项保持未勾选。
+
 ### 任务 1：注册 UI 入口物品
 
 文件：
@@ -513,13 +521,13 @@ export type PersistedAgentUiData = {
 
 步骤：
 
-- [ ] 增加 `isUiTriggerItem(itemTypeId: string): boolean`。
-- [ ] 第一阶段只匹配原版命令方块 `minecraft:command_block`。
-- [ ] 在 `registerUiEntry()` 中订阅 `world.afterEvents.itemUse`。
-- [ ] 命中目标物品时调用 `openAgentUi(event.source)`。
-- [ ] 如有必要，补充简单节流，避免长按或连点导致重复打开。
-- [ ] 执行 `cd MCBE-AI-Agent-addon && pnpm build`。
-- [ ] 进入游戏后手持原版命令方块并使用，确认能打开当前面板。
+- [x] 增加 `isUiTriggerItem(itemTypeId: string): boolean`。
+- [x] 第一阶段只匹配原版命令方块 `minecraft:command_block`。
+- [x] 在 `registerUiEntry()` 中订阅 `world.afterEvents.itemUse`。
+- [x] 命中目标物品时调用 `openAgentUi(event.source)`。
+- [x] 补充 per-player 冷却和 in-flight 锁，避免长按或连点导致重复打开。
+- [x] 执行 `cd MCBE-AI-Agent-addon && npm exec -- pnpm -- build`。
+- [ ] 进入游戏后手持原版命令方块并使用，确认能打开当前面板。（待游戏内手测）
 
 ### 任务 2：扩展 UI 状态和持久化
 
@@ -532,15 +540,15 @@ export type PersistedAgentUiData = {
 
 步骤：
 
-- [ ] 定义 `ChatHistoryItem`、`AgentUiSettings`、`AgentUiStats`。
-- [ ] 实现默认设置和默认统计。
-- [ ] 实现历史追加、截断、分页、清空。
-- [ ] 实现 dynamic property JSON 读取。
-- [ ] 实现 dynamic property JSON 写入。
-- [ ] 在 `openAgentUi(player)` 前加载玩家持久化状态。
-- [ ] 面板关闭或设置保存时写入玩家状态。
-- [ ] 执行 `cd MCBE-AI-Agent-addon && pnpm build`。
-- [ ] 游戏内打开面板两次，确认打开次数递增。
+- [x] 定义 `ChatHistoryItem`、`AgentUiSettings`、`AgentUiStats`。
+- [x] 实现默认设置和默认统计。
+- [x] 实现历史追加、截断、分页、清空。
+- [x] 实现 dynamic property JSON 读取。
+- [x] 实现 dynamic property JSON 写入。
+- [x] 在 `openAgentUi(player)` 前加载玩家持久化状态。
+- [x] 面板关闭或设置保存时写入玩家状态。
+- [x] 执行 `cd MCBE-AI-Agent-addon && npm exec -- pnpm -- build`。
+- [ ] 游戏内打开面板两次，确认打开次数递增。（待游戏内手测）
 
 ### 任务 3：改造主面板
 
@@ -551,12 +559,12 @@ export type PersistedAgentUiData = {
 
 步骤：
 
-- [ ] 将当前主面板改造成「状态摘要 + 功能入口」。
-- [ ] 增加按钮：发送消息、聊天记录、设置、统计信息、刷新、关闭。
-- [ ] 根据 `response.selection` 路由到不同子面板。
-- [ ] 所有子面板返回时重新打开主面板。
-- [ ] 执行 `cd MCBE-AI-Agent-addon && pnpm build`。
-- [ ] 游戏内点击每个按钮，确认不会报错或卡死。
+- [x] 将当前主面板改造成「状态摘要 + 功能入口」。
+- [x] 增加按钮：发送消息、聊天记录、设置、统计信息、刷新、关闭。
+- [x] 根据 `response.selection` 路由到不同子面板。
+- [x] 所有子面板返回时重新打开主面板。
+- [x] 执行 `cd MCBE-AI-Agent-addon && npm exec -- pnpm -- build`。
+- [ ] 游戏内点击每个按钮，确认不会报错或卡死。（待游戏内手测）
 
 ### 任务 4：实现发送消息面板
 
@@ -567,14 +575,14 @@ export type PersistedAgentUiData = {
 
 步骤：
 
-- [ ] 使用 `ModalFormData` 创建消息输入表单。
-- [ ] 空消息时提示玩家并返回输入表单。
-- [ ] 非空消息写入本地历史，角色为 `user`。
-- [ ] 增加 `sentCount` 和 `lastSentAt`。
-- [ ] 设置 `lastPrompt`。
-- [ ] 触发现有聊天命令链路或给出降级提示。
-- [ ] 执行 `cd MCBE-AI-Agent-addon && pnpm build`。
-- [ ] 游戏内通过 UI 发送「你好」，确认 Python 或降级提示行为符合预期。
+- [x] 使用 `ModalFormData` 创建消息输入表单。
+- [x] 空消息时提示玩家并返回输入表单。
+- [x] 非空消息按 `autoSaveHistory` 设置写入本地历史，角色为 `user`。
+- [x] 增加 `sentCount` 和 `lastSentAt`。
+- [x] 设置 `lastPrompt`。
+- [x] 给出等价 `AGENT 聊天 <消息>` 的降级提示。
+- [x] 执行 `cd MCBE-AI-Agent-addon && npm exec -- pnpm -- build`。
+- [ ] 游戏内通过 UI 发送「你好」，确认 Python 或降级提示行为符合预期。（待游戏内手测）
 
 ### 任务 5：实现聊天记录面板
 
@@ -585,13 +593,13 @@ export type PersistedAgentUiData = {
 
 步骤：
 
-- [ ] 展示最近历史，最新消息靠前。
-- [ ] 每页展示 5 条。
-- [ ] 增加上一页和下一页。
-- [ ] 增加清空历史按钮。
-- [ ] 清空时写入 dynamic property。
-- [ ] 执行 `cd MCBE-AI-Agent-addon && pnpm build`。
-- [ ] 游戏内发送 6 条本地消息，确认分页可用。
+- [x] 展示最近历史，最新消息靠前。
+- [x] 每页展示 5 条。
+- [x] 增加上一页和下一页。
+- [x] 增加清空历史按钮。
+- [x] 清空时写入 dynamic property。
+- [x] 执行 `cd MCBE-AI-Agent-addon && npm exec -- pnpm -- build`。
+- [ ] 游戏内发送 6 条本地消息，确认分页可用。（待游戏内手测）
 
 ### 任务 6：实现设置面板
 
@@ -602,15 +610,15 @@ export type PersistedAgentUiData = {
 
 步骤：
 
-- [ ] 使用 `ModalFormData` 展示设置项。
-- [ ] 保存 `autoSaveHistory`。
-- [ ] 保存 `maxHistoryItems`。
-- [ ] 保存 `showToolEvents`。
-- [ ] 保存 `responsePreviewLength`。
-- [ ] 保存 `defaultDelivery`。
-- [ ] 保存后立即写入 dynamic property。
-- [ ] 执行 `cd MCBE-AI-Agent-addon && pnpm build`。
-- [ ] 游戏内修改设置后重新打开面板，确认配置被读取。
+- [x] 使用 `ModalFormData` 展示设置项。
+- [x] 保存 `autoSaveHistory`。
+- [x] 保存 `maxHistoryItems`。
+- [x] 保存 `showToolEvents`。
+- [x] 保存 `responsePreviewLength`。
+- [x] 保存 `defaultDelivery`。
+- [x] 保存后立即写入 dynamic property。
+- [x] 执行 `cd MCBE-AI-Agent-addon && npm exec -- pnpm -- build`。
+- [ ] 游戏内修改设置后重新打开面板，确认配置被读取。（待游戏内手测）
 
 ### 任务 7：实现统计面板
 
@@ -621,12 +629,12 @@ export type PersistedAgentUiData = {
 
 步骤：
 
-- [ ] 展示打开次数、发送次数、本地历史条数、响应片段数。
-- [ ] 展示最近打开和最近发送时间。
-- [ ] 标注第一阶段响应同步状态。
-- [ ] 增加重置统计按钮。
-- [ ] 执行 `cd MCBE-AI-Agent-addon && pnpm build`。
-- [ ] 游戏内打开统计页，确认数值随操作变化。
+- [x] 展示打开次数、发送次数、本地历史条数、响应片段数。
+- [x] 展示最近打开和最近发送时间。
+- [x] 标注第一阶段响应同步状态。
+- [x] 增加重置统计按钮。
+- [x] 执行 `cd MCBE-AI-Agent-addon && npm exec -- pnpm -- build`。
+- [ ] 游戏内打开统计页，确认数值随操作变化。（待游戏内手测）
 
 ### 任务 8：补充 README 与联调说明
 
@@ -637,11 +645,11 @@ export type PersistedAgentUiData = {
 
 步骤：
 
-- [ ] 补充 UI 入口物品说明。
-- [ ] 补充第一阶段能力边界。
-- [ ] 补充游戏内验证步骤。
-- [ ] 补充 DDUI API 当前不可直接使用的说明。
-- [ ] 执行 `git diff -- README.md docs/addon-bridge-protocol.md` 检查文档变更。
+- [x] 补充 UI 入口物品说明。
+- [x] 补充第一阶段能力边界。
+- [x] 补充游戏内验证步骤。
+- [x] 补充 DDUI API 当前不可直接使用的说明。
+- [x] 执行 `git diff -- README.md docs/addon-bridge-protocol.md` 检查文档变更。
 
 ---
 
@@ -791,21 +799,22 @@ git commit -m "docs(addon-ui): 补充 DDUI 面板联调说明"
 
 第一检查点：入口可打开。
 
-- 手持原版命令方块并使用，能打开主面板。
-- 旧聊天命令不受影响。
+- [ ] 手持原版命令方块并使用，能打开主面板。（待游戏内手测）
+- [x] 旧聊天命令不受影响：未新增聊天监听，未修改 Python 聊天命令解析。
 
 第二检查点：本地状态可用。
 
-- 设置可保存。
-- 历史可分页。
-- 统计会更新。
+- [x] 设置可保存：已写入玩家 dynamic property。
+- [x] 历史可分页：已实现每页 5 条、上一页、下一页和清空。
+- [x] 统计会更新：已实现打开次数、发送次数、历史条数、响应片段数和重置。
+- [ ] 游戏内确认设置、历史、统计在真实客户端可用。（待游戏内手测）
 
 第三检查点：发送链路可用。
 
-- UI 输入能进入 Python 聊天链路，或明确降级提示。
-- 游戏内没有脚本报错。
+- [x] UI 输入给出明确降级提示：提示玩家发送等价 `AGENT 聊天 <消息>`。
+- [ ] 游戏内没有脚本报错。（待游戏内手测）
 
 第四检查点：文档完成。
 
-- README 有入口物品和限制说明。
-- 本文档风险项与实际实现一致。
+- [x] README 有入口物品和限制说明。
+- [x] 本文档风险项与实际实现一致。

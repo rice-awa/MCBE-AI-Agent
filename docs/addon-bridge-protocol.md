@@ -2,7 +2,7 @@
 
 ## 目标
 
-在 Python 服务与 Minecraft Addon 之间建立稳定的桥接协议，使用 `/scriptevent` 发起请求，并通过聊天分片返回响应。
+在 Python 服务与 Minecraft Addon 之间建立稳定的桥接协议，使用 `/scriptevent` 发起请求，并通过聊天分片返回响应。同时支持从 Addon UI 自动向 Python 发送聊天消息。
 
 ## 当前实现概览
 
@@ -19,11 +19,38 @@ Python Agent Tool
   -> Python 分片重组与 future 唤醒
 ```
 
+当前已实现两条独立链路：
+
+### 链路 A：Python -> Addon 能力请求（Bridge）
+
+```
+Python Agent Tool
+  -> AddonBridgeService
+  -> scriptevent mcbeai:bridge_request <json>
+  -> Addon scriptEventReceive
+  -> capability handler
+  -> MCBEAI_TOOL 模拟玩家聊天分片 (MCBEAI|RESP)
+  -> WebSocket PlayerMessage
+  -> Python 分片重组与 future 唤醒
+```
+
+### 链路 B：Addon UI -> Python 自动聊天（UI Chat）
+
+```
+玩家打开 UI 面板输入消息
+  -> chatInput.ts: sendUiChatMessage(playerName, message)
+  -> MCBEAI_TOOL 模拟玩家聊天分片 (MCBEAI|UI_CHAT)
+  -> WebSocket PlayerMessage
+  -> Python 分片重组
+  -> callback -> handle_chat -> Agent Worker -> tellraw 响应
+```
+
 其中：
 - Python 请求入口位于 `services/addon/service.py`。
 - Addon 请求监听基于 `scriptEventReceive`，命名空间固定为 `mcbeai:bridge_request`。
 - Addon 响应不是直接回发到 WebSocket，而是由模拟玩家 `MCBEAI_TOOL` 发送聊天分片。
 - Python 侧会在 WebSocket `PlayerMessage` 流中识别并拦截这些桥接分片，不再把它们当作普通聊天消息继续处理。
+- **UI 聊天**由 Addon UI 面板发起，通过模拟玩家 `MCBEAI_TOOL` 发送 `MCBEAI|UI_CHAT` 格式分片，Python 重组后自动作为聊天请求处理，无需玩家在聊天框手动输入命令。
 
 ## 请求格式（Python -> Addon）
 
@@ -42,6 +69,8 @@ scriptevent mcbeai:bridge_request {"request_id":"req-1","capability":"get_player
 
 ## 响应分片格式（Addon -> Python）
 
+### Bridge 响应（Python -> Addon 请求的回复）
+
 - 前缀：`MCBEAI|RESP`
 - 单片格式：`MCBEAI|RESP|<request_id>|<index>/<total>|<content>`
 - `<index>` 从 1 开始
@@ -53,6 +82,27 @@ scriptevent mcbeai:bridge_request {"request_id":"req-1","capability":"get_player
 ```text
 MCBEAI|RESP|req-1|1/2|{"ok":true,
 MCBEAI|RESP|req-1|2/2|"players":["Steve"]}
+```
+
+### UI Chat 消息（Addon UI -> Python 自动聊天）
+
+- 前缀：`MCBEAI|UI_CHAT`
+- 单片格式：`MCBEAI|UI_CHAT|<msg_id>|<index>/<total>|<content>`
+- `<index>` 从 1 开始
+- `<content>` 是 JSON 字符串的片段，完整 JSON 结构为 `{"player": "<玩家名>", "message": "<聊天内容>"}`
+- 分片同样由模拟玩家 `MCBEAI_TOOL` 通过 `tell @s` 发送，真实玩家不会看到回显
+
+示例（单分片）：
+
+```text
+MCBEAI|UI_CHAT|ui-1744876800000-1|1/1|{"player":"Steve","message":"你好世界"}
+```
+
+示例（多分片）：
+
+```text
+MCBEAI|UI_CHAT|ui-1744876800000-1|1/2|{"player":"Steve","mes
+MCBEAI|UI_CHAT|ui-1744876800000-1|2/2|sage":"你好世界"}
 ```
 
 ## 能力清单（任务 1 基线）
@@ -79,6 +129,8 @@ MCBEAI|RESP|req-1|2/2|"players":["Steve"]}
 
 ## 错误码（协议级）
 
+### Bridge 响应错误
+
 - `BRIDGE_INVALID_NAMESPACE`：分片命名空间不是 `MCBEAI`
 - `BRIDGE_INVALID_PREFIX`：分片类型前缀不是 `RESP`
 - `BRIDGE_INVALID_CHUNK_FORMAT`：分片字段数量错误
@@ -88,6 +140,17 @@ MCBEAI|RESP|req-1|2/2|"players":["Steve"]}
 - `BRIDGE_CHUNK_REQUEST_MISMATCH`：同一批分片出现不同 `request_id`
 - `BRIDGE_CHUNK_TOTAL_MISMATCH`：同一批分片出现不同 `total_chunks`
 - `BRIDGE_INVALID_JSON_PAYLOAD`：重组后的 JSON 反序列化失败
+
+### UI Chat 错误
+
+- `UI_CHAT_INVALID_NAMESPACE`：分片命名空间不是 `MCBEAI`
+- `UI_CHAT_INVALID_PREFIX`：分片类型前缀不是 `UI_CHAT`
+- `UI_CHAT_INVALID_CHUNK_FORMAT`：分片字段数量错误
+- `UI_CHAT_INVALID_CHUNK_METADATA`：分片元数据非法
+- `UI_CHAT_EMPTY_CHUNKS`：重组时分片列表为空
+- `UI_CHAT_CHUNK_SEQUENCE_ERROR`：分片序号缺失、重复或顺序不一致
+- `UI_CHAT_INVALID_JSON_PAYLOAD`：重组后的 JSON 反序列化失败
+- `UI_CHAT_MISSING_MESSAGE`：JSON 中缺少 `message` 字段
 
 ## 约束与设计依据
 
@@ -100,14 +163,23 @@ MCBEAI|RESP|req-1|2/2|"players":["Steve"]}
 
 ## 当前基线实现
 
-- Python:
-  - `encode_bridge_request`：编码请求命令
-  - `decode_bridge_chat_chunk`：解析响应分片
-  - `reassemble_bridge_chunks`：重组并解析 JSON payload
-  - `AddonBridgeService`：发送 `/scriptevent`、等待 future、处理超时
-  - WebSocket 侧在 `PlayerMessage` 事件流中拦截 `MCBEAI_TOOL` 的桥接分片
-- Addon:
-  - `formatResponseChunk`：格式化单个分片
-  - `chunkBridgePayload`：按最大片段长度分割并格式化全部分片
-  - `registerBridgeRouter`：订阅 `scriptEventReceive` 并分派 capability handler
-  - `sendBridgeResponseChunks`：驱动 `MCBEAI_TOOL` 发送聊天分片
+### Python 侧
+
+- `encode_bridge_request`：编码请求命令
+- `decode_bridge_chat_chunk`：解析 Bridge 响应分片
+- `reassemble_bridge_chunks`：重组并解析 JSON payload
+- `decode_ui_chat_chunk`：解析 UI Chat 消息分片
+- `reassemble_ui_chat_chunks`：重组 UI Chat 分片并提取玩家名与消息
+- `AddonBridgeService`：发送 `/scriptevent`、等待 future、处理超时、UI Chat 回调分发
+- WebSocket 侧在 `PlayerMessage` 事件流中拦截 `MCBEAI_TOOL` 的桥接分片与 UI Chat 消息
+
+### Addon 侧
+
+- `formatChunk`：通用分片格式化（支持自定义前缀）
+- `formatResponseChunk`：格式化 Bridge 响应分片
+- `chunkPayload`：通用分片分割（支持自定义前缀）
+- `chunkBridgePayload`：按最大片段长度分割 Bridge 响应
+- `chunkUiChatPayload`：按最大片段长度分割 UI Chat 消息
+- `sendBridgeResponseChunks`：驱动 `MCBEAI_TOOL` 发送 Bridge 响应分片
+- `sendUiChatMessage`：驱动 `MCBEAI_TOOL` 发送 UI Chat 消息
+- `registerBridgeRouter`：订阅 `scriptEventReceive` 并分派 capability handler

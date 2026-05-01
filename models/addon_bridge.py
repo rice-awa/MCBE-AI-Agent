@@ -19,3 +19,20 @@ class AddonBridgeResponse(BaseModel):
 
     request_id: str
     payload: dict[str, Any]
+
+
+class UiChatChunk(BaseModel):
+    """从聊天消息解析出的 UI 聊天分片。"""
+
+    msg_id: str
+    chunk_index: int
+    total_chunks: int
+    content: str
+
+
+class UiChatMessage(BaseModel):
+    """重组后的 UI 聊天消息。"""
+
+    msg_id: str
+    player_name: str
+    message: str

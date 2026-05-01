@@ -342,6 +342,15 @@ class AgentWorker:
                         tool_returns=event.metadata.get("tool_returns"),
                         tool_fallback_used=event.metadata.get("tool_fallback_used"),
                     )
+
+                    # AI 响应同步到 Addon UI 历史记录
+                    if response_text:
+                        await self.broker.send_response(connection_id, {
+                            "type": "ai_response_sync",
+                            "player_name": request.player_name or "Player",
+                            "role": "assistant",
+                            "text": response_text,
+                        })
                 elif event.event_type == "error":
                     response_text = "".join(response_parts)
                     logger.error(

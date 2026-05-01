@@ -3,6 +3,7 @@
 import asyncio
 import json
 from typing import Any
+from uuid import UUID
 
 import websockets
 from websockets.server import WebSocketServerProtocol, serve
@@ -10,7 +11,8 @@ from websockets.server import WebSocketServerProtocol, serve
 from core.queue import MessageBroker
 from services.addon.service import get_addon_bridge_service
 from services.websocket.connection import ConnectionManager
-from services.websocket.minecraft import MinecraftProtocolHandler
+from services.websocket.flow_control import FlowControlMiddleware
+from services.websocket.minecraft import MinecraftProtocolHandler, TellrawMessage
 from services.auth.jwt_handler import JWTHandler
 from config.settings import Settings
 from config.logging import get_logger
@@ -43,6 +45,7 @@ class WebSocketServer:
         self.connection_manager = ConnectionManager(broker, dev_mode=self.dev_mode)
         self.protocol_handler = MinecraftProtocolHandler()
         self.addon_bridge_service = get_addon_bridge_service()
+        self.addon_bridge_service.set_ui_chat_callback(self._handle_ui_chat_message)
         self._server: Any = None
 
     async def start(self) -> None:
@@ -184,14 +187,25 @@ class WebSocketServer:
             if not player_event:
                 return
 
+            # 检查是否为 addon 桥接消息（RESP 或 UI_CHAT）
             if self.addon_bridge_service.is_bridge_chat_message(
                 player_event.sender,
                 player_event.message,
+            ) or self.addon_bridge_service.is_ui_chat_message(
+                player_event.sender,
+                player_event.message,
             ):
-                self.addon_bridge_service.handle_player_message(
+                handled = self.addon_bridge_service.handle_player_message(
                     state.id,
                     player_event.sender,
                     player_event.message,
+                )
+                logger.debug(
+                    "addon_bridge_message_handled",
+                    connection_id=str(state.id),
+                    sender=player_event.sender,
+                    message_prefix=player_event.message[:30] if player_event.message else "",
+                    handled=handled,
                 )
                 return
 
@@ -331,6 +345,13 @@ class WebSocketServer:
         # 路由到具体处理器
         if cmd_type == "chat":
             await self.handle_chat(state, content, delivery="tellraw")
+            # 聊天框用户消息同步到 Addon UI 历史记录
+            await self.broker.send_response(state.id, {
+                "type": "ai_response_sync",
+                "player_name": state.player_name or "Player",
+                "role": "user",
+                "text": content,
+            })
         elif cmd_type == "chat_script":
             await self.handle_chat(state, content, delivery="scriptevent")
         elif cmd_type == "context":
@@ -785,12 +806,83 @@ class WebSocketServer:
 
         await self._send_ws_payload(state, msg, source="mcp")
 
-    async def _send_ws_payload(self, state: Any, payload: str, source: str) -> None:
-        """统一发送 WebSocket 响应并记录原始输出。"""
+    async def _handle_ui_chat_message(
+        self, connection_id: UUID, player_name: str, message: str
+    ) -> None:
+        """处理从 addon UI 发来的聊天消息。"""
+        state = self.connection_manager.get_connection(connection_id)
+        if not state:
+            logger.warning(
+                "ui_chat_connection_not_found",
+                connection_id=str(connection_id),
+            )
+            return
+
+        # 更新玩家名称
+        if player_name and not state.player_name:
+            state.player_name = player_name
+
+        logger.info(
+            "ui_chat_received",
+            connection_id=str(state.id),
+            player=player_name,
+            content_length=len(message),
+        )
+
+        # 与普通聊天命令保持一致：非开发模式必须先通过登录认证
+        if not self.dev_mode and not await self.check_auth(state):
+            error_msg = self.protocol_handler.create_error_message("请先登录")
+            await self._send_ws_payload(state, error_msg, source="auth")
+            return
+
+        await self.handle_chat(state, message, delivery="tellraw")
+
+    async def _send_ws_payload(
+        self,
+        state: Any,
+        payload: "str | TellrawMessage",
+        source: str,
+    ) -> None:
+        """统一发送 WebSocket 响应并记录原始输出。
+
+        - TellrawMessage: 走 FlowControlMiddleware.chunk_tellraw 自动分片，
+          从源头消除"反向解析自家产物"的反模式。
+        - str: 用于订阅消息、初始化等已序列化 payload，原样发送。
+        """
+        if isinstance(payload, TellrawMessage):
+            payloads = FlowControlMiddleware.chunk_tellraw(
+                payload.text, color=payload.color
+            )
+            chunk_delay = FlowControlMiddleware.chunk_delay_for("tellraw")
+            for idx, p in enumerate(payloads):
+                await state.websocket.send(p)
+                self._log_ws_send(
+                    state,
+                    p,
+                    source=f"{source}_chunked" if len(payloads) > 1 else source,
+                )
+                if len(payloads) > 1 and idx < len(payloads) - 1:
+                    await asyncio.sleep(chunk_delay)
+            return
+
         await state.websocket.send(payload)
+        self._log_ws_send(state, payload, source=source)
+
+    def _log_ws_send(self, state: Any, payload: str, source: str) -> None:
+        """记录 ws 发送，附带 commandLine 字节长度便于观察分片命中率。"""
+        command_line_len = 0
+        try:
+            data = json.loads(payload)
+            command_line_len = len(
+                data.get("body", {}).get("commandLine", "").encode("utf-8")
+            )
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
         ws_raw_logger.info(
             "websocket_response_sent",
             connection_id=str(state.id),
             source=source,
             payload=payload,
+            command_line_bytes=command_line_len,
         )

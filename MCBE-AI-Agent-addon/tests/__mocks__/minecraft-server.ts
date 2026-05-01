@@ -7,11 +7,18 @@ export const system = {
       unsubscribe: () => {},
     },
   },
+  currentTick: 0,
   runInterval: () => {},
   run: () => {},
 };
 
 export const world = {
+  afterEvents: {
+    itemUse: {
+      subscribe: () => {},
+      unsubscribe: () => {},
+    },
+  },
   getAllPlayers: () => [],
   getPlayers: () => [],
   getDimension: () => ({

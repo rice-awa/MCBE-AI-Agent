@@ -34,6 +34,19 @@ Minecraft Client <-> WebSocket Server <-> Message Broker <-> Agent Worker (Pydan
 - **非阻塞**：WebSocket 处理与 LLM 请求完全分离。
 - **消息队列**：使用 `asyncio.Queue` 实现生产者-消费者模式。
 - **类型安全**：使用 Pydantic 进行数据验证和配置管理。
+- **统一流控**：所有下行长文本统一经过 `FlowControlMiddleware` 分片，避免 MCBE 拒绝超长 `commandRequest`。
+
+## 统一流控中间件
+
+`services/websocket/flow_control.py` 提供统一的出站消息分片能力，当前覆盖 `tellraw`、`scriptevent`、AI 响应事件和原始命令包装。
+
+- `chunk_tellraw()`：将游戏内可见文本拆成多条安全的 `tellraw` 命令。
+- `chunk_scriptevent()`：将 Addon/脚本事件载荷拆成多条安全的 `scriptevent` 命令。
+- `chunk_ai_response()`：将 AI 响应编码为 `mcbeai:ai_resp` 分片事件，包含 `id/i/n/p/r/c` 元数据用于客户端重组。
+- `chunk_raw_command()`：只包装原始命令，不做分片；超长命令会抛出 `ValueError`，调用方需要在命令语义层面拆分。
+- `chunk_delay_for()`：集中提供不同分片场景的发送间隔，避免命令洪泛触发 MCBE 看门狗。
+
+流控以 MCBE `commandLine` 实测安全上限 461 字节为硬约束，并结合 `MAX_CHUNK_CONTENT_LENGTH` 字符上限与 `CHUNK_SENTENCE_MODE` 语义分句策略共同决定分片边界。新增或修改下行消息发送路径时，应优先复用该中间件，不要在调用点重新实现分片逻辑。
 
 ## 关键文件
 
@@ -47,6 +60,7 @@ Minecraft Client <-> WebSocket Server <-> Message Broker <-> Agent Worker (Pydan
 | `services/agent/worker.py` | Agent Worker，消费队列请求 |
 | `services/websocket/server.py` | WebSocket 服务器 |
 | `services/websocket/connection.py` | 连接管理 |
+| `services/websocket/flow_control.py` | 统一流控中间件，负责出站长文本分片与字节安全校验 |
 | `services/agent/tools.py` | Agent Tools（MC 命令执行、MCWiki 搜索） |
 
 ## 构建、测试与开发命令
@@ -99,6 +113,8 @@ Minecraft Client <-> WebSocket Server <-> Message Broker <-> Agent Worker (Pydan
 - `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`：LLM API Key。
 - `DEFAULT_PROVIDER`：默认 LLM 提供商。
 - `LLM_WORKER_COUNT`：Agent Worker 数量。
+- `MAX_CHUNK_CONTENT_LENGTH`：单个下行分片的内容字符上限，默认 `400`。
+- `CHUNK_SENTENCE_MODE`：是否优先按句子边界进行语义分片，默认 `true`。
 - `LOG_LEVEL`：日志级别。
 
 ## Minecraft 连接示例
