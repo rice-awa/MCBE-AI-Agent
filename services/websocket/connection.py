@@ -428,7 +428,11 @@ class ConnectionManager:
     async def _sync_response_to_addon(
         self, state: ConnectionState, response: dict
     ) -> None:
-        """将 AI 响应/用户消息同步到 Addon UI 历史记录。"""
+        """将 AI 响应/用户消息同步到 Addon UI 历史记录。
+
+        为避免看门狗踢出，assistant 响应先等 tellraw 流式发送完毕，
+        各分片之间插入延迟，避免命令洪泛。
+        """
         player_name = response.get("player_name", "Player")
         role = response.get("role", "assistant")
         text = response.get("text", "")
@@ -437,9 +441,17 @@ class ConnectionManager:
             return
 
         try:
+            # assistant 响应：等 tellraw 流式发送完毕后再发 scriptevent
+            if role == "assistant":
+                await asyncio.sleep(0.5)
+
             commands = encode_ai_response_chunks(player_name, role, text)
             for command in commands:
                 await self._run_command(state, command)
+                # 分片间延迟，避免看门狗超时
+                if len(commands) > 1:
+                    await asyncio.sleep(0.15)
+
             logger.debug(
                 "ai_response_sync_sent",
                 connection_id=str(state.id),
