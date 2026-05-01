@@ -24,6 +24,15 @@ from models.minecraft import MinecraftCommand, MinecraftSubscribe
 class SessionStats:
     sent_packets: int = 0
     sent_bytes: int = 0
+    sent_command_line_bytes: int = 0
+    max_payload_bytes: int = 0
+    max_command_line_bytes: int = 0
+    last_payload_bytes: int = 0
+    last_command_line_bytes: int = 0
+    last_failed_payload_bytes: int | None = None
+    last_failed_command_line_bytes: int | None = None
+    max_success_payload_bytes: int = 0
+    max_success_command_line_bytes: int = 0
     disconnected: bool = False
     disconnect_reason: str | None = None
     last_command_error: str | None = None
@@ -71,6 +80,16 @@ class InteractiveWSTester:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(f"[{timestamp}] {msg}\n")
+
+    @staticmethod
+    def _get_payload_metrics(payload: str) -> tuple[int, int]:
+        payload_bytes = len(payload.encode("utf-8"))
+        try:
+            data = json.loads(payload)
+            command_line = data.get("body", {}).get("commandLine", "")
+        except (json.JSONDecodeError, AttributeError):
+            command_line = ""
+        return payload_bytes, len(command_line.encode("utf-8"))
 
     @staticmethod
     def _format_bytes(size: int) -> str:
@@ -121,8 +140,16 @@ class InteractiveWSTester:
                             if not success:
                                 self.stats.last_command_error = body.get(
                                     "statusMessage", "未知命令错误")
-                                self._log(f"命令 {req_id} 失败: {self.stats.last_command_error}")
-                                print(f"[tester] ⚠️ 命令错误: {self.stats.last_command_error}")
+                                self._log(
+                                    f"命令 {req_id} 失败: {self.stats.last_command_error}, "
+                                    f"payload={self.stats.last_payload_bytes}B, "
+                                    f"commandLine={self.stats.last_command_line_bytes}B"
+                                )
+                                print(
+                                    f"[tester] ⚠️ 命令错误: {self.stats.last_command_error} "
+                                    f"(payload={self.stats.last_payload_bytes}B, "
+                                    f"commandLine={self.stats.last_command_line_bytes}B)"
+                                )
                 except (json.JSONDecodeError, TypeError):
                     pass
         except Exception as exc:
@@ -162,20 +189,41 @@ class InteractiveWSTester:
         self._pending_acks[req_id] = event
         self._ack_results[req_id] = False  # 默认失败
 
+        payload_bytes, command_line_bytes = self._get_payload_metrics(payload)
+        self.stats.last_payload_bytes = payload_bytes
+        self.stats.last_command_line_bytes = command_line_bytes
+        self.stats.max_payload_bytes = max(self.stats.max_payload_bytes, payload_bytes)
+        self.stats.max_command_line_bytes = max(self.stats.max_command_line_bytes, command_line_bytes)
+
         try:
             await self.client.send(payload)
             self.stats.sent_packets += 1
-            self.stats.sent_bytes += len(payload.encode("utf-8"))
+            self.stats.sent_bytes += payload_bytes
+            self.stats.sent_command_line_bytes += command_line_bytes
         except Exception:
+            self.stats.last_failed_payload_bytes = payload_bytes
+            self.stats.last_failed_command_line_bytes = command_line_bytes
             self._pending_acks.pop(req_id, None)
             self._ack_results.pop(req_id, None)
             return False
 
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
-            return self._ack_results.get(req_id, False)
+            success = self._ack_results.get(req_id, False)
+            if success:
+                self.stats.max_success_payload_bytes = max(self.stats.max_success_payload_bytes, payload_bytes)
+                self.stats.max_success_command_line_bytes = max(self.stats.max_success_command_line_bytes, command_line_bytes)
+            else:
+                self.stats.last_failed_payload_bytes = payload_bytes
+                self.stats.last_failed_command_line_bytes = command_line_bytes
+            return success
         except asyncio.TimeoutError:
-            self._log(f"命令 {req_id} 超时无响应 ({text[:50]}...)")
+            self.stats.last_failed_payload_bytes = payload_bytes
+            self.stats.last_failed_command_line_bytes = command_line_bytes
+            self._log(
+                f"命令 {req_id} 超时无响应 ({text[:50]}...), "
+                f"payload={payload_bytes}B, commandLine={command_line_bytes}B"
+            )
             return False
         finally:
             self._pending_acks.pop(req_id, None)
@@ -255,7 +303,11 @@ class InteractiveWSTester:
             success = await self._send_and_wait_ack("X" * size, timeout=1.0)
             if not success:
                 error_occurred = True
-                print(f"\n[burst] 第 {i+1} 包失败，停止")
+                print(
+                    f"\n[burst] 第 {i+1} 包失败，停止 "
+                    f"(payload={self.stats.last_failed_payload_bytes}B, "
+                    f"commandLine={self.stats.last_failed_command_line_bytes}B)"
+                )
                 break
             sent += 1
             if gap_ms > 0:
@@ -320,23 +372,31 @@ class InteractiveWSTester:
             if success:
                 safe = count
                 result = "success"
-                print(f"[sweep] ✅ 通过 {count} 包 (耗时 {round_elapsed:.2f}s)")
+                print(f"[sweep] ✅ 通过 {count} 包 (耗时 {round_elapsed:.2f}s, commandLine最大成功={self.stats.max_success_command_line_bytes}B)")
                 sweep_results.append({
                     "count": count,
                     "result": result,
                     "actual_sent": actual_sent,
                     "duration": round_elapsed,
-                    "pps": count / round_elapsed if round_elapsed > 0 else 0
+                    "pps": count / round_elapsed if round_elapsed > 0 else 0,
+                    "max_success_payload_bytes": self.stats.max_success_payload_bytes,
+                    "max_success_command_line_bytes": self.stats.max_success_command_line_bytes,
                 })
             else:
                 reason = "连接断开" if not self.client else f"命令错误: {self.stats.last_command_error}"
-                print(f"[sweep] ❌ 在 {count} 包时触发失败 ({reason})")
+                print(
+                    f"[sweep] ❌ 在 {count} 包时触发失败 ({reason}, "
+                    f"payload={self.stats.last_failed_payload_bytes}B, "
+                    f"commandLine={self.stats.last_failed_command_line_bytes}B)"
+                )
                 sweep_results.append({
                     "count": count,
                     "result": "failed",
                     "actual_sent": 0,
                     "duration": round_elapsed,
-                    "error": reason
+                    "error": reason,
+                    "failed_payload_bytes": self.stats.last_failed_payload_bytes,
+                    "failed_command_line_bytes": self.stats.last_failed_command_line_bytes,
                 })
                 break
 
@@ -423,28 +483,40 @@ class InteractiveWSTester:
                     "success": True,
                     "sent": actual_sent,
                     "duration": size_elapsed,
-                    "pps": count / size_elapsed if size_elapsed > 0 else 0
+                    "pps": count / size_elapsed if size_elapsed > 0 else 0,
+                    "payload_bytes": self.stats.last_payload_bytes,
+                    "command_line_bytes": self.stats.last_command_line_bytes,
                 })
                 if idx % 10 == 0 or idx == len(sizes):
                     print(f"\n[auto] ✅ {size}B: {actual_sent}/{count} 包, "
-                          f"{size_elapsed:.2f}s, {count/size_elapsed:.1f} pkt/s")
+                          f"{size_elapsed:.2f}s, {count/size_elapsed:.1f} pkt/s, "
+                          f"payload={self.stats.last_payload_bytes}B, "
+                          f"commandLine={self.stats.last_command_line_bytes}B")
             else:
                 failed_size = size
                 if first_failure is None:
                     first_failure = {
                         "size": size,
                         "sent": actual_sent,
-                        "error": self.stats.last_command_error or "连接断开"
+                        "error": self.stats.last_command_error or "连接断开",
+                        "payload_bytes": self.stats.last_failed_payload_bytes,
+                        "command_line_bytes": self.stats.last_failed_command_line_bytes,
                     }
                 auto_results.append({
                     "size": size,
                     "success": False,
                     "sent": actual_sent,
                     "duration": size_elapsed,
-                    "error": self.stats.last_command_error or "连接断开"
+                    "error": self.stats.last_command_error or "连接断开",
+                    "payload_bytes": self.stats.last_failed_payload_bytes,
+                    "command_line_bytes": self.stats.last_failed_command_line_bytes,
                 })
                 print(f"\n[auto] ❌ {size}B: 失败 (已发送 {actual_sent}/{count} 包)")
-                print(f"[auto] 错误: {self.stats.last_command_error or '连接断开'}")
+                print(
+                    f"[auto] 错误: {self.stats.last_command_error or '连接断开'} "
+                    f"(payload={self.stats.last_failed_payload_bytes}B, "
+                    f"commandLine={self.stats.last_failed_command_line_bytes}B)"
+                )
                 break  # 一旦失败立即停止递增
 
             if gap_ms == 0 and idx % 100 == 0:
@@ -464,8 +536,14 @@ class InteractiveWSTester:
         print(f"  - 实际发送: {total_sent}/{total_packets} 包")
         print(f"  - 总耗时: {total_elapsed:.2f}s")
         print(f"  - 最大成功的payload: {max_successful_size}B")
+        print(f"  - 最大成功WS包: {self.stats.max_success_payload_bytes}B")
+        print(f"  - 最大成功commandLine: {self.stats.max_success_command_line_bytes}B")
         if first_failure:
-            print(f"  - 首次失败: {first_failure['size']}B ({first_failure['error']})")
+            print(
+                f"  - 首次失败: {first_failure['size']}B ({first_failure['error']}, "
+                f"payload={first_failure['payload_bytes']}B, "
+                f"commandLine={first_failure['command_line_bytes']}B)"
+            )
 
         record = TestRecord(
             timestamp=datetime.now().isoformat(),
@@ -482,8 +560,16 @@ class InteractiveWSTester:
             actual_packets=total_sent,
             duration=total_elapsed,
             pps=total_sent / total_elapsed if total_elapsed > 0 else 0,
-            error_msg=f"最大成功: {max_successful_size}B" +
-                      (f", 首次失败: {first_failure['size']}B" if first_failure else ""),
+            error_msg=(
+                f"最大成功: {max_successful_size}B, "
+                f"最大成功WS包: {self.stats.max_success_payload_bytes}B, "
+                f"最大成功commandLine: {self.stats.max_success_command_line_bytes}B"
+            ) + (
+                f", 首次失败: {first_failure['size']}B, "
+                f"失败WS包: {first_failure['payload_bytes']}B, "
+                f"失败commandLine: {first_failure['command_line_bytes']}B"
+                if first_failure else ""
+            ),
             details=auto_results
         )
         self.test_records.append(record)
@@ -516,6 +602,14 @@ class InteractiveWSTester:
             f.write(f"- 测试总次数: {len(self.test_records)}\n")
             f.write(f"- 总发包数: {self.stats.sent_packets}\n")
             f.write(f"- 总数据量: {self._format_bytes(self.stats.sent_bytes)}\n")
+            f.write(f"- 总 commandLine 数据量: {self._format_bytes(self.stats.sent_command_line_bytes)}\n")
+            f.write(f"- 最大已发送 WS payload: {self.stats.max_payload_bytes} B\n")
+            f.write(f"- 最大已发送 commandLine: {self.stats.max_command_line_bytes} B\n")
+            f.write(f"- 最大成功 WS payload: {self.stats.max_success_payload_bytes} B\n")
+            f.write(f"- 最大成功 commandLine: {self.stats.max_success_command_line_bytes} B\n")
+            if self.stats.last_failed_command_line_bytes is not None:
+                f.write(f"- 最近失败 WS payload: {self.stats.last_failed_payload_bytes} B\n")
+                f.write(f"- 最近失败 commandLine: {self.stats.last_failed_command_line_bytes} B\n")
             f.write(f"- 客户端状态: {'已断开' if self.stats.disconnected else '已连接' if self.client else '未连接'}\n")
             if self.stats.disconnect_reason:
                 f.write(f"- 断开原因: {self.stats.disconnect_reason}\n")
@@ -547,12 +641,16 @@ class InteractiveWSTester:
                     f.write(f"- **安全上限: {test.actual_packets} 包**\n")
                     if test.details:
                         f.write("\n详细数据:\n")
-                        f.write("| 包数 | 结果 | 实际发送 | 耗时 | PPS |\n")
-                        f.write("|------|------|----------|------|-----|\n")
+                        f.write("| 包数 | 结果 | 实际发送 | 耗时 | PPS | 最大成功WS包 | 最大成功commandLine | 失败WS包 | 失败commandLine |\n")
+                        f.write("|------|------|----------|------|-----|-------------|-------------------|----------|----------------|\n")
                         for r in test.details:
                             f.write(f"| {r['count']} | {r['result']} | "
                                     f"{r['actual_sent']} | {r['duration']:.2f}s | "
-                                    f"{r.get('pps', 0):.1f} |\n")
+                                    f"{r.get('pps', 0):.1f} | "
+                                    f"{r.get('max_success_payload_bytes', '')} | "
+                                    f"{r.get('max_success_command_line_bytes', '')} | "
+                                    f"{r.get('failed_payload_bytes', '')} | "
+                                    f"{r.get('failed_command_line_bytes', '')} |\n")
                     f.write("\n")
 
             if auto_tests:
@@ -570,15 +668,16 @@ class InteractiveWSTester:
                     f.write(f"- **最大成功Payload: {test.error_msg}**\n")
                     if test.details:
                         f.write("\n详细数据 (前20和后20条):\n")
-                        f.write("| Payload | 结果 | 发送 | 耗时 | PPS |\n")
-                        f.write("|---------|------|------|------|-----|\n")
+                        f.write("| Payload | 结果 | 发送 | 耗时 | PPS | WS包字节 | commandLine字节 |\n")
+                        f.write("|---------|------|------|------|-----|----------|-----------------|\n")
                         details_to_show = test.details[:20] + test.details[-20:] if len(test.details) > 40 else test.details
                         if len(test.details) > 40:
-                            f.write("| ... | ... | ... | ... | ... |\n")
+                            f.write("| ... | ... | ... | ... | ... | ... | ... |\n")
                         for d in details_to_show:
                             icon = "✅" if d["success"] else "❌"
                             f.write(f"| {self._format_bytes(d['size'])} | {icon} | "
-                                    f"{d['sent']} | {d['duration']:.3f}s | {d.get('pps', 0):.1f} |\n")
+                                    f"{d['sent']} | {d['duration']:.3f}s | {d.get('pps', 0):.1f} | "
+                                    f"{d.get('payload_bytes', '')} | {d.get('command_line_bytes', '')} |\n")
                     f.write("\n")
 
             f.write("## 性能汇总\n\n")
@@ -617,6 +716,13 @@ class InteractiveWSTester:
 
     def _print_stats(self) -> None:
         print(f"[stats] sent_packets={self.stats.sent_packets}, sent_bytes={self.stats.sent_bytes}, "
+              f"command_line_bytes={self.stats.sent_command_line_bytes}, "
+              f"max_payload_bytes={self.stats.max_payload_bytes}, "
+              f"max_command_line_bytes={self.stats.max_command_line_bytes}, "
+              f"max_success_payload_bytes={self.stats.max_success_payload_bytes}, "
+              f"max_success_command_line_bytes={self.stats.max_success_command_line_bytes}, "
+              f"last_failed_payload_bytes={self.stats.last_failed_payload_bytes}, "
+              f"last_failed_command_line_bytes={self.stats.last_failed_command_line_bytes}, "
               f"connected={self.client is not None}, disconnected={self.stats.disconnected}, "
               f"reason={self.stats.disconnect_reason}, last_cmd_error={self.stats.last_command_error}")
         print(f"[stats] 已记录 {len(self.test_records)} 次测试")
