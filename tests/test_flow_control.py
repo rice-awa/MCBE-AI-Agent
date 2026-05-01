@@ -66,6 +66,40 @@ class TestSplitText:
         assert result[1] == "第二行\n"
         assert result[2] == "第三行"
 
+    def test_consecutive_delimiters(self):
+        """纯分隔符串：连续 '!!!' 应被合并为单分片（不丢字符）。"""
+        result = FlowControlMiddleware._split_text("!!!", max_length=10)
+        assert result == ["!!!"]
+        # 中文连续分隔符同理
+        result_zh = FlowControlMiddleware._split_text("。。。", max_length=10)
+        assert result_zh == ["。。。"]
+
+    def test_leading_delimiter(self):
+        """句首分隔符：'!hello' 不应丢失开头的 '!'。"""
+        result = FlowControlMiddleware._split_text("!hello", max_length=10)
+        assert "".join(result) == "!hello"
+        result_zh = FlowControlMiddleware._split_text("。中文", max_length=10)
+        assert "".join(result_zh) == "。中文"
+
+    def test_long_sentence_then_short(self):
+        """超长句紧跟短句：验证截断分支后 buffer 正确处理短句。"""
+        text = "A" * 500 + "!" + "B" * 5
+        result = FlowControlMiddleware._split_text(text, max_length=400)
+        # 期望：超长句被切成 ['A*400', 'A*100!']，短句独立成片 'B*5'
+        assert result == ["A" * 400, "A" * 100 + "!", "B" * 5]
+
+    def test_trailing_delimiter_only(self):
+        """单字符无分隔符：不丢内容也不爆。"""
+        result = FlowControlMiddleware._split_text("a", max_length=10)
+        assert result == ["a"]
+
+    def test_crlf_in_text(self):
+        """文本含 \\r\\n：\\n 仍作为分隔符，\\r 不丢失。"""
+        text = "hello\r\nworld"
+        result = FlowControlMiddleware._split_text(text, max_length=5)
+        # 重组后内容应保持原文（\r 不能丢）
+        assert "".join(result) == "hello\r\nworld"
+
 
 class TestChunkTellraw:
     """测试 tellraw 分片生成。"""
@@ -214,11 +248,11 @@ class TestChunkRawCommand:
         data = json.loads(payloads[0])
         assert data["body"]["commandLine"] == "say hello"
 
-    def test_long_command_chunks(self):
-        """超长命令按长度截断。"""
+    def test_long_command_raises(self):
+        """超长命令应抛 ValueError，不允许静默非法分片。"""
         cmd = "say " + "X" * 1000
-        payloads = FlowControlMiddleware.chunk_raw_command(cmd)
-        assert len(payloads) == 3
+        with pytest.raises(ValueError, match="raw command too long"):
+            FlowControlMiddleware.chunk_raw_command(cmd)
 
 
 class TestMaxLengthParameter:
@@ -239,3 +273,53 @@ class TestMaxLengthParameter:
         # max_length=None 也应使用默认值
         payloads = FlowControlMiddleware.chunk_tellraw(text, max_length=None)
         assert len(payloads) == 2
+
+
+class TestEmptyTextContract:
+    """空文本契约：tellraw/scriptevent 返回 []，ai_response 仍发 1 条。"""
+
+    def test_chunk_tellraw_empty(self):
+        assert FlowControlMiddleware.chunk_tellraw("") == []
+
+    def test_chunk_scriptevent_empty(self):
+        assert FlowControlMiddleware.chunk_scriptevent("") == []
+
+    def test_chunk_ai_response_empty_keeps_one(self):
+        payloads = FlowControlMiddleware.chunk_ai_response("Steve", "assistant", "")
+        assert len(payloads) == 1
+
+
+class TestConfigureRuntime:
+    """configure() 注入运行时默认值。"""
+
+    def test_configure_changes_default_max(self):
+        original_max = FlowControlMiddleware.DEFAULT_MAX_CONTENT_LENGTH
+        original_mode = FlowControlMiddleware.DEFAULT_SENTENCE_MODE
+        try:
+            FlowControlMiddleware.configure(max_content_length=100)
+            payloads = FlowControlMiddleware.chunk_tellraw("A" * 250)
+            assert len(payloads) == 3  # 250 / 100 = 3 片
+        finally:
+            FlowControlMiddleware.configure(
+                max_content_length=original_max,
+                sentence_mode=original_mode,
+            )
+
+    def test_configure_sentence_mode_off(self):
+        """关闭语义分片模式后，应纯按 max_length 等长截断。"""
+        original_mode = FlowControlMiddleware.DEFAULT_SENTENCE_MODE
+        try:
+            FlowControlMiddleware.configure(sentence_mode=False)
+            # 含分隔符也应被等长截断
+            result = FlowControlMiddleware._split_text("A。B。C。D", max_length=3)
+            assert result == ["A。B", "。C。", "D"]
+        finally:
+            FlowControlMiddleware.configure(sentence_mode=original_mode)
+
+    def test_configure_invalid_values_ignored(self):
+        """非法值应被忽略，保留现有默认。"""
+        original = FlowControlMiddleware.DEFAULT_MAX_CONTENT_LENGTH
+        FlowControlMiddleware.configure(max_content_length=0)
+        assert FlowControlMiddleware.DEFAULT_MAX_CONTENT_LENGTH == original
+        FlowControlMiddleware.configure(max_content_length=-1)
+        assert FlowControlMiddleware.DEFAULT_MAX_CONTENT_LENGTH == original

@@ -12,7 +12,7 @@ from core.queue import MessageBroker
 from services.addon.service import get_addon_bridge_service
 from services.websocket.connection import ConnectionManager
 from services.websocket.flow_control import FlowControlMiddleware
-from services.websocket.minecraft import MinecraftProtocolHandler
+from services.websocket.minecraft import MinecraftProtocolHandler, TellrawMessage
 from services.auth.jwt_handler import JWTHandler
 from config.settings import Settings
 from config.logging import get_logger
@@ -831,47 +831,49 @@ class WebSocketServer:
 
         await self.handle_chat(state, message, delivery="tellraw")
 
-    async def _send_ws_payload(self, state: Any, payload: str, source: str) -> None:
-        """统一发送 WebSocket 响应并记录原始输出。对 tellraw 长消息自动分片。"""
-        # 尝试解析 tellraw 消息，若内容超长则走流控分片
-        try:
-            data = json.loads(payload)
-            body = data.get("body", {})
-            command_line = body.get("commandLine", "")
-            if command_line.startswith("tellraw"):
-                json_start = command_line.find("{")
-                if json_start != -1:
-                    tellraw_data = json.loads(command_line[json_start:])
-                    rawtext = tellraw_data.get("rawtext", [])
-                    if rawtext and isinstance(rawtext, list):
-                        text = rawtext[0].get("text", "")
-                        if len(text) > FlowControlMiddleware.DEFAULT_MAX_CONTENT_LENGTH:
-                            # 提取颜色前缀（如 §a, §c 等）
-                            if text.startswith("§"):
-                                color = text[:2]
-                                plain_text = text[2:]
-                            else:
-                                color = ""
-                                plain_text = text
-                            chunked = FlowControlMiddleware.chunk_tellraw(
-                                plain_text, color=color
-                            )
-                            for p in chunked:
-                                await state.websocket.send(p)
-                                ws_raw_logger.info(
-                                    "websocket_response_sent",
-                                    connection_id=str(state.id),
-                                    source=f"{source}_chunked",
-                                    payload=p,
-                                )
-                            return
-        except Exception:
-            pass
+    async def _send_ws_payload(
+        self,
+        state: Any,
+        payload: "str | TellrawMessage",
+        source: str,
+    ) -> None:
+        """统一发送 WebSocket 响应并记录原始输出。
+
+        - TellrawMessage: 走 FlowControlMiddleware.chunk_tellraw 自动分片，
+          从源头消除"反向解析自家产物"的反模式。
+        - str: 用于订阅消息、初始化等已序列化 payload，原样发送。
+        """
+        if isinstance(payload, TellrawMessage):
+            payloads = FlowControlMiddleware.chunk_tellraw(
+                payload.text, color=payload.color
+            )
+            for p in payloads:
+                await state.websocket.send(p)
+                self._log_ws_send(
+                    state,
+                    p,
+                    source=f"{source}_chunked" if len(payloads) > 1 else source,
+                )
+            return
 
         await state.websocket.send(payload)
+        self._log_ws_send(state, payload, source=source)
+
+    def _log_ws_send(self, state: Any, payload: str, source: str) -> None:
+        """记录 ws 发送，附带 commandLine 字节长度便于观察分片命中率。"""
+        command_line_len = 0
+        try:
+            data = json.loads(payload)
+            command_line_len = len(
+                data.get("body", {}).get("commandLine", "").encode("utf-8")
+            )
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
         ws_raw_logger.info(
             "websocket_response_sent",
             connection_id=str(state.id),
             source=source,
             payload=payload,
+            command_line_bytes=command_line_len,
         )

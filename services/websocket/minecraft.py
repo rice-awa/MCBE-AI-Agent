@@ -1,6 +1,7 @@
 """Minecraft 协议处理"""
 
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from models.minecraft import (
@@ -26,6 +27,17 @@ COMMANDS = _minecraft_config.commands
 
 # 创建命令注册表
 _command_registry = CommandRegistry(COMMANDS)
+
+
+@dataclass(frozen=True)
+class TellrawMessage:
+    """结构化 tellraw 消息：携带原文与颜色，由 _send_ws_payload 统一分片。
+
+    避免在发送层反向解析已序列化的 commandLine JSON。
+    """
+
+    text: str
+    color: str
 
 
 class MinecraftProtocolHandler:
@@ -150,25 +162,28 @@ class MinecraftProtocolHandler:
         return "\n".join(lines)
 
     @staticmethod
-    def create_error_message(error: str) -> str:
-        """创建错误消息"""
+    def create_error_message(error: str) -> "TellrawMessage":
+        """创建错误消息（结构化，由发送层统一分片）。"""
         config = _minecraft_config
-        return MinecraftCommand.create_tellraw(
-            f"{config.error_prefix}{error}", color=config.error_color
-        ).model_dump_json(exclude_none=True)
+        return TellrawMessage(
+            text=f"{config.error_prefix}{error}",
+            color=config.error_color,
+        )
 
     @staticmethod
-    def create_info_message(info: str) -> str:
-        """创建信息消息"""
+    def create_info_message(info: str) -> "TellrawMessage":
+        """创建信息消息（结构化，由发送层统一分片）。"""
         config = _minecraft_config
-        return MinecraftCommand.create_tellraw(
-            f"{config.info_prefix}{info}", color=config.info_color
-        ).model_dump_json(exclude_none=True)
+        return TellrawMessage(
+            text=f"{config.info_prefix}{info}",
+            color=config.info_color,
+        )
 
     @staticmethod
-    def create_success_message(message: str) -> str:
-        """创建成功消息"""
+    def create_success_message(message: str) -> "TellrawMessage":
+        """创建成功消息（结构化，由发送层统一分片）。"""
         config = _minecraft_config
-        return MinecraftCommand.create_tellraw(
-            f"{config.success_prefix}{message}", color=config.success_color
-        ).model_dump_json(exclude_none=True)
+        return TellrawMessage(
+            text=f"{config.success_prefix}{message}",
+            color=config.success_color,
+        )
