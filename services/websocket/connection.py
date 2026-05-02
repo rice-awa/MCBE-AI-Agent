@@ -20,20 +20,49 @@ ws_raw_logger = get_logger("websocket.raw")
 
 
 @dataclass
+class PlayerSession:
+    """单个玩家在某连接上的会话状态（按玩家隔离的可变设置）。"""
+
+    player_name: str
+    context_enabled: bool = True
+    current_provider: str | None = None
+    current_template: str = "default"
+    custom_variables: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class ConnectionState:
-    """连接状态"""
+    """连接状态。
+
+    单条 WebSocket 连接被多个玩家共享（MCBE 服务器模型决定）。
+    所有"单值"字段（context_enabled / current_provider / current_template /
+    custom_variables）需要按玩家隔离，集中存放在 ``_player_sessions`` 中；
+    顶层的 ``player_name`` 仅作为"最近一次发言者"的便捷指针。
+    """
 
     id: UUID = field(default_factory=uuid4)
     websocket: WebSocketServerProtocol | None = None
     authenticated: bool = False
+    # 最近一次产生消息的玩家名，仅用于日志和兼容旧路径，禁止在多人逻辑里读它做分支。
     player_name: str | None = None
     connected_at: datetime = field(default_factory=datetime.now)
-    context_enabled: bool = True
     response_queue: asyncio.Queue | None = None
-    current_provider: str | None = None
     pending_command_futures: dict[str, asyncio.Future[str]] = field(default_factory=dict)
-    current_template: str = "default"  # 当前使用的提示词模板
-    custom_variables: dict[str, str] = field(default_factory=dict)  # 自定义变量
+    # 按玩家隔离的会话状态
+    _player_sessions: dict[str, PlayerSession] = field(default_factory=dict)
+
+    def get_player_session(self, player_name: str | None) -> PlayerSession:
+        """获取指定玩家的会话状态；不存在则按默认值创建。"""
+        key = player_name or "__anonymous__"
+        session = self._player_sessions.get(key)
+        if session is None:
+            session = PlayerSession(player_name=key)
+            self._player_sessions[key] = session
+        return session
+
+    def all_player_sessions(self) -> list[PlayerSession]:
+        """快照式列出连接下所有玩家会话。"""
+        return list(self._player_sessions.values())
 
 
 class ConnectionManager:

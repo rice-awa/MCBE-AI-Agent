@@ -46,13 +46,49 @@ def test_message_broker_history_lifecycle() -> None:
 
     broker.register_connection(connection_id)
     history = _build_turn(1)
-    broker.set_conversation_history(connection_id, history)
+    broker.set_conversation_history(connection_id, "alice", history)
 
-    stored = broker.get_conversation_history(connection_id)
+    stored = broker.get_conversation_history(connection_id, "alice")
     assert len(stored) == 2
 
+    # 不同玩家的历史应当互相隔离
+    assert broker.get_conversation_history(connection_id, "bob") == []
+
     broker.unregister_connection(connection_id)
-    assert broker.get_conversation_history(connection_id) == []
+    assert broker.get_conversation_history(connection_id, "alice") == []
+
+
+def test_message_broker_history_per_player_isolation() -> None:
+    """同一连接、不同玩家的历史互不串扰。"""
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    alice_history = _build_turn(1)
+    bob_history = _build_turn(2)
+
+    broker.set_conversation_history(connection_id, "alice", alice_history)
+    broker.set_conversation_history(connection_id, "bob", bob_history)
+
+    assert broker.get_conversation_history(connection_id, "alice")[0].parts[0].content == "user-1"
+    assert broker.get_conversation_history(connection_id, "bob")[0].parts[0].content == "user-2"
+
+    broker.clear_conversation_history(connection_id, "alice")
+    assert broker.get_conversation_history(connection_id, "alice") == []
+    # bob 的历史不受影响
+    assert broker.get_conversation_history(connection_id, "bob") != []
+
+
+def test_session_lock_per_player() -> None:
+    """同一玩家拿到同一把锁；不同玩家拿到不同锁，可并行。"""
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    lock_alice = broker.get_session_lock(connection_id, "alice")
+    lock_alice_again = broker.get_session_lock(connection_id, "alice")
+    lock_bob = broker.get_session_lock(connection_id, "bob")
+
+    assert lock_alice is lock_alice_again
+    assert lock_alice is not lock_bob
 
 class _ReasoningNode:
     def __init__(self, reasoning_content: str) -> None:

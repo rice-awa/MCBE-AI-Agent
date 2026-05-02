@@ -124,9 +124,9 @@ class AgentWorker:
         request: ChatRequest = item.payload
         connection_id: UUID = item.connection_id
 
-        # 同一连接请求串行处理，避免多 worker 并发导致上下文乱序。
-        connection_lock = self.broker.get_connection_lock(connection_id)
-        async with connection_lock:
+        # 同一 (连接, 玩家) 串行；不同玩家可并行，避免上下文乱序又不互相阻塞。
+        session_lock = self.broker.get_session_lock(connection_id, request.player_name)
+        async with session_lock:
             await self._process_request_locked(request, connection_id)
 
     async def _process_request_locked(
@@ -134,23 +134,27 @@ class AgentWorker:
         request: ChatRequest,
         connection_id: UUID,
     ) -> None:
-        """处理单个请求（已持有连接锁）"""
+        """处理单个请求（已持有会话锁）"""
 
         logger.info(
             "processing_chat_request",
             worker_id=self.worker_id,
             connection_id=str(connection_id),
+            player=request.player_name,
             content_length=len(request.content),
         )
 
         message_history: list[ModelMessage] | None = None
         if request.use_context:
-            raw_history = self.broker.get_conversation_history(connection_id)
+            raw_history = self.broker.get_conversation_history(
+                connection_id, request.player_name
+            )
             message_history, cleared_count = self._strip_reasoning_content(raw_history)
             logger.debug(
                 "chat_history_loaded",
                 worker_id=self.worker_id,
                 connection_id=str(connection_id),
+                player=request.player_name,
                 history_message_count=len(message_history),
                 cleared_reasoning_content_count=cleared_count,
             )
@@ -161,7 +165,9 @@ class AgentWorker:
             if not request.use_context:
                 return None
 
-            history = self.broker.get_conversation_history(connection_id)
+            history = self.broker.get_conversation_history(
+                connection_id, request.player_name
+            )
             message_count = len(history) if history else 0
             # 简单估算：平均每条消息 100 tokens
             estimated_tokens = message_count * 100
@@ -302,12 +308,14 @@ class AgentWorker:
                             )
                             self.broker.set_conversation_history(
                                 connection_id,
+                                request.player_name,
                                 trimmed_history,
                             )
                             logger.debug(
                                 "chat_history_updated",
                                 worker_id=self.worker_id,
                                 connection_id=str(connection_id),
+                                player=request.player_name,
                                 history_message_count=len(trimmed_history),
                                 cleared_reasoning_content_count=cleared_count,
                             )
@@ -316,12 +324,15 @@ class AgentWorker:
                             from core.conversation import get_conversation_manager
 
                             conv_manager = get_conversation_manager(self.broker, self.settings)
-                            compressed, msg = await conv_manager.check_and_compress(connection_id)
+                            compressed, msg = await conv_manager.check_and_compress(
+                                connection_id, request.player_name
+                            )
                             if compressed:
                                 logger.debug(
                                     "auto_compression_triggered",
                                     worker_id=self.worker_id,
                                     connection_id=str(connection_id),
+                                    player=request.player_name,
                                     message=msg,
                                 )
 
@@ -332,6 +343,7 @@ class AgentWorker:
                         "chat_response_complete",
                         worker_id=self.worker_id,
                         connection_id=str(connection_id),
+                        player=request.player_name,
                         response=response_text,
                         response_length=len(response_text),
                         reasoning_length=len(reasoning_text),

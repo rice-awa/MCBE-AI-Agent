@@ -30,3 +30,4 @@ data/*
 
 .pytest_cache
 test_logs/*
+*.log
