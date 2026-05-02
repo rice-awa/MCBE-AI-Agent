@@ -1,62 +1,66 @@
 import type { Player } from "@minecraft/server";
 
-import { createActionForm, showActionFormSafely } from "../forms/formAdapter";
+import {
+  createCustomForm,
+  createDduiObservable,
+  showCustomFormSafely,
+} from "../forms/formAdapter";
 import type { AgentUiState } from "../state";
 import { saveAgentUiState } from "../storage";
 import type { AgentPanelRoute } from "./routes";
 import { CLOSE_ROUTE } from "./routes";
 
-const MAIN_MENU_BUTTONS = {
-  sendMessage: 0,
-  history: 1,
-  settings: 2,
-  stats: 3,
-  refresh: 4,
-  close: 5,
-} as const;
-
 export async function showAgentConsole(
   player: Player,
   uiState: AgentUiState,
 ): Promise<AgentPanelRoute> {
-  const form = createActionForm("MCBE AI Agent", createSummary(uiState))
-    .button("发送消息")
-    .button("聊天记录")
-    .button("设置")
-    .button("统计信息")
-    .button("刷新")
-    .button("关闭");
+  try {
+    const summary = createDduiObservable(buildSummary(uiState));
+    let nextRoute: AgentPanelRoute = CLOSE_ROUTE;
 
-  const response = await showActionFormSafely(player, form);
-  if (response === undefined) {
-    saveAgentUiState(player, uiState);
-    return CLOSE_ROUTE;
-  }
+    const form = createCustomForm(player, "MCBE AI Agent")
+      .closeButton()
+      .label(summary)
+      .divider()
+      .button("发送消息", () => {
+        nextRoute = { panel: "chatInput" };
+        form.close();
+      })
+      .button("聊天记录", () => {
+        nextRoute = { panel: "history" };
+        form.close();
+      })
+      .button("设置", () => {
+        nextRoute = { panel: "settings" };
+        form.close();
+      })
+      .button("统计信息", () => {
+        nextRoute = { panel: "stats" };
+        form.close();
+      })
+      .button("关闭", () => {
+        nextRoute = CLOSE_ROUTE;
+        form.close();
+      });
 
-  if (response.canceled || response.selection === undefined) {
-    saveAgentUiState(player, uiState);
-    return CLOSE_ROUTE;
-  }
-
-  switch (response.selection) {
-    case MAIN_MENU_BUTTONS.sendMessage:
-      return { panel: "chatInput" };
-    case MAIN_MENU_BUTTONS.history:
-      return { panel: "history" };
-    case MAIN_MENU_BUTTONS.settings:
-      return { panel: "settings" };
-    case MAIN_MENU_BUTTONS.stats:
-      return { panel: "stats" };
-    case MAIN_MENU_BUTTONS.refresh:
-      return { panel: "main" };
-    case MAIN_MENU_BUTTONS.close:
-    default:
+    const shown = await showCustomFormSafely(player, form);
+    if (!shown) {
       saveAgentUiState(player, uiState);
       return CLOSE_ROUTE;
+    }
+
+    if (nextRoute.panel === "close") {
+      saveAgentUiState(player, uiState);
+    }
+    return nextRoute;
+  } catch {
+    player.sendMessage("MCBE AI Agent: 表单暂时无法打开，请稍后再试。");
+    saveAgentUiState(player, uiState);
+    return CLOSE_ROUTE;
   }
 }
 
-function createSummary(uiState: AgentUiState): string {
+function buildSummary(uiState: AgentUiState): string {
   const lastPrompt = uiState.lastPrompt.getData() || "无";
   const lastResponse = uiState.lastResponsePreview.getData() || "无";
 
