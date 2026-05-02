@@ -120,6 +120,7 @@ class MinecraftProtocolHandler:
         content: str,
         provider: str | None = None,
         delivery: str | None = None,
+        player_name: str | None = None,
     ) -> ChatRequest:
         """
         创建聊天请求
@@ -128,16 +129,21 @@ class MinecraftProtocolHandler:
             state: 连接状态
             content: 聊天内容
             provider: 可选的 LLM 提供商
+            delivery: 下行通道
+            player_name: 本次消息真实发送者；缺省时回退到 state.player_name
 
         Returns:
             ChatRequest 对象
         """
+        sender = player_name or state.player_name
+        # 多人场景下优先取该玩家的 PlayerSession 设置
+        session = state.get_player_session(sender)
         return ChatRequest(
             connection_id=state.id,
             content=content,
-            player_name=state.player_name,
-            use_context=state.context_enabled,
-            provider=provider or state.current_provider,
+            player_name=sender,
+            use_context=session.context_enabled,
+            provider=provider or session.current_provider,
             delivery=delivery or "tellraw",
         )
 

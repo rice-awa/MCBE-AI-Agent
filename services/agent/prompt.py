@@ -71,14 +71,22 @@ class PromptManager:
 
     职责:
     - 管理内置和自定义模板
-    - 提供模板切换功能
+    - 提供模板切换功能（按 (connection_id, player_name) 分桶）
     - 处理模板变量替换
     """
 
+    DEFAULT_PLAYER_KEY = "__anonymous__"
+
     def __init__(self):
         self._templates: dict[str, PromptTemplate] = BUILTIN_TEMPLATES.copy()
-        self._connection_templates: dict[str, str] = {}  # connection_id -> template_name
-        self._connection_variables: dict[str, dict[str, str]] = {}  # connection_id -> {key: value}
+        # (connection_id, player_name) -> template_name
+        self._session_templates: dict[tuple[str, str], str] = {}
+        # (connection_id, player_name) -> {key: value}
+        self._session_variables: dict[tuple[str, str], dict[str, str]] = {}
+
+    @classmethod
+    def _make_key(cls, connection_id: str, player_name: str | None) -> tuple[str, str]:
+        return (connection_id, player_name or cls.DEFAULT_PLAYER_KEY)
 
     def register_template(self, template: PromptTemplate) -> bool:
         """
@@ -110,58 +118,84 @@ class PromptManager:
         """列出所有可用模板"""
         return list(self._templates.keys())
 
-    def get_connection_template(self, connection_id: str) -> str:
-        """获取连接的当前模板名称"""
-        return self._connection_templates.get(connection_id, "default")
+    # ── 按 (连接, 玩家) 维度的模板 / 变量管理 ──
 
-    def set_connection_template(self, connection_id: str, template_name: str) -> bool:
+    def get_session_template(
+        self, connection_id: str, player_name: str | None
+    ) -> str:
+        """获取 (连接, 玩家) 当前的模板名称（找不到时回退到匿名桶以兼容旧 API）"""
+        key = self._make_key(connection_id, player_name)
+        if key in self._session_templates:
+            return self._session_templates[key]
+        # 回退：按连接级（匿名玩家）查询
+        fallback_key = self._make_key(connection_id, None)
+        return self._session_templates.get(fallback_key, "default")
+
+    def set_session_template(
+        self, connection_id: str, player_name: str | None, template_name: str
+    ) -> bool:
         """
-        设置连接的当前模板
+        设置 (连接, 玩家) 当前的模板
 
         Args:
             connection_id: 连接 ID
+            player_name: 玩家名
             template_name: 模板名称
 
         Returns:
             是否设置成功
         """
         if template_name not in self._templates:
-            logger.warning("set_connection_template_not_found", template=template_name)
+            logger.warning("set_session_template_not_found", template=template_name)
             return False
 
-        self._connection_templates[connection_id] = template_name
+        key = self._make_key(connection_id, player_name)
+        self._session_templates[key] = template_name
 
-        # 初始化该连接的自定义变量（如果不存在）
-        if connection_id not in self._connection_variables:
+        # 初始化该会话的自定义变量（如果不存在）
+        if key not in self._session_variables:
             template = self._templates[template_name]
-            self._connection_variables[connection_id] = template.variables.copy()
+            self._session_variables[key] = template.variables.copy()
 
         logger.info(
-            "connection_template_changed",
+            "session_template_changed",
             connection_id=connection_id,
+            player=player_name,
             template=template_name,
         )
         return True
 
-    def get_connection_variables(self, connection_id: str) -> dict[str, str]:
-        """获取连接的自定义变量"""
-        if connection_id not in self._connection_variables:
-            # 返回默认模板的变量
-            template_name = self.get_connection_template(connection_id)
-            template = self._templates.get(template_name)
-            if template:
-                return template.variables.copy()
-            return {}
-        return self._connection_variables.get(connection_id, {}).copy()
+    def get_session_variables(
+        self, connection_id: str, player_name: str | None
+    ) -> dict[str, str]:
+        """获取 (连接, 玩家) 的自定义变量（找不到时回退到匿名桶以兼容旧 API）"""
+        key = self._make_key(connection_id, player_name)
+        if key in self._session_variables:
+            return self._session_variables[key].copy()
+        # 回退：按连接级（匿名玩家）查询
+        fallback_key = self._make_key(connection_id, None)
+        if fallback_key in self._session_variables:
+            return self._session_variables[fallback_key].copy()
+        # 再退一步：用当前模板默认变量
+        template_name = self.get_session_template(connection_id, player_name)
+        template = self._templates.get(template_name)
+        if template:
+            return template.variables.copy()
+        return {}
 
-    def set_connection_variable(
-        self, connection_id: str, name: str, value: str
+    def set_session_variable(
+        self,
+        connection_id: str,
+        player_name: str | None,
+        name: str,
+        value: str,
     ) -> bool:
         """
-        设置连接的自定义变量
+        设置 (连接, 玩家) 的自定义变量
 
         Args:
             connection_id: 连接 ID
+            player_name: 玩家名
             name: 变量名
             value: 变量值
 
@@ -172,46 +206,85 @@ class PromptManager:
         if not name.startswith("custom_"):
             name = f"custom_{name}"
 
-        # 确保该连接的变量字典存在
-        if connection_id not in self._connection_variables:
-            template_name = self.get_connection_template(connection_id)
+        key = self._make_key(connection_id, player_name)
+        # 确保该会话的变量字典存在
+        if key not in self._session_variables:
+            template_name = self.get_session_template(connection_id, player_name)
             template = self._templates.get(template_name)
             if template:
-                self._connection_variables[connection_id] = template.variables.copy()
+                self._session_variables[key] = template.variables.copy()
             else:
-                self._connection_variables[connection_id] = {}
+                self._session_variables[key] = {}
 
-        self._connection_variables[connection_id][name] = value
+        self._session_variables[key][name] = value
         logger.info(
-            "connection_variable_set",
+            "session_variable_set",
             connection_id=connection_id,
+            player=player_name,
             name=name,
             value=value,
         )
         return True
 
-    def remove_connection_variable(
-        self, connection_id: str, name: str
+    def remove_session_variable(
+        self, connection_id: str, player_name: str | None, name: str
     ) -> bool:
-        """删除连接的自定义变量"""
-        if connection_id not in self._connection_variables:
+        """删除 (连接, 玩家) 的自定义变量"""
+        key = self._make_key(connection_id, player_name)
+        if key not in self._session_variables:
             return False
 
-        if name in self._connection_variables[connection_id]:
-            del self._connection_variables[connection_id][name]
+        if name in self._session_variables[key]:
+            del self._session_variables[key][name]
             logger.info(
-                "connection_variable_removed",
+                "session_variable_removed",
                 connection_id=connection_id,
+                player=player_name,
                 name=name,
             )
             return True
         return False
 
+    def clear_session(self, connection_id: str, player_name: str | None) -> None:
+        """清理 (连接, 玩家) 的模板与变量数据"""
+        key = self._make_key(connection_id, player_name)
+        self._session_templates.pop(key, None)
+        self._session_variables.pop(key, None)
+        logger.info(
+            "session_template_cleared",
+            connection_id=connection_id,
+            player=player_name,
+        )
+
     def clear_connection(self, connection_id: str) -> None:
-        """清理连接的模板和变量数据"""
-        self._connection_templates.pop(connection_id, None)
-        self._connection_variables.pop(connection_id, None)
+        """清理某连接下所有玩家的模板与变量数据。"""
+        for keys, store in (
+            (list(self._session_templates.keys()), self._session_templates),
+            (list(self._session_variables.keys()), self._session_variables),
+        ):
+            for key in keys:
+                if key[0] == connection_id:
+                    store.pop(key, None)
         logger.info("connection_template_cleared", connection_id=connection_id)
+
+    # ── 兼容旧 API（仅按 connection_id 操作；映射到匿名玩家桶） ──
+
+    def get_connection_template(self, connection_id: str) -> str:
+        return self.get_session_template(connection_id, None)
+
+    def set_connection_template(self, connection_id: str, template_name: str) -> bool:
+        return self.set_session_template(connection_id, None, template_name)
+
+    def get_connection_variables(self, connection_id: str) -> dict[str, str]:
+        return self.get_session_variables(connection_id, None)
+
+    def set_connection_variable(
+        self, connection_id: str, name: str, value: str
+    ) -> bool:
+        return self.set_session_variable(connection_id, None, name, value)
+
+    def remove_connection_variable(self, connection_id: str, name: str) -> bool:
+        return self.remove_session_variable(connection_id, None, name)
 
     def build_system_prompt(
         self,
@@ -227,7 +300,7 @@ class PromptManager:
 
         Args:
             connection_id: 连接 ID
-            player_name: 玩家名称
+            player_name: 玩家名称（同时是模板/变量分桶键）
             provider: LLM 提供商
             model: 模型名称
             context_length: 上下文长度
@@ -236,8 +309,8 @@ class PromptManager:
         Returns:
             完整的系统提示词
         """
-        # 获取当前模板
-        template_name = self.get_connection_template(connection_id)
+        # 获取当前模板（按 (连接, 玩家) 维度）
+        template_name = self.get_session_template(connection_id, player_name)
         template = self._templates.get(template_name)
 
         if not template:
@@ -245,7 +318,7 @@ class PromptManager:
             template = self._templates["default"]
 
         # 获取变量
-        custom_vars = self.get_connection_variables(connection_id)
+        custom_vars = self.get_session_variables(connection_id, player_name)
 
         # 构建内置变量
         builtin_vars = {

@@ -84,6 +84,7 @@ class ConversationManager:
     async def check_and_compress(
         self,
         connection_id: UUID,
+        player_name: str | None,
         force: bool = False,
     ) -> tuple[bool, str]:
         """
@@ -91,12 +92,13 @@ class ConversationManager:
 
         Args:
             connection_id: 连接 ID
+            player_name: 玩家名（多人会话隔离）
             force: 是否强制压缩
 
         Returns:
             (是否执行了压缩, 描述信息)
         """
-        history = self.broker.get_conversation_history(connection_id)
+        history = self.broker.get_conversation_history(connection_id, player_name)
         threshold = self._get_compression_threshold()
 
         if not history:
@@ -107,15 +109,16 @@ class ConversationManager:
 
         if force:
             # 强制模式下，尝试提取摘要（即使轮数少于阈值）
-            return await self.compress_history(connection_id, force=True)
+            return await self.compress_history(connection_id, player_name, force=True)
         elif turns >= threshold:
-            return await self.compress_history(connection_id)
+            return await self.compress_history(connection_id, player_name)
 
         return False, f"当前 {turns} 轮，未达到压缩阈值 {threshold} 轮"
 
     async def compress_history(
         self,
         connection_id: UUID,
+        player_name: str | None,
         force: bool = False,
     ) -> tuple[bool, str]:
         """
@@ -129,12 +132,13 @@ class ConversationManager:
 
         Args:
             connection_id: 连接 ID
+            player_name: 玩家名（多人会话隔离）
             force: 是否强制压缩（强制模式下即使轮数少于阈值也会提取摘要）
 
         Returns:
             (是否成功, 描述信息)
         """
-        history = self.broker.get_conversation_history(connection_id)
+        history = self.broker.get_conversation_history(connection_id, player_name)
         max_turns = self.settings.max_history_turns
         threshold = self._get_compression_threshold()
 
@@ -160,12 +164,13 @@ class ConversationManager:
             if summary_message:
                 truncated.insert(0, summary_message)
 
-        self.broker.set_conversation_history(connection_id, truncated)
+        self.broker.set_conversation_history(connection_id, player_name, truncated)
 
         new_turns = self._count_turns(truncated)
         logger.info(
             "conversation_compressed",
             connection_id=str(connection_id),
+            player=player_name,
             original_turns=current_turns,
             new_turns=new_turns,
             summary_length=len(summary),
@@ -297,7 +302,7 @@ class ConversationManager:
 
         Args:
             connection_id: 连接 ID
-            player_name: 玩家名称
+            player_name: 玩家名称（同时是会话分桶键）
             provider: LLM 提供商
             model: 模型名称
             template: 使用的模板
@@ -306,7 +311,7 @@ class ConversationManager:
         Returns:
             (是否成功, 消息/会话ID)
         """
-        history = self.broker.get_conversation_history(connection_id)
+        history = self.broker.get_conversation_history(connection_id, player_name)
 
         if not history:
             return False, "对话历史为空，无法保存"
@@ -424,6 +429,7 @@ class ConversationManager:
         self,
         connection_id: UUID,
         session_id: str,
+        player_name: str | None = None,
     ) -> tuple[bool, str]:
         """
         恢复对话到指定连接
@@ -431,6 +437,7 @@ class ConversationManager:
         Args:
             connection_id: 连接 ID
             session_id: 会话 ID
+            player_name: 玩家名（恢复到该玩家的桶里）
 
         Returns:
             (是否成功, 消息)
@@ -442,12 +449,13 @@ class ConversationManager:
 
         messages = result if isinstance(result, list) else []
 
-        # 设置到 broker
-        self.broker.set_conversation_history(connection_id, messages)
+        # 设置到 broker（按 player_name 分桶）
+        self.broker.set_conversation_history(connection_id, player_name, messages)
 
         logger.info(
             "conversation_restored",
             connection_id=str(connection_id),
+            player=player_name,
             session_id=session_id,
             message_count=len(messages),
         )
