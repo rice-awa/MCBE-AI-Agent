@@ -59,6 +59,44 @@ def register_agent_tools(chat_agent: Agent[AgentDependencies, str]) -> None:
             return f"命令执行失败: {str(e)}"
 
     @chat_agent.tool
+    async def run_minecraft_commands(
+        ctx: RunContext[AgentDependencies],
+        commands: list[str],
+    ) -> str:
+        """
+        批量执行 Minecraft 命令
+
+        Args:
+            ctx: 运行上下文
+            commands: 要执行的命令数组（不包括前导斜杠）
+
+        Returns:
+            每条命令的执行结果
+        """
+        logger.info(
+            "agent_tool_call",
+            tool="run_minecraft_commands",
+            command_count=len(commands),
+            connection_id=str(ctx.deps.connection_id),
+        )
+
+        results: list[str] = []
+        for index, command in enumerate(commands, start=1):
+            try:
+                result = await ctx.deps.run_command(command)
+                output = result if result else "命令执行成功"
+                results.append(f"{index}. {command}: {output}")
+            except Exception as e:
+                logger.error(
+                    "agent_tool_error",
+                    tool="run_minecraft_commands",
+                    command=command,
+                    error=str(e),
+                )
+                results.append(f"{index}. {command}: 命令执行失败: {str(e)}")
+        return "\n".join(results) if results else "没有可执行的命令"
+
+    @chat_agent.tool
     async def send_game_message(
         ctx: RunContext[AgentDependencies],
         message: str,
