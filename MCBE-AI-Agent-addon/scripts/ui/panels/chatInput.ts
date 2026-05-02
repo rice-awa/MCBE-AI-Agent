@@ -1,5 +1,6 @@
 import type { Player } from "@minecraft/server";
 
+import { sendUiChatMessage } from "../../bridge/toolPlayer";
 import { buildAgentChatCommand } from "../commands";
 import { appendHistoryItem, createHistoryId } from "../history";
 import {
@@ -62,7 +63,16 @@ export async function showChatInputPanel(
         );
 
         const command = buildAgentChatCommand(message);
-        player.sendMessage(`MCBE AI Agent: 已记录消息。若服务未收到，请在聊天框发送：${command}`);
+        try {
+          sendUiChatMessage(player.name, message);
+          uiState.bridgeStatus.setData("sent");
+          player.sendMessage("MCBE AI Agent: 消息已发送至 AI 服务。");
+        } catch {
+          uiState.bridgeStatus.setData("error");
+          player.sendMessage(
+            `MCBE AI Agent: 自动发送失败，请在聊天框手动发送：${command}`,
+          );
+        }
 
         const saveResult = saveAgentUiState(player, uiState);
         if (!saveResult.ok) {

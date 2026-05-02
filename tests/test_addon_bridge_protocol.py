@@ -8,8 +8,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.addon.protocol import (
     decode_bridge_chat_chunk,
+    decode_ui_chat_chunk,
     encode_bridge_request,
     reassemble_bridge_chunks,
+    reassemble_ui_chat_chunks,
 )
 
 
@@ -97,3 +99,35 @@ def test_reassemble_bridge_chunks_should_reject_incomplete_or_duplicate_chunks()
     ]
     with pytest.raises(ValueError, match="Bridge chunks are incomplete or out of sequence"):
         reassemble_bridge_chunks(chunks)
+
+
+# ─── UI Chat 协议测试 ───────────────────────────────────────────
+
+
+def test_decode_ui_chat_chunk_should_parse_single_chunk() -> None:
+    chunk = decode_ui_chat_chunk('MCBEAI|UI_CHAT|ui-1|1/1|{"player":"Steve","message":"hello"}')
+    assert chunk.msg_id == "ui-1"
+    assert chunk.chunk_index == 1
+    assert chunk.total_chunks == 1
+
+
+def test_reassemble_ui_chat_chunks_should_restore_message() -> None:
+    chunks = [
+        decode_ui_chat_chunk('MCBEAI|UI_CHAT|ui-2|1/2|{"player":"Steve","mes'),
+        decode_ui_chat_chunk('MCBEAI|UI_CHAT|ui-2|2/2|sage":"你好世界"}'),
+    ]
+    ui_msg = reassemble_ui_chat_chunks(chunks)
+    assert ui_msg.msg_id == "ui-2"
+    assert ui_msg.player_name == "Steve"
+    assert ui_msg.message == "你好世界"
+
+
+def test_decode_ui_chat_chunk_should_reject_wrong_prefix() -> None:
+    with pytest.raises(ValueError, match="Invalid UI chat chunk prefix"):
+        decode_ui_chat_chunk("MCBEAI|RESP|ui-1|1/1|{}")
+
+
+def test_reassemble_ui_chat_chunks_should_reject_missing_message() -> None:
+    chunks = [decode_ui_chat_chunk('MCBEAI|UI_CHAT|ui-3|1/1|{"player":"Steve"}')]
+    with pytest.raises(ValueError, match="missing message"):
+        reassemble_ui_chat_chunks(chunks)

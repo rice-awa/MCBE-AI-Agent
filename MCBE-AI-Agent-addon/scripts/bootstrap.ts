@@ -1,6 +1,7 @@
 import { system, world } from "@minecraft/server";
 import { registerBridgeRouter } from "./bridge/router";
 import { initializeToolPlayer } from "./bridge/toolPlayer";
+import { registerResponseSyncHandler } from "./bridge/responseSync";
 import { registerUiEntry } from "./ui/entry";
 
 /**
@@ -9,6 +10,7 @@ import { registerUiEntry } from "./ui/entry";
  */
 export function initializeAddonEarly(): void {
   registerBridgeRouter();
+  registerResponseSyncHandler();
   registerUiEntry();
 }
 

@@ -1,7 +1,7 @@
 import type { HistoryItem } from "./history";
 import type { AgentUiStats } from "./stats";
 
-export type BridgeStatus = "disconnected" | "connecting" | "ready";
+export type BridgeStatus = "disconnected" | "connecting" | "ready" | "sent" | "error";
 
 export type ObservableLike<T> = {
   getData(): T;

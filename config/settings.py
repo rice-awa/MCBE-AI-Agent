@@ -400,6 +400,19 @@ class Settings(BaseSettings):
         description="是否在游戏内显示工具调用的返回结果（False=仅显示工具名称和参数，True=显示完整返回内容）"
     )
 
+    # 流控中间件配置
+    max_chunk_content_length: int = Field(
+        default=400,
+        alias="MAX_CHUNK_CONTENT_LENGTH",
+        description="MCBE 单条消息内容长度上限（字符数），超过则分片发送",
+    )
+
+    chunk_sentence_mode: bool = Field(
+        default=True,
+        alias="CHUNK_SENTENCE_MODE",
+        description="分片时是否优先按句子分割（True=语义分片，False=强制等长截断）",
+    )
+
     def get_provider_config(self, provider_name: str | None = None) -> LLMProviderConfig:
         """获取指定提供商的配置"""
         name = provider_name or self.default_provider

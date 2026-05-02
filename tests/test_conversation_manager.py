@@ -42,19 +42,27 @@ def _build_multi_turn(count: int) -> list:
 
 
 class MockBroker:
-    """模拟 MessageBroker"""
+    """模拟 MessageBroker（按 (connection_id, player_name) 分桶）"""
 
     def __init__(self):
         self._histories = {}
 
-    def get_conversation_history(self, connection_id):
-        return list(self._histories.get(str(connection_id), []))
+    @staticmethod
+    def _key(connection_id, player_name):
+        return (str(connection_id), player_name or "__anonymous__")
 
-    def set_conversation_history(self, connection_id, history):
-        self._histories[str(connection_id)] = list(history)
+    def get_conversation_history(self, connection_id, player_name=None):
+        return list(self._histories.get(self._key(connection_id, player_name), []))
 
-    def clear_conversation_history(self, connection_id):
-        self._histories.pop(str(connection_id), None)
+    def set_conversation_history(self, connection_id, player_name, history=None):
+        # 兼容历史调用：若只传两个参数则视为旧 API，第二个参数即历史
+        if history is None and isinstance(player_name, list):
+            history = player_name
+            player_name = None
+        self._histories[self._key(connection_id, player_name)] = list(history or [])
+
+    def clear_conversation_history(self, connection_id, player_name=None):
+        self._histories.pop(self._key(connection_id, player_name), None)
 
 
 def test_conversation_manager_init():
@@ -163,7 +171,7 @@ async def test_compress_history():
     assert manager._count_turns(messages) == 25
 
     # 执行压缩
-    success, msg = await manager.compress_history(connection_id)
+    success, msg = await manager.compress_history(connection_id, None)
 
     assert success is True
     assert "压缩完成" in msg
@@ -187,7 +195,7 @@ async def test_check_and_compress_not_needed():
     messages = _build_multi_turn(5)
     broker.set_conversation_history(connection_id, messages)
 
-    success, msg = await manager.check_and_compress(connection_id)
+    success, msg = await manager.check_and_compress(connection_id, None)
 
     assert success is False
     assert "未达到压缩阈值" in msg
@@ -207,7 +215,7 @@ async def test_check_and_compress_force():
     broker.set_conversation_history(connection_id, messages)
 
     # 强制压缩
-    success, msg = await manager.check_and_compress(connection_id, force=True)
+    success, msg = await manager.check_and_compress(connection_id, None, force=True)
 
     assert success is True
     assert "压缩完成" in msg
@@ -225,7 +233,7 @@ async def test_save_and_load_conversation():
 
     # 构建3轮对话
     messages = _build_multi_turn(3)
-    broker.set_conversation_history(connection_id, messages)
+    broker.set_conversation_history(connection_id, player_name, messages)
 
     # 保存对话
     success, session_id = await manager.save_conversation(
@@ -239,7 +247,7 @@ async def test_save_and_load_conversation():
     assert session_id is not None
 
     # 清除当前历史
-    broker.clear_conversation_history(connection_id)
+    broker.clear_conversation_history(connection_id, player_name)
 
     # 加载对话
     success, loaded_messages = await manager.load_conversation(session_id)
@@ -325,7 +333,7 @@ async def test_restore_conversation():
 
     # 构建并保存对话
     messages = _build_multi_turn(3)
-    broker.set_conversation_history(connection_id, messages)
+    broker.set_conversation_history(connection_id, player_name, messages)
 
     success, session_id = await manager.save_conversation(
         connection_id=connection_id,
@@ -334,16 +342,16 @@ async def test_restore_conversation():
     assert success is True
 
     # 清除当前历史
-    broker.clear_conversation_history(connection_id)
+    broker.clear_conversation_history(connection_id, player_name)
 
     # 恢复对话
-    success, msg = await manager.restore_conversation(connection_id, session_id)
+    success, msg = await manager.restore_conversation(connection_id, session_id, player_name=player_name)
 
     assert success is True
     assert "已恢复" in msg
 
     # 验证历史已恢复
-    restored_history = broker.get_conversation_history(connection_id)
+    restored_history = broker.get_conversation_history(connection_id, player_name)
     assert len(restored_history) > 0
 
     # 清理

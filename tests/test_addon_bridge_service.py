@@ -149,3 +149,40 @@ async def test_handle_player_message_should_ignore_duplicate_chunk_indexes() -> 
 
     result = await task
     assert result["payload"]["name"] == "Steve"
+
+
+# ─── UI Chat 服务测试 ───────────────────────────────────────────
+
+
+def test_is_ui_chat_message_should_match_tool_player_and_prefix() -> None:
+    service = AddonBridgeService()
+
+    assert service.is_ui_chat_message("MCBEAI_TOOL", 'MCBEAI|UI_CHAT|ui-1|1/1|{}') is True
+    assert service.is_ui_chat_message("Steve", 'MCBEAI|UI_CHAT|ui-1|1/1|{}') is False
+    assert service.is_ui_chat_message("MCBEAI_TOOL", "hello") is False
+    assert service.is_ui_chat_message("MCBEAI_TOOL", 'MCBEAI|RESP|req-1|1/1|{}') is False
+
+
+@pytest.mark.asyncio
+async def test_handle_ui_chat_should_invoke_callback_on_reassembly() -> None:
+    service = AddonBridgeService()
+    connection_id = uuid4()
+    received: list[tuple[str, str, str]] = []
+
+    async def on_ui_chat(cid: object, player_name: str, message: str) -> None:
+        received.append((str(cid), player_name, message))
+
+    service.set_ui_chat_callback(on_ui_chat)
+
+    # 模拟单分片 UI chat 消息
+    handled = service.handle_player_message(
+        connection_id,
+        "MCBEAI_TOOL",
+        'MCBEAI|UI_CHAT|ui-42|1/1|{"player":"Steve","message":"你好"}',
+    )
+    assert handled is True
+
+    await asyncio.sleep(0)
+    assert len(received) == 1
+    assert received[0][1] == "Steve"
+    assert received[0][2] == "你好"

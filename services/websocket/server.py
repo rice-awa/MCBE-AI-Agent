@@ -3,6 +3,7 @@
 import asyncio
 import json
 from typing import Any
+from uuid import UUID
 
 import websockets
 from websockets.server import WebSocketServerProtocol, serve
@@ -10,7 +11,8 @@ from websockets.server import WebSocketServerProtocol, serve
 from core.queue import MessageBroker
 from services.addon.service import get_addon_bridge_service
 from services.websocket.connection import ConnectionManager
-from services.websocket.minecraft import MinecraftProtocolHandler
+from services.websocket.flow_control import FlowControlMiddleware
+from services.websocket.minecraft import MinecraftProtocolHandler, TellrawMessage
 from services.auth.jwt_handler import JWTHandler
 from config.settings import Settings
 from config.logging import get_logger
@@ -43,6 +45,7 @@ class WebSocketServer:
         self.connection_manager = ConnectionManager(broker, dev_mode=self.dev_mode)
         self.protocol_handler = MinecraftProtocolHandler()
         self.addon_bridge_service = get_addon_bridge_service()
+        self.addon_bridge_service.set_ui_chat_callback(self._handle_ui_chat_message)
         self._server: Any = None
 
     async def start(self) -> None:
@@ -119,12 +122,12 @@ class WebSocketServer:
             subscribe_msg = self.protocol_handler.create_subscribe_message()
             await self._send_ws_payload(state, subscribe_msg, source="subscribe")
 
-            # 发送欢迎消息
+            # 发送欢迎消息（连接刚建立时还没有具体玩家身份，用默认上下文开关）
             welcome_text = self.protocol_handler.create_welcome_message(
                 connection_id=str(state.id),
                 model=self.settings.get_provider_config().model,
                 provider=self.settings.default_provider,
-                context_enabled=state.context_enabled,
+                context_enabled=True,
             )
             welcome_cmd = self.protocol_handler.create_info_message(welcome_text)
             await self._send_ws_payload(state, welcome_cmd, source="welcome")
@@ -184,19 +187,30 @@ class WebSocketServer:
             if not player_event:
                 return
 
+            # 检查是否为 addon 桥接消息（RESP 或 UI_CHAT）
             if self.addon_bridge_service.is_bridge_chat_message(
                 player_event.sender,
                 player_event.message,
+            ) or self.addon_bridge_service.is_ui_chat_message(
+                player_event.sender,
+                player_event.message,
             ):
-                self.addon_bridge_service.handle_player_message(
+                handled = self.addon_bridge_service.handle_player_message(
                     state.id,
                     player_event.sender,
                     player_event.message,
                 )
+                logger.debug(
+                    "addon_bridge_message_handled",
+                    connection_id=str(state.id),
+                    sender=player_event.sender,
+                    message_prefix=player_event.message[:30] if player_event.message else "",
+                    handled=handled,
+                )
                 return
 
-            # 更新玩家名称
-            if player_event.sender and not state.player_name:
+            # 记录最近一次发言者（仅作便捷指针；多人路由必须用 player_event.sender）
+            if player_event.sender:
                 state.player_name = player_event.sender
 
             # 解析命令
@@ -214,8 +228,10 @@ class WebSocketServer:
                 player=player_event.sender,
             )
 
-            # 处理命令
-            await self.handle_command(state, cmd_type, content)
+            # 处理命令（player_name 直传，避免连接级状态串扰）
+            await self.handle_command(
+                state, cmd_type, content, player_name=player_event.sender
+            )
 
         except json.JSONDecodeError:
             logger.warning(
@@ -307,7 +323,11 @@ class WebSocketServer:
         return False
 
     async def handle_command(
-        self, state: Any, cmd_type: str, content: str
+        self,
+        state: Any,
+        cmd_type: str,
+        content: str,
+        player_name: str | None = None,
     ) -> None:
         """
         处理命令
@@ -316,6 +336,7 @@ class WebSocketServer:
             state: 连接状态
             cmd_type: 命令类型
             content: 命令内容
+            player_name: 触发本次命令的玩家名（多人会话隔离的关键参数）
         """
         # 登录命令不需要认证
         if cmd_type == "login":
@@ -330,19 +351,30 @@ class WebSocketServer:
 
         # 路由到具体处理器
         if cmd_type == "chat":
-            await self.handle_chat(state, content, delivery="tellraw")
+            await self.handle_chat(
+                state, content, delivery="tellraw", player_name=player_name
+            )
+            # 聊天框用户消息同步到 Addon UI 历史记录
+            await self.broker.send_response(state.id, {
+                "type": "ai_response_sync",
+                "player_name": player_name or state.player_name or "Player",
+                "role": "user",
+                "text": content,
+            })
         elif cmd_type == "chat_script":
-            await self.handle_chat(state, content, delivery="scriptevent")
+            await self.handle_chat(
+                state, content, delivery="scriptevent", player_name=player_name
+            )
         elif cmd_type == "context":
-            await self.handle_context(state, content)
+            await self.handle_context(state, content, player_name=player_name)
         elif cmd_type == "template":
-            await self.handle_template(state, content)
+            await self.handle_template(state, content, player_name=player_name)
         elif cmd_type == "setting":
-            await self.handle_setting(state, content)
+            await self.handle_setting(state, content, player_name=player_name)
         elif cmd_type == "mcp":
             await self.handle_mcp(state, content)
         elif cmd_type == "switch_model":
-            await self.handle_switch_model(state, content)
+            await self.handle_switch_model(state, content, player_name=player_name)
         elif cmd_type == "help":
             await self.handle_help(state)
         elif cmd_type == "save":
@@ -389,7 +421,11 @@ class WebSocketServer:
         return False
 
     async def handle_chat(
-        self, state: Any, content: str, delivery: str
+        self,
+        state: Any,
+        content: str,
+        delivery: str,
+        player_name: str | None = None,
     ) -> None:
         """处理聊天请求（非阻塞）"""
         if not content:
@@ -397,9 +433,9 @@ class WebSocketServer:
             await self._send_ws_payload(state, msg, source="chat")
             return
 
-        # 创建聊天请求
+        # 创建聊天请求（使用本次事件的真实 sender，而非缓存的 state.player_name）
         chat_req = self.protocol_handler.create_chat_request(
-            state, content, delivery=delivery
+            state, content, delivery=delivery, player_name=player_name
         )
 
         # 提交到消息队列（非阻塞！）
@@ -408,6 +444,7 @@ class WebSocketServer:
             logger.debug(
                 "chat_request_queued",
                 connection_id=str(state.id),
+                player=player_name,
                 content_length=len(content),
             )
         except asyncio.QueueFull:
@@ -416,12 +453,15 @@ class WebSocketServer:
             )
             await self._send_ws_payload(state, msg, source="chat")
 
-    async def handle_context(self, state: Any, option: str) -> None:
-        """处理上下文管理"""
+    async def handle_context(
+        self, state: Any, option: str, player_name: str | None = None
+    ) -> None:
+        """处理上下文管理（按玩家分桶）"""
         # 导入对话管理器
         from core.conversation import get_conversation_manager
 
         conv_manager = get_conversation_manager(self.broker, self.settings)
+        session = state.get_player_session(player_name)
 
         # 解析选项
         parts = option.strip().split(None, 1) if option.strip() else []
@@ -429,22 +469,22 @@ class WebSocketServer:
         arg = parts[1] if len(parts) > 1 else ""
 
         if action == "启用":
-            state.context_enabled = True
+            session.context_enabled = True
             msg = self.protocol_handler.create_success_message("上下文已启用")
         elif action == "关闭":
-            state.context_enabled = False
-            self.broker.clear_conversation_history(state.id)
+            session.context_enabled = False
+            self.broker.clear_conversation_history(state.id, player_name)
             msg = self.protocol_handler.create_success_message("上下文已关闭")
         elif action == "状态":
-            status = "启用" if state.context_enabled else "关闭"
-            history = self.broker.get_conversation_history(state.id)
+            status = "启用" if session.context_enabled else "关闭"
+            history = self.broker.get_conversation_history(state.id, player_name)
             turns = self._count_conversation_turns(history)
 
             # 获取上下文使用信息
             context_usage = ""
             try:
                 # 使用当前提供商或默认提供商
-                provider = state.current_provider or self.settings.default_provider
+                provider = session.current_provider or self.settings.default_provider
                 provider_config = self.settings.get_provider_config(provider)
                 message_count = len(history)
                 estimated_tokens = message_count * 100  # 简单估算
@@ -463,7 +503,9 @@ class WebSocketServer:
             return
         elif action == "压缩":
             # 手动触发压缩
-            success, result = await conv_manager.check_and_compress(state.id, force=True)
+            success, result = await conv_manager.check_and_compress(
+                state.id, player_name, force=True
+            )
             if success:
                 msg = self.protocol_handler.create_success_message(result)
             else:
@@ -472,10 +514,10 @@ class WebSocketServer:
             # 保存当前对话
             success, result = await conv_manager.save_conversation(
                 connection_id=state.id,
-                player_name=state.player_name,
-                provider=state.current_provider or self.settings.default_provider,
-                template=state.current_template,
-                custom_variables=state.custom_variables,
+                player_name=player_name or session.player_name,
+                provider=session.current_provider or self.settings.default_provider,
+                template=session.current_template,
+                custom_variables=session.custom_variables,
             )
             if success:
                 msg = self.protocol_handler.create_success_message(f"对话已保存: {result}")
@@ -488,7 +530,9 @@ class WebSocketServer:
                     "请指定要恢复的会话 ID\n用法: AGENT 上下文 恢复 <ID>"
                 )
             else:
-                success, result = await conv_manager.restore_conversation(state.id, arg)
+                success, result = await conv_manager.restore_conversation(
+                    state.id, arg, player_name=player_name
+                )
                 if success:
                     msg = self.protocol_handler.create_success_message(result)
                 else:
@@ -512,7 +556,7 @@ class WebSocketServer:
                     msg = self.protocol_handler.create_error_message(result)
         elif action == "清除":
             # 清除对话历史
-            self.broker.clear_conversation_history(state.id)
+            self.broker.clear_conversation_history(state.id, player_name)
             msg = self.protocol_handler.create_success_message("对话历史已清除")
         else:
             msg = self.protocol_handler.create_error_message(
@@ -532,13 +576,16 @@ class WebSocketServer:
                         break
         return turns
 
-    async def handle_switch_model(self, state: Any, provider: str) -> None:
-        """处理模型切换"""
+    async def handle_switch_model(
+        self, state: Any, provider: str, player_name: str | None = None
+    ) -> None:
+        """处理模型切换（按玩家分桶）"""
         available = self.settings.list_available_providers()
+        session = state.get_player_session(player_name)
 
         if provider.lower() in available:
-            state.current_provider = provider.lower()
-            self.broker.clear_conversation_history(state.id)
+            session.current_provider = provider.lower()
+            self.broker.clear_conversation_history(state.id, player_name)
             config = self.settings.get_provider_config(provider.lower())
             msg = self.protocol_handler.create_success_message(
                 f"已切换到 {provider}/{config.model}"
@@ -550,16 +597,20 @@ class WebSocketServer:
 
         await self._send_ws_payload(state, msg, source="switch_model")
 
-    async def handle_template(self, state: Any, content: str) -> None:
-        """处理模板管理"""
+    async def handle_template(
+        self, state: Any, content: str, player_name: str | None = None
+    ) -> None:
+        """处理模板管理（按玩家分桶）"""
         from services.agent.prompt import get_prompt_manager
 
         manager = get_prompt_manager()
         connection_id = str(state.id)
+        session = state.get_player_session(player_name)
+        actor = player_name or session.player_name
 
         if not content or content.strip() == "":
             # 显示当前模板
-            current = manager.get_connection_template(connection_id)
+            current = manager.get_session_template(connection_id, actor)
             template = manager.get_template(current)
             if template:
                 msg = self.protocol_handler.create_info_message(
@@ -570,7 +621,7 @@ class WebSocketServer:
         elif content.strip() == "list":
             # 列出所有模板
             templates = manager.list_templates()
-            current = manager.get_connection_template(connection_id)
+            current = manager.get_session_template(connection_id, actor)
             lines = ["可用模板:"]
             for name in templates:
                 template = manager.get_template(name)
@@ -581,10 +632,10 @@ class WebSocketServer:
         else:
             # 切换模板
             template_name = content.strip()
-            if manager.set_connection_template(connection_id, template_name):
-                # 同时更新 ConnectionState 的模板状态
-                state.current_template = template_name
-                state.custom_variables = manager.get_connection_variables(connection_id)
+            if manager.set_session_template(connection_id, actor, template_name):
+                # 同时更新 PlayerSession 的模板状态
+                session.current_template = template_name
+                session.custom_variables = manager.get_session_variables(connection_id, actor)
                 template = manager.get_template(template_name)
                 desc = template.description if template else ""
                 msg = self.protocol_handler.create_success_message(
@@ -598,12 +649,16 @@ class WebSocketServer:
 
         await self._send_ws_payload(state, msg, source="template")
 
-    async def handle_setting(self, state: Any, content: str) -> None:
-        """处理设置管理"""
+    async def handle_setting(
+        self, state: Any, content: str, player_name: str | None = None
+    ) -> None:
+        """处理设置管理（按玩家分桶）"""
         from services.agent.prompt import get_prompt_manager
 
         manager = get_prompt_manager()
         connection_id = str(state.id)
+        session = state.get_player_session(player_name)
+        actor = player_name or session.player_name
 
         if not content:
             msg = self.protocol_handler.create_error_message("请输入设置项")
@@ -641,9 +696,9 @@ class WebSocketServer:
                 name = var_parts[0]
                 value = var_parts[1]
 
-            # PromptManager.set_connection_variable 会自动添加 custom_ 前缀
-            manager.set_connection_variable(connection_id, name, value)
-            state.custom_variables = manager.get_connection_variables(connection_id)
+            # PromptManager.set_session_variable 会自动添加 custom_ 前缀
+            manager.set_session_variable(connection_id, actor, name, value)
+            session.custom_variables = manager.get_session_variables(connection_id, actor)
 
             # 显示带前缀的名称
             display_name = f"custom_{name}" if not name.startswith("custom_") else name
@@ -785,12 +840,93 @@ class WebSocketServer:
 
         await self._send_ws_payload(state, msg, source="mcp")
 
-    async def _send_ws_payload(self, state: Any, payload: str, source: str) -> None:
-        """统一发送 WebSocket 响应并记录原始输出。"""
+    async def _handle_ui_chat_message(
+        self, connection_id: UUID, player_name: str, message: str
+    ) -> None:
+        """处理从 addon UI 发来的聊天消息。"""
+        state = self.connection_manager.get_connection(connection_id)
+        if not state:
+            logger.warning(
+                "ui_chat_connection_not_found",
+                connection_id=str(connection_id),
+            )
+            return
+
+        # 记录最近发言者（仅用于日志）；多人路由统一使用 player_name 形参。
+        if player_name:
+            state.player_name = player_name
+
+        logger.info(
+            "ui_chat_received",
+            connection_id=str(state.id),
+            player=player_name,
+            content_length=len(message),
+        )
+
+        # 与普通聊天命令保持一致：非开发模式必须先通过登录认证
+        if not self.dev_mode and not await self.check_auth(state):
+            error_msg = self.protocol_handler.create_error_message("请先登录")
+            await self._send_ws_payload(state, error_msg, source="auth")
+            return
+
+        # 把 UI 玩家发出的"用户消息"回流到 Addon 历史（与聊天框命令保持一致）
+        await self.broker.send_response(state.id, {
+            "type": "ai_response_sync",
+            "player_name": player_name or "Player",
+            "role": "user",
+            "text": message,
+        })
+
+        await self.handle_chat(
+            state, message, delivery="tellraw", player_name=player_name
+        )
+
+    async def _send_ws_payload(
+        self,
+        state: Any,
+        payload: "str | TellrawMessage",
+        source: str,
+    ) -> None:
+        """统一发送 WebSocket 响应并记录原始输出。
+
+        - TellrawMessage: 走 FlowControlMiddleware.chunk_tellraw 自动分片，
+          从源头消除"反向解析自家产物"的反模式。
+        - str: 用于订阅消息、初始化等已序列化 payload，原样发送。
+        """
+        if isinstance(payload, TellrawMessage):
+            payloads = FlowControlMiddleware.chunk_tellraw(
+                payload.text, color=payload.color
+            )
+            chunk_delay = FlowControlMiddleware.chunk_delay_for("tellraw")
+            for idx, p in enumerate(payloads):
+                await state.websocket.send(p)
+                self._log_ws_send(
+                    state,
+                    p,
+                    source=f"{source}_chunked" if len(payloads) > 1 else source,
+                )
+                if len(payloads) > 1 and idx < len(payloads) - 1:
+                    await asyncio.sleep(chunk_delay)
+            return
+
         await state.websocket.send(payload)
+        self._log_ws_send(state, payload, source=source)
+
+    def _log_ws_send(self, state: Any, payload: str, source: str) -> None:
+        """记录 ws 发送，附带 commandLine 字节长度便于观察分片命中率。"""
+        command_line_len = 0
+        try:
+            data = json.loads(payload)
+            command_line_len = len(
+                data.get("body", {}).get("commandLine", "").encode("utf-8")
+            )
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
         ws_raw_logger.info(
             "websocket_response_sent",
             connection_id=str(state.id),
             source=source,
             payload=payload,
+            command_line_bytes=command_line_len,
         )

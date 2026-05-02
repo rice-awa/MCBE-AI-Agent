@@ -5,7 +5,7 @@ import type { AgentUiStats } from "./stats";
 
 export const AGENT_UI_STATE_PROPERTY_KEY = "mcbeai:ui_state";
 export const AGENT_UI_STATE_VERSION = 1;
-export const PERSISTED_HISTORY_LIMIT = 10;
+export const PERSISTED_HISTORY_LIMIT = 20;
 
 type DynamicPropertyOwner = {
   getDynamicProperty(identifier: string): unknown;

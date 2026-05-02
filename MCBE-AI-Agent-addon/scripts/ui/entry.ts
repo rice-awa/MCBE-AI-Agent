@@ -10,6 +10,7 @@ import { showSettingsPanel } from "./panels/settingsPanel";
 import { showStatsPanel } from "./panels/statsPanel";
 import { loadAgentUiState, saveAgentUiState } from "./storage";
 import { recordUiOpened } from "./stats";
+import { setActiveUiState, clearActiveUiState } from "../bridge/responseSync";
 
 const OPEN_COOLDOWN_TICKS = 20;
 const lastOpenedTicks = new Map<string, number>();
@@ -46,6 +47,9 @@ export async function openAgentUi(player: Player): Promise<void> {
   uiState.stats = recordUiOpened(uiState.stats);
   saveAgentUiState(player, uiState);
 
+  // 注册活跃 UI 状态，以便响应同步模块实时更新
+  setActiveUiState(player.id, uiState);
+
   try {
     let route: AgentPanelRoute = { panel: "main" };
     while (route.panel !== "close") {
@@ -70,6 +74,7 @@ export async function openAgentUi(player: Player): Promise<void> {
 
     saveAgentUiState(player, uiState);
   } finally {
+    clearActiveUiState(player.id);
     openPanels.delete(player.id);
   }
 }

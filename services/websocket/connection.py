@@ -1,6 +1,7 @@
 """WebSocket 连接管理"""
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -11,6 +12,7 @@ from core.queue import MessageBroker
 from models.messages import StreamChunk
 from models.minecraft import MinecraftCommand
 from models.agent import MCColor, MCPrefix
+from services.websocket.flow_control import FlowControlMiddleware
 from config.logging import get_logger
 
 logger = get_logger(__name__)
@@ -18,20 +20,49 @@ ws_raw_logger = get_logger("websocket.raw")
 
 
 @dataclass
+class PlayerSession:
+    """单个玩家在某连接上的会话状态（按玩家隔离的可变设置）。"""
+
+    player_name: str
+    context_enabled: bool = True
+    current_provider: str | None = None
+    current_template: str = "default"
+    custom_variables: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class ConnectionState:
-    """连接状态"""
+    """连接状态。
+
+    单条 WebSocket 连接被多个玩家共享（MCBE 服务器模型决定）。
+    所有"单值"字段（context_enabled / current_provider / current_template /
+    custom_variables）需要按玩家隔离，集中存放在 ``_player_sessions`` 中；
+    顶层的 ``player_name`` 仅作为"最近一次发言者"的便捷指针。
+    """
 
     id: UUID = field(default_factory=uuid4)
     websocket: WebSocketServerProtocol | None = None
     authenticated: bool = False
+    # 最近一次产生消息的玩家名，仅用于日志和兼容旧路径，禁止在多人逻辑里读它做分支。
     player_name: str | None = None
     connected_at: datetime = field(default_factory=datetime.now)
-    context_enabled: bool = True
     response_queue: asyncio.Queue | None = None
-    current_provider: str | None = None
     pending_command_futures: dict[str, asyncio.Future[str]] = field(default_factory=dict)
-    current_template: str = "default"  # 当前使用的提示词模板
-    custom_variables: dict[str, str] = field(default_factory=dict)  # 自定义变量
+    # 按玩家隔离的会话状态
+    _player_sessions: dict[str, PlayerSession] = field(default_factory=dict)
+
+    def get_player_session(self, player_name: str | None) -> PlayerSession:
+        """获取指定玩家的会话状态；不存在则按默认值创建。"""
+        key = player_name or "__anonymous__"
+        session = self._player_sessions.get(key)
+        if session is None:
+            session = PlayerSession(player_name=key)
+            self._player_sessions[key] = session
+        return session
+
+    def all_player_sessions(self) -> list[PlayerSession]:
+        """快照式列出连接下所有玩家会话。"""
+        return list(self._player_sessions.values())
 
 
 class ConnectionManager:
@@ -274,6 +305,8 @@ class ConnectionManager:
                     response["command"],
                     response.get("result_future"),
                 )
+            elif msg_type == "ai_response_sync":
+                await self._sync_response_to_addon(state, response)
         else:
             logger.warning(
                 "unknown_response_type",
@@ -324,6 +357,27 @@ class ConnectionManager:
         else:
             await self._send_game_message_with_color(state, message, color)
 
+    def _log_ws_send(
+        self, state: ConnectionState, payload: str, source: str
+    ) -> None:
+        """记录 ws 发送，附带 commandLine 字节长度便于观察分片命中率。"""
+        command_line_bytes = 0
+        try:
+            data = json.loads(payload)
+            command_line_bytes = len(
+                data.get("body", {}).get("commandLine", "").encode("utf-8")
+            )
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
+        ws_raw_logger.info(
+            "websocket_response_sent",
+            connection_id=str(state.id),
+            source=source,
+            payload=payload,
+            command_line_bytes=command_line_bytes,
+        )
+
     async def _send_game_message(
         self, state: ConnectionState, message: str
     ) -> None:
@@ -338,21 +392,21 @@ class ConnectionManager:
             return
 
         try:
-            command = MinecraftCommand.create_tellraw(message, color=color)
-            payload = command.model_dump_json(exclude_none=True)
-            await state.websocket.send(payload)
-            ws_raw_logger.info(
-                "websocket_response_sent",
-                connection_id=str(state.id),
-                source="stream_tellraw",
-                payload=payload,
-            )
+            payloads = FlowControlMiddleware.chunk_tellraw(message, color=color)
+            chunk_delay = FlowControlMiddleware.chunk_delay_for("tellraw")
+            for payload in payloads:
+                await state.websocket.send(payload)
+                self._log_ws_send(state, payload, source="stream_tellraw")
+                # 分片间插入微小延迟，避免命令洪泛触发看门狗
+                if len(payloads) > 1:
+                    await asyncio.sleep(chunk_delay)
 
             logger.debug(
                 "game_message_sent",
                 connection_id=str(state.id),
                 message_length=len(message),
                 color=color,
+                chunk_count=len(payloads),
             )
         except Exception as e:
             logger.error(
@@ -389,12 +443,7 @@ class ConnectionManager:
                 result_future.add_done_callback(_cleanup_cancelled_future)
 
             await state.websocket.send(payload)
-            ws_raw_logger.info(
-                "websocket_response_sent",
-                connection_id=str(state.id),
-                source="stream_run_command",
-                payload=payload,
-            )
+            self._log_ws_send(state, payload, source="stream_run_command")
 
             logger.debug(
                 "command_executed",
@@ -422,6 +471,53 @@ class ConnectionManager:
                 error=str(e),
             )
 
+    async def _sync_response_to_addon(
+        self, state: ConnectionState, response: dict
+    ) -> None:
+        """将 AI 响应/用户消息同步到 Addon UI 历史记录。
+
+        为避免看门狗踢出，assistant 响应先等 tellraw 流式发送完毕，
+        各分片之间插入延迟，避免命令洪泛。
+        """
+        player_name = response.get("player_name", "Player")
+        role = response.get("role", "assistant")
+        text = response.get("text", "")
+
+        if not text:
+            return
+
+        try:
+            # assistant 响应：等 tellraw 流式发送完毕后再发 scriptevent
+            if role == "assistant":
+                await asyncio.sleep(
+                    FlowControlMiddleware.chunk_delay_for("ai_resp_prelude")
+                )
+
+            payloads = FlowControlMiddleware.chunk_ai_response(
+                player_name, role, text
+            )
+            chunk_delay = FlowControlMiddleware.chunk_delay_for("ai_resp")
+            for payload in payloads:
+                await state.websocket.send(payload)
+                self._log_ws_send(state, payload, source="ai_response_sync")
+                # 分片间延迟，避免看门狗超时
+                if len(payloads) > 1:
+                    await asyncio.sleep(chunk_delay)
+
+            logger.debug(
+                "ai_response_sync_sent",
+                connection_id=str(state.id),
+                player_name=player_name,
+                role=role,
+                chunk_count=len(payloads),
+            )
+        except Exception as e:
+            logger.error(
+                "ai_response_sync_error",
+                connection_id=str(state.id),
+                error=str(e),
+            )
+
     async def _send_script_event(
         self,
         state: ConnectionState,
@@ -433,20 +529,22 @@ class ConnectionManager:
             return
 
         try:
-            command = MinecraftCommand.create_scriptevent(message, message_id)
-            payload = command.model_dump_json(exclude_none=True)
-            await state.websocket.send(payload)
-            ws_raw_logger.info(
-                "websocket_response_sent",
-                connection_id=str(state.id),
-                source="stream_scriptevent",
-                payload=payload,
+            payloads = FlowControlMiddleware.chunk_scriptevent(
+                message, message_id
             )
+            chunk_delay = FlowControlMiddleware.chunk_delay_for("scriptevent")
+            for payload in payloads:
+                await state.websocket.send(payload)
+                self._log_ws_send(state, payload, source="stream_scriptevent")
+                # 分片间插入微小延迟，避免命令洪泛触发看门狗
+                if len(payloads) > 1:
+                    await asyncio.sleep(chunk_delay)
 
             logger.debug(
                 "script_event_sent",
                 connection_id=str(state.id),
                 message_length=len(message),
+                chunk_count=len(payloads),
             )
         except Exception as e:
             logger.error(

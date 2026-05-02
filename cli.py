@@ -44,6 +44,13 @@ class Application:
             dev_mode=self.settings.dev_mode,
         )
 
+        # 注入流控中间件运行时配置
+        from services.websocket.flow_control import FlowControlMiddleware
+        FlowControlMiddleware.configure(
+            max_content_length=self.settings.max_chunk_content_length,
+            sentence_mode=self.settings.chunk_sentence_mode,
+        )
+
         # 预热 LLM 模型
         await ProviderRegistry.warmup_models(self.settings)
 

@@ -1,6 +1,7 @@
 """Minecraft 协议处理"""
 
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from models.minecraft import (
@@ -26,6 +27,17 @@ COMMANDS = _minecraft_config.commands
 
 # 创建命令注册表
 _command_registry = CommandRegistry(COMMANDS)
+
+
+@dataclass(frozen=True)
+class TellrawMessage:
+    """结构化 tellraw 消息：携带原文与颜色，由 _send_ws_payload 统一分片。
+
+    避免在发送层反向解析已序列化的 commandLine JSON。
+    """
+
+    text: str
+    color: str
 
 
 class MinecraftProtocolHandler:
@@ -108,6 +120,7 @@ class MinecraftProtocolHandler:
         content: str,
         provider: str | None = None,
         delivery: str | None = None,
+        player_name: str | None = None,
     ) -> ChatRequest:
         """
         创建聊天请求
@@ -116,16 +129,21 @@ class MinecraftProtocolHandler:
             state: 连接状态
             content: 聊天内容
             provider: 可选的 LLM 提供商
+            delivery: 下行通道
+            player_name: 本次消息真实发送者；缺省时回退到 state.player_name
 
         Returns:
             ChatRequest 对象
         """
+        sender = player_name or state.player_name
+        # 多人场景下优先取该玩家的 PlayerSession 设置
+        session = state.get_player_session(sender)
         return ChatRequest(
             connection_id=state.id,
             content=content,
-            player_name=state.player_name,
-            use_context=state.context_enabled,
-            provider=provider or state.current_provider,
+            player_name=sender,
+            use_context=session.context_enabled,
+            provider=provider or session.current_provider,
             delivery=delivery or "tellraw",
         )
 
@@ -150,25 +168,28 @@ class MinecraftProtocolHandler:
         return "\n".join(lines)
 
     @staticmethod
-    def create_error_message(error: str) -> str:
-        """创建错误消息"""
+    def create_error_message(error: str) -> "TellrawMessage":
+        """创建错误消息（结构化，由发送层统一分片）。"""
         config = _minecraft_config
-        return MinecraftCommand.create_tellraw(
-            f"{config.error_prefix}{error}", color=config.error_color
-        ).model_dump_json(exclude_none=True)
+        return TellrawMessage(
+            text=f"{config.error_prefix}{error}",
+            color=config.error_color,
+        )
 
     @staticmethod
-    def create_info_message(info: str) -> str:
-        """创建信息消息"""
+    def create_info_message(info: str) -> "TellrawMessage":
+        """创建信息消息（结构化，由发送层统一分片）。"""
         config = _minecraft_config
-        return MinecraftCommand.create_tellraw(
-            f"{config.info_prefix}{info}", color=config.info_color
-        ).model_dump_json(exclude_none=True)
+        return TellrawMessage(
+            text=f"{config.info_prefix}{info}",
+            color=config.info_color,
+        )
 
     @staticmethod
-    def create_success_message(message: str) -> str:
-        """创建成功消息"""
+    def create_success_message(message: str) -> "TellrawMessage":
+        """创建成功消息（结构化，由发送层统一分片）。"""
         config = _minecraft_config
-        return MinecraftCommand.create_tellraw(
-            f"{config.success_prefix}{message}", color=config.success_color
-        ).model_dump_json(exclude_none=True)
+        return TellrawMessage(
+            text=f"{config.success_prefix}{message}",
+            color=config.success_color,
+        )
