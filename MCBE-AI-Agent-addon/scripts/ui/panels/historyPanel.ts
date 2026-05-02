@@ -1,6 +1,6 @@
 import type { Player } from "@minecraft/server";
 
-import { clearHistory, getHistoryPage, summarizeHistoryItem } from "../history";
+import { clearHistory, formatHistoryItem, getHistoryPage } from "../history";
 import { createActionForm, showActionFormSafely } from "../forms/formAdapter";
 import type { AgentUiState } from "../state";
 import { saveAgentUiState } from "../storage";
@@ -22,7 +22,7 @@ export async function showHistoryPanel(
       : [
           `第 ${page.pageIndex + 1}/${page.totalPages} 页，共 ${page.totalItems} 条`,
           "",
-          ...page.items.map((item) => summarizeHistoryItem(item, uiState.settings.responsePreviewLength)),
+          ...page.items.map(formatHistoryItem),
         ].join("\n");
 
   const form = createActionForm("聊天记录", body)

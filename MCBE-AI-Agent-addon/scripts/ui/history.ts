@@ -52,6 +52,10 @@ export function getHistoryPage(
   };
 }
 
+export function formatHistoryItem(item: ChatHistoryItem): string {
+  return `[${item.role}/${item.source}] ${item.content}`;
+}
+
 export function summarizeHistoryItem(item: ChatHistoryItem, previewLength: number): string {
   const normalizedLength = Math.max(0, Math.floor(previewLength));
   const content =

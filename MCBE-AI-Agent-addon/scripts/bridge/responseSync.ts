@@ -122,6 +122,7 @@ function onMessageComplete(playerName: string, role: HistoryRole, text: string):
 
     // 仅 assistant 角色更新响应预览
     if (role === "assistant") {
+      activeState.bridgeStatus.setData("ready");
       const previewLength = activeState.settings.responsePreviewLength;
       activeState.lastResponsePreview.setData(
         text.length > previewLength ? `${text.slice(0, previewLength)}...` : text,
@@ -139,6 +140,7 @@ function onMessageComplete(playerName: string, role: HistoryRole, text: string):
     );
 
     if (role === "assistant") {
+      uiState.bridgeStatus.setData("ready");
       const previewLength = uiState.settings.responsePreviewLength;
       uiState.lastResponsePreview.setData(
         text.length > previewLength ? `${text.slice(0, previewLength)}...` : text,
