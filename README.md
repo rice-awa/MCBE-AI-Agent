@@ -1,4 +1,4 @@
-# MCBE GPT Agent v2.0 - 现代化重构
+# MCBE AI Agent v2.0 - 现代化重构
 
 ## 概述
 
@@ -220,9 +220,9 @@ DEV_MODE=true
 - **切勿在生产环境中启用**，否则任何人都可以连接服务器
 - 启用时会在控制台和日志中显示警告信息
 
-## Addon Bridge 联调
+## Addon Bridge 桥接
 
-当前仓库已经接入一条可用的 Python <-> Addon <-> 游戏桥接链路，用于让 Agent 通过 Addon 获取更稳定的游戏内上下文。联调时建议优先使用开发模式启动 Python 服务。
+当前仓库已经接入一条可用的 Python <-> Addon <-> 游戏桥接链路，用于让 Agent 通过 Addon 获取更稳定的游戏内上下文，如玩家背包，实体信息等。打包好的 Addon 可在[release](https://github.com/rice-awa/MCBE-AI-Agent/release)获取
 
 ### Python 服务启动
 
@@ -238,7 +238,7 @@ python cli.py info
 
 ### Addon 安装、构建与部署
 
-Addon 工程位于 `MCBE-AI-Agent-addon/`，本地联调前至少执行一次依赖安装、测试、构建和本地部署。
+Addon 工程位于 `MCBE-AI-Agent-addon/`，本地调试前至少执行一次依赖安装、测试、构建和本地部署。
 
 ```bash
 cd MCBE-AI-Agent-addon
@@ -254,7 +254,7 @@ npm run local-deploy
 - `npm run build`：构建行为包脚本。
 - `npm run local-deploy`：将本地构建结果部署到 Minecraft 本地开发目录。
 
-### 联调步骤
+### 调试步骤
 
 1. 启动 Python 服务：`python cli.py serve --dev`。
 2. 在 `MCBE-AI-Agent-addon/` 下执行 `npm run local-deploy`，确保最新脚本已部署。
@@ -457,9 +457,6 @@ pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
 **解决方案**:
 ```bash
-# 使用轻量级模型
-DEFAULT_MODEL=deepseek-chat  # 而不是 deepseek-reasoner
-
 # 减少工作线程
 LLM_WORKER_COUNT=1
 
