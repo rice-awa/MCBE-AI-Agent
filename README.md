@@ -166,13 +166,34 @@ pip install -r requirements.txt
 python cli.py init
 ```
 
-这会从 `.env.example` 复制创建 `.env` 文件，编辑并填入 API 密钥：
+这会创建两个本地配置文件：
+
+- `.env`：只保存密钥、密码等敏感内容，不提交到 Git。
+- `config.json`：保存普通应用配置，不提交到 Git；模板来自 `config.example.json`。
+
+先编辑 `.env` 填入密钥：
 
 ```env
-DEEPSEEK_API_KEY=your-api-key-here
 SECRET_KEY=your-secret-key
 WEBSOCKET_PASSWORD=your-password
+DEEPSEEK_API_KEY=your-api-key-here
 ```
+
+再按需编辑 `config.json`。JSON 字符串可以使用 `${VAR}` 引用 `.env` 或进程环境变量，例如：
+
+```json
+{
+  "providers": {
+    "deepseek": {
+      "api_key": "${DEEPSEEK_API_KEY}",
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-chat"
+    }
+  }
+}
+```
+
+如果 `${VAR}` 指向的变量缺失或为空，服务启动会失败并显示对应 JSON 路径和变量名。
 
 ### 4. 查看配置信息
 
@@ -203,10 +224,11 @@ python cli.py serve
 python cli.py serve --dev
 ```
 
-方式二：环境变量
-```bash
-# 在 .env 文件中设置
-DEV_MODE=true
+方式二：配置文件
+```json
+{
+  "dev_mode": true
+}
 ```
 
 **开发模式特性：**

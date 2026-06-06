@@ -121,16 +121,12 @@ MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多
 
 ## 配置
 
-环境变量通过 `.env` 文件管理，参考 `.env.example`：
+项目使用 `config.json` 作为普通配置文件，使用 `.env` 保存敏感内容。运行 `python cli.py init` 会从 `.env.example` 和 `config.example.json` 创建本地文件。
 
-- `SECRET_KEY`：JWT 密钥。
-- `WEBSOCKET_PASSWORD`：连接密码。
-- `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`：LLM API Key。
-- `DEFAULT_PROVIDER`：默认 LLM 提供商。
-- `LLM_WORKER_COUNT`：Agent Worker 数量。
-- `MAX_CHUNK_CONTENT_LENGTH`：单个下行分片的内容字符上限，默认 `400`。
-- `CHUNK_SENTENCE_MODE`：是否优先按句子边界进行语义分片，默认 `true`。
-- `LOG_LEVEL`：日志级别。
+- `.env`：只保存 `SECRET_KEY`、`WEBSOCKET_PASSWORD`、`DEEPSEEK_API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY` 等密钥或密码。
+- `config.json`：保存服务器地址、默认 provider、模型名、队列、日志、MCP、Minecraft 命令和流控配置。
+- JSON 字符串支持 `${VAR}` 引用 `.env` 或进程环境变量；缺失或空值会导致启动失败并显示 JSON 路径和变量名。
+- 不要再把 `HOST`、`PORT`、默认 provider、MCP servers、Minecraft commands 等普通配置写入 `.env`。
 
 ## Minecraft 连接示例
 
