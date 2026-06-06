@@ -2,7 +2,7 @@
 
 本文档是 `docs/ddui-migration-assessment.md` 的实施配套，基于现有 `MCBE-AI-Agent-addon/` 代码与 `@minecraft/server-ui` 官方 DDUI 文档，给出可直接动手的 DDUI 改造方案、代码骨架、验证清单与回滚策略。
 
-> 评估文档结论：主线继续走稳定 ActionForm/ModalForm，DDUI 走 beta 分支试点。本文档不推翻这个结论，只在 beta 分支落地时给出**完整实施级**指引。如果你需要的是「为什么要分阶段」「为什么不直接整体迁移」的论证，请回到评估文档。
+> 当前分支已迁移到 DDUI 正式包通道。本文档保留迁移路径说明，并以 `@minecraft/*` 的 1.26.20 `stable` npm 包作为实施基线。
 
 ---
 
@@ -13,20 +13,20 @@
 - 把现有 `scripts/ui/` 下的稳定表单（ActionForm / ModalForm）平滑切换到 DDUI（CustomForm / MessageBox + Observable），保留全部已实现业务能力。
 - 让面板状态层（`bridgeStatus`、`lastPrompt`、`lastResponsePreview`、`history`、`settings`、`stats`）以**响应式**方式驱动 UI，免去手工重开表单刷新数据的步骤。
 - 不破坏现有 Python 与 addon 的 ScriptEvent 桥接协议（`mcbeai:bridge_request` / `mcbeai:ai_resp`）。
-- 把 manifest、构建、测试矩阵区分为 **stable** 与 **beta** 两条产物线，避免互相污染。
+- 使用 1.26.20 `stable` npm 包通道提供的 DDUI 类型与运行时能力。
+- 不再维护 stable/beta 双轨构建；当前 Addon 直接使用 DDUI 表单适配层。
 
 ### 1.2 非目标
 
-- 不在主线（master）打开 DDUI；DDUI 改造在 `feature/ddui` 或 `beta/*` 分支执行。
 - 不重写桥接能力（`get_player_snapshot` 等仍走原路径）。
 - 不修改 Python 侧 `services/websocket/flow_control.py` 的分片协议。
 - 不引入除官方 `@minecraft/server` / `@minecraft/server-ui` / `@minecraft/server-gametest` 之外的运行时依赖。
 
 ### 1.3 适用读者
 
-- 拿到 DDUI 试点任务的 addon 开发者。
-- 需要把 `ObservableLike<T>` 抽象替换为官方 `Observable` 的维护者。
-- 关心 stable/beta 分支构建与回滚策略的发布负责人。
+- 维护 Addon DDUI 面板的开发者。
+- 需要理解 `ObservableLike<T>` 与官方 `Observable` 关系的维护者。
+- 关心 DDUI 正式包通道依赖、构建与回滚策略的发布负责人。
 
 ---
 
@@ -38,14 +38,14 @@
 
 `behavior_packs/MCBE-AI-Agent/manifest.json`：
 
-| 模块 | 当前版本 | DDUI 目标版本 |
-|------|---------|---------------|
-| `@minecraft/server` | `2.0.0` | `2.8.0-beta` |
-| `@minecraft/server-ui` | `2.0.0` | `2.1.0-beta` |
-| `@minecraft/server-gametest` | `1.0.0-beta` | 不变 |
-| `min_engine_version` | `[1, 21, 80]` | 跟随 beta API 需求上调 |
+| 模块 | 当前 manifest API surface | npm 类型包 |
+|------|--------------------------|------------|
+| `@minecraft/server` | `2.8.0` | `2.8.0-beta.1.26.20-stable` |
+| `@minecraft/server-ui` | `2.1.0` | `2.1.0-beta.1.26.20-stable` |
+| `@minecraft/server-gametest` | `1.0.0-beta` | `1.0.0-beta.1.26.20-preview.28`（不变） |
+| `min_engine_version` | `[1, 21, 80]` | 跟随 manifest 保持不变 |
 
-`package.json` 同步切换。
+`package.json` 锁定同一 1.26.20 `stable` npm 通道，避免 preview 类型漂移。
 
 ### 2.2 入口与状态机
 
@@ -89,7 +89,7 @@ export type ObservableLike<T> = {
 
 ## 3. DDUI API 速查
 
-> 来源：`@minecraft/server-ui@2.1.0-beta` 官方文档（`intro-to-ddui.md`）。本节只列改造会用到的 API。
+> 来源：`@minecraft/server-ui@2.1.0-beta.1.26.20-stable` 类型声明与官方 `intro-to-ddui.md`。本节只列改造会用到的 API。
 
 ### 3.1 Observable
 
@@ -331,7 +331,7 @@ export function createModalForm(...) { ... }
 export async function showActionFormSafely(...) { ... }
 export async function showModalFormSafely(...) { ... }
 
-// DDUI（仅在 beta 构建保留）
+// DDUI
 export function createCustomForm(player: Player, title: string): CustomForm {
   return CustomForm.create(player, title).closeButton();
 }
@@ -674,13 +674,13 @@ mcbeai:ui_event  payload={"type":"switch_provider","player":"<name>","provider":
 
 ## 9. Manifest 与依赖切换
 
-### 9.1 双轨产物
+### 9.1 当前产物
 
-- `master` 分支：stable 包，`@minecraft/server@2.0.0` + `@minecraft/server-ui@2.0.0`。
-- `feature/ddui` 分支：beta 包，依赖切到 `2.8.0-beta` / `2.1.0-beta`。
-- 通过 `just-scripts` 的 `--production` 与 `mcaddon` task 各自构建，产物文件名带 `-beta` 后缀（在 `just.config.ts` 配置）。
+- 当前 Addon 直接使用 DDUI，`@minecraft/server` 与 `@minecraft/server-ui` 锁定到 1.26.20 `stable` 包通道。
+- manifest 声明 Minecraft Script API 正式模块 surface：`2.8.0` / `2.1.0`，`@minecraft/server-gametest` 保持 `1.0.0-beta`。
+- `@minecraft/server-gametest` 暂不参与本次 DDUI 正式包迁移，保持原 preview 包。
 
-### 9.2 manifest 改动
+### 9.2 manifest
 
 ```json
 {
@@ -688,34 +688,26 @@ mcbeai:ui_event  payload={"type":"switch_provider","player":"<name>","provider":
     "min_engine_version": [1, 21, 80]
   },
   "dependencies": [
-    { "module_name": "@minecraft/server", "version": "2.8.0-beta" },
-    { "module_name": "@minecraft/server-ui", "version": "2.1.0-beta" },
+    { "module_name": "@minecraft/server", "version": "2.8.0" },
+    { "module_name": "@minecraft/server-ui", "version": "2.1.0" },
     { "module_name": "@minecraft/server-gametest", "version": "1.0.0-beta" }
   ]
 }
 ```
 
-`min_engine_version` 跟随 beta API 实测可用版本调整，必要时拉到 `[1, 21, 90]` 以上。
-
-### 9.3 实验开关
-
-beta 包安装说明里必须强制要求世界开启：
-- `Beta APIs`
-- 现有 `GameTest Framework`（已开）
-
-### 9.4 npm 依赖
+### 9.3 npm 依赖
 
 ```json
 {
   "dependencies": {
-    "@minecraft/server": "2.8.0-beta",
-    "@minecraft/server-ui": "2.1.0-beta",
+    "@minecraft/server": "2.8.0-beta.1.26.20-stable",
+    "@minecraft/server-ui": "2.1.0-beta.1.26.20-stable",
     "@minecraft/server-gametest": "1.0.0-beta.1.26.20-preview.28"
   }
 }
 ```
 
-锁定具体 beta 版本号，不要用 `^` 通配——beta 通道随时可能 break。
+锁定具体 `stable` 包版本，不要使用 `^` 通配。
 
 ---
 
@@ -780,12 +772,12 @@ python cli.py serve
 
 ## 11. 验证清单
 
-发布 beta 包前**必须**全部通过：
+发布前**必须**全部通过：
 
 - [ ] 本地 `node_modules/@minecraft/server-ui/index.d.ts` 含 `CustomForm`、`MessageBox`、`Observable`。
 - [ ] `npm run build` 无 type error。
 - [ ] `npm test` 全部通过。
-- [ ] 游戏内开 `Beta APIs`，加载 addon 不报红字。
+- [ ] 游戏内加载 addon 不报红字。
 - [ ] 手持 `minecraft:command_block` 右键打开主面板，能看到摘要、四个按钮。
 - [ ] 「发送消息」流程：textField 输入、toggle 改默认值、点发送、Python 收到、`bridgeStatus` 在打开中的面板自动从 `connecting` → `sent` → `ready`。
 - [ ] 「设置」流程：所有控件初始值正确、修改保存后 `getDynamicProperty("mcbeai:ui_state")` 含新值。
@@ -803,24 +795,23 @@ python cli.py serve
 
 | 风险 | 触发条件 | 缓解 |
 |------|----------|------|
-| beta 类型签名变化 | 升级 npm 后 `CustomForm.create` 参数变了 | 锁死具体 beta 版本号；写适配层吸收差异 |
+| 正式包类型签名变化 | 升级 npm 后 `CustomForm.create` 参数变了 | 锁定具体 stable 包版本；写适配层吸收差异 |
 | `clientWritable` 写回延迟 | 玩家拨完 slider 立刻按按钮，回调里 `getData()` 还是旧值 | 在按钮回调里 `await system.runIdle()` 一帧再读，或显式让玩家先按「保存」 |
 | `MessageBox.show()` 在 read-only 抛错 | 桥接事件回调里直接弹 MessageBox | 全部通过 `system.run()` 切换到 normal mode |
 | `Observable.subscribe` 内存泄漏 | 面板关闭后还订阅 | 主面板生命周期内集中订阅一次；子面板用临时 Observable，不直接订阅全局 state |
-| `Beta APIs` 关闭导致玩家加载失败 | 用户拿 beta 包到 stable 世界 | 安装文档强制说明，并在 README 加红字提示 |
 
 ### 12.2 回滚策略
 
-- DDUI 改造在独立分支，主线不受影响。
-- 如果游戏内验证发现阻断性问题：保留分支但暂停合并。stable 包继续按现有 ActionForm/ModalForm 发版。
-- 单文件回滚：`git checkout master -- scripts/ui/<file>` 恢复 stable 实现，因为 `formAdapter.ts` 在 stable 阶段保留双签名，业务面板可以选择性回退。
+- DDUI 改造在迁移分支完成，合并前可整体放弃该分支。
+- 如果游戏内验证发现阻断性问题：保留分支但暂停合并，回退到上一版 Addon 产物。
+- 单文件回滚：恢复对应 `scripts/ui/<file>` 与 `formAdapter.ts` 的上一版实现。
 
 ---
 
 ## 13. FAQ
 
-**Q: 为什么不直接在主线开 DDUI？**
-A: 见评估文档第 5 章。短答：beta 模块要求世界级实验开关，会改变所有用户的安装条件。
+**Q: 为什么 npm 包版本里还有 `beta` 字样？**
+A: 当前 npm 包名仍以 `2.8.0-beta.1.26.20-stable` / `2.1.0-beta.1.26.20-stable` 发布，但 manifest 已声明正式模块版本 `2.8.0` / `2.1.0`；本次迁移切换的是正式 manifest 版本与 stable npm 包通道。
 
 **Q: `Observable<HistoryItem[]>` 修改数组成员，UI 会刷新吗？**
 A: 必须 `setData(newArray)` 替换整个引用。不要 `state.history.getData().push(item)`，那不会触发 subscribe。

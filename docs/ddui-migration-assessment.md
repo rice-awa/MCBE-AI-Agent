@@ -1,5 +1,9 @@
 # DDUI 迁移评估
 
+## 状态更新（2026-06-06）
+
+当前迁移分支已将 Addon 的 DDUI 相关依赖从 1.26.20 preview 包切到 1.26.20 stable npm 包通道：`@minecraft/server@2.8.0-beta.1.26.20-stable`、`@minecraft/server-ui@2.1.0-beta.1.26.20-stable`。`@minecraft/server-gametest` 不参与本次迁移，保持 `1.0.0-beta.1.26.20-preview.28`。下方评估保留为历史背景；继续实现时以 `docs/ddui-development-guide.md` 的当前依赖基线为准。
+
 ## 评估结论
 
 当前 `MCBE-AI-Agent-addon` 适合先做「渐进式迁移准备」，不建议立即整体迁移到真正的 DDUI。

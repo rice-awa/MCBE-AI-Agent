@@ -320,8 +320,8 @@ AGENT 聊天 请读取我的玩家状态并告诉我当前位置
 - 现有 `AGENT 聊天`、`AGENT 上下文`、`切换模型`、`运行命令` 等聊天命令仍然是主入口。
 - 面板入口绑定为使用原版命令方块物品 `minecraft:command_block`，避免抢占聊天监听。
 - 面板支持发送消息、本地聊天记录、设置保存和统计信息；发送消息会记录本地历史，并提示等价的 `AGENT 聊天 <消息>`。
-- 当前本地 `@minecraft/server-ui` 类型只暴露 `ActionFormData` / `ModalFormData`，暂不能直接使用官方 DDUI `CustomForm` / `Observable`。
-- 后续如果类型和运行时支持真正 DDUI，可在 Addon 的表单适配层中替换实现，而不重写业务状态。
+- 当前 UI 使用官方 DDUI `CustomForm` / `Observable`，通过 Addon 表单适配层隔离具体 API。
+- 依赖锁定在 Minecraft 1.26.20 stable npm 通道，manifest 中 `@minecraft/server` / `@minecraft/server-ui` 声明正式模块版本。
 
 ### 当前限制
 
