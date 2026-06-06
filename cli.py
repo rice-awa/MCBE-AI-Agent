@@ -8,7 +8,7 @@ from typing import Any
 
 import click
 
-from config.settings import get_settings
+from config.settings import Settings, get_settings
 from config.logging import setup_logging, get_logger
 from core.queue import MessageBroker
 from services.agent.worker import AgentWorker
@@ -22,12 +22,20 @@ logger = get_logger(__name__)
 class Application:
     """MCBE AI Agent 应用"""
 
-    def __init__(self):
-        self.settings = get_settings()
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        configuration_error: Exception | None = None,
+    ):
+        self.settings = settings or get_settings()
+        self.configuration_error = configuration_error
         self.broker = MessageBroker(max_size=self.settings.queue_max_size)
         self.jwt_handler = JWTHandler(self.settings)
         self.ws_server = WebSocketServer(
-            self.broker, self.settings, self.jwt_handler
+            self.broker,
+            self.settings,
+            self.jwt_handler,
+            configuration_error=configuration_error,
         )
         self.workers: list[AgentWorker] = []
         self._shutdown_event = asyncio.Event()
@@ -43,6 +51,16 @@ class Application:
             worker_count=self.settings.llm_worker_count,
             dev_mode=self.settings.dev_mode,
         )
+
+        if self.configuration_error is not None:
+            logger.error(
+                "configuration_invalid_starting_limited_websocket",
+                error=str(self.configuration_error),
+            )
+            await self.ws_server.start()
+            logger.info("application_started_in_unconfigured_mode")
+            await self._shutdown_event.wait()
+            return
 
         # 注入流控中间件运行时配置
         from services.websocket.flow_control import FlowControlMiddleware
@@ -121,10 +139,13 @@ class Application:
         self._shutdown_event.set()
 
 
-async def run_application() -> None:
+async def run_application(
+    settings: Settings | None = None,
+    configuration_error: Exception | None = None,
+) -> None:
     """运行应用主逻辑"""
     # 加载设置
-    settings = get_settings()
+    settings = settings or get_settings()
 
     # 配置日志
     setup_logging(
@@ -135,7 +156,7 @@ async def run_application() -> None:
     )
 
     # 创建应用
-    app = Application()
+    app = Application(settings=settings, configuration_error=configuration_error)
 
     # 注册信号处理器
     loop = asyncio.get_running_loop()
@@ -170,7 +191,16 @@ def cli():
 def serve(host: str | None, port: int | None, log_level: str | None, dev: bool):
     """启动 WebSocket 服务器"""
     # 加载设置
-    settings = get_settings()
+    configuration_error: Exception | None = None
+    try:
+        settings = get_settings()
+    except (FileNotFoundError, ValueError) as exc:
+        configuration_error = exc
+        settings = Settings()
+        click.echo(
+            f"⚠️  配置未完成: {exc}\n"
+            "WebSocket 将以受限模式启动，进入游戏后会提示初始化 config.json。\n"
+        )
 
     # 覆盖配置
     if host:
@@ -188,7 +218,7 @@ def serve(host: str | None, port: int | None, log_level: str | None, dev: bool):
 
     # 运行应用
     try:
-        asyncio.run(run_application())
+        asyncio.run(run_application(settings=settings, configuration_error=configuration_error))
     except KeyboardInterrupt:
         click.echo("\n服务器已停止")
 
