@@ -24,7 +24,9 @@ export async function showStatsPanel(
     const form = createCustomForm(player, "统计信息")
       .closeButton()
       .label(statsBody)
+      .spacer()
       .divider()
+      .spacer()
       .button("返回主面板", () => {
         nextRoute = MAIN_ROUTE;
         form.close();
@@ -42,7 +44,7 @@ export async function showStatsPanel(
       });
 
     const shown = await showCustomFormSafely(player, form);
-    if (!shown) {
+    if (!shown.ok) {
       saveAgentUiState(player, uiState);
       return CLOSE_ROUTE;
     }
@@ -66,7 +68,7 @@ function createStatsBody(uiState: AgentUiState): string {
     `响应片段数: ${uiState.stats.responseChunkCount}（响应同步已启用）`,
     `最近打开: ${formatTimestamp(uiState.stats.lastOpenedAt)}`,
     `最近发送: ${formatTimestamp(uiState.stats.lastSentAt)}`,
-  ].join("\n");
+  ].join("\n\n");
 }
 
 function formatTimestamp(timestamp: number): string {

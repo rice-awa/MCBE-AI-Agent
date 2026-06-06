@@ -30,11 +30,17 @@ export async function showSettingsPanel(
     const form = createCustomForm(player, "MCBE AI Agent 设置")
       .closeButton()
       .label("调整当前面板偏好，关闭即返回主菜单。")
+      .spacer()
       .divider()
+      .spacer()
       .toggle("自动保存历史", autoSaveHistory)
+      .spacer()
       .slider("历史保留条数", maxHistoryItems, 10, 50, { step: 5 })
+      .spacer()
       .toggle("显示工具事件", showToolEvents)
+      .spacer()
       .slider("响应预览长度", responsePreviewLength, 60, 240, { step: 20 })
+      .spacer()
       .dropdown(
         "默认响应方式",
         defaultDelivery,
@@ -72,7 +78,7 @@ export async function showSettingsPanel(
       });
 
     const shown = await showCustomFormSafely(player, form);
-    if (!shown) {
+    if (!shown.ok) {
       saveAgentUiState(player, uiState);
       return CLOSE_ROUTE;
     }

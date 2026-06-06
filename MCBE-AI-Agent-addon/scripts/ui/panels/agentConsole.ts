@@ -35,10 +35,15 @@ export async function showAgentConsole(
     const form = createCustomForm(player, "MCBE AI Agent")
       .closeButton()
       .label(summary)
+      .spacer()
       .divider()
+      .spacer()
       .label(conversationBody)
+      .spacer()
       .divider()
+      .spacer()
       .textField("消息内容", messageValue, { description: "发送后面板会保持打开" })
+      .spacer()
       .button("发送", () => {
         const message = messageValue.getData().trim();
         if (!message) {
@@ -98,8 +103,9 @@ export async function showAgentConsole(
       });
 
     const shown = await showCustomFormSafely(player, form);
-    if (!shown) {
+    if (!shown.ok || (shown.closedByUser && nextRoute.panel === "main")) {
       saveAgentUiState(player, uiState);
+      uiState.refreshConversation = undefined;
       return CLOSE_ROUTE;
     }
 
@@ -123,7 +129,7 @@ function buildConversationBody(uiState: AgentUiState): string {
 
   return items
     .map((item) => summarizeHistoryItem(item, uiState.settings.responsePreviewLength))
-    .join("\n");
+    .join("\n\n");
 }
 
 function buildSummary(uiState: AgentUiState): string {
@@ -131,5 +137,5 @@ function buildSummary(uiState: AgentUiState): string {
     `桥接状态: ${uiState.bridgeStatus.getData()}`,
     `历史条数: ${uiState.history.length}`,
     `发送次数: ${uiState.stats.sentCount}`,
-  ].join("\n");
+  ].join("\n\n");
 }

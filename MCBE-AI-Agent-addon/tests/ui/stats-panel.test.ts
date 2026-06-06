@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
+  __getLastCustomForm,
   __resetDduiMock,
   __setNextCustomFormInteraction,
 } from "@minecraft/server-ui";
@@ -93,6 +94,32 @@ describe("stats panel", () => {
     expect(persisted.stats.sentCount).toBe(5);
     expect(persisted.stats.localHistoryCount).toBe(2);
     expect(persisted.version).toBe(1);
+  });
+
+  it("routes to close and persists state when the player dismisses stats", async () => {
+    __setNextCustomFormInteraction({
+      closeReason: "UserClose",
+    });
+
+    const player = createFakePlayer();
+    const uiState = createAgentUiState({
+      history: createHistoryItems(2),
+      stats: { sentCount: 5, localHistoryCount: 0 },
+    });
+
+    const route = await showStatsPanel(player, uiState);
+
+    expect(route).toEqual(CLOSE_ROUTE);
+    const persisted = JSON.parse(String(player.getDynamicProperty(AGENT_UI_STATE_PROPERTY_KEY)));
+    expect(persisted.stats.localHistoryCount).toBe(2);
+  });
+
+  it("adds spacing around the stats body and actions", async () => {
+    await showStatsPanel(createFakePlayer(), createAgentUiState());
+
+    const form = __getLastCustomForm();
+
+    expect(form?.getComponents().filter((component) => component === "spacer").length).toBeGreaterThanOrEqual(2);
   });
 
   it("closes cleanly when the DDUI observable api is unavailable", async () => {

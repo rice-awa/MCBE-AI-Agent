@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
+  __getLastCustomForm,
   __resetDduiMock,
   __setNextCustomFormInteraction,
 } from "@minecraft/server-ui";
@@ -94,6 +95,24 @@ describe("settings panel", () => {
     const persisted = JSON.parse(String(player.getDynamicProperty(AGENT_UI_STATE_PROPERTY_KEY)));
     expect(persisted.history).toEqual([]);
     expect(persisted.stats.localHistoryCount).toBe(0);
+  });
+
+  it("returns to the main panel when the player dismisses settings", async () => {
+    __setNextCustomFormInteraction({
+      closeReason: "UserClose",
+    });
+
+    const route = await showSettingsPanel(createFakePlayer(), createAgentUiState());
+
+    expect(route).toEqual({ panel: "main" });
+  });
+
+  it("adds spacing between setting groups", async () => {
+    await showSettingsPanel(createFakePlayer(), createAgentUiState());
+
+    const form = __getLastCustomForm();
+
+    expect(form?.getComponents().filter((component) => component === "spacer").length).toBeGreaterThanOrEqual(3);
   });
 
   it("closes cleanly when the DDUI beta api is unavailable", async () => {

@@ -16,6 +16,7 @@ type DduiDropdownOption<T> = {
 
 export type DduiCustomForm = {
   divider(): DduiCustomForm;
+  header(text: string | DduiObservable<string>): DduiCustomForm;
   label(text: string | DduiObservable<string>): DduiCustomForm;
   textField(
     label: string,
@@ -47,7 +48,13 @@ export type DduiCustomForm = {
     callback: () => void,
     options?: { tooltip?: string },
   ): DduiCustomForm;
-  show(): Promise<void>;
+  show(): Promise<unknown>;
+};
+
+export type DduiCustomFormShowResult = {
+  ok: boolean;
+  closedByUser: boolean;
+  closeReason?: unknown;
 };
 
 type DduiServerUiModule = {
@@ -112,12 +119,56 @@ export async function showModalFormSafely(
 export async function showCustomFormSafely(
   player: Player,
   form: DduiCustomForm,
-): Promise<boolean> {
+): Promise<DduiCustomFormShowResult> {
   try {
-    await form.show();
-    return true;
+    const closeReason = await form.show();
+    return {
+      ok: closeReason !== false && !isUserBusyReason(closeReason),
+      closedByUser: isUserClosedReason(closeReason),
+      closeReason,
+    };
   } catch {
     player.sendMessage("MCBE AI Agent: 表单暂时无法打开，请稍后再试。");
+    return { ok: false, closedByUser: false };
+  }
+}
+
+function isUserClosedReason(reason: unknown): boolean {
+  if (typeof reason === "string") {
+    return reason === "UserClose" || reason === "UserClosed";
+  }
+
+  if (typeof reason === "boolean") {
+    return !reason;
+  }
+
+  if (!reason || typeof reason !== "object") {
     return false;
   }
+
+  const maybeReason = reason as { canceled?: unknown; closeReason?: unknown; cancelationReason?: unknown };
+  if (maybeReason.canceled === true) {
+    return true;
+  }
+
+  return (
+    isUserClosedReason(maybeReason.closeReason)
+    || isUserClosedReason(maybeReason.cancelationReason)
+  );
+}
+
+function isUserBusyReason(reason: unknown): boolean {
+  if (typeof reason === "string") {
+    return reason === "UserBusy";
+  }
+
+  if (!reason || typeof reason !== "object") {
+    return false;
+  }
+
+  const maybeReason = reason as { closeReason?: unknown; cancelationReason?: unknown };
+  return (
+    isUserBusyReason(maybeReason.closeReason)
+    || isUserBusyReason(maybeReason.cancelationReason)
+  );
 }

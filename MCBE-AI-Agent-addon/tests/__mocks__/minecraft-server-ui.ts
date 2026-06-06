@@ -3,6 +3,7 @@
 type ObservableSubscriber<T> = (value: T) => void;
 type CustomFormInteraction = {
   clickButtonLabel?: string;
+  closeReason?: unknown;
   failOnCustomFormCreate?: boolean;
   failOnObservableCreate?: boolean;
   failOnShow?: boolean;
@@ -19,6 +20,7 @@ export function __getLastCustomForm(): MockCustomForm | undefined {
 
 export function __resetDduiMock(): void {
   nextInteraction.clickButtonLabel = undefined;
+  nextInteraction.closeReason = undefined;
   nextInteraction.failOnCustomFormCreate = false;
   nextInteraction.failOnObservableCreate = false;
   nextInteraction.failOnShow = false;
@@ -29,6 +31,7 @@ export function __resetDduiMock(): void {
 
 export function __setNextCustomFormInteraction(interaction: CustomFormInteraction): void {
   nextInteraction.clickButtonLabel = interaction.clickButtonLabel;
+  nextInteraction.closeReason = interaction.closeReason;
   nextInteraction.failOnCustomFormCreate = interaction.failOnCustomFormCreate ?? false;
   nextInteraction.failOnObservableCreate = interaction.failOnObservableCreate ?? false;
   nextInteraction.failOnShow = interaction.failOnShow ?? false;
@@ -74,32 +77,52 @@ class MockCustomForm {
   #fields = new Map<string, MockObservable<unknown>>();
   #buttons = new Map<string, () => void>();
   #labels: Array<string | MockObservable<unknown>> = [];
+  #components: string[] = [];
 
-  closeButton() { return this; }
-  spacer() { return this; }
-  label(value: string | MockObservable<unknown>) {
-    this.#labels.push(value);
+  closeButton() {
+    this.#components.push("closeButton");
     return this;
   }
-  divider() { return this; }
+  spacer() {
+    this.#components.push("spacer");
+    return this;
+  }
+  header() {
+    this.#components.push("header");
+    return this;
+  }
+  label(value: string | MockObservable<unknown>) {
+    this.#labels.push(value);
+    this.#components.push("label");
+    return this;
+  }
+  divider() {
+    this.#components.push("divider");
+    return this;
+  }
   toggle(label: string, value: MockObservable<boolean>) {
     this.#fields.set(label, value as MockObservable<unknown>);
+    this.#components.push("toggle");
     return this;
   }
   slider(label: string, value: MockObservable<number>) {
     this.#fields.set(label, value as MockObservable<unknown>);
+    this.#components.push("slider");
     return this;
   }
   dropdown(label: string, value: MockObservable<unknown>) {
     this.#fields.set(label, value);
+    this.#components.push("dropdown");
     return this;
   }
   textField(label: string, value: MockObservable<string>) {
     this.#fields.set(label, value as MockObservable<unknown>);
+    this.#components.push("textField");
     return this;
   }
   button(label: string, callback: () => void) {
     this.#buttons.set(label, callback);
+    this.#components.push(`button:${label}`);
     return this;
   }
 
@@ -109,6 +132,10 @@ class MockCustomForm {
 
   getLabelTexts(): unknown[] {
     return this.#labels.map((value) => typeof value === "string" ? value : value.getData());
+  }
+
+  getComponents(): string[] {
+    return [...this.#components];
   }
 
   clickButton(label: string): void {
@@ -130,6 +157,7 @@ class MockCustomForm {
       if (nextInteraction.autoCloseAfterButtonClick) {
         this.#showing = false;
       }
+      return nextInteraction.closeReason ?? (this.#showing ? "ServerClose" : "UserClose");
     });
   }
 

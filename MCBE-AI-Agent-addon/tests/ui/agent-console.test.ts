@@ -111,6 +111,29 @@ describe("agent console panel", () => {
     expect(persisted.settings).toBeDefined();
   });
 
+  it("routes to close when the player dismisses the form without pressing a panel button", async () => {
+    __setNextCustomFormInteraction({
+      closeReason: "UserClose",
+    });
+
+    const player = createFakePlayer();
+    const uiState = createAgentUiState();
+    uiState.lastPrompt.setData("hello");
+
+    const route = await showAgentConsole(player, uiState);
+
+    expect(route).toEqual(CLOSE_ROUTE);
+    expect(player.getDynamicProperty(AGENT_UI_STATE_PROPERTY_KEY)).toBeTypeOf("string");
+  });
+
+  it("adds spacing between dense main panel sections", async () => {
+    await showAgentConsole(createFakePlayer(), createAgentUiState());
+
+    const form = __getLastCustomForm();
+
+    expect(form?.getComponents().filter((component) => component === "spacer").length).toBeGreaterThanOrEqual(3);
+  });
+
   it("closes cleanly when the DDUI observable api is unavailable", async () => {
     __setNextCustomFormInteraction({
       failOnObservableCreate: true,
