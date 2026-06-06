@@ -2,7 +2,8 @@ import json
 
 import pytest
 
-from config.settings import Settings
+from config.settings import CONFIG_FILE, Settings, get_settings
+from services.websocket.minecraft import MinecraftProtocolHandler
 
 
 def write_json_config(tmp_path, data):
@@ -148,3 +149,65 @@ def test_old_plain_environment_variables_do_not_override_settings(tmp_path, monk
     assert settings.port == 8080
     assert settings.default_provider == "deepseek"
     assert settings.llm_worker_count == 2
+
+
+def test_runtime_settings_require_config_json(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        get_settings()
+
+    assert str(CONFIG_FILE) in str(exc_info.value)
+
+
+def test_runtime_settings_reject_incomplete_config_json(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+    write_json_config(tmp_path, {"server": {"host": "127.0.0.1"}})
+
+    with pytest.raises(ValueError) as exc_info:
+        get_settings()
+
+    message = str(exc_info.value)
+    assert "config.json is incomplete" in message
+    assert "server.port" in message
+
+
+def test_minecraft_protocol_uses_injected_config():
+    settings = Settings(
+        minecraft={
+            "commands": {
+                "#登录": "login",
+                "问": {
+                    "type": "chat",
+                    "aliases": ["ask"],
+                    "description": "自定义聊天",
+                    "usage": "<内容>",
+                },
+                "求助": {
+                    "type": "help",
+                    "aliases": [],
+                    "description": "自定义帮助",
+                    "usage": None,
+                },
+            },
+            "welcome_message_template": "help={help_command}; ctx={context_status}",
+            "context_enabled_text": "开",
+            "context_disabled_text": "关",
+            "error_prefix": "ERR:",
+            "info_prefix": "INFO:",
+            "success_prefix": "OK:",
+            "error_color": "red",
+            "info_color": "blue",
+            "success_color": "green",
+        }
+    )
+    handler = MinecraftProtocolHandler(settings.minecraft)
+
+    assert handler.parse_command("ask hello") == ("chat", "hello")
+    assert "问 <内容> - 自定义聊天" in handler.get_help_text()
+    assert handler.create_welcome_message("abcdef123456", "model", "provider", False) == (
+        "help=求助; ctx=关"
+    )
+    assert handler.create_error_message("bad").text == "ERR:bad"

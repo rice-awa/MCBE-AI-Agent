@@ -173,7 +173,7 @@ class TestMCPManager:
         """测试 MCP 管理器初始化"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         assert manager.is_initialized is False
         assert len(manager.servers) == 0
 
@@ -181,7 +181,7 @@ class TestMCPManager:
         """测试 MCP 管理器 servers 属性"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         servers = manager.servers
         assert isinstance(servers, dict)
 
@@ -189,7 +189,7 @@ class TestMCPManager:
         """测试 MCP 管理器 toolsets 属性"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         toolsets = manager.toolsets
         assert isinstance(toolsets, list)
 
@@ -197,7 +197,7 @@ class TestMCPManager:
         """测试获取 MCP 状态摘要"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         summary = manager.get_status_summary()
 
         assert "enabled" in summary
@@ -210,7 +210,7 @@ class TestMCPManager:
         """测试获取不存在的服务器信息"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         info = manager.get_server_info("non-existent")
         assert info is None
 
@@ -218,7 +218,7 @@ class TestMCPManager:
         """测试获取用于 Agent 的工具集"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         toolsets = manager.get_toolsets_for_agent()
         assert isinstance(toolsets, list)
 
@@ -226,7 +226,7 @@ class TestMCPManager:
         """测试根据名称获取工具集"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         toolset = manager.get_toolset_by_name("non-existent")
         assert toolset is None
 
@@ -249,7 +249,7 @@ class TestMCPManager:
         """测试 MCP 管理器关闭"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         await manager.shutdown()
 
         assert manager.is_initialized is False
@@ -258,7 +258,7 @@ class TestMCPManager:
         """测试更新服务器状态"""
         from services.agent.mcp import MCPManager, MCPConnectionStatus, MCPServerInfo
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         # 手动添加一个服务器信息
         config = MCPServerConfig(command="echo")
         manager._servers["test-server"] = MCPServerInfo(
@@ -278,7 +278,7 @@ class TestMCPManager:
         """测试重置服务器状态"""
         from services.agent.mcp import MCPManager, MCPConnectionStatus, MCPServerInfo
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         config = MCPServerConfig(command="echo")
         manager._servers["test-server"] = MCPServerInfo(
             name="test-server",
@@ -300,8 +300,8 @@ class TestGetMCPManager:
         """测试获取 MCP 管理器单例"""
         from services.agent.mcp import get_mcp_manager, MCPManager
 
-        manager1 = get_mcp_manager()
-        manager2 = get_mcp_manager()
+        manager1 = get_mcp_manager(Settings())
+        manager2 = get_mcp_manager(Settings())
         assert manager1 is manager2
         assert isinstance(manager1, MCPManager)
 

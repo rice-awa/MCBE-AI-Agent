@@ -174,6 +174,58 @@ class LLMProviderConfig(BaseModel):
 CONFIG_FILE = Path("config.json")
 DOTENV_FILE = Path(".env")
 _ENV_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+REQUIRED_CONFIG_PATHS = (
+    "server.host",
+    "server.port",
+    "auth.jwt_secret",
+    "auth.jwt_expiration",
+    "auth.default_password",
+    "providers.default",
+    "providers.deepseek.api_key",
+    "providers.deepseek.base_url",
+    "providers.deepseek.model",
+    "providers.openai.api_key",
+    "providers.openai.base_url",
+    "providers.openai.model",
+    "providers.anthropic.api_key",
+    "providers.anthropic.model",
+    "providers.ollama.base_url",
+    "providers.ollama.model",
+    "agent.system_prompt",
+    "agent.enable_reasoning_output",
+    "agent.max_history_turns",
+    "agent.stream_sentence_mode",
+    "agent.llm_warmup_enabled",
+    "agent.mcwiki_base_url",
+    "agent.dedup_external_messages",
+    "agent.tool_response_verbose",
+    "queue.max_size",
+    "queue.llm_worker_count",
+    "websocket.ping_interval",
+    "websocket.ping_timeout",
+    "websocket.close_timeout",
+    "websocket.max_size",
+    "websocket.max_queue",
+    "minecraft.commands",
+    "minecraft.welcome_message_template",
+    "minecraft.context_enabled_text",
+    "minecraft.context_disabled_text",
+    "minecraft.error_prefix",
+    "minecraft.info_prefix",
+    "minecraft.success_prefix",
+    "minecraft.error_color",
+    "minecraft.info_color",
+    "minecraft.success_color",
+    "mcp.enabled",
+    "mcp.servers",
+    "logging.level",
+    "logging.enable_file_logging",
+    "logging.enable_ws_raw_log",
+    "logging.enable_llm_raw_log",
+    "dev_mode",
+    "flow_control.max_chunk_content_length",
+    "flow_control.chunk_sentence_mode",
+)
 
 
 def _parse_dotenv_line(line: str) -> tuple[str, str] | None:
@@ -231,6 +283,36 @@ def _resolve_env_refs(value: Any, env: dict[str, str], path: str = "") -> Any:
         return resolved
 
     return _ENV_REF_PATTERN.sub(replace, value)
+
+
+def _path_exists(data: dict[str, Any], path: str) -> bool:
+    current: Any = data
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return False
+        current = current[part]
+    return True
+
+
+def _validate_runtime_config_data(data: dict[str, Any]) -> None:
+    missing = [path for path in REQUIRED_CONFIG_PATHS if not _path_exists(data, path)]
+    if missing:
+        preview = ", ".join(missing[:5])
+        suffix = "" if len(missing) <= 5 else f", ... (+{len(missing) - 5} more)"
+        raise ValueError(f"config.json is incomplete; missing required path(s): {preview}{suffix}")
+
+
+def _load_runtime_config_data() -> dict[str, Any]:
+    if not CONFIG_FILE.exists():
+        raise FileNotFoundError(
+            f"{CONFIG_FILE} is required for runtime settings. "
+            "Run `python cli.py init` or copy `config.example.json` to `config.json`."
+        )
+    data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("config.json root must be an object")
+    _validate_runtime_config_data(data)
+    return data
 
 
 def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
@@ -377,7 +459,7 @@ class MCPServerConfig(BaseModel):
     args: list[str] = []  # 命令参数
     env: dict[str, str] = {}  # 环境变量
     url: str | None = None  # 远程服务器 URL (用于 HTTP 模式)
-    timeout: int = 5  # 初始化超时时间（秒），npx 首次下载需要较长时间
+    timeout: int = 10  # 初始化超时时间（秒），npx 首次下载需要较长时间
 
 
 class MCPConfig(BaseModel):
@@ -586,4 +668,5 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     """获取配置单例"""
+    _load_runtime_config_data()
     return Settings()

@@ -43,7 +43,7 @@ class WebSocketServer:
         self.jwt_handler = jwt_handler
         self.dev_mode = settings.dev_mode
         self.connection_manager = ConnectionManager(broker, dev_mode=self.dev_mode)
-        self.protocol_handler = MinecraftProtocolHandler()
+        self.protocol_handler = MinecraftProtocolHandler(settings.minecraft)
         self.addon_bridge_service = get_addon_bridge_service()
         self.addon_bridge_service.set_ui_chat_callback(self._handle_ui_chat_message)
         self._server: Any = None
@@ -753,7 +753,7 @@ class WebSocketServer:
         """处理 MCP 服务器管理命令"""
         from services.agent.mcp import get_mcp_manager, MCPConnectionStatus
 
-        manager = get_mcp_manager()
+        manager = get_mcp_manager(self.settings)
         parts = content.strip().split(None, 1) if content.strip() else []
         action = parts[0] if parts else ""
         arg = parts[1] if len(parts) > 1 else ""

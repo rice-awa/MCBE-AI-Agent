@@ -56,7 +56,7 @@ class Application:
 
         # 异步初始化 MCP 管理器
         from services.agent.mcp import get_mcp_manager
-        mcp_manager = get_mcp_manager()
+        mcp_manager = get_mcp_manager(self.settings)
         mcp_connected = await mcp_manager.initialize()
 
         mcp_status = mcp_manager.get_status_summary()
@@ -107,7 +107,7 @@ class Application:
 
         # 关闭 MCP 管理器
         from services.agent.mcp import get_mcp_manager
-        mcp_manager = get_mcp_manager()
+        mcp_manager = get_mcp_manager(self.settings)
         await mcp_manager.shutdown()
 
         # 关闭 Provider 维护的 HTTP 客户端
@@ -336,7 +336,7 @@ def mcp_status():
     try:
         from services.agent.mcp import get_mcp_manager, MCPConnectionStatus
 
-        manager = get_mcp_manager()
+        manager = get_mcp_manager(settings)
 
         if not manager.is_initialized:
             click.echo("⚠️  MCP 管理器尚未初始化")
@@ -395,7 +395,7 @@ def mcp_test(server_name: str | None):
     async def _test_config():
         from services.agent.mcp import get_mcp_manager, MCPConnectionStatus
 
-        manager = get_mcp_manager()
+        manager = get_mcp_manager(settings)
 
         # 如果未初始化，先初始化
         if not manager.is_initialized:
