@@ -127,6 +127,8 @@ function onMessageComplete(playerName: string, role: HistoryRole, text: string):
         text.length > previewLength ? `${text.slice(0, previewLength)}...` : text,
       );
     }
+
+    activeState.refreshConversation?.();
   }
 
   // 持久化到 DynamicProperty

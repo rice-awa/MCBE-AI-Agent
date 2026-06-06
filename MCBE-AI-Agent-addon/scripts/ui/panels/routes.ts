@@ -1,7 +1,5 @@
 export type AgentPanelRoute =
   | { panel: "main" }
-  | { panel: "chatInput" }
-  | { panel: "history"; pageIndex?: number }
   | { panel: "settings" }
   | { panel: "stats" }
   | { panel: "close" };

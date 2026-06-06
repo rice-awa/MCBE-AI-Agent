@@ -5,8 +5,10 @@ import {
   createDduiObservable,
   showCustomFormSafely,
 } from "../forms/formAdapter";
+import { clearHistory } from "../history";
 import type { AgentUiDelivery, AgentUiState } from "../state";
 import { saveAgentUiState } from "../storage";
+import { syncLocalHistoryCount } from "../stats";
 import type { AgentPanelRoute } from "./routes";
 import { CLOSE_ROUTE, MAIN_ROUTE } from "./routes";
 
@@ -57,6 +59,15 @@ export async function showSettingsPanel(
             ? "MCBE AI Agent: 设置已保存。"
             : "MCBE AI Agent: 设置保存失败，本次仅内存生效。",
         );
+        form.close();
+      })
+      .button("清空历史", () => {
+        uiState.history = clearHistory(uiState.history);
+        uiState.stats = syncLocalHistoryCount(uiState.stats, 0);
+        uiState.lastResponsePreview.setData("");
+        saveAgentUiState(player, uiState);
+        didSave = true;
+        player.sendMessage("MCBE AI Agent: 本地聊天记录已清空。");
         form.close();
       });
 

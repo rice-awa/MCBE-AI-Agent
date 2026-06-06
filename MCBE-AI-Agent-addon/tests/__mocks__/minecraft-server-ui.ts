@@ -11,6 +11,11 @@ type CustomFormInteraction = {
 };
 
 const nextInteraction: CustomFormInteraction = {};
+let lastCustomForm: MockCustomForm | undefined;
+
+export function __getLastCustomForm(): MockCustomForm | undefined {
+  return lastCustomForm;
+}
 
 export function __resetDduiMock(): void {
   nextInteraction.clickButtonLabel = undefined;
@@ -19,6 +24,7 @@ export function __resetDduiMock(): void {
   nextInteraction.failOnShow = false;
   nextInteraction.autoCloseAfterButtonClick = false;
   nextInteraction.fieldValues = undefined;
+  lastCustomForm = undefined;
 }
 
 export function __setNextCustomFormInteraction(interaction: CustomFormInteraction): void {
@@ -67,10 +73,14 @@ class MockCustomForm {
   #showing = false;
   #fields = new Map<string, MockObservable<unknown>>();
   #buttons = new Map<string, () => void>();
+  #labels: Array<string | MockObservable<unknown>> = [];
 
   closeButton() { return this; }
   spacer() { return this; }
-  label() { return this; }
+  label(value: string | MockObservable<unknown>) {
+    this.#labels.push(value);
+    return this;
+  }
   divider() { return this; }
   toggle(label: string, value: MockObservable<boolean>) {
     this.#fields.set(label, value as MockObservable<unknown>);
@@ -91,6 +101,18 @@ class MockCustomForm {
   button(label: string, callback: () => void) {
     this.#buttons.set(label, callback);
     return this;
+  }
+
+  getFieldData(label: string): unknown {
+    return this.#fields.get(label)?.getData();
+  }
+
+  getLabelTexts(): unknown[] {
+    return this.#labels.map((value) => typeof value === "string" ? value : value.getData());
+  }
+
+  clickButton(label: string): void {
+    this.#buttons.get(label)?.();
   }
 
   show() {
@@ -134,7 +156,8 @@ export const CustomForm = {
     if (nextInteraction.failOnCustomFormCreate) {
       throw new Error("Mock DDUI CustomForm API is unavailable.");
     }
-    return new MockCustomForm();
+    lastCustomForm = new MockCustomForm();
+    return lastCustomForm;
   },
 };
 

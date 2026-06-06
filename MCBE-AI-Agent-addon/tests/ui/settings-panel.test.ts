@@ -61,6 +61,41 @@ describe("settings panel", () => {
     expect(persisted.history).toHaveLength(10);
   });
 
+  it("clears local history from settings", async () => {
+    __setNextCustomFormInteraction({
+      clickButtonLabel: "清空历史",
+      autoCloseAfterButtonClick: true,
+    });
+
+    const player = createFakePlayer();
+    const uiState = createAgentUiState({
+      history: [
+        {
+          id: "history-1",
+          role: "user",
+          content: "hello",
+          createdAt: 1,
+          source: "ui",
+        },
+      ],
+      stats: { localHistoryCount: 1 },
+      lastPrompt: "hello",
+      lastResponsePreview: "world",
+    });
+
+    const route = await showSettingsPanel(player, uiState);
+
+    expect(route).toEqual({ panel: "main" });
+    expect(uiState.history).toEqual([]);
+    expect(uiState.stats.localHistoryCount).toBe(0);
+    expect(uiState.lastResponsePreview.getData()).toBe("");
+    expect(player.messages).toContain("MCBE AI Agent: 本地聊天记录已清空。");
+
+    const persisted = JSON.parse(String(player.getDynamicProperty(AGENT_UI_STATE_PROPERTY_KEY)));
+    expect(persisted.history).toEqual([]);
+    expect(persisted.stats.localHistoryCount).toBe(0);
+  });
+
   it("closes cleanly when the DDUI beta api is unavailable", async () => {
     __setNextCustomFormInteraction({
       failOnObservableCreate: true,

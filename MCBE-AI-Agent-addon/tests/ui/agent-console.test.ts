@@ -1,10 +1,16 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
+  __resetMinecraftServerMock,
+  __setMockPlayers,
+} from "@minecraft/server";
+import {
+  __getLastCustomForm,
   __resetDduiMock,
   __setNextCustomFormInteraction,
 } from "@minecraft/server-ui";
 
+import { TOOL_PLAYER_NAME } from "../../scripts/bridge/constants";
 import { showAgentConsole } from "../../scripts/ui/panels/agentConsole";
 import { CLOSE_ROUTE } from "../../scripts/ui/panels/routes";
 import { createAgentUiState } from "../../scripts/ui/state";
@@ -13,12 +19,16 @@ import { AGENT_UI_STATE_PROPERTY_KEY } from "../../scripts/ui/storage";
 describe("agent console panel", () => {
   beforeEach(() => {
     __resetDduiMock();
+    __resetMinecraftServerMock();
+    __setMockPlayers([createToolPlayer()]);
   });
 
-  it("routes to chat input when 发送消息 is clicked", async () => {
+  it("sends a message from the main panel without closing it", async () => {
     __setNextCustomFormInteraction({
-      clickButtonLabel: "发送消息",
-      autoCloseAfterButtonClick: true,
+      clickButtonLabel: "发送",
+      fieldValues: {
+        "消息内容": "  你好 AI  ",
+      },
     });
 
     const player = createFakePlayer();
@@ -26,13 +36,26 @@ describe("agent console panel", () => {
 
     const route = await showAgentConsole(player, uiState);
 
-    expect(route).toEqual({ panel: "chatInput" });
+    expect(route).toEqual({ panel: "main" });
+    expect(uiState.history).toHaveLength(1);
+    expect(uiState.history[0]).toMatchObject({
+      role: "user",
+      content: "你好 AI",
+      source: "ui",
+    });
+    expect(uiState.lastPrompt.getData()).toBe("你好 AI");
+    expect(uiState.bridgeStatus.getData()).toBe("sent");
+    expect(uiState.stats.sentCount).toBe(1);
+    expect(__getLastCustomForm()?.getFieldData("消息内容")).toBe("");
+    expect(player.messages).toContain("MCBE AI Agent: 消息已发送至 AI 服务。");
   });
 
-  it("routes to history when 聊天记录 is clicked", async () => {
+  it("keeps the main panel open when the message is empty", async () => {
     __setNextCustomFormInteraction({
-      clickButtonLabel: "聊天记录",
-      autoCloseAfterButtonClick: true,
+      clickButtonLabel: "发送",
+      fieldValues: {
+        "消息内容": "   ",
+      },
     });
 
     const player = createFakePlayer();
@@ -40,7 +63,31 @@ describe("agent console panel", () => {
 
     const route = await showAgentConsole(player, uiState);
 
-    expect(route).toEqual({ panel: "history" });
+    expect(route).toEqual({ panel: "main" });
+    expect(uiState.history).toEqual([]);
+    expect(player.messages).toContain("MCBE AI Agent: 消息不能为空。");
+  });
+
+  it("routes to settings from the main panel", async () => {
+    __setNextCustomFormInteraction({
+      clickButtonLabel: "设置",
+      autoCloseAfterButtonClick: true,
+    });
+
+    const route = await showAgentConsole(createFakePlayer(), createAgentUiState());
+
+    expect(route).toEqual({ panel: "settings" });
+  });
+
+  it("routes to stats from the main panel", async () => {
+    __setNextCustomFormInteraction({
+      clickButtonLabel: "统计信息",
+      autoCloseAfterButtonClick: true,
+    });
+
+    const route = await showAgentConsole(createFakePlayer(), createAgentUiState());
+
+    expect(route).toEqual({ panel: "stats" });
   });
 
   it("routes to close and persists state when 关闭 is clicked", async () => {
@@ -82,6 +129,8 @@ function createFakePlayer(initialProperties: Record<string, unknown> = {}) {
   const messages: string[] = [];
 
   return {
+    id: "player-1",
+    name: "TestPlayer",
     messages,
     getDynamicProperty(identifier: string) {
       return properties.get(identifier);
@@ -96,5 +145,12 @@ function createFakePlayer(initialProperties: Record<string, unknown> = {}) {
     sendMessage(message: string) {
       messages.push(message);
     },
+  };
+}
+
+function createToolPlayer() {
+  return {
+    name: TOOL_PLAYER_NAME,
+    runCommand: () => ({ successCount: 1 }),
   };
 }

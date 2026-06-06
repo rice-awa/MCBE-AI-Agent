@@ -1,10 +1,35 @@
 // Mock for @minecraft/server - provides minimal stubs for vitest unit tests
 
+type ScriptEventCallback = (event: { id: string; message: string }) => void;
+
+const scriptEventSubscribers = new Set<ScriptEventCallback>();
+let mockPlayers: unknown[] = [];
+
+export function __resetMinecraftServerMock(): void {
+  scriptEventSubscribers.clear();
+  mockPlayers = [];
+}
+
+export function __setMockPlayers(players: unknown[]): void {
+  mockPlayers = players;
+}
+
+export function __emitScriptEvent(event: { id: string; message: string }): void {
+  for (const subscriber of scriptEventSubscribers) {
+    subscriber(event);
+  }
+}
+
 export const system = {
   afterEvents: {
     scriptEventReceive: {
-      subscribe: () => {},
-      unsubscribe: () => {},
+      subscribe: (callback: ScriptEventCallback) => {
+        scriptEventSubscribers.add(callback);
+        return callback;
+      },
+      unsubscribe: (callback: ScriptEventCallback) => {
+        scriptEventSubscribers.delete(callback);
+      },
     },
   },
   currentTick: 0,
@@ -19,8 +44,8 @@ export const world = {
       unsubscribe: () => {},
     },
   },
-  getAllPlayers: () => [],
-  getPlayers: () => [],
+  getAllPlayers: () => mockPlayers,
+  getPlayers: () => mockPlayers,
   getDimension: () => ({
     getEntities: () => [],
     runCommand: () => ({ successCount: 0 }),
