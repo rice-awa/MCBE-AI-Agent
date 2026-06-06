@@ -5,6 +5,7 @@
 !MCBE-AI-Agent-addon/.env
 
 # coding agent
+.codebuddy
 .claude
 .qoder
 .kiro

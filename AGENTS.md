@@ -34,6 +34,7 @@ Minecraft Client <-> WebSocket Server <-> Message Broker <-> Agent Worker (Pydan
 - **非阻塞**：WebSocket 处理与 LLM 请求完全分离。
 - **消息队列**：使用 `asyncio.Queue` 实现生产者-消费者模式。
 - **类型安全**：使用 Pydantic 进行数据验证和配置管理。
+- **多人会话隔离**：MCBE 单个 `/wsserver` 连接可承载多个玩家，历史、锁、上下文、模型、模板和变量均按 `(connection_id, player_name)` 分桶。
 - **统一流控**：所有下行长文本统一经过 `FlowControlMiddleware` 分片，避免 MCBE 拒绝超长 `commandRequest`。
 
 ## 统一流控中间件
@@ -48,18 +49,32 @@ Minecraft Client <-> WebSocket Server <-> Message Broker <-> Agent Worker (Pydan
 
 流控以 MCBE `commandLine` 实测安全上限 461 字节为硬约束，并结合 `MAX_CHUNK_CONTENT_LENGTH` 字符上限与 `CHUNK_SENTENCE_MODE` 语义分句策略共同决定分片边界。新增或修改下行消息发送路径时，应优先复用该中间件，不要在调用点重新实现分片逻辑。
 
+## 多人会话隔离
+
+MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多名玩家共享同一个 `connection_id`。仓库内玩家相关状态应按 `(connection_id, player_name)` 作为会话键隔离，不能把 `ConnectionState.player_name` 当作真实会话身份来源；它只适合记录最近发言者用于日志或兼容路径。
+
+- `MessageBroker` 的历史、锁、自动压缩上下文都必须传入当前 `player_name`；同玩家串行，不同玩家可并行。
+- `ConnectionState.get_player_session(player_name)` 保存玩家级 `context_enabled`、`current_provider`、`current_template` 和 `custom_variables`。
+- `PromptManager` 模板和变量按玩家分桶；旧 connection 级 API 是匿名桶兼容层。
+- `handle_message`、聊天命令、UI 消息、上下文、模板、设置、切换模型等路径应从本次事件的 `sender` 向下直传 `player_name`。
+- 连接注销时清理该连接下所有玩家桶，避免多人测试后残留历史或锁。
+
+相关分析与修复文档：`claude_md/report/MULTIPLAYER_BUG_REPORT.md`、`claude_md/fix/MULTIPLAYER_SESSION_FIX.md`。
+
 ## 关键文件
 
 | 文件 | 用途 |
 | --- | --- |
 | `cli.py` | 应用入口，CLI 命令组 |
 | `config/settings.py` | Pydantic Settings 配置管理 |
-| `core/queue.py` | `MessageBroker` 消息队列 |
+| `core/queue.py` | `MessageBroker` 消息队列；对话历史和会话锁按 `(connection_id, player_name)` 隔离 |
+| `core/conversation.py` | 对话压缩、保存和恢复；按玩家会话桶读写历史 |
 | `services/agent/core.py` | PydanticAI Agent 核心 |
 | `services/agent/providers.py` | LLM Provider 注册表 |
-| `services/agent/worker.py` | Agent Worker，消费队列请求 |
-| `services/websocket/server.py` | WebSocket 服务器 |
-| `services/websocket/connection.py` | 连接管理 |
+| `services/agent/prompt.py` | 系统提示词、模板和变量管理；模板/变量按玩家会话隔离 |
+| `services/agent/worker.py` | Agent Worker，消费队列请求；按玩家锁串行化同一玩家请求 |
+| `services/websocket/server.py` | WebSocket 服务器；每条玩家消息必须直传当前 `sender` |
+| `services/websocket/connection.py` | 连接管理；`PlayerSession` 保存玩家级上下文、模型、模板和变量 |
 | `services/websocket/flow_control.py` | 统一流控中间件，负责出站长文本分片与字节安全校验 |
 | `services/agent/tools.py` | Agent Tools（MC 命令执行、MCWiki 搜索） |
 

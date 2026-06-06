@@ -1,4 +1,4 @@
-# MCBE GPT Agent v2.0 - 现代化重构
+# MCBE AI Agent v2.0 - 现代化重构
 
 ## 概述
 
@@ -30,6 +30,7 @@
 - **非阻塞通信**: LLM 请求不影响 MC 连接
 - **实时切换模型**: 游戏内动态切换 LLM
 - **上下文管理**: 灵活的对话历史控制
+- **多人会话隔离**: 同一 `/wsserver` 连接下按玩家隔离历史、上下文、模型、模板和变量，避免多人串扰
 - **JWT 认证**: 安全的令牌认证机制
 - **ScriptEvent 支持**: 支持发送 scriptevent，方便后续对接SAPI
 
@@ -109,7 +110,13 @@ MCBE-AI-Agent/
        use_context: bool = True
    ```
 
-3. **依赖注入**
+3. **多人会话隔离**
+   - MCBE 单个 `/wsserver` 连接可承载多个玩家
+   - 对话历史、会话锁、上下文开关、当前模型、模板和自定义变量均按 `(connection_id, player_name)` 分桶
+   - `ConnectionState.player_name` 仅表示最近发言者，处理聊天、UI、上下文、设置和切换模型时必须使用本次事件的 `sender`
+   - 同一玩家请求串行处理，不同玩家可并行处理，避免上下文串扰和 UI 响应推给错人
+
+4. **依赖注入**
    ```python
    @dataclass
    class AgentDependencies:
@@ -213,9 +220,9 @@ DEV_MODE=true
 - **切勿在生产环境中启用**，否则任何人都可以连接服务器
 - 启用时会在控制台和日志中显示警告信息
 
-## Addon Bridge 联调
+## Addon Bridge 桥接
 
-当前仓库已经接入一条可用的 Python <-> Addon <-> 游戏桥接链路，用于让 Agent 通过 Addon 获取更稳定的游戏内上下文。联调时建议优先使用开发模式启动 Python 服务。
+当前仓库已经接入一条可用的 Python <-> Addon <-> 游戏桥接链路，用于让 Agent 通过 Addon 获取更稳定的游戏内上下文，如玩家背包，实体信息等。打包好的 Addon 可在[release](https://github.com/rice-awa/MCBE-AI-Agent/release)获取
 
 ### Python 服务启动
 
@@ -231,7 +238,7 @@ python cli.py info
 
 ### Addon 安装、构建与部署
 
-Addon 工程位于 `MCBE-AI-Agent-addon/`，本地联调前至少执行一次依赖安装、测试、构建和本地部署。
+Addon 工程位于 `MCBE-AI-Agent-addon/`，本地调试前至少执行一次依赖安装、测试、构建和本地部署。
 
 ```bash
 cd MCBE-AI-Agent-addon
@@ -247,7 +254,7 @@ npm run local-deploy
 - `npm run build`：构建行为包脚本。
 - `npm run local-deploy`：将本地构建结果部署到 Minecraft 本地开发目录。
 
-### 联调步骤
+### 调试步骤
 
 1. 启动 Python 服务：`python cli.py serve --dev`。
 2. 在 `MCBE-AI-Agent-addon/` 下执行 `npm run local-deploy`，确保最新脚本已部署。
@@ -411,6 +418,18 @@ AGENT 上下文 状态          # 查看当前状态
 运行命令 time set day    # 执行游戏命令
 ```
 
+### 多人会话说明
+
+MCBE 世界通常只会通过 `/wsserver` 建立一条 WebSocket 连接，所有玩家的聊天框命令和 Addon UI 消息都会复用这条连接。后端不会再把 `connection_id` 视为单个玩家会话，而是使用 `(connection_id, player_name)` 区分真实会话。
+
+- 玩家 A 和玩家 B 的对话历史互不读取。
+- `AGENT 上下文`、`切换模型`、模板和变量设置只影响发起命令的玩家。
+- Agent Worker 对同一玩家保持串行处理，但不同玩家请求可以并发执行。
+- UI 响应同步使用当前消息的真实 `player_name`，避免响应写入其他玩家面板。
+- 连接断开或注销时会清理该连接下所有玩家会话。
+
+详细根因分析与修复记录见 `claude_md/report/MULTIPLAYER_BUG_REPORT.md` 和 `claude_md/fix/MULTIPLAYER_SESSION_FIX.md`。
+
 ## Termux 常见问题
 
 ### 1. 端口无法访问
@@ -438,9 +457,6 @@ pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
 **解决方案**:
 ```bash
-# 使用轻量级模型
-DEFAULT_MODEL=deepseek-chat  # 而不是 deepseek-reasoner
-
 # 减少工作线程
 LLM_WORKER_COUNT=1
 
@@ -524,6 +540,8 @@ class MessageBroker:
 **关键特性**:
 - 优先级队列支持紧急请求
 - 每连接独立响应队列
+- 对话历史和会话锁按 `(connection_id, player_name)` 隔离
+- 注销连接时清理该连接下全部玩家会话
 - 支持多 Worker 并发消费
 
 ### 2. ProviderRegistry - LLM 抽象
@@ -544,6 +562,10 @@ class ProviderRegistry:
 ### 3. ConnectionManager - 连接管理
 
 ```python
+class ConnectionState:
+    def get_player_session(self, player_name: str | None) -> PlayerSession:
+        """获取指定玩家在当前连接下的独立会话状态"""
+
 class ConnectionManager:
     async def _response_sender(self, state: ConnectionState):
         """独立的响应发送协程 - 不阻塞主循环"""
@@ -551,6 +573,8 @@ class ConnectionManager:
 
 **设计优势**:
 - 每个连接独立的发送协程
+- 每名玩家独立保存上下文开关、当前模型、模板和变量
+- `state.player_name` 仅作为最近发言者指针，不能作为多人会话身份来源
 - 超时机制避免永久阻塞
 - 优雅的错误处理
 
@@ -816,6 +840,12 @@ pip install --prefer-binary -r requirements.txt
 
 ## 更新日志
 
+### v2.3.1 (2026-05-02)
+- 修复多人共享同一 `/wsserver` 连接时的玩家识别、上下文历史和 UI 响应串扰问题
+- 将对话历史、会话锁、上下文开关、模型、模板和变量升级为 `(connection_id, player_name)` 维度隔离
+- Agent Worker 改为同玩家串行、跨玩家并行处理请求
+- UI 聊天路径和聊天框命令统一使用当前消息的真实 `sender`
+
 ### v2.3.0 (2026-02-16)
 - ✨ **开发模式**: 新增开发模式功能，支持跳过身份验证用于本地开发调试
 - 🔧 支持通过 `--dev` 命令行参数或 `DEV_MODE` 环境变量启用
@@ -885,7 +915,7 @@ pip install --prefer-binary -r requirements.txt
 
 ---
 
-**版本**: 2.3.0
-**最后更新**: 2026-02-16
+**版本**: 2.3.1
+**最后更新**: 2026-05-02
 **架构**: 现代化异步 + PydanticAI
 **平台支持**: Windows, Linux, macOS, Termux (Android)

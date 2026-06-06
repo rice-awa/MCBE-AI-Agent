@@ -1,4 +1,4 @@
-import type { AgentUiSettings, AgentUiState } from "./state";
+import type { AgentUiSettings, AgentUiState, BridgeStatus } from "./state";
 import { createAgentUiState } from "./state";
 import type { HistoryItem } from "./history";
 import type { AgentUiStats } from "./stats";
@@ -14,6 +14,7 @@ type DynamicPropertyOwner = {
 
 type PersistedAgentUiState = {
   version: 1;
+  bridgeStatus?: BridgeStatus;
   settings?: Partial<AgentUiSettings>;
   history?: HistoryItem[];
   stats?: Partial<AgentUiStats>;
@@ -37,12 +38,23 @@ export function loadAgentUiState(owner: DynamicPropertyOwner): AgentUiState {
 
     return createAgentUiState({
       settings: normalizeSettings(persisted.settings),
+      bridgeStatus: normalizeBridgeStatus(persisted.bridgeStatus),
       history,
       stats: normalizeStats(persisted.stats, history.length),
     });
   } catch {
     return createAgentUiState();
   }
+}
+
+function normalizeBridgeStatus(status: unknown): BridgeStatus | undefined {
+  return status === "disconnected" ||
+    status === "connecting" ||
+    status === "ready" ||
+    status === "sent" ||
+    status === "error"
+    ? status
+    : undefined;
 }
 
 function normalizeSettings(settings: Partial<AgentUiSettings> | undefined): Partial<AgentUiSettings> {
@@ -138,6 +150,7 @@ export function saveAgentUiState(
   try {
     const persisted: PersistedAgentUiState = {
       version: AGENT_UI_STATE_VERSION,
+      bridgeStatus: state.bridgeStatus.getData(),
       settings: state.settings,
       history: state.history.slice(-PERSISTED_HISTORY_LIMIT),
       stats: state.stats,

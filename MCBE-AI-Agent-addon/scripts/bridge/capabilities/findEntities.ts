@@ -1,4 +1,4 @@
-import type { Entity } from "@minecraft/server";
+import { world, type Entity } from "@minecraft/server";
 
 export type EntitySnapshot = {
   id: string;
@@ -25,10 +25,26 @@ function isPlayerNameTarget(target: string | undefined): target is string {
   return !target.trim().startsWith("@");
 }
 
-function resolveQueryAnchor(event: {
-  sourceEntity?: QueryAnchor;
-  sourceBlock?: QueryAnchor;
-}): QueryAnchor | undefined {
+function resolveQueryAnchor(
+  event: {
+    sourceEntity?: QueryAnchor;
+    sourceBlock?: QueryAnchor;
+  },
+  targetPlayerName?: string,
+): QueryAnchor | undefined {
+  // 如果指定了目标玩家名，尝试找到该玩家并以其位置为查询中心
+  if (targetPlayerName) {
+    const players = world.getPlayers({ name: targetPlayerName });
+    if (players.length > 0) {
+      const player = players[0];
+      return {
+        dimension: player.dimension,
+        location: player.location,
+      };
+    }
+  }
+
+  // 否则使用事件源作为查询中心
   if (event.sourceEntity) {
     return event.sourceEntity;
   }
@@ -60,7 +76,10 @@ export function handleFindEntities(
   },
   payload: { entity_type: string; radius?: number; target?: string },
 ): { ok: true; payload: { entities: EntitySnapshot[] } } {
-  const queryAnchor = resolveQueryAnchor(event);
+  // target 参数用于指定查询中心玩家（如果提供且不是 @ 开头）
+  const targetPlayerName = isPlayerNameTarget(payload.target) ? payload.target.trim() : undefined;
+  const queryAnchor = resolveQueryAnchor(event, targetPlayerName);
+
   if (!queryAnchor) {
     return { ok: true, payload: { entities: [] } };
   }
@@ -69,16 +88,11 @@ export function handleFindEntities(
     type: string;
     location: { x: number; y: number; z: number };
     maxDistance: number;
-    name?: string;
   } = {
     type: payload.entity_type,
     location: queryAnchor.location,
     maxDistance: payload.radius ?? 32,
   };
-
-  if (isPlayerNameTarget(payload.target)) {
-    options.name = payload.target.trim();
-  }
 
   const entities = queryAnchor.dimension.getEntities(options);
 
