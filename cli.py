@@ -245,27 +245,33 @@ def test_provider(provider: str):
 
 
 @cli.command()
-
 def init():
     """初始化配置文件"""
     env_file = Path(".env")
     env_example = Path(".env.example")
+    config_file = Path("config.json")
+    config_example = Path("config.example.json")
 
     if env_file.exists():
-        click.confirm("配置文件已存在，是否覆盖?", abort=True)
+        click.confirm(".env 已存在，是否覆盖?", abort=True)
+    if config_file.exists():
+        click.confirm("config.json 已存在，是否覆盖?", abort=True)
 
     if not env_example.exists():
         click.echo(f"❌ 找不到模板文件: {env_example.absolute()}", err=True)
         sys.exit(1)
+    if not config_example.exists():
+        click.echo(f"❌ 找不到模板文件: {config_example.absolute()}", err=True)
+        sys.exit(1)
 
     try:
-        # 复制 .env.example 到 .env
-        env_content = env_example.read_text(encoding="utf-8")
-        env_file.write_text(env_content, encoding="utf-8")
-        click.echo(f"✅ 配置文件已创建: {env_file.absolute()}")
-        click.echo("\n请编辑 .env 文件并填入您的 API 密钥")
+        env_file.write_text(env_example.read_text(encoding="utf-8"), encoding="utf-8")
+        config_file.write_text(config_example.read_text(encoding="utf-8"), encoding="utf-8")
+        click.echo(f"✅ 敏感配置文件已创建: {env_file.absolute()}")
+        click.echo(f"✅ 应用配置文件已创建: {config_file.absolute()}")
+        click.echo("\n请编辑 .env 填入密钥，并按需编辑 config.json 调整普通配置")
     except Exception as e:
-        click.echo(f"❌ 复制配置文件失败: {e}", err=True)
+        click.echo(f"❌ 创建配置文件失败: {e}", err=True)
         sys.exit(1)
 
 
@@ -284,12 +290,12 @@ def mcp_list():
 
     if not settings.mcp.enabled:
         click.echo("⚠️  MCP 功能未启用")
-        click.echo("提示: 设置 MCP_ENABLED=true 启用 MCP")
+        click.echo("提示: 在 config.json 中设置 mcp.enabled=true 启用 MCP")
         return
 
     if not settings.mcp.servers:
         click.echo("⚠️  未配置任何 MCP 服务器")
-        click.echo("提示: 通过 MCP_SERVERS 环境变量配置服务器")
+        click.echo("提示: 在 config.json 的 mcp.servers 中配置服务器")
         return
 
     click.echo(f"MCP 状态: 已启用")
