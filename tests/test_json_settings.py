@@ -53,6 +53,8 @@ def test_settings_loads_plain_values_from_config_json(tmp_path, monkeypatch):
 
 def test_json_placeholders_resolve_from_dotenv_and_process_env(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    monkeypatch.delenv("WEBSOCKET_PASSWORD", raising=False)
     write_env(
         tmp_path,
         "SECRET_KEY=dotenv-secret\n"
@@ -109,6 +111,7 @@ def test_missing_placeholder_reports_path_and_variable(tmp_path, monkeypatch):
 
 def test_empty_placeholder_value_reports_path_and_variable(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     write_env(tmp_path, "DEEPSEEK_API_KEY=\n")
     write_json_config(
         tmp_path,
