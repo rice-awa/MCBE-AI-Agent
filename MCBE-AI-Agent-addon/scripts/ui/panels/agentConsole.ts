@@ -6,6 +6,7 @@ import { appendHistoryItem, createHistoryId, summarizeHistoryItem } from "../his
 import {
   createCustomForm,
   createDduiObservable,
+  createDduiTextObservable,
   showCustomFormSafely,
 } from "../forms/formAdapter";
 import type { AgentUiState } from "../state";
@@ -23,7 +24,7 @@ export async function showAgentConsole(
   try {
     const summary = createDduiObservable(buildSummary(uiState));
     const conversationBody = createDduiObservable(buildConversationBody(uiState));
-    const messageValue = createDduiObservable("");
+    const messageValue = createDduiTextObservable("");
     let nextRoute: AgentPanelRoute = MAIN_ROUTE;
 
     const refreshConversation = () => {

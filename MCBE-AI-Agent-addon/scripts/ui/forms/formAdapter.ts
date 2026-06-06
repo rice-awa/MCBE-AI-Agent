@@ -1,72 +1,15 @@
-import { ActionFormData, ModalFormData } from "@minecraft/server-ui";
+import { ActionFormData, CustomForm, ModalFormData, Observable } from "@minecraft/server-ui";
 import type { ActionFormResponse, ModalFormResponse } from "@minecraft/server-ui";
 import type { Player } from "@minecraft/server";
-import * as ServerUiModule from "@minecraft/server-ui";
 
-export type DduiObservable<T> = {
-  getData(): T;
-  setData(value: T): void;
-};
-
-type DduiDropdownOption<T> = {
-  label: string;
-  value: T;
-  description?: string;
-};
-
-export type DduiCustomForm = {
-  divider(): DduiCustomForm;
-  header(text: string | DduiObservable<string>): DduiCustomForm;
-  label(text: string | DduiObservable<string>): DduiCustomForm;
-  textField(
-    label: string,
-    value: DduiObservable<string>,
-    options?: { description?: string },
-  ): DduiCustomForm;
-  spacer(): DduiCustomForm;
-  closeButton(): DduiCustomForm;
-  close(): void;
-  toggle(
-    label: string,
-    value: DduiObservable<boolean>,
-    options?: { description?: string },
-  ): DduiCustomForm;
-  slider(
-    label: string,
-    value: DduiObservable<number>,
-    min: number,
-    max: number,
-    options?: { description?: string; step?: number },
-  ): DduiCustomForm;
-  dropdown(
-    label: string,
-    value: DduiObservable<number>,
-    options: DduiDropdownOption<number>[],
-  ): DduiCustomForm;
-  button(
-    label: string,
-    callback: () => void,
-    options?: { tooltip?: string },
-  ): DduiCustomForm;
-  show(): Promise<unknown>;
-};
+export type DduiObservable<T extends string | number | boolean> = Observable<T>;
+export type DduiCustomForm = CustomForm;
 
 export type DduiCustomFormShowResult = {
   ok: boolean;
   closedByUser: boolean;
   closeReason?: unknown;
 };
-
-type DduiServerUiModule = {
-  CustomForm: {
-    create(player: Player, title: string): DduiCustomForm;
-  };
-  Observable: {
-    create<T>(initialValue: T, options: { clientWritable: true }): DduiObservable<T>;
-  };
-};
-
-const dduiServerUi = ServerUiModule as unknown as Partial<DduiServerUiModule>;
 
 export function createActionForm(title: string, body: string): ActionFormData {
   return new ActionFormData().title(title).body(body);
@@ -76,20 +19,16 @@ export function createModalForm(title: string): ModalFormData {
   return new ModalFormData().title(title);
 }
 
-export function createDduiObservable<T>(initialValue: T): DduiObservable<T> {
-  const observableFactory = dduiServerUi.Observable;
-  if (!observableFactory) {
-    throw new Error("DDUI Observable API is unavailable.");
-  }
-  return observableFactory.create<T>(initialValue, { clientWritable: true });
+export function createDduiObservable<T extends string | number | boolean>(initialValue: T): DduiObservable<T> {
+  return Observable.create<T>(initialValue, { clientWritable: true });
 }
 
 export function createCustomForm(player: Player, title: string): DduiCustomForm {
-  const customFormFactory = dduiServerUi.CustomForm;
-  if (!customFormFactory) {
-    throw new Error("DDUI CustomForm API is unavailable.");
-  }
-  return customFormFactory.create(player, title);
+  return CustomForm.create(player, title);
+}
+
+export function createDduiTextObservable(initialValue: string): DduiObservable<string> {
+  return createDduiObservable<string>(initialValue);
 }
 
 export async function showActionFormSafely(
@@ -123,7 +62,7 @@ export async function showCustomFormSafely(
   try {
     const closeReason = await form.show();
     return {
-      ok: closeReason !== false && !isUserBusyReason(closeReason),
+      ok: !isUserBusyReason(closeReason),
       closedByUser: isUserClosedReason(closeReason),
       closeReason,
     };
