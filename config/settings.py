@@ -1,11 +1,15 @@
 """应用配置 - 使用 Pydantic Settings 管理"""
 
 import json
+import os
+import re
 from functools import lru_cache
-from typing import Literal, Any
+from pathlib import Path
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+from pydantic_settings.sources import JsonConfigSettingsSource
 
 
 class MinecraftCommandConfig(BaseModel):
@@ -167,6 +171,171 @@ class LLMProviderConfig(BaseModel):
 
 
 # 常用模型的上下文窗口大小（单位：tokens）
+CONFIG_FILE = Path("config.json")
+DOTENV_FILE = Path(".env")
+_ENV_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _parse_dotenv_line(line: str) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    key, value = stripped.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if not key:
+        return None
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return key, value
+
+
+def _load_dotenv(path: Path = DOTENV_FILE) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parsed = _parse_dotenv_line(line)
+        if parsed is not None:
+            key, value = parsed
+            values[key] = value
+    return values
+
+
+def _secret_environment() -> dict[str, str]:
+    values = _load_dotenv()
+    values.update(os.environ)
+    return values
+
+
+def _resolve_env_refs(value: Any, env: dict[str, str], path: str = "") -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _resolve_env_refs(child, env, f"{path}.{key}" if path else str(key))
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _resolve_env_refs(child, env, f"{path}[{index}]")
+            for index, child in enumerate(value)
+        ]
+    if not isinstance(value, str):
+        return value
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        resolved = env.get(name)
+        if resolved is None or resolved == "":
+            location = path or "<root>"
+            raise ValueError(f"missing environment variable {name!r} for config path {location}")
+        return resolved
+
+    return _ENV_REF_PATTERN.sub(replace, value)
+
+
+def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
+    providers = data.get("providers", {})
+    logging_config = data.get("logging", {})
+    flow_control = data.get("flow_control", {})
+    queue = data.get("queue", {})
+    agent = data.get("agent", {})
+    auth = data.get("auth", {})
+    server = data.get("server", {})
+
+    result: dict[str, Any] = {}
+
+    result.update(server)
+
+    if "jwt_secret" in auth:
+        result["jwt_secret"] = auth["jwt_secret"]
+    if "jwt_expiration" in auth:
+        result["jwt_expiration"] = auth["jwt_expiration"]
+    if "default_password" in auth:
+        result["default_password"] = auth["default_password"]
+
+    if "default" in providers:
+        result["default_provider"] = providers["default"]
+
+    deepseek = providers.get("deepseek", {})
+    if "api_key" in deepseek:
+        result["deepseek_api_key"] = deepseek["api_key"]
+    if "model" in deepseek:
+        result["deepseek_model"] = deepseek["model"]
+    if "base_url" in deepseek:
+        result["deepseek_base_url"] = deepseek["base_url"]
+
+    openai = providers.get("openai", {})
+    if "api_key" in openai:
+        result["openai_api_key"] = openai["api_key"]
+    if "model" in openai:
+        result["openai_model"] = openai["model"]
+    if "base_url" in openai:
+        result["openai_base_url"] = openai["base_url"]
+
+    anthropic = providers.get("anthropic", {})
+    if "api_key" in anthropic:
+        result["anthropic_api_key"] = anthropic["api_key"]
+    if "model" in anthropic:
+        result["anthropic_model"] = anthropic["model"]
+
+    ollama = providers.get("ollama", {})
+    if "base_url" in ollama:
+        result["ollama_base_url"] = ollama["base_url"]
+    if "model" in ollama:
+        result["ollama_model"] = ollama["model"]
+
+    result.update(agent)
+
+    if "max_size" in queue:
+        result["queue_max_size"] = queue["max_size"]
+    if "llm_worker_count" in queue:
+        result["llm_worker_count"] = queue["llm_worker_count"]
+
+    if "websocket" in data:
+        result["websocket"] = data["websocket"]
+    if "minecraft" in data:
+        result["minecraft"] = data["minecraft"]
+    if "mcp" in data:
+        result["mcp"] = data["mcp"]
+
+    if "level" in logging_config:
+        result["log_level"] = logging_config["level"]
+    if "enable_file_logging" in logging_config:
+        result["enable_file_logging"] = logging_config["enable_file_logging"]
+    if "enable_ws_raw_log" in logging_config:
+        result["enable_ws_raw_log"] = logging_config["enable_ws_raw_log"]
+    if "enable_llm_raw_log" in logging_config:
+        result["enable_llm_raw_log"] = logging_config["enable_llm_raw_log"]
+
+    if "dev_mode" in data:
+        result["dev_mode"] = data["dev_mode"]
+
+    if "max_chunk_content_length" in flow_control:
+        result["max_chunk_content_length"] = flow_control["max_chunk_content_length"]
+    if "chunk_sentence_mode" in flow_control:
+        result["chunk_sentence_mode"] = flow_control["chunk_sentence_mode"]
+
+    return result
+
+
+class EnvInterpolatedJsonConfigSettingsSource(JsonConfigSettingsSource):
+    def __init__(self, settings_cls: type[BaseSettings]) -> None:
+        super().__init__(
+            settings_cls,
+            json_file=CONFIG_FILE,
+            json_file_encoding="utf-8",
+        )
+
+    def __call__(self) -> dict[str, Any]:
+        if not CONFIG_FILE.exists():
+            return {}
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("config.json root must be an object")
+        resolved = _resolve_env_refs(data, _secret_environment())
+        return _flatten_json_config(resolved)
+
+
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     # DeepSeek
     "deepseek-chat": 128000,
@@ -222,11 +391,26 @@ class Settings(BaseSettings):
     """应用主配置"""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
+        env_file=None,
         env_nested_delimiter="__",
         extra="ignore",
+        populate_by_name=True,
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            init_settings,
+            EnvInterpolatedJsonConfigSettingsSource(settings_cls),
+            file_secret_settings,
+        )
 
     # 服务器配置
     host: str = "0.0.0.0"
@@ -297,78 +481,6 @@ class Settings(BaseSettings):
 
     # MCP 配置
     mcp: MCPConfig = Field(default_factory=MCPConfig)
-    mcp_enabled: bool = Field(
-        default=False,
-        alias="MCP_ENABLED",
-        description="是否启用 MCP 服务器集成"
-    )
-    mcp_servers_json: str | None = Field(
-        default=None,
-        alias="MCP_SERVERS",
-        description="MCP 服务器配置 JSON 字符串"
-    )
-
-    # 命令配置 (通过环境变量覆盖)
-    minecraft_commands_json: str | None = Field(
-        default=None,
-        alias="MINECRAFT_COMMANDS",
-        description="通过 JSON 字符串配置命令 (可选)"
-    )
-
-    @model_validator(mode="after")
-    def merge_minecraft_commands(self) -> "Settings":
-        """合并环境变量中的命令配置"""
-        if self.minecraft_commands_json:
-            try:
-                env_commands: dict[str, Any] = json.loads(self.minecraft_commands_json)
-                # 合并命令配置
-                for prefix, cmd_config in env_commands.items():
-                    if isinstance(cmd_config, dict):
-                        # 新格式: {type, aliases, description, usage}
-                        self.minecraft.commands[prefix] = cmd_config
-                    elif isinstance(cmd_config, str):
-                        # 旧格式: type
-                        self.minecraft.commands[prefix] = cmd_config
-            except json.JSONDecodeError as e:
-                # 记录警告但继续使用默认配置
-                import logging
-                logging.getLogger(__name__).warning(
-                    "invalid_minecraft_commands_json: %s",
-                    str(e),
-                )
-        return self
-
-    @model_validator(mode="after")
-    def merge_mcp_config(self) -> "Settings":
-        """合并 MCP 配置 - 使用官方 mcpServers 字典格式"""
-        # 只有在 MCP 启用时才解析和加载 MCP 服务器配置
-        if not self.mcp_enabled:
-            # 即使配置了 MCP_SERVERS，如果没有明确启用也不加载
-            return self
-
-        # 如果显式设置了 mcp_servers_json，解析并覆盖
-        if self.mcp_servers_json:
-            try:
-                config_data: dict[str, Any] = json.loads(self.mcp_servers_json)
-                # 支持两种格式：
-                # 1. 官方格式: {"mcpServers": {"server-name": {...}}}
-                # 2. 简化格式: {"server-name": {...}}
-                servers_data = config_data.get("mcpServers", config_data)
-                if isinstance(servers_data, dict):
-                    for server_name, server_config in servers_data.items():
-                        if isinstance(server_config, dict):
-                            self.mcp.servers[server_name] = MCPServerConfig(**server_config)
-                    self.mcp.enabled = True
-            except (json.JSONDecodeError, ValueError) as e:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "invalid_mcp_servers_json: %s",
-                    str(e),
-                )
-        # 如果设置了 mcp_enabled 环境变量，启用 MCP
-        if self.mcp_enabled:
-            self.mcp.enabled = True
-        return self
 
     # 日志配置
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
