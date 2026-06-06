@@ -372,12 +372,17 @@ pip install -r requirements.txt
 
 由于 Termux 的特殊环境，可能需要调整一些配置：
 
-```bash
-# 1. 确保主机设置为 0.0.0.0 而不是 localhost
-# 编辑 .env 文件
-HOST=0.0.0.0
-PORT=8080
+```json
+// 1. 确保 config.json 中主机设置为 0.0.0.0 而不是 localhost
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080
+  }
+}
+```
 
+```bash
 # 2. 获取 Termux 的 IP 地址
 ifconfig | grep inet
 
@@ -478,10 +483,16 @@ pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 ### 3. 内存不足
 
 **解决方案**:
-```bash
-# 减少工作线程
-LLM_WORKER_COUNT=1
+```json
+// config.json
+{
+  "queue": {
+    "llm_worker_count": 1
+  }
+}
+```
 
+```bash
 # 优化虚拟内存
 pkg install tur-repo -y
 pkg install zram -y
@@ -513,24 +524,27 @@ nohup python cli.py serve > mcbe.log 2>&1 &
 
 ## 配置说明
 
-### 环境变量
+### `config.json` 普通配置
 
-| 变量名 | 说明 | 默认值 |
+普通应用配置写入 `config.json`，敏感内容只保留在 `.env`。常用配置路径如下：
+
+| 配置路径 | 说明 | 默认值 |
 |--------|------|--------|
-| `HOST` | 服务器地址 | `0.0.0.0` |
-| `PORT` | 服务器端口 | `8080` |
-| `SECRET_KEY` | JWT 密钥 | - |
-| `WEBSOCKET_PASSWORD` | 登录密码 | `123456` |
-| `DEEPSEEK_API_KEY` | DeepSeek API Key | - |
-| `OPENAI_API_KEY` | OpenAI API Key | - |
-| `ANTHROPIC_API_KEY` | Anthropic API Key | - |
-| `DEFAULT_PROVIDER` | 默认 LLM | `deepseek` |
-| `LLM_WORKER_COUNT` | Worker 数量 | `2` |
-| `STREAM_SENTENCE_MODE` | true=流式按句输出，false=关闭流式并在完成后按句子分批输出 | `true` |
-| `LOG_LEVEL` | 日志级别 | `INFO` |
-| `ENABLE_WS_RAW_LOG` | WebSocket 原始日志开关 | `true` |
-| `ENABLE_LLM_RAW_LOG` | LLM 原始日志开关 | `true` |
-| `DEV_MODE` | 开发模式 (跳过身份验证) | `false` |
+| `server.host` | 服务器地址 | `0.0.0.0` |
+| `server.port` | 服务器端口 | `8080` |
+| `providers.default` | 默认 LLM | `deepseek` |
+| `providers.<name>.model` | Provider 使用的模型 | 取决于 provider |
+| `providers.<name>.base_url` | Provider API 地址 | 取决于 provider |
+| `providers.<name>.api_key` | API Key 引用，通常写 `${DEEPSEEK_API_KEY}` 等 | - |
+| `queue.llm_worker_count` | Agent Worker 数量 | `2` |
+| `queue.max_size` | 请求队列大小 | `100` |
+| `stream_sentence_mode` | true=流式按句输出，false=关闭流式并在完成后按句子分批输出 | `true` |
+| `logging.level` | 日志级别 | `INFO` |
+| `logging.enable_ws_raw_log` | WebSocket 原始日志开关 | `true` |
+| `logging.enable_llm_raw_log` | LLM 原始日志开关 | `true` |
+| `dev_mode` | 开发模式（跳过身份验证） | `false` |
+
+`.env` 仅用于敏感变量，例如 `SECRET_KEY`、`WEBSOCKET_PASSWORD`、`DEEPSEEK_API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`。
 
 ### Settings 配置
 
@@ -643,7 +657,7 @@ async def _response_sender():
 ### Worker 池
 
 - 多个 Agent Worker 并发处理请求
-- 可配置 Worker 数量 (`LLM_WORKER_COUNT`)
+- 可通过 `config.json` 的 `queue.llm_worker_count` 配置 Worker 数量
 - 自动负载均衡
 
 ## 与旧版对比
@@ -655,7 +669,7 @@ async def _response_sender():
 | 类型安全 | 字典 | Pydantic 模型 |
 | 消息队列 | 无 | MessageBroker |
 | Agent 框架 | 自定义 | PydanticAI |
-| 配置管理 | 环境变量 | Pydantic Settings |
+| 配置管理 | JSON 配置 + Pydantic Settings | Pydantic Settings |
 | 日志系统 | print/基础 logging | structlog |
 | 代码组织 | 单文件 | 模块化分层 |
 
@@ -800,16 +814,18 @@ tail -f logs/MCBE-AI-Agent.log
 
 ### 3. 内存问题
 
-```bash
-# 查看内存使用
-free -h
-
-# 查看进程内存
-ps aux | grep python
-
-# 优化配置
-export LLM_WORKER_COUNT=1
-export DEFAULT_MODEL="deepseek-chat"
+```json
+// config.json
+{
+  "queue": {
+    "llm_worker_count": 1
+  },
+  "providers": {
+    "deepseek": {
+      "model": "deepseek-chat"
+    }
+  }
+}
 ```
 
 ### 4. Python 依赖问题
@@ -870,7 +886,7 @@ pip install --prefer-binary -r requirements.txt
 
 ### v2.3.0 (2026-02-16)
 - ✨ **开发模式**: 新增开发模式功能，支持跳过身份验证用于本地开发调试
-- 🔧 支持通过 `--dev` 命令行参数或 `DEV_MODE` 环境变量启用
+- 🔧 支持通过 `--dev` 命令行参数或 `config.json` 的 `dev_mode` 启用
 - ⚠️ 开发模式下会显示明确的安全警告
 
 ### v2.2.1 (2026-02-15)

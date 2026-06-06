@@ -81,10 +81,10 @@ MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多
 ## 构建、测试与开发命令
 
 - 安装依赖：`pip install -r requirements.txt`
-- 初始化配置：`python cli.py init`（生成 `.env` 并填写 API Key）。
+- 初始化配置：`python cli.py init`（生成 `.env` 和 `config.json`；先在 `.env` 填写 API Key，再按需修改 `config.json`）。
 - 查看配置：`python cli.py info`
 - 测试 LLM：`python cli.py test-provider deepseek`
-- 启动服务：`python cli.py serve` 或 `python main.py`
+- 启动服务：`python cli.py serve`
 - 运行测试：`pytest`
 
 ## 代码风格与命名规范

@@ -127,7 +127,7 @@ MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多
 
 普通配置在 `config.json` 中维护，包括：
 - `server.host` / `server.port`
-- `providers.default` 与各 provider 的 `model`、`base_url`、`api_key`
+- `providers.default` 与各 provider 的 `model`、`base_url`、`api_key`；`api_key` 字段通常写 `${...}` 引用 `.env` 中的密钥，不要直接写明文密钥。
 - `queue.llm_worker_count` / `queue.max_size`
 - `agent.*`
 - `logging.*`
