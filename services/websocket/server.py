@@ -37,12 +37,10 @@ class WebSocketServer:
         broker: MessageBroker,
         settings: Settings,
         jwt_handler: JWTHandler,
-        configuration_error: Exception | None = None,
     ):
         self.broker = broker
         self.settings = settings
         self.jwt_handler = jwt_handler
-        self.configuration_error = configuration_error
         self.dev_mode = settings.dev_mode
         self.connection_manager = ConnectionManager(broker, dev_mode=self.dev_mode)
         self.protocol_handler = MinecraftProtocolHandler(settings.minecraft)
@@ -125,16 +123,13 @@ class WebSocketServer:
             await self._send_ws_payload(state, subscribe_msg, source="subscribe")
 
             # 发送欢迎消息（连接刚建立时还没有具体玩家身份，用默认上下文开关）
-            if self.configuration_error is not None:
-                welcome_cmd = self._create_configuration_error_message()
-            else:
-                welcome_text = self.protocol_handler.create_welcome_message(
-                    connection_id=str(state.id),
-                    model=self.settings.get_provider_config().model,
-                    provider=self.settings.default_provider,
-                    context_enabled=True,
-                )
-                welcome_cmd = self.protocol_handler.create_info_message(welcome_text)
+            welcome_text = self.protocol_handler.create_welcome_message(
+                connection_id=str(state.id),
+                model=self.settings.get_provider_config().model,
+                provider=self.settings.default_provider,
+                context_enabled=True,
+            )
+            welcome_cmd = self.protocol_handler.create_info_message(welcome_text)
             await self._send_ws_payload(state, welcome_cmd, source="welcome")
 
             logger.info(
@@ -343,10 +338,6 @@ class WebSocketServer:
             content: 命令内容
             player_name: 触发本次命令的玩家名（多人会话隔离的关键参数）
         """
-        if self.configuration_error is not None:
-            await self._send_configuration_error(state)
-            return
-
         # 登录命令不需要认证
         if cmd_type == "login":
             await self.handle_login(state, content)
@@ -428,21 +419,6 @@ class WebSocketServer:
             state.authenticated = True
             return True
         return False
-
-    def _create_configuration_error_message(self) -> TellrawMessage:
-        detail = str(self.configuration_error) if self.configuration_error else "未知配置错误"
-        return self.protocol_handler.create_error_message(
-            "服务未配置，无法处理 AI 命令。\n"
-            "请在服务器目录运行 python cli.py init，编辑 .env 和 config.json 后重启服务。\n"
-            f"配置错误: {detail}"
-        )
-
-    async def _send_configuration_error(self, state: Any) -> None:
-        await self._send_ws_payload(
-            state,
-            self._create_configuration_error_message(),
-            source="configuration_error",
-        )
 
     async def handle_chat(
         self,
