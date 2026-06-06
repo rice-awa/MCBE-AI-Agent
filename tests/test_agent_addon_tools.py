@@ -13,7 +13,7 @@ from pydantic_ai import Agent
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
-from config.settings import get_settings
+from config.settings import Settings
 from models.agent import AgentDependencies
 from services.agent.tools import register_agent_tools
 
@@ -36,7 +36,7 @@ async def _noop_command(_: str) -> str:
 
 
 def _build_tool_context(fake_addon: _FakeAddonBridge) -> SimpleNamespace:
-    settings = get_settings()
+    settings = Settings()
     deps = AgentDependencies(
         connection_id=uuid4(),
         player_name="Steve",

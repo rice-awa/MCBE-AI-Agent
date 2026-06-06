@@ -115,15 +115,27 @@ MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多
 
 ## Configuration
 
-环境变量通过 `.env` 文件管理，参考 `.env.example`：
+配置分为普通配置和敏感配置：
+
+- `config.json`：普通应用配置，运行 `python cli.py init` 后由 `config.example.json` 生成；不提交到 Git。
+- `.env`：只保存密钥、密码等敏感内容，运行 `python cli.py init` 后由 `.env.example` 生成；不提交到 Git。
+
+`.env` 保留的敏感项：
 - `SECRET_KEY` - JWT 密钥
 - `WEBSOCKET_PASSWORD` - 连接密码
 - `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` - LLM API Keys
-- `DEFAULT_PROVIDER` - 默认 LLM 提供商
-- `LLM_WORKER_COUNT` - Agent Worker 数量
-- `MAX_CHUNK_CONTENT_LENGTH` - 单个下行分片的内容字符上限，默认 `400`
-- `CHUNK_SENTENCE_MODE` - 是否优先按句子边界进行语义分片，默认 `true`
-- `LOG_LEVEL` - 日志级别
+
+普通配置在 `config.json` 中维护，包括：
+- `server.host` / `server.port`
+- `providers.default` 与各 provider 的 `model`、`base_url`、`api_key`；`api_key` 字段通常写 `${...}` 引用 `.env` 中的密钥，不要直接写明文密钥。
+- `queue.llm_worker_count` / `queue.max_size`
+- `agent.*`
+- `logging.*`
+- `mcp.enabled` / `mcp.servers`
+- `minecraft.commands`
+- `flow_control.max_chunk_content_length` / `flow_control.chunk_sentence_mode`
+
+JSON 字符串可以通过 `${VAR}` 引用 `.env` 或进程环境变量。缺失或空值会导致启动失败并显示 JSON 路径和变量名。新增普通配置应进入 `config.json`，不要添加新的普通 `.env` 字段。
 
 ## Minecraft Connection
 

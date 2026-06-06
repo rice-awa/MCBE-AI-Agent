@@ -14,19 +14,9 @@ from models.messages import ChatRequest
 from services.websocket.connection import ConnectionState
 from services.websocket.command import CommandRegistry
 from config.logging import get_logger
-from config.settings import get_settings
+from config.settings import MinecraftConfig
 
 logger = get_logger(__name__)
-
-# 获取配置
-_settings = get_settings()
-_minecraft_config = _settings.minecraft
-
-# 命令前缀定义（从配置读取）
-COMMANDS = _minecraft_config.commands
-
-# 创建命令注册表
-_command_registry = CommandRegistry(COMMANDS)
 
 
 @dataclass(frozen=True)
@@ -43,27 +33,30 @@ class TellrawMessage:
 class MinecraftProtocolHandler:
     """Minecraft WebSocket 协议处理器"""
 
+    def __init__(self, config: MinecraftConfig):
+        self.config = config
+        self.command_registry = CommandRegistry(config.commands)
+
     @staticmethod
     def create_subscribe_message() -> str:
         """创建订阅玩家消息事件的消息"""
         subscribe = MinecraftSubscribe.player_message()
         return subscribe.model_dump_json(exclude_none=True)
 
-    @staticmethod
     def create_welcome_message(
+        self,
         connection_id: str,
         model: str,
         provider: str,
         context_enabled: bool,
     ) -> str:
         """创建欢迎消息"""
-        config = _minecraft_config
         # 找到帮助命令的前缀
-        help_prefix = _command_registry.get_command_prefix("help") or "帮助"
+        help_prefix = self.command_registry.get_command_prefix("help") or "帮助"
         context_status = (
-            config.context_enabled_text if context_enabled else config.context_disabled_text
+            self.config.context_enabled_text if context_enabled else self.config.context_disabled_text
         )
-        return config.welcome_message_template.format(
+        return self.config.welcome_message_template.format(
             connection_id=connection_id[:8],
             provider=provider,
             model=model,
@@ -100,8 +93,7 @@ class MinecraftProtocolHandler:
             )
             return None
 
-    @staticmethod
-    def parse_command(message: str) -> tuple[str | None, str]:
+    def parse_command(self, message: str) -> tuple[str | None, str]:
         """
         解析命令
 
@@ -112,7 +104,7 @@ class MinecraftProtocolHandler:
             (命令类型, 内容) 元组
         """
         # 使用 CommandRegistry 进行命令解析（支持别名）
-        return _command_registry.resolve(message)
+        return self.command_registry.resolve(message)
 
     @staticmethod
     def create_chat_request(
@@ -147,19 +139,20 @@ class MinecraftProtocolHandler:
             delivery=delivery or "tellraw",
         )
 
-    @staticmethod
-    def get_help_text() -> str:
+    def get_help_text(self) -> str:
         """获取帮助文本（根据命令前缀动态生成）"""
-        config = _minecraft_config
         lines = ["可用命令:"]
 
         # 使用 CommandRegistry 获取命令列表
-        for prefix, cmd_type, aliases in _command_registry.list_all_commands():
+        for prefix, cmd_type, aliases in self.command_registry.list_all_commands():
             if cmd_type == "login":
                 continue  # 登录命令不显示在帮助中
 
-            # 从命令配置中获取描述和用法
-            cmd_desc, usage = config.get_command_description(cmd_type)
+            cmd_config = self.command_registry.get_command_config(prefix)
+            if cmd_config is None:
+                cmd_desc, usage = self.config.get_command_description(cmd_type)
+            else:
+                cmd_desc, usage = cmd_config.description, cmd_config.usage
             if usage:
                 lines.append(f"• {prefix} {usage} - {cmd_desc}")
             else:
@@ -167,29 +160,23 @@ class MinecraftProtocolHandler:
 
         return "\n".join(lines)
 
-    @staticmethod
-    def create_error_message(error: str) -> "TellrawMessage":
+    def create_error_message(self, error: str) -> "TellrawMessage":
         """创建错误消息（结构化，由发送层统一分片）。"""
-        config = _minecraft_config
         return TellrawMessage(
-            text=f"{config.error_prefix}{error}",
-            color=config.error_color,
+            text=f"{self.config.error_prefix}{error}",
+            color=self.config.error_color,
         )
 
-    @staticmethod
-    def create_info_message(info: str) -> "TellrawMessage":
+    def create_info_message(self, info: str) -> "TellrawMessage":
         """创建信息消息（结构化，由发送层统一分片）。"""
-        config = _minecraft_config
         return TellrawMessage(
-            text=f"{config.info_prefix}{info}",
-            color=config.info_color,
+            text=f"{self.config.info_prefix}{info}",
+            color=self.config.info_color,
         )
 
-    @staticmethod
-    def create_success_message(message: str) -> "TellrawMessage":
+    def create_success_message(self, message: str) -> "TellrawMessage":
         """创建成功消息（结构化，由发送层统一分片）。"""
-        config = _minecraft_config
         return TellrawMessage(
-            text=f"{config.success_prefix}{message}",
-            color=config.success_color,
+            text=f"{self.config.success_prefix}{message}",
+            color=self.config.success_color,
         )
