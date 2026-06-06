@@ -34,8 +34,8 @@
     ]
   },
   "dependencies": {
-    "@minecraft/server": "2.8.0-beta.1.26.20-preview.28",
+    "@minecraft/server": "2.8.0-beta.1.26.20-stable",
     "@minecraft/server-gametest": "1.0.0-beta.1.26.20-preview.28",
-    "@minecraft/server-ui": "2.1.0-beta.1.26.20-preview.28"
+    "@minecraft/server-ui": "2.1.0-beta.1.26.20-stable"
   }
 }
