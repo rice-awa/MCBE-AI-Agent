@@ -74,11 +74,6 @@ describe("stats panel", () => {
   });
 
   it("routes to close and persists state when 关闭 is clicked", async () => {
-    __setNextCustomFormInteraction({
-      clickButtonLabel: "关闭",
-      autoCloseAfterButtonClick: true,
-    });
-
     const player = createFakePlayer();
     const uiState = createAgentUiState({
       history: createHistoryItems(2),
@@ -94,6 +89,16 @@ describe("stats panel", () => {
     expect(persisted.stats.sentCount).toBe(5);
     expect(persisted.stats.localHistoryCount).toBe(2);
     expect(persisted.version).toBe(1);
+  });
+
+  it("does not add a manual close button when the built-in close button exists", async () => {
+    await showStatsPanel(createFakePlayer(), createAgentUiState());
+
+    const buttons = __getLastCustomForm()
+      ?.getComponents()
+      .filter((component) => component.startsWith("button:"));
+
+    expect(buttons).toEqual(["button:返回主面板", "button:重置统计"]);
   });
 
   it("routes to close and persists state when the player dismisses stats", async () => {

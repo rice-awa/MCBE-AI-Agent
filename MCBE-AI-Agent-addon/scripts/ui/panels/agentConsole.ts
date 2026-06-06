@@ -14,7 +14,7 @@ import { recordPromptSent, syncLocalHistoryCount } from "../stats";
 import type { AgentPanelRoute } from "./routes";
 import { CLOSE_ROUTE, MAIN_ROUTE } from "./routes";
 
-const CONVERSATION_PREVIEW_LIMIT = 10;
+const CONVERSATION_PREVIEW_LIMIT = 6;
 
 export async function showAgentConsole(
   player: Player,
@@ -88,16 +88,8 @@ export async function showAgentConsole(
           player.sendMessage("MCBE AI Agent: 保存历史失败，本次仅内存生效。");
         }
       })
-      .button("设置", () => {
-        nextRoute = { panel: "settings" };
-        form.close();
-      })
-      .button("统计信息", () => {
-        nextRoute = { panel: "stats" };
-        form.close();
-      })
-      .button("关闭", () => {
-        nextRoute = CLOSE_ROUTE;
+      .button("其他", () => {
+        nextRoute = { panel: "more" };
         saveAgentUiState(player, uiState);
         form.close();
       });
@@ -129,7 +121,7 @@ function buildConversationBody(uiState: AgentUiState): string {
 
   return items
     .map((item) => summarizeHistoryItem(item, uiState.settings.responsePreviewLength))
-    .join("\n\n");
+    .join("\n\n---\n\n");
 }
 
 function buildSummary(uiState: AgentUiState): string {

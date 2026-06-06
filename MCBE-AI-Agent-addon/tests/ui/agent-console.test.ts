@@ -50,6 +50,27 @@ describe("agent console panel", () => {
     expect(player.messages).toContain("MCBE AI Agent: 消息已发送至 AI 服务。");
   });
 
+  it("keeps only send and more actions on the main panel", async () => {
+    await showAgentConsole(createFakePlayer(), createAgentUiState());
+
+    const buttons = __getLastCustomForm()
+      ?.getComponents()
+      .filter((component) => component.startsWith("button:"));
+
+    expect(buttons).toEqual(["button:发送", "button:其他"]);
+  });
+
+  it("routes to the more menu from the main panel", async () => {
+    __setNextCustomFormInteraction({
+      clickButtonLabel: "其他",
+      autoCloseAfterButtonClick: true,
+    });
+
+    const route = await showAgentConsole(createFakePlayer(), createAgentUiState());
+
+    expect(route).toEqual({ panel: "more" });
+  });
+
   it("keeps the main panel open when the message is empty", async () => {
     __setNextCustomFormInteraction({
       clickButtonLabel: "发送",
@@ -66,49 +87,6 @@ describe("agent console panel", () => {
     expect(route).toEqual({ panel: "main" });
     expect(uiState.history).toEqual([]);
     expect(player.messages).toContain("MCBE AI Agent: 消息不能为空。");
-  });
-
-  it("routes to settings from the main panel", async () => {
-    __setNextCustomFormInteraction({
-      clickButtonLabel: "设置",
-      autoCloseAfterButtonClick: true,
-    });
-
-    const route = await showAgentConsole(createFakePlayer(), createAgentUiState());
-
-    expect(route).toEqual({ panel: "settings" });
-  });
-
-  it("routes to stats from the main panel", async () => {
-    __setNextCustomFormInteraction({
-      clickButtonLabel: "统计信息",
-      autoCloseAfterButtonClick: true,
-    });
-
-    const route = await showAgentConsole(createFakePlayer(), createAgentUiState());
-
-    expect(route).toEqual({ panel: "stats" });
-  });
-
-  it("routes to close and persists state when 关闭 is clicked", async () => {
-    __setNextCustomFormInteraction({
-      clickButtonLabel: "关闭",
-      autoCloseAfterButtonClick: true,
-    });
-
-    const player = createFakePlayer();
-    const uiState = createAgentUiState();
-    uiState.lastPrompt.setData("hello");
-    uiState.lastResponsePreview.setData("world");
-
-    const route = await showAgentConsole(player, uiState);
-
-    expect(route).toEqual(CLOSE_ROUTE);
-    const persistedRaw = player.getDynamicProperty(AGENT_UI_STATE_PROPERTY_KEY);
-    expect(typeof persistedRaw).toBe("string");
-    const persisted = JSON.parse(String(persistedRaw));
-    expect(persisted.version).toBe(1);
-    expect(persisted.settings).toBeDefined();
   });
 
   it("routes to close when the player dismisses the form without pressing a panel button", async () => {

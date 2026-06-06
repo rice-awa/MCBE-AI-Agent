@@ -1,5 +1,6 @@
 export type AgentPanelRoute =
   | { panel: "main" }
+  | { panel: "more" }
   | { panel: "settings" }
   | { panel: "stats" }
   | { panel: "close" };

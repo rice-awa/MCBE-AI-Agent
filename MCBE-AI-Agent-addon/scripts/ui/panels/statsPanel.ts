@@ -37,10 +37,6 @@ export async function showStatsPanel(
         player.sendMessage("MCBE AI Agent: 统计信息已重置。");
         nextRoute = MAIN_ROUTE;
         form.close();
-      })
-      .button("关闭", () => {
-        nextRoute = CLOSE_ROUTE;
-        form.close();
       });
 
     const shown = await showCustomFormSafely(player, form);

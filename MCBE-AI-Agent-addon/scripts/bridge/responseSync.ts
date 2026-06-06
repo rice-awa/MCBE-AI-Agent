@@ -39,6 +39,12 @@ export function clearActiveUiState(playerId: string): void {
   activeUiStates.delete(playerId);
 }
 
+export function resetResponseSyncForTests(): void {
+  chunkBuffers.clear();
+  activeUiStates.clear();
+  isRegistered = false;
+}
+
 /**
  * 注册 scriptEventReceive 订阅，监听 mcbeai:ai_resp 分片。
  */
@@ -114,6 +120,10 @@ function onMessageComplete(playerName: string, role: HistoryRole, text: string):
   // 尝试从内存中的活跃 UI 状态更新
   const activeState = activeUiStates.get(targetPlayer.id);
   if (activeState) {
+    if (isDuplicateUiUserEcho(activeState.history, historyItem)) {
+      return;
+    }
+
     activeState.history = appendHistoryItem(
       activeState.history,
       historyItem,
@@ -134,6 +144,10 @@ function onMessageComplete(playerName: string, role: HistoryRole, text: string):
   // 持久化到 DynamicProperty
   try {
     const uiState = loadAgentUiState(targetPlayer);
+    if (isDuplicateUiUserEcho(uiState.history, historyItem)) {
+      return;
+    }
+
     uiState.history = appendHistoryItem(
       uiState.history,
       historyItem,
@@ -154,4 +168,17 @@ function onMessageComplete(playerName: string, role: HistoryRole, text: string):
   } catch {
     // DynamicProperty 读写可能因世界未就绪而失败
   }
+}
+
+function isDuplicateUiUserEcho(history: HistoryItem[], item: HistoryItem): boolean {
+  if (item.role !== "user" || item.source !== "python") {
+    return false;
+  }
+
+  return history.some(
+    (existing) =>
+      existing.role === "user"
+      && existing.source === "ui"
+      && existing.content.trim() === item.content.trim(),
+  );
 }
