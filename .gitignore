@@ -2,6 +2,7 @@
 .venv/*
 .env
 .env.local
+config.json
 !MCBE-AI-Agent-addon/.env
 
 # coding agent
