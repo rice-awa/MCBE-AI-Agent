@@ -87,7 +87,7 @@ class ConversationManager:
         self,
         connection_id: UUID,
         player_name: str | None,
-        conversation_id: str | None = None,
+        conversation_id: str | bool | None = None,
         force: bool = False,
     ) -> tuple[bool, str]:
         """
@@ -101,6 +101,10 @@ class ConversationManager:
         Returns:
             (是否执行了压缩, 描述信息)
         """
+        if isinstance(conversation_id, bool):
+            force = conversation_id
+            conversation_id = None
+
         history = self.broker.get_conversation_history(connection_id, player_name, conversation_id)
         threshold = self._get_compression_threshold()
 
@@ -112,9 +116,13 @@ class ConversationManager:
 
         if force:
             # 强制模式下，尝试提取摘要（即使轮数少于阈值）
-            return await self.compress_history(connection_id, player_name, conversation_id, force=True)
+            return await self.compress_history(
+                connection_id, player_name, force=True, conversation_id=conversation_id
+            )
         elif turns >= threshold:
-            return await self.compress_history(connection_id, player_name, conversation_id)
+            return await self.compress_history(
+                connection_id, player_name, conversation_id=conversation_id
+            )
 
         return False, f"当前 {turns} 轮，未达到压缩阈值 {threshold} 轮"
 
@@ -122,7 +130,7 @@ class ConversationManager:
         self,
         connection_id: UUID,
         player_name: str | None,
-        conversation_id: str | None = None,
+        conversation_id: str | bool | None = None,
         force: bool = False,
     ) -> tuple[bool, str]:
         """
@@ -142,6 +150,10 @@ class ConversationManager:
         Returns:
             (是否成功, 描述信息)
         """
+        if isinstance(conversation_id, bool):
+            force = conversation_id
+            conversation_id = None
+
         history = self.broker.get_conversation_history(connection_id, player_name, conversation_id)
         max_turns = self.settings.max_history_turns
         threshold = self._get_compression_threshold()
@@ -329,8 +341,8 @@ class ConversationManager:
             messages_json_str = messages_json_bytes.decode("utf-8")
 
             # 生成会话ID
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            session_id = f"{connection_id}_{timestamp}"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            session_id = f"{connection_id}_{timestamp}_{uuid4().hex[:8]}"
 
             # 构建保存数据
             saved_data = {
@@ -570,11 +582,8 @@ class ConversationManager:
             count = conv.get("message_count", 0)
             updated = conv.get("updated_at", "")[:16]  # 只取日期时间
 
-            # 简化 session_id 显示
-            display_id = session_id.split("_")[1] if "_" in session_id else session_id[:8]
-
             lines.append(
-                f"{i + 1}. [{display_id}] {player} | {provider}/{model} | "
+                f"{i + 1}. [{session_id}] {player} | {provider}/{model} | "
                 f"对话:{conversation_id} | {count}条消息 | {updated}"
             )
 

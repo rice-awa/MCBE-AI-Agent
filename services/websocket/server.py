@@ -2,8 +2,9 @@
 
 import asyncio
 import json
+from datetime import datetime
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import websockets
 from websockets.server import WebSocketServerProtocol, serve
@@ -439,6 +440,12 @@ class WebSocketServer:
         chat_req = self.protocol_handler.create_chat_request(
             state, content, delivery=delivery, player_name=player_name
         )
+        self.broker.ensure_conversation(
+            state.id, chat_req.player_name, chat_req.conversation_id
+        )
+        chat_req.conversation_generation = self.broker.get_conversation_generation(
+            state.id, chat_req.player_name, chat_req.conversation_id
+        )
 
         # 提交到消息队列（非阻塞！）
         try:
@@ -503,6 +510,12 @@ class WebSocketServer:
                 f"\n当前对话轮数: {turns}/{self.settings.max_history_turns}"
                 f"{context_usage}"
             )
+        elif action in (
+            "clear", "清除", "压缩", "compress", "保存", "save",
+            "恢复", "restore", "列表", "list", "删除", "delete",
+        ):
+            await self.handle_conversation(state, option, player_name=player_name)
+            return
         else:
             msg = self.protocol_handler.create_error_message(
                 "上下文命令仅管理是否携带历史。用法: AGENT 上下文 <启用/关闭/状态>\n"
@@ -515,6 +528,15 @@ class WebSocketServer:
         self, state: Any, option: str, player_name: str | None = None
     ) -> None:
         """处理对话管理：新建、切换、清除、压缩、保存、恢复、列表和删除。"""
+        lock = self.broker.get_session_lock(state.id, player_name)
+        async with lock:
+            msg = await self._handle_conversation_locked(state, option, player_name)
+
+        await self._send_ws_payload(state, msg, source="conversation")
+
+    async def _handle_conversation_locked(
+        self, state: Any, option: str, player_name: str | None = None
+    ) -> TellrawMessage:
         from core.conversation import get_conversation_manager
 
         conv_manager = get_conversation_manager(self.broker, self.settings)
@@ -527,37 +549,40 @@ class WebSocketServer:
         conversation_id = normalize_conversation_id(session.active_conversation_id)
 
         if action in ("new", "新建", "创建"):
-            new_id = normalize_conversation_id(arg) if arg else self._generate_conversation_id()
+            new_id = self._generate_unique_conversation_id(state.id, actor, arg)
+            if new_id is None:
+                target_id = normalize_conversation_id(arg)
+                return self.protocol_handler.create_error_message(
+                    f"对话 {target_id} 已存在，请使用 AGENT 对话 switch {target_id} 切换"
+                )
             session.active_conversation_id = new_id
             self.broker.set_conversation_history(state.id, actor, [], new_id)
-            msg = self.protocol_handler.create_success_message(f"已新建并切换到对话: {new_id}")
+            return self.protocol_handler.create_success_message(f"已新建并切换到对话: {new_id}")
         elif action in ("switch", "切换"):
             if not arg:
-                msg = self.protocol_handler.create_error_message(
+                return self.protocol_handler.create_error_message(
                     "请指定要切换的对话 ID\n用法: AGENT 对话 switch <ID>"
                 )
-            else:
-                target_id = normalize_conversation_id(arg)
-                session.active_conversation_id = target_id
-                history = self.broker.get_conversation_history(state.id, actor, target_id)
-                if not history:
-                    self.broker.set_conversation_history(state.id, actor, [], target_id)
-                turns = self._count_conversation_turns(history)
-                msg = self.protocol_handler.create_success_message(
-                    f"已切换到对话: {target_id}（{turns}轮）"
-                )
+            target_id = normalize_conversation_id(arg)
+            session.active_conversation_id = target_id
+            history = self.broker.get_conversation_history(state.id, actor, target_id)
+            if not self.broker.conversation_exists(state.id, actor, target_id):
+                self.broker.set_conversation_history(state.id, actor, [], target_id)
+            turns = self._count_conversation_turns(history)
+            return self.protocol_handler.create_success_message(
+                f"已切换到对话: {target_id}（{turns}轮）"
+            )
         elif action in ("clear", "清除"):
             self.broker.clear_conversation_history(state.id, actor, conversation_id)
-            # 保留一个空桶，让列表仍能展示当前对话。
             self.broker.set_conversation_history(state.id, actor, [], conversation_id)
-            msg = self.protocol_handler.create_success_message(
+            return self.protocol_handler.create_success_message(
                 f"对话 {conversation_id} 的历史已清除"
             )
         elif action in ("状态", "status", ""):
             history = self.broker.get_conversation_history(state.id, actor, conversation_id)
             turns = self._count_conversation_turns(history)
             context_status = "启用" if session.context_enabled else "关闭"
-            msg = self.protocol_handler.create_info_message(
+            return self.protocol_handler.create_info_message(
                 f"当前对话: {conversation_id}"
                 f"\n对话轮数: {turns}/{self.settings.max_history_turns}"
                 f"\n上下文携带: {context_status}"
@@ -571,12 +596,12 @@ class WebSocketServer:
             for conv_id, message_count in sorted(live_conversations.items()):
                 marker = " *" if conv_id == conversation_id else ""
                 lines.append(f"• {conv_id}{marker} - {message_count} 条消息")
-            msg = self.protocol_handler.create_info_message("\n".join(lines))
+            return self.protocol_handler.create_info_message("\n".join(lines))
         elif action in ("压缩", "compress"):
             success, result = await conv_manager.check_and_compress(
-                state.id, actor, conversation_id, force=True
+                state.id, actor, force=True, conversation_id=conversation_id
             )
-            msg = (
+            return (
                 self.protocol_handler.create_success_message(result)
                 if success else self.protocol_handler.create_info_message(result)
             )
@@ -589,52 +614,65 @@ class WebSocketServer:
                 custom_variables=session.custom_variables,
                 conversation_id=conversation_id,
             )
-            msg = (
+            return (
                 self.protocol_handler.create_success_message(f"对话已保存: {result}")
                 if success else self.protocol_handler.create_error_message(result)
             )
         elif action in ("恢复", "restore"):
             if not arg:
-                msg = self.protocol_handler.create_error_message(
+                return self.protocol_handler.create_error_message(
                     "请指定要恢复的会话 ID\n用法: AGENT 对话 restore <保存ID>"
                 )
-            else:
-                success, result = await conv_manager.restore_conversation(
-                    state.id, arg, player_name=actor, conversation_id=conversation_id
-                )
-                msg = (
-                    self.protocol_handler.create_success_message(result)
-                    if success else self.protocol_handler.create_error_message(result)
-                )
+            success, result = await conv_manager.restore_conversation(
+                state.id, arg, player_name=actor, conversation_id=conversation_id
+            )
+            return (
+                self.protocol_handler.create_success_message(result)
+                if success else self.protocol_handler.create_error_message(result)
+            )
         elif action in ("已保存", "saved"):
             conversations = await conv_manager.list_conversations()
             list_text = conv_manager.format_conversation_list(conversations)
-            msg = self.protocol_handler.create_info_message(list_text)
+            return self.protocol_handler.create_info_message(list_text)
         elif action in ("删除", "delete"):
             if not arg:
-                msg = self.protocol_handler.create_error_message(
+                return self.protocol_handler.create_error_message(
                     "请指定要删除的保存会话 ID\n用法: AGENT 对话 delete <保存ID>"
                 )
-            else:
-                success, result = await conv_manager.delete_conversation(arg)
-                msg = (
-                    self.protocol_handler.create_success_message(result)
-                    if success else self.protocol_handler.create_error_message(result)
-                )
-        else:
-            msg = self.protocol_handler.create_error_message(
-                "无效选项，请使用: new [ID]/switch <ID>/clear/status/list/"
-                "compress/save/restore <保存ID>/saved/delete <保存ID>"
+            success, result = await conv_manager.delete_conversation(arg)
+            return (
+                self.protocol_handler.create_success_message(result)
+                if success else self.protocol_handler.create_error_message(result)
             )
 
-        await self._send_ws_payload(state, msg, source="conversation")
+        return self.protocol_handler.create_error_message(
+            "无效选项，请使用: new [ID]/switch <ID>/clear/status/list/"
+            "compress/save/restore <保存ID>/saved/delete <保存ID>"
+        )
+
+    def _generate_unique_conversation_id(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        requested_id: str = "",
+    ) -> str | None:
+        """生成不覆盖已有运行时对话的 ID；显式 ID 已存在时返回 None。"""
+        if requested_id:
+            new_id = normalize_conversation_id(requested_id)
+            if self.broker.conversation_exists(connection_id, player_name, new_id):
+                return None
+            return new_id
+
+        for _ in range(10):
+            new_id = self._generate_conversation_id()
+            if not self.broker.conversation_exists(connection_id, player_name, new_id):
+                return new_id
+        raise RuntimeError("无法生成唯一对话 ID")
 
     @staticmethod
     def _generate_conversation_id() -> str:
         """生成简短运行时对话 ID。"""
-        from datetime import datetime
-
-        return "chat-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+        return "chat-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid4().hex[:6]
 
     def _count_conversation_turns(self, history: list) -> int:
         """计算对话轮次"""
@@ -651,24 +689,29 @@ class WebSocketServer:
         self, state: Any, provider: str, player_name: str | None = None
     ) -> None:
         """处理模型切换（按玩家分桶）"""
+        lock = self.broker.get_session_lock(state.id, player_name)
+        async with lock:
+            msg = await self._handle_switch_model_locked(state, provider, player_name)
+
+        await self._send_ws_payload(state, msg, source="switch_model")
+
+    async def _handle_switch_model_locked(
+        self, state: Any, provider: str, player_name: str | None = None
+    ) -> TellrawMessage:
         available = self.settings.list_available_providers()
         session = state.get_player_session(player_name)
 
         if provider.lower() in available:
             session.current_provider = provider.lower()
-            self.broker.clear_conversation_history(
-                state.id, player_name, session.active_conversation_id
-            )
+            self.broker.clear_player_conversation_histories(state.id, player_name)
             config = self.settings.get_provider_config(provider.lower())
-            msg = self.protocol_handler.create_success_message(
-                f"已切换到 {provider}/{config.model}"
-            )
-        else:
-            msg = self.protocol_handler.create_error_message(
-                f"不可用的提供商。可用: {', '.join(available)}"
+            return self.protocol_handler.create_success_message(
+                f"已切换到 {provider}/{config.model}，该玩家的运行时对话历史已清理"
             )
 
-        await self._send_ws_payload(state, msg, source="switch_model")
+        return self.protocol_handler.create_error_message(
+            f"不可用的提供商。可用: {', '.join(available)}"
+        )
 
     async def handle_template(
         self, state: Any, content: str, player_name: str | None = None
