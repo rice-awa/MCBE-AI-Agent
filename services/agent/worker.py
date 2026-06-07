@@ -125,7 +125,9 @@ class AgentWorker:
         connection_id: UUID = item.connection_id
 
         # 同一 (连接, 玩家) 串行；不同玩家可并行，避免上下文乱序又不互相阻塞。
-        session_lock = self.broker.get_session_lock(connection_id, request.player_name)
+        session_lock = self.broker.get_session_lock(
+            connection_id, request.player_name, request.conversation_id
+        )
         async with session_lock:
             await self._process_request_locked(request, connection_id)
 
@@ -141,13 +143,14 @@ class AgentWorker:
             worker_id=self.worker_id,
             connection_id=str(connection_id),
             player=request.player_name,
+            conversation_id=request.conversation_id,
             content_length=len(request.content),
         )
 
         message_history: list[ModelMessage] | None = None
         if request.use_context:
             raw_history = self.broker.get_conversation_history(
-                connection_id, request.player_name
+                connection_id, request.player_name, request.conversation_id
             )
             message_history, cleared_count = self._strip_reasoning_content(raw_history)
             logger.debug(
@@ -155,6 +158,7 @@ class AgentWorker:
                 worker_id=self.worker_id,
                 connection_id=str(connection_id),
                 player=request.player_name,
+                conversation_id=request.conversation_id,
                 history_message_count=len(message_history),
                 cleared_reasoning_content_count=cleared_count,
             )
@@ -166,7 +170,7 @@ class AgentWorker:
                 return None
 
             history = self.broker.get_conversation_history(
-                connection_id, request.player_name
+                connection_id, request.player_name, request.conversation_id
             )
             message_count = len(history) if history else 0
             # 简单估算：平均每条消息 100 tokens
@@ -310,12 +314,14 @@ class AgentWorker:
                                 connection_id,
                                 request.player_name,
                                 trimmed_history,
+                                request.conversation_id,
                             )
                             logger.debug(
                                 "chat_history_updated",
                                 worker_id=self.worker_id,
                                 connection_id=str(connection_id),
                                 player=request.player_name,
+                                conversation_id=request.conversation_id,
                                 history_message_count=len(trimmed_history),
                                 cleared_reasoning_content_count=cleared_count,
                             )
@@ -325,7 +331,7 @@ class AgentWorker:
 
                             conv_manager = get_conversation_manager(self.broker, self.settings)
                             compressed, msg = await conv_manager.check_and_compress(
-                                connection_id, request.player_name
+                                connection_id, request.player_name, request.conversation_id
                             )
                             if compressed:
                                 logger.debug(

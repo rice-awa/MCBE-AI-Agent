@@ -78,6 +78,42 @@ def test_message_broker_history_per_player_isolation() -> None:
     assert broker.get_conversation_history(connection_id, "bob") != []
 
 
+
+def test_message_broker_history_per_conversation_isolation() -> None:
+    """同一玩家的不同对话历史应互相隔离。"""
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    broker.set_conversation_history(connection_id, "alice", _build_turn(1), "default")
+    broker.set_conversation_history(connection_id, "alice", _build_turn(2), "build-plan")
+
+    assert (
+        broker.get_conversation_history(connection_id, "alice", "default")[0].parts[0].content
+        == "user-1"
+    )
+    assert (
+        broker.get_conversation_history(connection_id, "alice", "build-plan")[0].parts[0].content
+        == "user-2"
+    )
+
+    broker.clear_conversation_history(connection_id, "alice", "default")
+
+    assert broker.get_conversation_history(connection_id, "alice", "default") == []
+    assert broker.get_conversation_history(connection_id, "alice", "build-plan") != []
+
+
+def test_session_lock_per_conversation() -> None:
+    """同一玩家的不同对话使用不同锁，避免切换对话后互相阻塞。"""
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    default_lock = broker.get_session_lock(connection_id, "alice", "default")
+    default_lock_again = broker.get_session_lock(connection_id, "alice", "default")
+    other_lock = broker.get_session_lock(connection_id, "alice", "build-plan")
+
+    assert default_lock is default_lock_again
+    assert default_lock is not other_lock
+
 def test_session_lock_per_player() -> None:
     """同一玩家拿到同一把锁；不同玩家拿到不同锁，可并行。"""
     broker = MessageBroker()
@@ -153,7 +189,11 @@ def test_worker_tool_events_should_not_be_sent_twice(monkeypatch) -> None:
     connection_id = uuid4()
     broker.register_connection(connection_id)
 
-    worker = AgentWorker(broker=broker, settings=Settings(), worker_id=1)
+    worker = AgentWorker(
+        broker=broker,
+        settings=Settings(tool_response_verbose=True),
+        worker_id=1,
+    )
 
     class _FakeManager:
         def get_agent(self):

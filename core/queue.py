@@ -15,15 +15,27 @@ logger = get_logger(__name__)
 # 全局占位玩家名：当请求未携带玩家身份时使用，确保仍能落到独立的桶里。
 DEFAULT_PLAYER_KEY = "__anonymous__"
 
-# 会话键: (connection_id, player_name)
-SessionKey = tuple[UUID, str]
+# 默认对话名：未显式新建/切换对话时使用。
+DEFAULT_CONVERSATION_ID = "default"
+
+# 会话键: (connection_id, player_name, conversation_id)
+SessionKey = tuple[UUID, str, str]
 
 
-def make_session_key(connection_id: UUID, player_name: str | None) -> SessionKey:
+def normalize_conversation_id(conversation_id: str | None) -> str:
+    """标准化对话 ID，空值回落到默认对话。"""
+    value = (conversation_id or DEFAULT_CONVERSATION_ID).strip()
+    return value or DEFAULT_CONVERSATION_ID
+
+
+def make_session_key(
+    connection_id: UUID,
+    player_name: str | None,
+    conversation_id: str | None = None,
+) -> SessionKey:
     """生成会话键。player_name 为空时回落到匿名键。"""
-    if not player_name:
-        return (connection_id, DEFAULT_PLAYER_KEY)
-    return (connection_id, player_name)
+    player = player_name or DEFAULT_PLAYER_KEY
+    return (connection_id, player, normalize_conversation_id(conversation_id))
 
 
 @dataclass(order=True)
@@ -43,7 +55,7 @@ class MessageBroker:
     架构:
     - 请求队列 (共享): WS Handler -> Agent Worker
     - 响应队列 (每连接): Agent Worker -> WS Handler
-    - 对话历史 / 串行锁: 按 (connection_id, player_name) 复合键分桶
+    - 对话历史 / 串行锁: 按 (connection_id, player_name, conversation_id) 复合键分桶
 
     这种设计确保:
     1. LLM 请求不阻塞 WS 消息处理
@@ -59,7 +71,7 @@ class MessageBroker:
         )
         # 响应队列: Agent -> WS (每个连接一个；下行不区分玩家，由 Addon 端按 player 路由)
         self._response_queues: dict[UUID, asyncio.Queue[Any]] = {}
-        # 对话历史: 按 (连接, 玩家) 存储 pydantic-ai message_history
+        # 对话历史: 按 (连接, 玩家, 对话) 存储 pydantic-ai message_history
         self._conversation_histories: dict[SessionKey, list[ModelMessage]] = {}
         # 会话锁: 保证同一 (连接, 玩家) 的请求按顺序处理；
         # 不同玩家可在同一连接上并行。
@@ -209,18 +221,20 @@ class MessageBroker:
         self,
         connection_id: UUID,
         player_name: str | None,
+        conversation_id: str | None = None,
     ) -> asyncio.Lock:
-        """获取 (连接, 玩家) 级锁；同一玩家串行，跨玩家并行。"""
-        key = make_session_key(connection_id, player_name)
+        """获取 (连接, 玩家, 对话) 级锁；同一对话串行，跨玩家/对话并行。"""
+        key = make_session_key(connection_id, player_name, conversation_id)
         return self._session_locks.setdefault(key, asyncio.Lock())
 
     def get_conversation_history(
         self,
         connection_id: UUID,
         player_name: str | None,
+        conversation_id: str | None = None,
     ) -> list[ModelMessage]:
-        """获取 (连接, 玩家) 维度的对话历史副本。"""
-        key = make_session_key(connection_id, player_name)
+        """获取 (连接, 玩家, 对话) 维度的对话历史副本。"""
+        key = make_session_key(connection_id, player_name, conversation_id)
         history = self._conversation_histories.get(key, [])
         return list(history)
 
@@ -229,27 +243,47 @@ class MessageBroker:
         connection_id: UUID,
         player_name: str | None,
         history: list[ModelMessage],
+        conversation_id: str | None = None,
     ) -> None:
-        """更新 (连接, 玩家) 维度的对话历史。"""
-        key = make_session_key(connection_id, player_name)
+        """更新 (连接, 玩家, 对话) 维度的对话历史。"""
+        key = make_session_key(connection_id, player_name, conversation_id)
         self._conversation_histories[key] = list(history)
 
     def clear_conversation_history(
         self,
         connection_id: UUID,
         player_name: str | None,
+        conversation_id: str | None = None,
     ) -> None:
-        """清理 (连接, 玩家) 维度的对话历史。"""
-        key = make_session_key(connection_id, player_name)
+        """清理 (连接, 玩家, 对话) 维度的对话历史。"""
+        key = make_session_key(connection_id, player_name, conversation_id)
         self._conversation_histories.pop(key, None)
+
+    def list_player_conversations(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+    ) -> list[tuple[str, int]]:
+        """列出某玩家在当前连接下的运行时对话及消息数。"""
+        player = player_name or DEFAULT_PLAYER_KEY
+        conversations: dict[str, int] = {}
+        for cid, pname, conversation_id in self._conversation_histories.keys():
+            if cid == connection_id and pname == player:
+                conversations[conversation_id] = len(
+                    self._conversation_histories[(cid, pname, conversation_id)]
+                )
+        for cid, pname, conversation_id in self._session_locks.keys():
+            if cid == connection_id and pname == player:
+                conversations.setdefault(conversation_id, 0)
+        return sorted(conversations.items())
 
     def list_session_players(self, connection_id: UUID) -> list[str]:
         """列出某连接下所有有过历史/锁的玩家名（不含匿名占位）。"""
         names: set[str] = set()
-        for cid, player in self._conversation_histories.keys():
+        for cid, player, _conversation_id in self._conversation_histories.keys():
             if cid == connection_id and player != DEFAULT_PLAYER_KEY:
                 names.add(player)
-        for cid, player in self._session_locks.keys():
+        for cid, player, _conversation_id in self._session_locks.keys():
             if cid == connection_id and player != DEFAULT_PLAYER_KEY:
                 names.add(player)
         return sorted(names)

@@ -24,6 +24,7 @@ class ChatRequest(BaseMessage):
     use_context: bool = True
     provider: str | None = None  # 可选指定 LLM 提供商
     delivery: Literal["tellraw", "scriptevent"] = "tellraw"
+    conversation_id: str = "default"
 
 
 class ChatResponse(BaseMessage):
@@ -75,7 +76,7 @@ class CommandRequest(BaseMessage):
     """命令请求"""
 
     type: Literal["command"] = "command"
-    command_type: Literal["login", "save", "context", "run_command", "switch_model", "help"]
+    command_type: Literal["login", "save", "context", "conversation", "run_command", "switch_model", "help"]
     content: str | None = None
 
 

@@ -112,7 +112,7 @@ MCBE-AI-Agent/
 
 3. **多人会话隔离**
    - MCBE 单个 `/wsserver` 连接可承载多个玩家
-   - 对话历史、会话锁、上下文开关、当前模型、模板和自定义变量均按 `(connection_id, player_name)` 分桶
+   - 对话历史、会话锁按 `(connection_id, player_name, conversation_id)` 分桶；上下文开关、当前模型、模板和自定义变量按 `(connection_id, player_name)` 分桶
    - `ConnectionState.player_name` 仅表示最近发言者，处理聊天、UI、上下文、设置和切换模型时必须使用本次事件的 `sender`
    - 同一玩家请求串行处理，不同玩家可并行处理，避免上下文串扰和 UI 响应推给错人
 
@@ -436,9 +436,13 @@ AGENT 聊天 你好，请介绍一下自己
 ### 4. 其他命令
 
 ```
-AGENT 上下文 启用          # 启用对话上下文
-AGENT 上下文 关闭          # 关闭对话上下文
-AGENT 上下文 状态          # 查看当前状态
+AGENT 对话 new 建筑规划     # 新建并切换到一个对话
+AGENT 对话 switch default  # 切换到指定对话
+AGENT 对话 clear           # 清除当前对话历史
+AGENT 对话 list            # 查看当前连接内的对话
+AGENT 上下文 启用          # 启用携带当前对话历史
+AGENT 上下文 关闭          # 关闭携带历史但不清除对话
+AGENT 上下文 状态          # 查看上下文开关与当前对话状态
 切换模型 openai          # 切换到 OpenAI
 切换模型 deepseek        # 切换回 DeepSeek
 帮助                     # 显示帮助信息
@@ -447,10 +451,12 @@ AGENT 上下文 状态          # 查看当前状态
 
 ### 多人会话说明
 
-MCBE 世界通常只会通过 `/wsserver` 建立一条 WebSocket 连接，所有玩家的聊天框命令和 Addon UI 消息都会复用这条连接。后端不会再把 `connection_id` 视为单个玩家会话，而是使用 `(connection_id, player_name)` 区分真实会话。
+MCBE 世界通常只会通过 `/wsserver` 建立一条 WebSocket 连接，所有玩家的聊天框命令和 Addon UI 消息都会复用这条连接。后端不会再把 `connection_id` 视为单个玩家会话，而是使用 `(connection_id, player_name)` 区分真实玩家会话，并在玩家内使用 `conversation_id` 区分不同对话。
 
-- 玩家 A 和玩家 B 的对话历史互不读取。
-- `AGENT 上下文`、`切换模型`、模板和变量设置只影响发起命令的玩家。
+- 玩家 A 和玩家 B 的对话历史互不读取；同一玩家的不同对话也互不读取。
+- `AGENT 对话` 负责新建、切换、清除、保存和恢复对话。
+- `AGENT 上下文` 只负责是否在请求中携带当前对话历史，不再清除或保存对话。
+- `切换模型`、模板和变量设置只影响发起命令的玩家。
 - Agent Worker 对同一玩家保持串行处理，但不同玩家请求可以并发执行。
 - UI 响应同步使用当前消息的真实 `player_name`，避免响应写入其他玩家面板。
 - 连接断开或注销时会清理该连接下所有玩家会话。
@@ -609,7 +615,7 @@ class ConnectionManager:
 
 **设计优势**:
 - 每个连接独立的发送协程
-- 每名玩家独立保存上下文开关、当前模型、模板和变量
+- 每名玩家独立保存上下文开关、当前模型、模板、变量和当前活动对话
 - `state.player_name` 仅作为最近发言者指针，不能作为多人会话身份来源
 - 超时机制避免永久阻塞
 - 优雅的错误处理
