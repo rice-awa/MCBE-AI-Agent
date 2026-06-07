@@ -1,0 +1,142 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080
+  },
+  "auth": {
+    "jwt_secret": "${SECRET_KEY}",
+    "jwt_expiration": 1800,
+    "default_password": "${WEBSOCKET_PASSWORD}"
+  },
+  "providers": {
+    "default": "deepseek",
+    "deepseek": {
+      "api_key": "${DEEPSEEK_API_KEY}",
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-chat"
+    },
+    "openai": {
+      "api_key": null,
+      "base_url": null,
+      "model": "gpt-4o"
+    },
+    "anthropic": {
+      "api_key": null,
+      "model": "claude-sonnet-4-20250514"
+    },
+    "ollama": {
+      "base_url": "http://localhost:11434",
+      "model": "llama3"
+    }
+  },
+  "agent": {
+    "system_prompt": "请始终保持积极和专业的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown",
+    "enable_reasoning_output": true,
+    "max_history_turns": 20,
+    "stream_sentence_mode": true,
+    "llm_warmup_enabled": true,
+    "mcwiki_base_url": "https://mcwiki.rice-awa.top",
+    "dedup_external_messages": true,
+    "tool_response_verbose": false
+  },
+  "queue": {
+    "max_size": 100,
+    "llm_worker_count": 2
+  },
+  "websocket": {
+    "ping_interval": 30,
+    "ping_timeout": 15,
+    "close_timeout": 15,
+    "max_size": 10485760,
+    "max_queue": 32
+  },
+  "minecraft": {
+    "commands": {
+      "#登录": "login",
+      "AGENT 聊天": {
+        "type": "chat",
+        "aliases": ["AGENT chat", "AI 聊天", "AI chat"],
+        "description": "与 AI 对话",
+        "usage": "<内容>"
+      },
+      "AGENT 脚本": {
+        "type": "chat_script",
+        "aliases": ["AGENT script", "AI 脚本", "AI script"],
+        "description": "使用脚本事件发送",
+        "usage": "<内容>"
+      },
+      "AGENT 保存": {
+        "type": "save",
+        "aliases": ["AGENT save", "AI save"],
+        "description": "保存对话历史",
+        "usage": null
+      },
+      "AGENT 上下文": {
+        "type": "context",
+        "aliases": ["AGENT context", "AI 上下文", "AI context"],
+        "description": "管理上下文",
+        "usage": "<启用/关闭/状态/清除/压缩/保存/恢复/列表/删除>"
+      },
+      "AGENT 模板": {
+        "type": "template",
+        "aliases": ["AGENT template", "AI 模板", "AI template"],
+        "description": "切换提示词模板",
+        "usage": "<模板名/list>"
+      },
+      "AGENT 设置": {
+        "type": "setting",
+        "aliases": ["AGENT setting", "AI 设置", "AI setting"],
+        "description": "设置管理",
+        "usage": "<变量/别名> <子命令>"
+      },
+      "AGENT MCP": {
+        "type": "mcp",
+        "aliases": ["AGENT mcp", "AI MCP", "AI mcp"],
+        "description": "MCP 服务器管理",
+        "usage": "<list/status/reload>"
+      },
+      "运行命令": {
+        "type": "run_command",
+        "aliases": ["runcmd", "cmd"],
+        "description": "执行游戏命令",
+        "usage": "<命令>"
+      },
+      "切换模型": {
+        "type": "switch_model",
+        "aliases": ["switch", "模型"],
+        "description": "切换 LLM",
+        "usage": "<provider>"
+      },
+      "帮助": {
+        "type": "help",
+        "aliases": ["help", "?"],
+        "description": "显示此帮助",
+        "usage": null
+      }
+    },
+    "welcome_message_template": "-----------\n成功连接 MCBE AI Agent v2.2.0\n连接 ID: {connection_id}...\n当前模型: {provider}/{model}\n上下文: {context_status}\n-----------\n使用 \"{help_command}\" 查看可用命令",
+    "context_enabled_text": "启用",
+    "context_disabled_text": "关闭",
+    "error_prefix": "❌ 错误: ",
+    "info_prefix": "ℹ ",
+    "success_prefix": "✅ ",
+    "error_color": "§c",
+    "info_color": "§b",
+    "success_color": "§a"
+  },
+  "mcp": {
+    "enabled": false,
+    "servers": {}
+  },
+  "logging": {
+    "level": "INFO",
+    "enable_file_logging": true,
+    "enable_ws_raw_log": false,
+    "enable_llm_raw_log": false
+  },
+  "dev_mode": false,
+  "flow_control": {
+    "max_chunk_content_length": 400,
+    "chunk_sentence_mode": true
+  }
+}

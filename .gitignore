@@ -2,6 +2,7 @@
 .venv/*
 .env
 .env.local
+config.json
 !MCBE-AI-Agent-addon/.env
 
 # coding agent
@@ -32,3 +33,5 @@ data/*
 .pytest_cache
 test_logs/*
 *.log
+
+config.json

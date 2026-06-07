@@ -173,7 +173,7 @@ class TestMCPManager:
         """测试 MCP 管理器初始化"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         assert manager.is_initialized is False
         assert len(manager.servers) == 0
 
@@ -181,7 +181,7 @@ class TestMCPManager:
         """测试 MCP 管理器 servers 属性"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         servers = manager.servers
         assert isinstance(servers, dict)
 
@@ -189,7 +189,7 @@ class TestMCPManager:
         """测试 MCP 管理器 toolsets 属性"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         toolsets = manager.toolsets
         assert isinstance(toolsets, list)
 
@@ -197,7 +197,7 @@ class TestMCPManager:
         """测试获取 MCP 状态摘要"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         summary = manager.get_status_summary()
 
         assert "enabled" in summary
@@ -210,7 +210,7 @@ class TestMCPManager:
         """测试获取不存在的服务器信息"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         info = manager.get_server_info("non-existent")
         assert info is None
 
@@ -218,7 +218,7 @@ class TestMCPManager:
         """测试获取用于 Agent 的工具集"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         toolsets = manager.get_toolsets_for_agent()
         assert isinstance(toolsets, list)
 
@@ -226,7 +226,7 @@ class TestMCPManager:
         """测试根据名称获取工具集"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         toolset = manager.get_toolset_by_name("non-existent")
         assert toolset is None
 
@@ -249,7 +249,7 @@ class TestMCPManager:
         """测试 MCP 管理器关闭"""
         from services.agent.mcp import MCPManager
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         await manager.shutdown()
 
         assert manager.is_initialized is False
@@ -258,7 +258,7 @@ class TestMCPManager:
         """测试更新服务器状态"""
         from services.agent.mcp import MCPManager, MCPConnectionStatus, MCPServerInfo
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         # 手动添加一个服务器信息
         config = MCPServerConfig(command="echo")
         manager._servers["test-server"] = MCPServerInfo(
@@ -278,7 +278,7 @@ class TestMCPManager:
         """测试重置服务器状态"""
         from services.agent.mcp import MCPManager, MCPConnectionStatus, MCPServerInfo
 
-        manager = MCPManager()
+        manager = MCPManager(Settings())
         config = MCPServerConfig(command="echo")
         manager._servers["test-server"] = MCPServerInfo(
             name="test-server",
@@ -300,8 +300,8 @@ class TestGetMCPManager:
         """测试获取 MCP 管理器单例"""
         from services.agent.mcp import get_mcp_manager, MCPManager
 
-        manager1 = get_mcp_manager()
-        manager2 = get_mcp_manager()
+        manager1 = get_mcp_manager(Settings())
+        manager2 = get_mcp_manager(Settings())
         assert manager1 is manager2
         assert isinstance(manager1, MCPManager)
 
@@ -309,63 +309,110 @@ class TestGetMCPManager:
 class TestSettingsMCPIntegration:
     """Settings MCP 集成测试"""
 
-    def test_invalid_minecraft_commands_json_should_not_raise(self, caplog):
-        """测试非法命令 JSON 只记录警告不抛异常"""
-        settings = Settings(minecraft_commands_json="{invalid")
-        assert settings.minecraft.commands
-
-    def test_invalid_mcp_servers_json_should_not_raise(self, caplog):
-        """测试非法 MCP servers JSON 只记录警告不抛异常"""
-        settings = Settings(mcp_servers_json="{invalid")
-        assert settings.mcp.enabled is False
-
-    def test_mcp_servers_json_official_format(self):
-        """测试官方格式 MCP servers JSON"""
+    def test_mcp_servers_official_format_from_config_json(self, tmp_path, monkeypatch):
+        """测试官方格式 MCP servers JSON 文件配置"""
         import json
-        # 使用环境变量别名来设置 mcp_enabled
-        settings = Settings(
-            MCP_ENABLED=True,
-            mcp_servers_json=json.dumps({
-                "mcpServers": {
-                    "filesystem": {
-                        "command": "npx",
-                        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "mcp": {
+                        "enabled": True,
+                        "servers": {
+                            "filesystem": {
+                                "command": "npx",
+                                "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+                            }
+                        },
                     }
-                }
-            })
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
         )
+
+        settings = Settings()
+
         assert settings.mcp.enabled is True
         assert "filesystem" in settings.mcp.servers
         assert settings.mcp.servers["filesystem"].command == "npx"
 
-    def test_mcp_servers_json_simple_format(self):
-        """测试简化格式 MCP servers JSON"""
+    def test_mcp_servers_simple_format_from_config_json(self, tmp_path, monkeypatch):
+        """测试简化格式 MCP servers JSON 文件配置"""
         import json
-        settings = Settings(
-            MCP_ENABLED=True,
-            mcp_servers_json=json.dumps({
-                "filesystem": {
-                    "command": "npx",
-                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
-                }
-            })
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "mcp": {
+                        "enabled": True,
+                        "servers": {
+                            "filesystem": {
+                                "command": "npx",
+                                "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+                            }
+                        },
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
         )
+
+        settings = Settings()
+
         assert settings.mcp.enabled is True
         assert "filesystem" in settings.mcp.servers
 
-    def test_mcp_command_in_minecraft_config(self):
-        """测试 MCP 命令在 Minecraft 配置中"""
+    def test_minecraft_commands_from_config_json(self, tmp_path, monkeypatch):
+        """测试 Minecraft 命令可通过 JSON 文件配置"""
+        import json
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "minecraft": {
+                        "commands": {
+                            "AGENT MCP": {
+                                "type": "mcp",
+                                "aliases": ["AGENT mcp", "AI MCP", "AI mcp"],
+                                "description": "MCP 服务器管理",
+                                "usage": "<list/status/reload>",
+                            },
+                            "测试": "help",
+                        }
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
         settings = Settings()
+
         assert "AGENT MCP" in settings.minecraft.commands
+        assert settings.minecraft.commands["测试"] == "help"
         mcp_cmd = settings.minecraft.commands["AGENT MCP"]
         assert isinstance(mcp_cmd, dict)
         assert mcp_cmd["type"] == "mcp"
         assert "AGENT mcp" in mcp_cmd["aliases"]
 
-    def test_invalid_minecraft_commands_json_should_not_raise(caplog):
-        """测试非法命令 JSON 只记录警告不抛异常"""
-        settings = Settings(minecraft_commands_json="{invalid")
-        assert settings.minecraft.commands
+    def test_plain_mcp_environment_json_is_ignored(self, tmp_path, monkeypatch):
+        """测试旧 MCP_SERVERS 环境变量不会再配置 MCP"""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv(
+            "MCP_SERVERS",
+            '{"filesystem": {"command": "npx", "args": ["-y", "server"]}}',
+        )
+        monkeypatch.setenv("MCP_ENABLED", "true")
+
+        settings = Settings()
+
+        assert settings.mcp.enabled is False
+        assert settings.mcp.servers == {}
 
 class TestMCPManagerAsyncOperations:
     """MCP 管理器异步操作测试"""

@@ -232,7 +232,7 @@ class AgentWorker:
         agent = agent_manager.get_agent()
 
         # 尝试获取 MCP 管理器以跟踪服务器状态
-        mcp_manager = get_mcp_manager()
+        mcp_manager = get_mcp_manager(self.settings)
 
         try:
             async for event in stream_chat(

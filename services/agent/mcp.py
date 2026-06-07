@@ -484,11 +484,11 @@ class MCPManager:
 _mcp_manager: MCPManager | None = None
 
 
-def get_mcp_manager() -> MCPManager:
+def get_mcp_manager(settings: Settings | None = None) -> MCPManager:
     """获取 MCP 管理器单例"""
     global _mcp_manager
     if _mcp_manager is None:
-        _mcp_manager = MCPManager()
+        _mcp_manager = MCPManager(settings)
     return _mcp_manager
 
 
