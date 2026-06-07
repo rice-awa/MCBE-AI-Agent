@@ -27,7 +27,7 @@ class MinecraftConfig(BaseModel):
 
     # 命令前缀定义: {前缀: 命令类型} - 兼容旧格式
     # 新格式: {前缀: {"type": 命令类型, "aliases": [别名列表], "description": 描述}}
-    commands: dict[str, str | dict] = {
+    commands: dict[str, str | dict] = Field(default_factory=lambda: {
         "#登录": "login",
         "AGENT 聊天": {
             "type": "chat",
@@ -44,14 +44,20 @@ class MinecraftConfig(BaseModel):
         "AGENT 保存": {
             "type": "save",
             "aliases": ["AGENT save", "AI save"],
-            "description": "保存对话历史",
+            "description": "保存当前对话历史",
             "usage": None
+        },
+        "AGENT 对话": {
+            "type": "conversation",
+            "aliases": ["AGENT conv", "AGENT conversation", "AI 对话", "AI conv"],
+            "description": "管理对话",
+            "usage": "<new/switch/clear/status/list/save/restore>"
         },
         "AGENT 上下文": {
             "type": "context",
             "aliases": ["AGENT context", "AI 上下文", "AI context"],
-            "description": "管理上下文",
-            "usage": "<启用/关闭/状态/清除/压缩/保存/恢复/列表/删除>"
+            "description": "管理上下文开关",
+            "usage": "<启用/关闭/状态>"
         },
         "AGENT 模板": {
             "type": "template",
@@ -89,15 +95,16 @@ class MinecraftConfig(BaseModel):
             "description": "显示此帮助",
             "usage": None
         },
-    }
+    })
 
     # 命令帮助信息: {命令类型: (描述, 用法)}
     command_help: dict[str, tuple[str, str | None]] = {
         "chat": ("与 AI 对话", "<内容>"),
         "chat_script": ("使用脚本事件发送", "<内容>"),
-        "context": ("管理上下文", "<启用/关闭/状态/压缩/保存/恢复/列表/删除>"),
+        "conversation": ("管理对话", "<new/switch/clear/status/list/save/restore>"),
+        "context": ("管理上下文开关", "<启用/关闭/状态>"),
         "switch_model": ("切换 LLM", "<provider>"),
-        "save": ("保存对话历史", None),
+        "save": ("保存当前对话历史", None),
         "run_command": ("执行游戏命令", "<命令>"),
         "help": ("显示此帮助", None),
     }
@@ -311,8 +318,29 @@ def _load_runtime_config_data() -> dict[str, Any]:
     data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("config.json root must be an object")
+    data = _merge_minecraft_commands(data)
     _validate_runtime_config_data(data)
     return data
+
+
+def _merge_minecraft_commands(data: dict[str, Any]) -> dict[str, Any]:
+    minecraft = data.get("minecraft")
+    if not isinstance(minecraft, dict):
+        return data
+
+    user_commands = minecraft.get("commands")
+    if not isinstance(user_commands, dict):
+        return data
+
+    merged = MinecraftConfig().commands
+    merged.update(user_commands)
+    return {
+        **data,
+        "minecraft": {
+            **minecraft,
+            "commands": merged,
+        },
+    }
 
 
 def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
@@ -415,7 +443,7 @@ class EnvInterpolatedJsonConfigSettingsSource(JsonConfigSettingsSource):
         if not isinstance(data, dict):
             raise ValueError("config.json root must be an object")
         resolved = _resolve_env_refs(data, _secret_environment())
-        return _flatten_json_config(resolved)
+        return _flatten_json_config(_merge_minecraft_commands(resolved))
 
 
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {

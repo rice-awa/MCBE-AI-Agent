@@ -2,13 +2,14 @@
 
 import asyncio
 import json
+from datetime import datetime
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import websockets
 from websockets.server import WebSocketServerProtocol, serve
 
-from core.queue import MessageBroker
+from core.queue import MessageBroker, normalize_conversation_id
 from services.addon.service import get_addon_bridge_service
 from services.websocket.connection import ConnectionManager
 from services.websocket.flow_control import FlowControlMiddleware
@@ -367,6 +368,8 @@ class WebSocketServer:
             )
         elif cmd_type == "context":
             await self.handle_context(state, content, player_name=player_name)
+        elif cmd_type == "conversation":
+            await self.handle_conversation(state, content, player_name=player_name)
         elif cmd_type == "template":
             await self.handle_template(state, content, player_name=player_name)
         elif cmd_type == "setting":
@@ -378,7 +381,7 @@ class WebSocketServer:
         elif cmd_type == "help":
             await self.handle_help(state)
         elif cmd_type == "save":
-            await self.handle_save(state)
+            await self.handle_save(state, player_name=player_name)
         elif cmd_type == "run_command":
             await self.handle_run_command(state, content)
 
@@ -437,6 +440,12 @@ class WebSocketServer:
         chat_req = self.protocol_handler.create_chat_request(
             state, content, delivery=delivery, player_name=player_name
         )
+        self.broker.ensure_conversation(
+            state.id, chat_req.player_name, chat_req.conversation_id
+        )
+        chat_req.conversation_generation = self.broker.get_conversation_generation(
+            state.id, chat_req.player_name, chat_req.conversation_id
+        )
 
         # 提交到消息队列（非阻塞！）
         try:
@@ -456,114 +465,214 @@ class WebSocketServer:
     async def handle_context(
         self, state: Any, option: str, player_name: str | None = None
     ) -> None:
-        """处理上下文管理（按玩家分桶）"""
-        # 导入对话管理器
-        from core.conversation import get_conversation_manager
-
-        conv_manager = get_conversation_manager(self.broker, self.settings)
+        """处理上下文开关与状态（按玩家分桶，不再承担对话管理职责）。"""
         session = state.get_player_session(player_name)
 
-        # 解析选项
         parts = option.strip().split(None, 1) if option.strip() else []
-        action = parts[0] if parts else ""
-        arg = parts[1] if len(parts) > 1 else ""
+        action = parts[0] if parts else "状态"
 
-        if action == "启用":
+        if action in ("启用", "开启", "on", "enable"):
             session.context_enabled = True
             msg = self.protocol_handler.create_success_message("上下文已启用")
-        elif action == "关闭":
+        elif action in ("关闭", "off", "disable"):
             session.context_enabled = False
-            self.broker.clear_conversation_history(state.id, player_name)
-            msg = self.protocol_handler.create_success_message("上下文已关闭")
-        elif action == "状态":
+            msg = self.protocol_handler.create_success_message(
+                "上下文已关闭；现有对话历史不会被清除，如需清除请使用 AGENT 对话 clear"
+            )
+        elif action in ("状态", "status", ""):
             status = "启用" if session.context_enabled else "关闭"
-            history = self.broker.get_conversation_history(state.id, player_name)
+            conversation_id = normalize_conversation_id(session.active_conversation_id)
+            history = self.broker.get_conversation_history(
+                state.id, player_name, conversation_id
+            )
             turns = self._count_conversation_turns(history)
 
-            # 获取上下文使用信息
             context_usage = ""
             try:
-                # 使用当前提供商或默认提供商
                 provider = session.current_provider or self.settings.default_provider
                 provider_config = self.settings.get_provider_config(provider)
                 message_count = len(history)
-                estimated_tokens = message_count * 100  # 简单估算
+                estimated_tokens = message_count * 100
                 if provider_config.context_window:
                     usage_percent = (estimated_tokens / provider_config.context_window) * 100
-                    context_usage = f"\n上下文使用: {usage_percent:.1f}% ({estimated_tokens}/{provider_config.context_window} tokens)"
+                    context_usage = (
+                        f"\n上下文使用: {usage_percent:.1f}% "
+                        f"({estimated_tokens}/{provider_config.context_window} tokens)"
+                    )
                 else:
                     context_usage = f"\n上下文使用: ~{estimated_tokens} tokens (模型上下文窗口未知)"
             except Exception:
                 pass
 
             msg = self.protocol_handler.create_info_message(
-                f"上下文状态: {status}\n当前对话轮数: {turns}/{self.settings.max_history_turns}{context_usage}"
+                f"上下文状态: {status}"
+                f"\n当前对话: {conversation_id}"
+                f"\n当前对话轮数: {turns}/{self.settings.max_history_turns}"
+                f"{context_usage}"
             )
-            await self._send_ws_payload(state, msg, source="context")
+        elif action in (
+            "clear", "清除", "压缩", "compress", "保存", "save",
+            "恢复", "restore", "列表", "list", "删除", "delete",
+        ):
+            await self.handle_conversation(state, option, player_name=player_name)
             return
-        elif action == "压缩":
-            # 手动触发压缩
-            success, result = await conv_manager.check_and_compress(
-                state.id, player_name, force=True
-            )
-            if success:
-                msg = self.protocol_handler.create_success_message(result)
-            else:
-                msg = self.protocol_handler.create_info_message(result)
-        elif action == "保存":
-            # 保存当前对话
-            success, result = await conv_manager.save_conversation(
-                connection_id=state.id,
-                player_name=player_name or session.player_name,
-                provider=session.current_provider or self.settings.default_provider,
-                template=session.current_template,
-                custom_variables=session.custom_variables,
-            )
-            if success:
-                msg = self.protocol_handler.create_success_message(f"对话已保存: {result}")
-            else:
-                msg = self.protocol_handler.create_error_message(result)
-        elif action == "恢复":
-            # 恢复对话
-            if not arg:
-                msg = self.protocol_handler.create_error_message(
-                    "请指定要恢复的会话 ID\n用法: AGENT 上下文 恢复 <ID>"
-                )
-            else:
-                success, result = await conv_manager.restore_conversation(
-                    state.id, arg, player_name=player_name
-                )
-                if success:
-                    msg = self.protocol_handler.create_success_message(result)
-                else:
-                    msg = self.protocol_handler.create_error_message(result)
-        elif action == "列表":
-            # 列出保存的对话
-            conversations = await conv_manager.list_conversations()
-            list_text = conv_manager.format_conversation_list(conversations)
-            msg = self.protocol_handler.create_info_message(list_text)
-        elif action == "删除":
-            # 删除对话
-            if not arg:
-                msg = self.protocol_handler.create_error_message(
-                    "请指定要删除的会话 ID\n用法: AGENT 上下文 删除 <ID>"
-                )
-            else:
-                success, result = await conv_manager.delete_conversation(arg)
-                if success:
-                    msg = self.protocol_handler.create_success_message(result)
-                else:
-                    msg = self.protocol_handler.create_error_message(result)
-        elif action == "清除":
-            # 清除对话历史
-            self.broker.clear_conversation_history(state.id, player_name)
-            msg = self.protocol_handler.create_success_message("对话历史已清除")
         else:
             msg = self.protocol_handler.create_error_message(
-                "无效选项，请使用: 启用/关闭/状态/压缩/保存/恢复 <ID>/列表/删除 <ID>/清除"
+                "上下文命令仅管理是否携带历史。用法: AGENT 上下文 <启用/关闭/状态>\n"
+                "对话的新建/切换/清除/保存/恢复请使用: AGENT 对话 <new/switch/clear/...>"
             )
 
         await self._send_ws_payload(state, msg, source="context")
+
+    async def handle_conversation(
+        self, state: Any, option: str, player_name: str | None = None
+    ) -> None:
+        """处理对话管理：新建、切换、清除、压缩、保存、恢复、列表和删除。"""
+        lock = self.broker.get_session_lock(state.id, player_name)
+        async with lock:
+            msg = await self._handle_conversation_locked(state, option, player_name)
+
+        await self._send_ws_payload(state, msg, source="conversation")
+
+    async def _handle_conversation_locked(
+        self, state: Any, option: str, player_name: str | None = None
+    ) -> TellrawMessage:
+        from core.conversation import get_conversation_manager
+
+        conv_manager = get_conversation_manager(self.broker, self.settings)
+        session = state.get_player_session(player_name)
+        actor = player_name or session.player_name
+
+        parts = option.strip().split(None, 1) if option.strip() else []
+        action = parts[0].lower() if parts else "状态"
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        conversation_id = normalize_conversation_id(session.active_conversation_id)
+
+        if action in ("new", "新建", "创建"):
+            new_id = self._generate_unique_conversation_id(state.id, actor, arg)
+            if new_id is None:
+                target_id = normalize_conversation_id(arg)
+                return self.protocol_handler.create_error_message(
+                    f"对话 {target_id} 已存在，请使用 AGENT 对话 switch {target_id} 切换"
+                )
+            session.active_conversation_id = new_id
+            self.broker.set_conversation_history(state.id, actor, [], new_id)
+            return self.protocol_handler.create_success_message(f"已新建并切换到对话: {new_id}")
+        elif action in ("switch", "切换"):
+            if not arg:
+                return self.protocol_handler.create_error_message(
+                    "请指定要切换的对话 ID\n用法: AGENT 对话 switch <ID>"
+                )
+            target_id = normalize_conversation_id(arg)
+            session.active_conversation_id = target_id
+            history = self.broker.get_conversation_history(state.id, actor, target_id)
+            if not self.broker.conversation_exists(state.id, actor, target_id):
+                self.broker.set_conversation_history(state.id, actor, [], target_id)
+            turns = self._count_conversation_turns(history)
+            return self.protocol_handler.create_success_message(
+                f"已切换到对话: {target_id}（{turns}轮）"
+            )
+        elif action in ("clear", "清除"):
+            self.broker.clear_conversation_history(state.id, actor, conversation_id)
+            self.broker.set_conversation_history(state.id, actor, [], conversation_id)
+            return self.protocol_handler.create_success_message(
+                f"对话 {conversation_id} 的历史已清除"
+            )
+        elif action in ("状态", "status", ""):
+            history = self.broker.get_conversation_history(state.id, actor, conversation_id)
+            turns = self._count_conversation_turns(history)
+            context_status = "启用" if session.context_enabled else "关闭"
+            return self.protocol_handler.create_info_message(
+                f"当前对话: {conversation_id}"
+                f"\n对话轮数: {turns}/{self.settings.max_history_turns}"
+                f"\n上下文携带: {context_status}"
+            )
+        elif action in ("list", "列表"):
+            live_conversations = dict(self.broker.list_player_conversations(state.id, actor))
+            live_conversations.setdefault(conversation_id, len(
+                self.broker.get_conversation_history(state.id, actor, conversation_id)
+            ))
+            lines = ["当前连接内对话:"]
+            for conv_id, message_count in sorted(live_conversations.items()):
+                marker = " *" if conv_id == conversation_id else ""
+                lines.append(f"• {conv_id}{marker} - {message_count} 条消息")
+            return self.protocol_handler.create_info_message("\n".join(lines))
+        elif action in ("压缩", "compress"):
+            success, result = await conv_manager.check_and_compress(
+                state.id, actor, force=True, conversation_id=conversation_id
+            )
+            return (
+                self.protocol_handler.create_success_message(result)
+                if success else self.protocol_handler.create_info_message(result)
+            )
+        elif action in ("保存", "save"):
+            success, result = await conv_manager.save_conversation(
+                connection_id=state.id,
+                player_name=actor,
+                provider=session.current_provider or self.settings.default_provider,
+                template=session.current_template,
+                custom_variables=session.custom_variables,
+                conversation_id=conversation_id,
+            )
+            return (
+                self.protocol_handler.create_success_message(f"对话已保存: {result}")
+                if success else self.protocol_handler.create_error_message(result)
+            )
+        elif action in ("恢复", "restore"):
+            if not arg:
+                return self.protocol_handler.create_error_message(
+                    "请指定要恢复的会话 ID\n用法: AGENT 对话 restore <保存ID>"
+                )
+            success, result = await conv_manager.restore_conversation(
+                state.id, arg, player_name=actor, conversation_id=conversation_id
+            )
+            return (
+                self.protocol_handler.create_success_message(result)
+                if success else self.protocol_handler.create_error_message(result)
+            )
+        elif action in ("已保存", "saved"):
+            conversations = await conv_manager.list_conversations()
+            list_text = conv_manager.format_conversation_list(conversations)
+            return self.protocol_handler.create_info_message(list_text)
+        elif action in ("删除", "delete"):
+            if not arg:
+                return self.protocol_handler.create_error_message(
+                    "请指定要删除的保存会话 ID\n用法: AGENT 对话 delete <保存ID>"
+                )
+            success, result = await conv_manager.delete_conversation(arg)
+            return (
+                self.protocol_handler.create_success_message(result)
+                if success else self.protocol_handler.create_error_message(result)
+            )
+
+        return self.protocol_handler.create_error_message(
+            "无效选项，请使用: new [ID]/switch <ID>/clear/status/list/"
+            "compress/save/restore <保存ID>/saved/delete <保存ID>"
+        )
+
+    def _generate_unique_conversation_id(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        requested_id: str = "",
+    ) -> str | None:
+        """生成不覆盖已有运行时对话的 ID；显式 ID 已存在时返回 None。"""
+        if requested_id:
+            new_id = normalize_conversation_id(requested_id)
+            if self.broker.conversation_exists(connection_id, player_name, new_id):
+                return None
+            return new_id
+
+        for _ in range(10):
+            new_id = self._generate_conversation_id()
+            if not self.broker.conversation_exists(connection_id, player_name, new_id):
+                return new_id
+        raise RuntimeError("无法生成唯一对话 ID")
+
+    @staticmethod
+    def _generate_conversation_id() -> str:
+        """生成简短运行时对话 ID。"""
+        return "chat-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid4().hex[:6]
 
     def _count_conversation_turns(self, history: list) -> int:
         """计算对话轮次"""
@@ -580,22 +689,29 @@ class WebSocketServer:
         self, state: Any, provider: str, player_name: str | None = None
     ) -> None:
         """处理模型切换（按玩家分桶）"""
+        lock = self.broker.get_session_lock(state.id, player_name)
+        async with lock:
+            msg = await self._handle_switch_model_locked(state, provider, player_name)
+
+        await self._send_ws_payload(state, msg, source="switch_model")
+
+    async def _handle_switch_model_locked(
+        self, state: Any, provider: str, player_name: str | None = None
+    ) -> TellrawMessage:
         available = self.settings.list_available_providers()
         session = state.get_player_session(player_name)
 
         if provider.lower() in available:
             session.current_provider = provider.lower()
-            self.broker.clear_conversation_history(state.id, player_name)
+            self.broker.clear_player_conversation_histories(state.id, player_name)
             config = self.settings.get_provider_config(provider.lower())
-            msg = self.protocol_handler.create_success_message(
-                f"已切换到 {provider}/{config.model}"
-            )
-        else:
-            msg = self.protocol_handler.create_error_message(
-                f"不可用的提供商。可用: {', '.join(available)}"
+            return self.protocol_handler.create_success_message(
+                f"已切换到 {provider}/{config.model}，该玩家的运行时对话历史已清理"
             )
 
-        await self._send_ws_payload(state, msg, source="switch_model")
+        return self.protocol_handler.create_error_message(
+            f"不可用的提供商。可用: {', '.join(available)}"
+        )
 
     async def handle_template(
         self, state: Any, content: str, player_name: str | None = None
@@ -721,11 +837,9 @@ class WebSocketServer:
         msg = self.protocol_handler.create_info_message(help_text)
         await self._send_ws_payload(state, msg, source="help")
 
-    async def handle_save(self, state: Any) -> None:
-        """保存对话"""
-        # TODO: 实现对话历史保存
-        msg = self.protocol_handler.create_info_message("对话保存功能开发中")
-        await self._send_ws_payload(state, msg, source="save")
+    async def handle_save(self, state: Any, player_name: str | None = None) -> None:
+        """兼容旧保存命令：保存当前活动对话。"""
+        await self.handle_conversation(state, "save", player_name=player_name)
 
     async def handle_run_command(self, state: Any, command: str) -> None:
         """执行游戏命令"""

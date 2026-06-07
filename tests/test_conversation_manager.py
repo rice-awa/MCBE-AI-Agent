@@ -48,21 +48,23 @@ class MockBroker:
         self._histories = {}
 
     @staticmethod
-    def _key(connection_id, player_name):
-        return (str(connection_id), player_name or "__anonymous__")
+    def _key(connection_id, player_name, conversation_id="default"):
+        return (str(connection_id), player_name or "__anonymous__", conversation_id or "default")
 
-    def get_conversation_history(self, connection_id, player_name=None):
-        return list(self._histories.get(self._key(connection_id, player_name), []))
+    def get_conversation_history(self, connection_id, player_name=None, conversation_id="default"):
+        return list(self._histories.get(self._key(connection_id, player_name, conversation_id), []))
 
-    def set_conversation_history(self, connection_id, player_name, history=None):
+    def set_conversation_history(
+        self, connection_id, player_name, history=None, conversation_id="default"
+    ):
         # 兼容历史调用：若只传两个参数则视为旧 API，第二个参数即历史
         if history is None and isinstance(player_name, list):
             history = player_name
             player_name = None
-        self._histories[self._key(connection_id, player_name)] = list(history or [])
+        self._histories[self._key(connection_id, player_name, conversation_id)] = list(history or [])
 
-    def clear_conversation_history(self, connection_id, player_name=None):
-        self._histories.pop(self._key(connection_id, player_name), None)
+    def clear_conversation_history(self, connection_id, player_name=None, conversation_id="default"):
+        self._histories.pop(self._key(connection_id, player_name, conversation_id), None)
 
 
 def test_conversation_manager_init():

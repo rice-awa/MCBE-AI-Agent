@@ -137,6 +137,7 @@ class MinecraftProtocolHandler:
             use_context=session.context_enabled,
             provider=provider or session.current_provider,
             delivery=delivery or "tellraw",
+            conversation_id=session.active_conversation_id,
         )
 
     def get_help_text(self) -> str:

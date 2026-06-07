@@ -125,29 +125,41 @@ class AgentWorker:
         connection_id: UUID = item.connection_id
 
         # 同一 (连接, 玩家) 串行；不同玩家可并行，避免上下文乱序又不互相阻塞。
-        session_lock = self.broker.get_session_lock(connection_id, request.player_name)
+        session_lock = self.broker.get_session_lock(
+            connection_id, request.player_name, request.conversation_id
+        )
         async with session_lock:
-            await self._process_request_locked(request, connection_id)
+            await self._process_request_locked(
+                request,
+                connection_id,
+                conversation_generation=request.conversation_generation,
+            )
 
     async def _process_request_locked(
         self,
         request: ChatRequest,
         connection_id: UUID,
+        conversation_generation: int | None = None,
     ) -> None:
         """处理单个请求（已持有会话锁）"""
+        if conversation_generation is None:
+            conversation_generation = self.broker.get_conversation_generation(
+                connection_id, request.player_name, request.conversation_id
+            )
 
         logger.info(
             "processing_chat_request",
             worker_id=self.worker_id,
             connection_id=str(connection_id),
             player=request.player_name,
+            conversation_id=request.conversation_id,
             content_length=len(request.content),
         )
 
         message_history: list[ModelMessage] | None = None
         if request.use_context:
             raw_history = self.broker.get_conversation_history(
-                connection_id, request.player_name
+                connection_id, request.player_name, request.conversation_id
             )
             message_history, cleared_count = self._strip_reasoning_content(raw_history)
             logger.debug(
@@ -155,6 +167,7 @@ class AgentWorker:
                 worker_id=self.worker_id,
                 connection_id=str(connection_id),
                 player=request.player_name,
+                conversation_id=request.conversation_id,
                 history_message_count=len(message_history),
                 cleared_reasoning_content_count=cleared_count,
             )
@@ -166,7 +179,7 @@ class AgentWorker:
                 return None
 
             history = self.broker.get_conversation_history(
-                connection_id, request.player_name
+                connection_id, request.player_name, request.conversation_id
             )
             message_count = len(history) if history else 0
             # 简单估算：平均每条消息 100 tokens
@@ -297,7 +310,7 @@ class AgentWorker:
 
                 if event.metadata and event.metadata.get("is_complete"):
                     all_messages = event.metadata.get("all_messages")
-                    if request.use_context and isinstance(all_messages, list):
+                    if isinstance(all_messages, list):
                         if self.broker.get_response_queue(connection_id) is not None:
                             trimmed_history = self._trim_history(
                                 all_messages,
@@ -306,34 +319,49 @@ class AgentWorker:
                             trimmed_history, cleared_count = self._strip_reasoning_content(
                                 trimmed_history
                             )
-                            self.broker.set_conversation_history(
+                            history_updated = self.broker.set_conversation_history(
                                 connection_id,
                                 request.player_name,
                                 trimmed_history,
+                                request.conversation_id,
+                                expected_generation=conversation_generation,
                             )
-                            logger.debug(
-                                "chat_history_updated",
-                                worker_id=self.worker_id,
-                                connection_id=str(connection_id),
-                                player=request.player_name,
-                                history_message_count=len(trimmed_history),
-                                cleared_reasoning_content_count=cleared_count,
-                            )
-
-                            # 自动压缩检查：当对话历史超过阈值的 80% 时自动压缩
-                            from core.conversation import get_conversation_manager
-
-                            conv_manager = get_conversation_manager(self.broker, self.settings)
-                            compressed, msg = await conv_manager.check_and_compress(
-                                connection_id, request.player_name
-                            )
-                            if compressed:
+                            if history_updated:
                                 logger.debug(
-                                    "auto_compression_triggered",
+                                    "chat_history_updated",
                                     worker_id=self.worker_id,
                                     connection_id=str(connection_id),
                                     player=request.player_name,
-                                    message=msg,
+                                    conversation_id=request.conversation_id,
+                                    history_message_count=len(trimmed_history),
+                                    cleared_reasoning_content_count=cleared_count,
+                                )
+
+                                # 自动压缩检查：当对话历史超过阈值的 80% 时自动压缩
+                                from core.conversation import get_conversation_manager
+
+                                conv_manager = get_conversation_manager(self.broker, self.settings)
+                                compressed, msg = await conv_manager.check_and_compress(
+                                    connection_id,
+                                    request.player_name,
+                                    force=False,
+                                    conversation_id=request.conversation_id,
+                                )
+                                if compressed:
+                                    logger.debug(
+                                        "auto_compression_triggered",
+                                        worker_id=self.worker_id,
+                                        connection_id=str(connection_id),
+                                        player=request.player_name,
+                                        message=msg,
+                                    )
+                            else:
+                                logger.info(
+                                    "chat_history_stale_write_skipped",
+                                    worker_id=self.worker_id,
+                                    connection_id=str(connection_id),
+                                    player=request.player_name,
+                                    conversation_id=request.conversation_id,
                                 )
 
                     response_text = "".join(response_parts)
