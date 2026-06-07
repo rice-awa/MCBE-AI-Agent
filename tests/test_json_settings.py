@@ -174,6 +174,51 @@ def test_runtime_settings_reject_incomplete_config_json(tmp_path, monkeypatch):
     assert "server.port" in message
 
 
+def test_minecraft_commands_merge_defaults_with_user_config(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    write_json_config(
+        tmp_path,
+        {
+            "minecraft": {
+                "commands": {
+                    "#登录": "login",
+                    "AGENT 聊天": {
+                        "type": "chat",
+                        "aliases": ["自定义聊天"],
+                        "description": "用户自定义聊天",
+                        "usage": "<自定义内容>",
+                    },
+                    "运行命令": {
+                        "type": "run_command",
+                        "aliases": ["cmd"],
+                        "description": "执行游戏命令",
+                        "usage": "<命令>",
+                    },
+                    "帮助": {
+                        "type": "help",
+                        "aliases": ["help"],
+                        "description": "显示帮助",
+                        "usage": None,
+                    },
+                }
+            }
+        },
+    )
+
+    settings = Settings()
+    handler = MinecraftProtocolHandler(settings.minecraft)
+
+    assert "AGENT 对话" in settings.minecraft.commands
+    assert handler.parse_command("AGENT 对话 list") == ("conversation", "list")
+    assert settings.minecraft.commands["AGENT 聊天"] == {
+        "type": "chat",
+        "aliases": ["自定义聊天"],
+        "description": "用户自定义聊天",
+        "usage": "<自定义内容>",
+    }
+    assert handler.parse_command("自定义聊天 hello") == ("chat", "hello")
+
+
 def test_minecraft_protocol_uses_injected_config():
     settings = Settings(
         minecraft={

@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 from websockets.server import WebSocketServerProtocol
 
-from core.queue import MessageBroker
+from core.queue import DEFAULT_CONVERSATION_ID, MessageBroker
 from models.messages import StreamChunk
 from models.minecraft import MinecraftCommand
 from models.agent import MCColor, MCPrefix
@@ -28,6 +28,7 @@ class PlayerSession:
     current_provider: str | None = None
     current_template: str = "default"
     custom_variables: dict[str, str] = field(default_factory=dict)
+    active_conversation_id: str = DEFAULT_CONVERSATION_ID
 
 
 @dataclass

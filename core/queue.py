@@ -15,15 +15,38 @@ logger = get_logger(__name__)
 # 全局占位玩家名：当请求未携带玩家身份时使用，确保仍能落到独立的桶里。
 DEFAULT_PLAYER_KEY = "__anonymous__"
 
-# 会话键: (connection_id, player_name)
-SessionKey = tuple[UUID, str]
+# 默认对话名：未显式新建/切换对话时使用。
+DEFAULT_CONVERSATION_ID = "default"
+
+# 对话历史键: (connection_id, player_name, conversation_id)
+SessionKey = tuple[UUID, str, str]
+# 会话锁键: (connection_id, player_name)
+SessionLockKey = tuple[UUID, str]
 
 
-def make_session_key(connection_id: UUID, player_name: str | None) -> SessionKey:
-    """生成会话键。player_name 为空时回落到匿名键。"""
-    if not player_name:
-        return (connection_id, DEFAULT_PLAYER_KEY)
-    return (connection_id, player_name)
+def normalize_conversation_id(conversation_id: str | None) -> str:
+    """标准化对话 ID，空值回落到默认对话。"""
+    value = (conversation_id or DEFAULT_CONVERSATION_ID).strip()
+    return value or DEFAULT_CONVERSATION_ID
+
+
+def make_session_key(
+    connection_id: UUID,
+    player_name: str | None,
+    conversation_id: str | None = None,
+) -> SessionKey:
+    """生成对话历史键。player_name 为空时回落到匿名键。"""
+    player = player_name or DEFAULT_PLAYER_KEY
+    return (connection_id, player, normalize_conversation_id(conversation_id))
+
+
+def make_session_lock_key(
+    connection_id: UUID,
+    player_name: str | None,
+) -> SessionLockKey:
+    """生成会话锁键。player_name 为空时回落到匿名键。"""
+    player = player_name or DEFAULT_PLAYER_KEY
+    return (connection_id, player)
 
 
 @dataclass(order=True)
@@ -43,7 +66,8 @@ class MessageBroker:
     架构:
     - 请求队列 (共享): WS Handler -> Agent Worker
     - 响应队列 (每连接): Agent Worker -> WS Handler
-    - 对话历史 / 串行锁: 按 (connection_id, player_name) 复合键分桶
+    - 对话历史: 按 (连接, 玩家, 对话) 复合键分桶
+    - 串行锁: 按 (连接, 玩家) 复合键分桶
 
     这种设计确保:
     1. LLM 请求不阻塞 WS 消息处理
@@ -59,11 +83,12 @@ class MessageBroker:
         )
         # 响应队列: Agent -> WS (每个连接一个；下行不区分玩家，由 Addon 端按 player 路由)
         self._response_queues: dict[UUID, asyncio.Queue[Any]] = {}
-        # 对话历史: 按 (连接, 玩家) 存储 pydantic-ai message_history
+        # 对话历史: 按 (连接, 玩家, 对话) 存储 pydantic-ai message_history
         self._conversation_histories: dict[SessionKey, list[ModelMessage]] = {}
+        self._conversation_generations: dict[SessionKey, int] = {}
         # 会话锁: 保证同一 (连接, 玩家) 的请求按顺序处理；
         # 不同玩家可在同一连接上并行。
-        self._session_locks: dict[SessionKey, asyncio.Lock] = {}
+        self._session_locks: dict[SessionLockKey, asyncio.Lock] = {}
         # 序列号计数器
         self._sequence = 0
         # 锁
@@ -209,18 +234,51 @@ class MessageBroker:
         self,
         connection_id: UUID,
         player_name: str | None,
+        conversation_id: str | None = None,
     ) -> asyncio.Lock:
-        """获取 (连接, 玩家) 级锁；同一玩家串行，跨玩家并行。"""
-        key = make_session_key(connection_id, player_name)
+        """获取 (连接, 玩家) 级锁；同一玩家跨对话串行，跨玩家并行。"""
+        key = make_session_lock_key(connection_id, player_name)
         return self._session_locks.setdefault(key, asyncio.Lock())
+
+    def get_conversation_generation(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        conversation_id: str | None = None,
+    ) -> int:
+        """获取对话桶版本，用于避免过期请求覆盖后续管理命令。"""
+        key = make_session_key(connection_id, player_name, conversation_id)
+        return self._conversation_generations.get(key, 0)
+
+    def ensure_conversation(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        conversation_id: str | None = None,
+    ) -> None:
+        """确保对话桶存在，便于后续管理命令更新版本。"""
+        key = make_session_key(connection_id, player_name, conversation_id)
+        self._conversation_histories.setdefault(key, [])
+        self._conversation_generations.setdefault(key, 0)
+
+    def conversation_exists(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        conversation_id: str | None = None,
+    ) -> bool:
+        """判断对话桶是否已存在，即使历史为空也算存在。"""
+        key = make_session_key(connection_id, player_name, conversation_id)
+        return key in self._conversation_histories
 
     def get_conversation_history(
         self,
         connection_id: UUID,
         player_name: str | None,
+        conversation_id: str | None = None,
     ) -> list[ModelMessage]:
-        """获取 (连接, 玩家) 维度的对话历史副本。"""
-        key = make_session_key(connection_id, player_name)
+        """获取 (连接, 玩家, 对话) 维度的对话历史副本。"""
+        key = make_session_key(connection_id, player_name, conversation_id)
         history = self._conversation_histories.get(key, [])
         return list(history)
 
@@ -229,24 +287,70 @@ class MessageBroker:
         connection_id: UUID,
         player_name: str | None,
         history: list[ModelMessage],
-    ) -> None:
-        """更新 (连接, 玩家) 维度的对话历史。"""
-        key = make_session_key(connection_id, player_name)
+        conversation_id: str | None = None,
+        expected_generation: int | None = None,
+    ) -> bool:
+        """更新 (连接, 玩家, 对话) 维度的对话历史。"""
+        key = make_session_key(connection_id, player_name, conversation_id)
+        current_generation = self._conversation_generations.get(key, 0)
+        if expected_generation is not None and current_generation != expected_generation:
+            return False
         self._conversation_histories[key] = list(history)
+        self._conversation_generations[key] = current_generation + 1
+        return True
 
     def clear_conversation_history(
         self,
         connection_id: UUID,
         player_name: str | None,
+        conversation_id: str | None = None,
     ) -> None:
-        """清理 (连接, 玩家) 维度的对话历史。"""
-        key = make_session_key(connection_id, player_name)
+        """清理 (连接, 玩家, 对话) 维度的对话历史。"""
+        key = make_session_key(connection_id, player_name, conversation_id)
         self._conversation_histories.pop(key, None)
+        self._conversation_generations[key] = self._conversation_generations.get(key, 0) + 1
+
+    def clear_player_conversation_histories(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+    ) -> None:
+        """清理某玩家在当前连接下的全部运行时对话历史。"""
+        player = player_name or DEFAULT_PLAYER_KEY
+        history_keys = [
+            key for key in self._conversation_histories
+            if key[0] == connection_id and key[1] == player
+        ]
+        generation_keys = [
+            key for key in self._conversation_generations
+            if key[0] == connection_id and key[1] == player
+        ]
+        for key in set(history_keys + generation_keys):
+            self._conversation_histories.pop(key, None)
+            self._conversation_generations[key] = self._conversation_generations.get(key, 0) + 1
+
+    def list_player_conversations(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+    ) -> list[tuple[str, int]]:
+        """列出某玩家在当前连接下的运行时对话及消息数。"""
+        player = player_name or DEFAULT_PLAYER_KEY
+        conversations: dict[str, int] = {}
+        for cid, pname, conversation_id in self._conversation_histories.keys():
+            if cid == connection_id and pname == player:
+                conversations[conversation_id] = len(
+                    self._conversation_histories[(cid, pname, conversation_id)]
+                )
+        for cid, pname in self._session_locks.keys():
+            if cid == connection_id and pname == player:
+                conversations.setdefault(DEFAULT_CONVERSATION_ID, 0)
+        return sorted(conversations.items())
 
     def list_session_players(self, connection_id: UUID) -> list[str]:
         """列出某连接下所有有过历史/锁的玩家名（不含匿名占位）。"""
         names: set[str] = set()
-        for cid, player in self._conversation_histories.keys():
+        for cid, player, _conversation_id in self._conversation_histories.keys():
             if cid == connection_id and player != DEFAULT_PLAYER_KEY:
                 names.add(player)
         for cid, player in self._session_locks.keys():
@@ -259,6 +363,10 @@ class MessageBroker:
         history_keys = [key for key in self._conversation_histories if key[0] == connection_id]
         for key in history_keys:
             self._conversation_histories.pop(key, None)
+
+        generation_keys = [key for key in self._conversation_generations if key[0] == connection_id]
+        for key in generation_keys:
+            self._conversation_generations.pop(key, None)
 
         lock_keys = [key for key in self._session_locks if key[0] == connection_id]
         for key in lock_keys:

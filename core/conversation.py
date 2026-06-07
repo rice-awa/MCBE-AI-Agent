@@ -24,6 +24,7 @@ class ConversationMetadata(BaseModel):
 
     connection_id: str
     player_name: str | None = None
+    conversation_id: str = "default"
     provider: str = "deepseek"
     model: str = "deepseek-chat"
     created_at: datetime = Field(default_factory=datetime.now)
@@ -38,6 +39,7 @@ class SavedConversation(BaseModel):
 
     connection_id: str
     player_name: str | None = None
+    conversation_id: str = "default"
     provider: str
     model: str
     created_at: datetime
@@ -85,6 +87,7 @@ class ConversationManager:
         self,
         connection_id: UUID,
         player_name: str | None,
+        conversation_id: str | bool | None = None,
         force: bool = False,
     ) -> tuple[bool, str]:
         """
@@ -98,7 +101,11 @@ class ConversationManager:
         Returns:
             (是否执行了压缩, 描述信息)
         """
-        history = self.broker.get_conversation_history(connection_id, player_name)
+        if isinstance(conversation_id, bool):
+            force = conversation_id
+            conversation_id = None
+
+        history = self.broker.get_conversation_history(connection_id, player_name, conversation_id)
         threshold = self._get_compression_threshold()
 
         if not history:
@@ -109,9 +116,13 @@ class ConversationManager:
 
         if force:
             # 强制模式下，尝试提取摘要（即使轮数少于阈值）
-            return await self.compress_history(connection_id, player_name, force=True)
+            return await self.compress_history(
+                connection_id, player_name, force=True, conversation_id=conversation_id
+            )
         elif turns >= threshold:
-            return await self.compress_history(connection_id, player_name)
+            return await self.compress_history(
+                connection_id, player_name, conversation_id=conversation_id
+            )
 
         return False, f"当前 {turns} 轮，未达到压缩阈值 {threshold} 轮"
 
@@ -119,6 +130,7 @@ class ConversationManager:
         self,
         connection_id: UUID,
         player_name: str | None,
+        conversation_id: str | bool | None = None,
         force: bool = False,
     ) -> tuple[bool, str]:
         """
@@ -138,7 +150,11 @@ class ConversationManager:
         Returns:
             (是否成功, 描述信息)
         """
-        history = self.broker.get_conversation_history(connection_id, player_name)
+        if isinstance(conversation_id, bool):
+            force = conversation_id
+            conversation_id = None
+
+        history = self.broker.get_conversation_history(connection_id, player_name, conversation_id)
         max_turns = self.settings.max_history_turns
         threshold = self._get_compression_threshold()
 
@@ -164,7 +180,9 @@ class ConversationManager:
             if summary_message:
                 truncated.insert(0, summary_message)
 
-        self.broker.set_conversation_history(connection_id, player_name, truncated)
+        self.broker.set_conversation_history(
+            connection_id, player_name, truncated, conversation_id
+        )
 
         new_turns = self._count_turns(truncated)
         logger.info(
@@ -294,6 +312,7 @@ class ConversationManager:
         player_name: str | None = None,
         provider: str | None = None,
         model: str | None = None,
+        conversation_id: str | None = None,
         template: str = "default",
         custom_variables: dict[str, str] | None = None,
     ) -> tuple[bool, str]:
@@ -311,7 +330,7 @@ class ConversationManager:
         Returns:
             (是否成功, 消息/会话ID)
         """
-        history = self.broker.get_conversation_history(connection_id, player_name)
+        history = self.broker.get_conversation_history(connection_id, player_name, conversation_id)
 
         if not history:
             return False, "对话历史为空，无法保存"
@@ -322,13 +341,14 @@ class ConversationManager:
             messages_json_str = messages_json_bytes.decode("utf-8")
 
             # 生成会话ID
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            session_id = f"{connection_id}_{timestamp}"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            session_id = f"{connection_id}_{timestamp}_{uuid4().hex[:8]}"
 
             # 构建保存数据
             saved_data = {
                 "connection_id": str(connection_id),
                 "player_name": player_name,
+                "conversation_id": conversation_id or "default",
                 "provider": provider or self.settings.default_provider,
                 "model": model or self.settings.get_provider_config(
                     provider or self.settings.default_provider
@@ -339,6 +359,7 @@ class ConversationManager:
                 "messages": json.loads(messages_json_str),
                 "metadata": {
                     "template": template,
+                    "conversation_id": conversation_id or "default",
                     "custom_variables": custom_variables or {},
                 },
             }
@@ -430,6 +451,7 @@ class ConversationManager:
         connection_id: UUID,
         session_id: str,
         player_name: str | None = None,
+        conversation_id: str | None = None,
     ) -> tuple[bool, str]:
         """
         恢复对话到指定连接
@@ -450,17 +472,18 @@ class ConversationManager:
         messages = result if isinstance(result, list) else []
 
         # 设置到 broker（按 player_name 分桶）
-        self.broker.set_conversation_history(connection_id, player_name, messages)
+        self.broker.set_conversation_history(connection_id, player_name, messages, conversation_id)
 
         logger.info(
             "conversation_restored",
             connection_id=str(connection_id),
             player=player_name,
+            conversation_id=conversation_id,
             session_id=session_id,
             message_count=len(messages),
         )
 
-        return True, f"已恢复会话 {session_id}，共 {len(messages)} 条消息"
+        return True, f"已恢复会话 {session_id} 到对话 {conversation_id or 'default'}，共 {len(messages)} 条消息"
 
     async def list_conversations(self) -> list[dict]:
         """
@@ -481,6 +504,7 @@ class ConversationManager:
                     {
                         "session_id": file_path.stem,
                         "player_name": data.get("player_name"),
+                        "conversation_id": data.get("conversation_id", data.get("metadata", {}).get("conversation_id", "default")),
                         "provider": data.get("provider"),
                         "model": data.get("model"),
                         "created_at": data.get("created_at"),
@@ -552,17 +576,15 @@ class ConversationManager:
         for i, conv in enumerate(conversations[:limit]):
             session_id = conv.get("session_id", "unknown")
             player = conv.get("player_name", "未知玩家")
+            conversation_id = conv.get("conversation_id", "default")
             provider = conv.get("provider", "deepseek")
             model = conv.get("model", "")
             count = conv.get("message_count", 0)
             updated = conv.get("updated_at", "")[:16]  # 只取日期时间
 
-            # 简化 session_id 显示
-            display_id = session_id.split("_")[1] if "_" in session_id else session_id[:8]
-
             lines.append(
-                f"{i + 1}. [{display_id}] {player} | {provider}/{model} | "
-                f"{count}条消息 | {updated}"
+                f"{i + 1}. [{session_id}] {player} | {provider}/{model} | "
+                f"对话:{conversation_id} | {count}条消息 | {updated}"
             )
 
         if len(conversations) > limit:

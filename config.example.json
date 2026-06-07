@@ -68,14 +68,20 @@
       "AGENT 保存": {
         "type": "save",
         "aliases": ["AGENT save", "AI save"],
-        "description": "保存对话历史",
+        "description": "保存当前对话历史",
         "usage": null
+      },
+      "AGENT 对话": {
+        "type": "conversation",
+        "aliases": ["AGENT conv", "AGENT conversation", "AI 对话", "AI conv"],
+        "description": "管理对话",
+        "usage": "<new/switch/clear/status/list/save/restore>"
       },
       "AGENT 上下文": {
         "type": "context",
         "aliases": ["AGENT context", "AI 上下文", "AI context"],
-        "description": "管理上下文",
-        "usage": "<启用/关闭/状态/清除/压缩/保存/恢复/列表/删除>"
+        "description": "管理上下文开关",
+        "usage": "<启用/关闭/状态>"
       },
       "AGENT 模板": {
         "type": "template",
