@@ -102,17 +102,17 @@ def test_message_broker_history_per_conversation_isolation() -> None:
     assert broker.get_conversation_history(connection_id, "alice", "build-plan") != []
 
 
-def test_session_lock_per_conversation() -> None:
-    """同一玩家的不同对话使用不同锁，避免切换对话后互相阻塞。"""
+def test_session_lock_per_player_across_conversations() -> None:
+    """同一玩家跨不同对话使用同一把锁；不同玩家使用不同锁，可并行。"""
     broker = MessageBroker()
     connection_id = uuid4()
 
     default_lock = broker.get_session_lock(connection_id, "alice", "default")
-    default_lock_again = broker.get_session_lock(connection_id, "alice", "default")
-    other_lock = broker.get_session_lock(connection_id, "alice", "build-plan")
+    other_conversation_lock = broker.get_session_lock(connection_id, "alice", "build-plan")
+    bob_lock = broker.get_session_lock(connection_id, "bob", "default")
 
-    assert default_lock is default_lock_again
-    assert default_lock is not other_lock
+    assert default_lock is other_conversation_lock
+    assert default_lock is not bob_lock
 
 def test_session_lock_per_player() -> None:
     """同一玩家拿到同一把锁；不同玩家拿到不同锁，可并行。"""
@@ -125,6 +125,25 @@ def test_session_lock_per_player() -> None:
 
     assert lock_alice is lock_alice_again
     assert lock_alice is not lock_bob
+
+def test_conversation_generation_blocks_stale_history_write() -> None:
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    generation = broker.get_conversation_generation(connection_id, "alice", "default")
+    broker.clear_conversation_history(connection_id, "alice", "default")
+
+    updated = broker.set_conversation_history(
+        connection_id,
+        "alice",
+        _build_turn(1),
+        "default",
+        expected_generation=generation,
+    )
+
+    assert updated is False
+    assert broker.get_conversation_history(connection_id, "alice", "default") == []
+
 
 class _ReasoningNode:
     def __init__(self, reasoning_content: str) -> None:
@@ -232,3 +251,80 @@ def test_worker_tool_events_should_not_be_sent_twice(monkeypatch) -> None:
 
     assert [chunk.chunk_type for chunk in chunks] == ["tool_call", "tool_result", "content"]
     assert [chunk.sequence for chunk in chunks] == [0, 1, 2]
+
+
+def test_worker_persists_completed_history_when_context_disabled(monkeypatch) -> None:
+    """use_context=False 时不读取历史，但完成事件仍应写回当前 conversation 历史。"""
+
+    import asyncio
+    from types import SimpleNamespace
+
+    from config.settings import Settings
+    from models.messages import ChatRequest
+
+    broker = MessageBroker()
+    connection_id = uuid4()
+    broker.register_connection(connection_id)
+    broker.set_conversation_history(
+        connection_id,
+        "alice",
+        _build_turn(1),
+        "old-conversation",
+    )
+
+    worker = AgentWorker(
+        broker=broker,
+        settings=Settings(max_history_turns=5),
+        worker_id=1,
+    )
+
+    captured_message_history = object()
+    completed_messages = _build_turn(2)
+
+    class _FakeManager:
+        def get_agent(self):
+            return object()
+
+    async def _fake_stream_chat(*args, **kwargs):
+        nonlocal captured_message_history
+        captured_message_history = kwargs.get("message_history")
+        yield SimpleNamespace(
+            event_type="content",
+            content="完成",
+            metadata={"is_complete": True, "all_messages": completed_messages},
+        )
+
+    async def _fake_check_and_compress(*args, **kwargs):
+        return False, "not compressed"
+
+    monkeypatch.setattr("services.agent.worker.stream_chat", _fake_stream_chat)
+    monkeypatch.setattr("services.agent.core.get_agent_manager", lambda: _FakeManager())
+    monkeypatch.setattr("services.agent.worker.ProviderRegistry.get_model", lambda *_: object())
+    monkeypatch.setattr(
+        "core.conversation.ConversationManager.check_and_compress",
+        _fake_check_and_compress,
+    )
+
+    request = ChatRequest(
+        connection_id=connection_id,
+        player_name="alice",
+        content="test",
+        use_context=False,
+        conversation_id="current-conversation",
+    )
+    asyncio.run(worker._process_request_locked(request, connection_id))
+
+    assert captured_message_history is None
+    current_history = broker.get_conversation_history(
+        connection_id,
+        "alice",
+        "current-conversation",
+    )
+    old_history = broker.get_conversation_history(
+        connection_id,
+        "alice",
+        "old-conversation",
+    )
+    assert len(current_history) == 2
+    assert current_history[0].parts[0].content == "user-2"
+    assert old_history[0].parts[0].content == "user-1"

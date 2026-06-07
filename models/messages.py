@@ -25,6 +25,7 @@ class ChatRequest(BaseMessage):
     provider: str | None = None  # 可选指定 LLM 提供商
     delivery: Literal["tellraw", "scriptevent"] = "tellraw"
     conversation_id: str = "default"
+    conversation_generation: int = 0
 
 
 class ChatResponse(BaseMessage):
