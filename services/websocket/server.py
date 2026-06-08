@@ -557,21 +557,31 @@ class WebSocketServer:
                 )
             session.active_conversation_id = new_id
             self.broker.set_conversation_history(state.id, actor, [], new_id)
-            return self.protocol_handler.create_success_message(f"已新建并切换到对话: {new_id}")
+            metadata = self.broker.ensure_conversation_metadata(state.id, actor, new_id)
+            return self.protocol_handler.create_success_message(
+                f"已新建并切换到对话: #{metadata.short_id} {new_id}"
+            )
         elif action in ("switch", "切换"):
             if not arg:
                 return self.protocol_handler.create_error_message(
                     "请指定要切换的对话 ID\n用法: AGENT 对话 switch <ID>"
                 )
-            target_id = normalize_conversation_id(arg)
+            resolved_id = self.broker.resolve_conversation_short_id(state.id, actor, arg)
+            target_id = normalize_conversation_id(resolved_id or arg)
+            was_existing = self.broker.conversation_exists(state.id, actor, target_id)
+            if not was_existing:
+                self.broker.set_conversation_history(state.id, actor, [], target_id)
             session.active_conversation_id = target_id
             history = self.broker.get_conversation_history(state.id, actor, target_id)
-            if not self.broker.conversation_exists(state.id, actor, target_id):
-                self.broker.set_conversation_history(state.id, actor, [], target_id)
             turns = self._count_conversation_turns(history)
-            return self.protocol_handler.create_success_message(
-                f"已切换到对话: {target_id}（{turns}轮）"
+            metadata = self.broker.ensure_conversation_metadata(state.id, actor, target_id)
+            display_id = f"#{metadata.short_id} {target_id}"
+            message = (
+                f"已切换到对话: {display_id}（{turns}轮）"
+                if was_existing
+                else f"已创建并切换到新会话: {display_id}"
             )
+            return self.protocol_handler.create_success_message(message)
         elif action in ("clear", "清除"):
             self.broker.clear_conversation_history(state.id, actor, conversation_id)
             self.broker.set_conversation_history(state.id, actor, [], conversation_id)
@@ -593,10 +603,19 @@ class WebSocketServer:
             live_conversations.setdefault(conversation_id, len(
                 self.broker.get_conversation_history(state.id, actor, conversation_id)
             ))
+            for conv_id in live_conversations:
+                self.broker.ensure_conversation_metadata(state.id, actor, conv_id)
             lines = ["当前连接内对话:"]
-            for conv_id, message_count in sorted(live_conversations.items()):
+            for metadata in self.broker.list_player_conversation_metadata(state.id, actor):
+                conv_id = metadata.conversation_id
+                message_count = live_conversations.get(conv_id, len(
+                    self.broker.get_conversation_history(state.id, actor, conv_id)
+                ))
                 marker = " *" if conv_id == conversation_id else ""
-                lines.append(f"• {conv_id}{marker} - {message_count} 条消息")
+                title = metadata.title or "未命名"
+                lines.append(
+                    f"• #{metadata.short_id} {conv_id}{marker} - {title} - {message_count} 条消息"
+                )
             return self.protocol_handler.create_info_message("\n".join(lines))
         elif action in ("压缩", "compress"):
             success, result = await conv_manager.check_and_compress(

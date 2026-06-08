@@ -12,6 +12,7 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, Thin
 from core.queue import MessageBroker
 from services.agent.core import stream_chat, _extract_exception_details
 from services.agent.providers import ProviderRegistry
+from services.agent.title import generate_conversation_title
 from services.addon.service import get_addon_bridge_service
 from models.messages import ChatRequest, StreamChunk
 from models.agent import (
@@ -51,6 +52,8 @@ class AgentWorker:
         self._running = False
         self._http_client: httpx.AsyncClient | None = None
         self._task: asyncio.Task | None = None
+        self._title_tasks: set[asyncio.Task] = set()
+        self.run_title_generation_inline = False
 
     async def start(self) -> None:
         """启动 Worker"""
@@ -76,6 +79,13 @@ class AgentWorker:
                 await self._task
             except asyncio.CancelledError:
                 pass
+
+        if self._title_tasks:
+            title_tasks = list(self._title_tasks)
+            for task in title_tasks:
+                task.cancel()
+            await asyncio.gather(*title_tasks, return_exceptions=True)
+            self._title_tasks.clear()
 
         if self._http_client:
             await self._http_client.aclose()
@@ -337,6 +347,22 @@ class AgentWorker:
                                     cleared_reasoning_content_count=cleared_count,
                                 )
 
+                                if (
+                                    self._count_user_prompts(trimmed_history) == 1
+                                    and self.broker.mark_conversation_title_generating(
+                                        connection_id,
+                                        request.player_name,
+                                        request.conversation_id,
+                                    )
+                                ):
+                                    await self._schedule_title_generation(
+                                        connection_id,
+                                        request.player_name,
+                                        request.conversation_id,
+                                        request.content,
+                                        model,
+                                    )
+
                                 # 自动压缩检查：当对话历史超过阈值的 80% 时自动压缩
                                 from core.conversation import get_conversation_manager
 
@@ -453,6 +479,93 @@ class AgentWorker:
                 exc_info=True,
             )
             await self._send_error_chunk(connection_id, error_detail, sequence)
+
+    async def _generate_title_for_conversation(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        conversation_id: str | None,
+        first_user_message: str,
+        model: object,
+    ) -> None:
+        """为首轮完成后的对话生成标题。"""
+        try:
+            title = await generate_conversation_title(first_user_message, model)
+            if not self.broker.has_connection(connection_id):
+                return
+            self.broker.set_conversation_title(
+                connection_id,
+                player_name,
+                conversation_id,
+                title,
+            )
+            logger.info(
+                "conversation_title_generated",
+                worker_id=self.worker_id,
+                connection_id=str(connection_id),
+                player=player_name,
+                conversation_id=conversation_id,
+                title=title,
+            )
+        except Exception as e:
+            if self.broker.has_connection(connection_id):
+                self.broker.mark_conversation_title_failed(
+                    connection_id,
+                    player_name,
+                    conversation_id,
+                )
+            logger.warning(
+                "conversation_title_generation_failed",
+                worker_id=self.worker_id,
+                connection_id=str(connection_id),
+                player=player_name,
+                conversation_id=conversation_id,
+                error=str(e),
+                exc_info=True,
+            )
+
+    async def _schedule_title_generation(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        conversation_id: str | None,
+        first_user_message: str,
+        model: object,
+    ) -> None:
+        """调度对话标题生成；测试可切换为内联执行。"""
+        if self.run_title_generation_inline:
+            await self._generate_title_for_conversation(
+                connection_id,
+                player_name,
+                conversation_id,
+                first_user_message,
+                model,
+            )
+            return
+
+        task = asyncio.create_task(
+            self._generate_title_for_conversation(
+                connection_id,
+                player_name,
+                conversation_id,
+                first_user_message,
+                model,
+            )
+        )
+        self._title_tasks.add(task)
+        task.add_done_callback(self._title_tasks.discard)
+
+    @staticmethod
+    def _count_user_prompts(history: list[ModelMessage]) -> int:
+        """统计历史中包含用户提示部分的消息数量。"""
+        return sum(
+            1
+            for message in history
+            if any(
+                getattr(part, "part_kind", None) == "user-prompt"
+                for part in getattr(message, "parts", [])
+            )
+        )
 
     @staticmethod
     def _trim_history(

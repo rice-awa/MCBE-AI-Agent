@@ -1,8 +1,10 @@
 """对话管理器测试"""
 
 import asyncio
+import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -44,6 +46,7 @@ class MockBroker:
     def __init__(self):
         self._histories = {}
         self._generations = {}
+        self._titles = {}
 
     @staticmethod
     def _key(connection_id, player_name, conversation_id="default"):
@@ -69,6 +72,19 @@ class MockBroker:
         self._histories[key] = list(history or [])
         self._generations[key] = current_generation + 1
         return True
+
+    def get_conversation_metadata(self, connection_id, player_name=None, conversation_id="default"):
+        conversation_id = conversation_id or "default"
+        title = self._titles.get(self._key(connection_id, player_name, conversation_id))
+        return SimpleNamespace(
+            title=title,
+            short_id=1,
+            title_status="ready" if title else "pending",
+            conversation_id=conversation_id,
+        )
+
+    def set_conversation_title(self, connection_id, player_name, conversation_id, title):
+        self._titles[self._key(connection_id, player_name, conversation_id)] = title
 
     def clear_conversation_history(self, connection_id, player_name=None, conversation_id="default"):
         key = self._key(connection_id, player_name, conversation_id)
@@ -571,6 +587,39 @@ async def test_save_and_restore_compressed_summary_message(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_save_conversation_persists_runtime_title():
+    """测试保存对话时持久化运行时标题"""
+    settings = Settings()
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+
+    connection_id = uuid4()
+    player_name = "Builder"
+    conversation_id = "default"
+
+    messages = _build_multi_turn(1)
+    broker.set_conversation_history(connection_id, player_name, messages, conversation_id)
+    broker.set_conversation_title(connection_id, player_name, conversation_id, "建筑计划")
+
+    success, session_id = await manager.save_conversation(
+        connection_id=connection_id,
+        player_name=player_name,
+        conversation_id=conversation_id,
+    )
+
+    assert success is True
+
+    test_file = manager._storage_dir / f"{session_id}.json"
+    try:
+        data = json.loads(test_file.read_text(encoding="utf-8"))
+        assert data["title"] == "建筑计划"
+        assert data["metadata"]["title"] == "建筑计划"
+    finally:
+        if test_file.exists():
+            test_file.unlink()
+
+
+@pytest.mark.asyncio
 async def test_delete_conversation():
     """测试删除对话"""
     settings = Settings()
@@ -608,6 +657,8 @@ async def test_format_conversation_list():
         {
             "session_id": "test_session_1",
             "player_name": "Player1",
+            "conversation_id": "default",
+            "title": "建筑计划",
             "provider": "deepseek",
             "model": "deepseek-chat",
             "created_at": "2026-02-15T10:00:00",
@@ -626,8 +677,44 @@ async def test_format_conversation_list():
     ]
 
     result = manager.format_conversation_list(conversations)
+    assert "建筑计划" in result
+    assert "未命名" in result
     assert "Player1" in result
     assert "Player2" in result
+
+
+@pytest.mark.asyncio
+async def test_list_conversations_reads_legacy_metadata_title():
+    """测试旧保存文件没有顶层标题时仍读取 metadata.title。"""
+    settings = Settings()
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+    session_id = f"legacy_{uuid4().hex}"
+    test_file = manager._storage_dir / f"{session_id}.json"
+    test_file.write_text(
+        json.dumps(
+            {
+                "player_name": "Player1",
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "created_at": "2026-02-15T10:00:00",
+                "updated_at": "2026-02-15T10:30:00",
+                "message_count": 10,
+                "metadata": {"title": "旧标题", "conversation_id": "legacy"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        conversations = await manager.list_conversations()
+        legacy = next(item for item in conversations if item["session_id"] == session_id)
+        assert legacy["title"] == "旧标题"
+        assert legacy["conversation_id"] == "legacy"
+    finally:
+        if test_file.exists():
+            test_file.unlink()
 
 
 @pytest.mark.asyncio
