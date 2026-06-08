@@ -30,6 +30,7 @@ class ConversationMetadata(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     message_count: int = 0
+    title: str | None = None
     template: str = "default"
     custom_variables: dict[str, str] = Field(default_factory=dict)
 
@@ -45,6 +46,7 @@ class SavedConversation(BaseModel):
     created_at: datetime
     updated_at: datetime
     message_count: int
+    title: str | None = None
     messages: list[dict] = Field(default_factory=list)
     metadata: ConversationMetadata
 
@@ -344,11 +346,17 @@ class ConversationManager:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             session_id = f"{connection_id}_{timestamp}_{uuid4().hex[:8]}"
 
+            metadata = self.broker.get_conversation_metadata(
+                connection_id, player_name, conversation_id
+            )
+            title = metadata.title or "未命名"
+
             # 构建保存数据
             saved_data = {
                 "connection_id": str(connection_id),
                 "player_name": player_name,
                 "conversation_id": conversation_id or "default",
+                "title": title,
                 "provider": provider or self.settings.default_provider,
                 "model": model or self.settings.get_provider_config(
                     provider or self.settings.default_provider
@@ -358,6 +366,7 @@ class ConversationManager:
                 "message_count": len(history),
                 "messages": json.loads(messages_json_str),
                 "metadata": {
+                    "title": title,
                     "template": template,
                     "conversation_id": conversation_id or "default",
                     "custom_variables": custom_variables or {},
@@ -505,6 +514,7 @@ class ConversationManager:
                         "session_id": file_path.stem,
                         "player_name": data.get("player_name"),
                         "conversation_id": data.get("conversation_id", data.get("metadata", {}).get("conversation_id", "default")),
+                        "title": data.get("title", data.get("metadata", {}).get("title")),
                         "provider": data.get("provider"),
                         "model": data.get("model"),
                         "created_at": data.get("created_at"),
@@ -577,13 +587,14 @@ class ConversationManager:
             session_id = conv.get("session_id", "unknown")
             player = conv.get("player_name", "未知玩家")
             conversation_id = conv.get("conversation_id", "default")
+            title = conv.get("title") or "未命名"
             provider = conv.get("provider", "deepseek")
             model = conv.get("model", "")
             count = conv.get("message_count", 0)
             updated = conv.get("updated_at", "")[:16]  # 只取日期时间
 
             lines.append(
-                f"{i + 1}. [{session_id}] {player} | {provider}/{model} | "
+                f"{i + 1}. [{session_id}] {title} | {player} | {provider}/{model} | "
                 f"对话:{conversation_id} | {count}条消息 | {updated}"
             )
 
