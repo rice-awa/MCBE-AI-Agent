@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +17,74 @@ def write_env(tmp_path, content):
     path = tmp_path / ".env"
     path.write_text(content, encoding="utf-8")
     return path
+
+
+def test_agent_compression_settings_loaded_from_json(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    write_json_config(
+        tmp_path,
+        {
+            "agent": {
+                "compression_enabled": False,
+                "compression_trigger_ratio": 0.6,
+                "compression_keep_recent_turns": 3,
+                "compression_summary_max_chars": 777,
+                "compression_timeout": 12,
+            }
+        },
+    )
+
+    settings = Settings()
+
+    assert settings.compression_enabled is False
+    assert settings.compression_trigger_ratio == 0.6
+    assert settings.compression_keep_recent_turns == 3
+    assert settings.compression_summary_max_chars == 777
+    assert settings.compression_timeout == 12
+
+
+def test_agent_compression_settings_are_optional_in_runtime_config(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SECRET_KEY", "test-secret")
+    monkeypatch.setenv("WEBSOCKET_PASSWORD", "test-password")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-deepseek")
+    get_settings.cache_clear()
+    data = json.loads(Path(__file__).resolve().parents[1].joinpath("config.example.json").read_text())
+    for key in list(data["agent"]):
+        if key.startswith("compression_"):
+            data["agent"].pop(key)
+    write_json_config(tmp_path, data)
+
+    settings = get_settings()
+
+    assert settings.compression_enabled is True
+    assert settings.compression_trigger_ratio == 0.8
+    assert settings.compression_keep_recent_turns == 8
+    assert settings.compression_summary_max_chars == 2000
+    assert settings.compression_timeout == 30
+
+
+def test_agent_compression_settings_validate_ranges(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    write_json_config(
+        tmp_path,
+        {
+            "agent": {
+                "compression_trigger_ratio": 0,
+                "compression_keep_recent_turns": -1,
+                "compression_summary_max_chars": 0,
+                "compression_timeout": 0,
+            }
+        },
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        Settings()
+
+    message = str(exc_info.value)
+    assert "compression_trigger_ratio" in message
+    assert "compression_summary_max_chars" in message
+    assert "compression_timeout" in message
 
 
 def test_settings_loads_plain_values_from_config_json(tmp_path, monkeypatch):
