@@ -595,6 +595,7 @@ class WebSocketServer:
             return self.protocol_handler.create_info_message(
                 f"当前对话: {conversation_id}"
                 f"\n对话轮数: {turns}/{self.settings.max_history_turns}"
+                f"\n压缩触发: {self._conversation_compression_status_text()}"
                 f"\n上下文携带: {context_status}"
             )
         elif action in ("list", "列表"):
@@ -618,7 +619,11 @@ class WebSocketServer:
             return self.protocol_handler.create_info_message("\n".join(lines))
         elif action in ("压缩", "compress"):
             success, result = await conv_manager.check_and_compress(
-                state.id, actor, force=True, conversation_id=conversation_id
+                state.id,
+                actor,
+                force=True,
+                conversation_id=conversation_id,
+                provider_name=session.current_provider or self.settings.default_provider,
             )
             return (
                 self.protocol_handler.create_success_message(result)
@@ -703,6 +708,15 @@ class WebSocketServer:
                         turns += 1
                         break
         return turns
+
+    def _conversation_compression_status_text(self) -> str:
+        if not self.settings.compression_enabled:
+            return "关闭"
+        threshold = max(
+            1,
+            int(self.settings.max_history_turns * self.settings.compression_trigger_ratio),
+        )
+        return f"{threshold}轮，保留最近{self.settings.compression_keep_recent_turns}轮"
 
     async def handle_switch_model(
         self, state: Any, provider: str, player_name: str | None = None

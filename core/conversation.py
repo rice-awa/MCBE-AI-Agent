@@ -1,22 +1,39 @@
 """对话管理器 - 管理对话历史、压缩和持久化存储"""
 
 import asyncio
+import inspect
 import json
-import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
 from uuid import UUID, uuid4
 
 import aiofiles
 from pydantic import BaseModel, Field
-from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
+from pydantic_ai import Agent
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelResponse,
+    UserPromptPart,
+)
 
 from config.logging import get_logger
 from config.settings import Settings
+from services.agent.providers import ProviderRegistry
 
 logger = get_logger(__name__)
+
+
+class CompressionResult(BaseModel):
+    compressed: bool
+    used_llm: bool = False
+    fallback_used: bool = False
+    original_turns: int = 0
+    new_turns: int = 0
+    summary: str = ""
+    message: str = ""
 
 
 class ConversationMetadata(BaseModel):
@@ -51,6 +68,153 @@ class SavedConversation(BaseModel):
     metadata: ConversationMetadata
 
 
+class ConversationCompressor:
+    """对话压缩器：分离历史、生成摘要、构造压缩后的 message_history。"""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    def count_turns(self, history: list[ModelMessage]) -> int:
+        turns = 0
+        for message in history:
+            for part in getattr(message, "parts", []):
+                if getattr(part, "part_kind", None) == "user-prompt":
+                    turns += 1
+                    break
+        return turns
+
+    def split_history(self, history: list[ModelMessage]) -> tuple[list[ModelMessage], list[ModelMessage]]:
+        return self._split_history_by_keep_turns(history, self.settings.compression_keep_recent_turns)
+
+    @staticmethod
+    def _split_history_by_keep_turns(
+        history: list[ModelMessage],
+        keep_turns: int,
+    ) -> tuple[list[ModelMessage], list[ModelMessage]]:
+        if keep_turns <= 0:
+            return list(history), []
+
+        user_turns = 0
+        cut_idx = len(history)
+        for idx in range(len(history) - 1, -1, -1):
+            message = history[idx]
+            if any(getattr(part, "part_kind", None) == "user-prompt" for part in getattr(message, "parts", [])):
+                user_turns += 1
+                if user_turns == keep_turns:
+                    cut_idx = idx
+                    break
+
+        if user_turns < keep_turns:
+            return [], list(history)
+        return list(history[:cut_idx]), list(history[cut_idx:])
+
+    def serialize_messages_for_summary(self, messages: list[ModelMessage]) -> str:
+        lines: list[str] = []
+        for message in messages:
+            role = self._message_role(message)
+            text_parts: list[str] = []
+            for part in getattr(message, "parts", []):
+                part_kind = getattr(part, "part_kind", None)
+                if part_kind == "thinking":
+                    continue
+                if part_kind in {"user-prompt", "text"}:
+                    content = str(getattr(part, "content", "") or "").strip()
+                    if content:
+                        text_parts.append(re.sub(r"\s+", " ", content))
+                elif part_kind == "tool-call":
+                    tool_name = getattr(part, "tool_name", "tool")
+                    text_parts.append(f"调用工具 {tool_name}")
+                elif part_kind == "tool-return":
+                    content = str(getattr(part, "content", "") or "").strip()
+                    if content:
+                        normalized_content = re.sub(r"\s+", " ", content)
+                        text_parts.append(f"工具返回 {normalized_content[:200]}")
+            if text_parts:
+                lines.append(f"{role}: {' '.join(text_parts)}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _message_role(message: ModelMessage) -> str:
+        if isinstance(message, ModelRequest):
+            return "用户"
+        if isinstance(message, ModelResponse):
+            return "AI"
+        return "消息"
+
+    def build_local_summary(self, messages: list[ModelMessage]) -> str:
+        text = self.serialize_messages_for_summary(messages)
+        if not text:
+            return ""
+
+        max_chars = self.settings.compression_summary_max_chars
+        if max_chars <= 0:
+            return ""
+
+        compact = re.sub(r"\s+", " ", text).strip()
+        summary = f"事实: 以下为较早对话的本地压缩摘要。{compact}"
+        if len(summary) <= max_chars:
+            return summary
+        if max_chars <= 3:
+            return "事实:"[:max_chars]
+        return summary[: max_chars - 3].rstrip() + "..."
+
+    async def build_llm_summary(
+        self,
+        messages: list[ModelMessage],
+        provider_name: str | None = None,
+    ) -> str:
+        source_text = self.serialize_messages_for_summary(messages)
+        if not source_text:
+            return ""
+
+        provider = provider_name or self.settings.default_provider
+        provider_config = self.settings.get_provider_config(provider)
+        model = ProviderRegistry.get_model(provider_config)
+        agent = Agent(
+            "openai:gpt-4o-mini",
+            instructions=self._summary_instructions(),
+            retries=1,
+        )
+        prompt = self._summary_prompt(source_text)
+
+        result = await asyncio.wait_for(
+            agent.run(prompt, model=model),
+            timeout=self.settings.compression_timeout,
+        )
+        output = self._extract_output_text(result).strip()
+        return output[: self.settings.compression_summary_max_chars].strip()
+
+    def _summary_instructions(self) -> str:
+        return (
+            "你是 Minecraft Bedrock AI 助手的对话压缩器。"
+            "只总结对后续回答有用的信息，不要编造。"
+            "输出中文，使用以下小标题中实际有内容的项：事实、玩家偏好、未完成任务、重要约束。"
+            "不要包含推理过程，不要输出 Markdown 表格。"
+        )
+
+    def _summary_prompt(self, source_text: str) -> str:
+        max_chars = self.settings.compression_summary_max_chars
+        return (
+            "请总结以下较早的 Minecraft AI 对话，供后续轮次作为历史摘要使用。\n"
+            f"摘要上限 {max_chars} 字。\n\n"
+            f"较早对话:\n{source_text}"
+        )
+
+    @staticmethod
+    def _extract_output_text(result: object) -> str:
+        for field_name in ("output", "data"):
+            if hasattr(result, field_name):
+                value = getattr(result, field_name)
+                return "" if value is None else str(value)
+        return str(result)
+
+    def create_summary_message(self, summary: str) -> ModelMessage | None:
+        if not summary.strip():
+            return None
+
+        return ModelRequest(parts=[UserPromptPart(content=f"[历史摘要]\n{summary.strip()}", part_kind="user-prompt")])
+
+
 class ConversationManager:
     """
     对话管理器 - 管理对话历史的压缩和持久化存储
@@ -62,9 +226,6 @@ class ConversationManager:
     - 列表/删除：管理已保存的对话
     """
 
-    # 压缩触发阈值比例
-    COMPRESSION_THRESHOLD_RATIO = 0.8
-
     def __init__(
         self,
         broker,
@@ -72,6 +233,7 @@ class ConversationManager:
     ):
         self.broker = broker
         self.settings = settings
+        self.compressor = ConversationCompressor(settings)
         self._storage_dir = Path("data/conversations")
         self._storage_dir.mkdir(parents=True, exist_ok=True)
 
@@ -83,7 +245,7 @@ class ConversationManager:
 
     def _get_compression_threshold(self) -> int:
         """获取压缩触发阈值"""
-        return int(self.settings.max_history_turns * self.COMPRESSION_THRESHOLD_RATIO)
+        return max(1, int(self.settings.max_history_turns * self.settings.compression_trigger_ratio))
 
     async def check_and_compress(
         self,
@@ -91,6 +253,7 @@ class ConversationManager:
         player_name: str | None,
         conversation_id: str | bool | None = None,
         force: bool = False,
+        provider_name: str | None = None,
     ) -> tuple[bool, str]:
         """
         检查是否需要压缩，必要时执行压缩
@@ -113,17 +276,27 @@ class ConversationManager:
         if not history:
             return False, "对话历史为空"
 
+        if not self.settings.compression_enabled and not force:
+            return False, "对话自动压缩已禁用"
+
         # 计算当前轮次
         turns = self._count_turns(history)
 
         if force:
             # 强制模式下，尝试提取摘要（即使轮数少于阈值）
             return await self.compress_history(
-                connection_id, player_name, force=True, conversation_id=conversation_id
+                connection_id,
+                player_name,
+                force=True,
+                conversation_id=conversation_id,
+                provider_name=provider_name,
             )
         elif turns >= threshold:
             return await self.compress_history(
-                connection_id, player_name, conversation_id=conversation_id
+                connection_id,
+                player_name,
+                conversation_id=conversation_id,
+                provider_name=provider_name,
             )
 
         return False, f"当前 {turns} 轮，未达到压缩阈值 {threshold} 轮"
@@ -134,6 +307,7 @@ class ConversationManager:
         player_name: str | None,
         conversation_id: str | bool | None = None,
         force: bool = False,
+        provider_name: str | None = None,
     ) -> tuple[bool, str]:
         """
         压缩对话历史 - 保留关键信息，删除冗余内容
@@ -157,57 +331,129 @@ class ConversationManager:
             conversation_id = None
 
         history = self.broker.get_conversation_history(connection_id, player_name, conversation_id)
-        max_turns = self.settings.max_history_turns
-        threshold = self._get_compression_threshold()
+        generation = self._get_conversation_generation(connection_id, player_name, conversation_id)
 
         if not history:
             return False, "对话历史为空"
 
         current_turns = self._count_turns(history)
 
-        # 强制模式下可以处理少于阈值的情况，用于提取摘要
-        if not force and current_turns <= threshold:
+        older_messages, recent_messages = self.compressor.split_history(history)
+        if not older_messages and not force:
             return False, f"当前 {current_turns} 轮，无需压缩"
+        if not older_messages:
+            return False, f"当前 {current_turns} 轮，无可压缩的旧历史"
 
-        # 保留最近 threshold 轮对话
-        truncated = self._truncate_to_turns(history, threshold)
+        summary = ""
+        used_llm = False
+        fallback_used = False
 
-        # 提取关键词摘要
-        summary = self._extract_summary(history, threshold)
+        if self.settings.compression_enabled and older_messages:
+            try:
+                summary = await self.compressor.build_llm_summary(
+                    older_messages,
+                    provider_name=provider_name,
+                )
+                used_llm = bool(summary)
+            except Exception as e:
+                fallback_used = True
+                logger.warning(
+                    "conversation_llm_compression_failed",
+                    connection_id=str(connection_id),
+                    player=player_name,
+                    conversation_id=conversation_id,
+                    error=str(e),
+                )
 
-        # 如果有摘要，添加到历史开头
-        if summary:
-            # 创建一个带有摘要的系统消息
-            summary_message = self._create_summary_message(summary)
-            if summary_message:
-                truncated.insert(0, summary_message)
+        if older_messages and not summary:
+            summary = self.compressor.build_local_summary(older_messages)
+            fallback_used = True
 
-        self.broker.set_conversation_history(
-            connection_id, player_name, truncated, conversation_id
+        compressed_history = list(recent_messages)
+        summary_message = self.compressor.create_summary_message(summary)
+        if summary_message:
+            compressed_history.insert(0, summary_message)
+
+        write_success = self._set_conversation_history(
+            connection_id,
+            player_name,
+            compressed_history,
+            conversation_id,
+            expected_generation=generation,
         )
+        if write_success is False:
+            logger.warning(
+                "conversation_compression_stale_generation",
+                connection_id=str(connection_id),
+                player=player_name,
+                conversation_id=conversation_id,
+                expected_generation=generation,
+            )
+            return False, "对话历史已更新，跳过过期压缩结果"
 
-        new_turns = self._count_turns(truncated)
+        new_turns = self._count_turns(compressed_history)
         logger.info(
             "conversation_compressed",
             connection_id=str(connection_id),
             player=player_name,
+            conversation_id=conversation_id,
             original_turns=current_turns,
             new_turns=new_turns,
             summary_length=len(summary),
+            used_llm=used_llm,
+            fallback_used=fallback_used,
         )
 
-        return True, f"压缩完成: {current_turns}轮 -> {new_turns}轮"
+        mode = "LLM摘要" if used_llm else "本地回退摘要"
+        return True, f"压缩完成({mode}): {current_turns}轮 -> {new_turns}轮"
+
+    def _get_conversation_generation(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        conversation_id: str | None,
+    ) -> int | None:
+        get_generation = getattr(self.broker, "get_conversation_generation", None)
+        if get_generation is None:
+            return None
+
+        return get_generation(connection_id, player_name, conversation_id)
+
+    def _set_conversation_history(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        history: list[ModelMessage],
+        conversation_id: str | None,
+        expected_generation: int | None = None,
+    ) -> bool | None:
+        set_history = self.broker.set_conversation_history
+        if self._supports_expected_generation(set_history):
+            return set_history(
+                connection_id,
+                player_name,
+                history,
+                conversation_id,
+                expected_generation=expected_generation,
+            )
+
+        return set_history(connection_id, player_name, history, conversation_id)
+
+    @staticmethod
+    def _supports_expected_generation(set_history) -> bool:
+        try:
+            signature = inspect.signature(set_history)
+        except (TypeError, ValueError):
+            return False
+
+        return (
+            "expected_generation" in signature.parameters
+            or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+        )
 
     def _count_turns(self, history: list[ModelMessage]) -> int:
         """计算对话轮次（用户提问次数）"""
-        turns = 0
-        for message in history:
-            # 检查是否是用户请求消息
-            for part in message.parts:
-                if getattr(part, "part_kind", None) == "user-prompt":
-                    turns += 1
-                    break
-        return turns
+        return self.compressor.count_turns(history)
 
     def _truncate_to_turns(
         self,
@@ -239,32 +485,8 @@ class ConversationManager:
 
     def _extract_summary(self, history: list[ModelMessage], keep_turns: int) -> str:
         """从历史中提取摘要信息"""
-        summary_parts = []
-
-        # 获取需要摘要的旧对话（排除保留的最近 N 轮）
-        old_history = self._truncate_to_turns(history, keep_turns)
-        if len(old_history) >= len(history):
-            return ""
-
-        older_messages = history[: len(history) - len(old_history)]
-
-        for message in older_messages:
-            # 提取用户问题关键词
-            if hasattr(message, "parts"):
-                for part in message.parts:
-                    if getattr(part, "part_kind", None) == "user-prompt":
-                        content = getattr(part, "content", "") or ""
-                        keywords = self._extract_keywords(content)
-                        if keywords:
-                            summary_parts.append(f"用户问: {keywords}")
-                    elif getattr(part, "part_kind", None) == "text":
-                        # AI 回复
-                        content = getattr(part, "content", "") or ""
-                        summary = self._summarize_text(content)
-                        if summary:
-                            summary_parts.append(f"AI答: {summary}")
-
-        return " | ".join(summary_parts[:10])  # 限制摘要长度
+        older, _recent = self.compressor._split_history_by_keep_turns(history, keep_turns)
+        return self.compressor.build_local_summary(older)
 
     def _extract_keywords(self, text: str) -> str:
         """提取文本关键词"""
@@ -293,17 +515,7 @@ class ConversationManager:
     def _create_summary_message(self, summary: str) -> ModelMessage | None:
         """创建摘要消息"""
         try:
-            # 使用 PydanticAI 的 ModelRequest 创建摘要消息
-            from pydantic_ai.messages import ModelRequest, UserPromptPart
-
-            return ModelRequest(
-                parts=[
-                    UserPromptPart(
-                        content=f"[历史摘要] {summary}",
-                        part_kind="user-prompt",
-                    )
-                ]
-            )
+            return self.compressor.create_summary_message(summary)
         except Exception as e:
             logger.warning("create_summary_message_failed", error=str(e))
             return None

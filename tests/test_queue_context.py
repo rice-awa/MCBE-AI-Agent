@@ -615,3 +615,56 @@ def test_worker_persists_completed_history_when_context_disabled(monkeypatch) ->
     assert len(current_history) == 2
     assert current_history[0].parts[0].content == "user-2"
     assert old_history[0].parts[0].content == "user-1"
+
+
+def test_worker_passes_request_provider_to_auto_compression(monkeypatch) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from config.settings import Settings
+    from models.messages import ChatRequest
+
+    broker = MessageBroker()
+    connection_id = uuid4()
+    broker.register_connection(connection_id)
+    worker = AgentWorker(broker=broker, settings=Settings(max_history_turns=5), worker_id=1)
+    completed_messages = []
+    for index in range(1, 8):
+        completed_messages.extend(_build_turn(index))
+    captured = {}
+
+    class _FakeManager:
+        def get_agent(self):
+            return object()
+
+    async def _fake_stream_chat(*args, **kwargs):
+        yield SimpleNamespace(
+            event_type="content",
+            content="完成",
+            metadata={"is_complete": True, "all_messages": completed_messages},
+        )
+
+    async def _fake_check_and_compress(self, *args, **kwargs):
+        captured.update(kwargs)
+        return False, "not compressed"
+
+    monkeypatch.setattr("services.agent.worker.stream_chat", _fake_stream_chat)
+    monkeypatch.setattr("services.agent.core.get_agent_manager", lambda: _FakeManager())
+    monkeypatch.setattr("services.agent.worker.ProviderRegistry.get_model", lambda *_: object())
+    monkeypatch.setattr(
+        "core.conversation.ConversationManager.check_and_compress",
+        _fake_check_and_compress,
+    )
+
+    request = ChatRequest(
+        connection_id=connection_id,
+        player_name="alice",
+        content="test",
+        use_context=True,
+        provider="anthropic",
+        conversation_id="build",
+    )
+    asyncio.run(worker._process_request_locked(request, connection_id))
+
+    assert captured["provider_name"] == "anthropic"
+    assert captured["conversation_id"] == "build"

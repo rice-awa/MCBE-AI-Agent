@@ -556,6 +556,14 @@ class Settings(BaseSettings):
     system_prompt: str = "请始终保持积极和专业的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown"
     enable_reasoning_output: bool = True
     max_history_turns: int = 20
+
+    # 对话压缩配置
+    compression_enabled: bool = True
+    compression_trigger_ratio: float = Field(default=0.8, gt=0, le=1)
+    compression_keep_recent_turns: int = Field(default=8, ge=0)
+    compression_summary_max_chars: int = Field(default=2000, gt=0)
+    compression_timeout: int = Field(default=30, gt=0)
+
     stream_sentence_mode: bool = Field(
         default=True,
         alias="STREAM_SENTENCE_MODE",

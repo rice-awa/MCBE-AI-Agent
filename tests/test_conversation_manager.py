@@ -3,11 +3,9 @@
 import asyncio
 import json
 import sys
-import os
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
-from datetime import datetime
 
 import pytest
 
@@ -47,6 +45,7 @@ class MockBroker:
 
     def __init__(self):
         self._histories = {}
+        self._generations = {}
         self._titles = {}
 
     @staticmethod
@@ -56,14 +55,23 @@ class MockBroker:
     def get_conversation_history(self, connection_id, player_name=None, conversation_id="default"):
         return list(self._histories.get(self._key(connection_id, player_name, conversation_id), []))
 
+    def get_conversation_generation(self, connection_id, player_name=None, conversation_id="default"):
+        return self._generations.get(self._key(connection_id, player_name, conversation_id), 0)
+
     def set_conversation_history(
-        self, connection_id, player_name, history=None, conversation_id="default"
+        self, connection_id, player_name, history=None, conversation_id="default", expected_generation=None
     ):
         # 兼容历史调用：若只传两个参数则视为旧 API，第二个参数即历史
         if history is None and isinstance(player_name, list):
             history = player_name
             player_name = None
-        self._histories[self._key(connection_id, player_name, conversation_id)] = list(history or [])
+        key = self._key(connection_id, player_name, conversation_id)
+        current_generation = self._generations.get(key, 0)
+        if expected_generation is not None and expected_generation != current_generation:
+            return False
+        self._histories[key] = list(history or [])
+        self._generations[key] = current_generation + 1
+        return True
 
     def get_conversation_metadata(self, connection_id, player_name=None, conversation_id="default"):
         conversation_id = conversation_id or "default"
@@ -79,7 +87,9 @@ class MockBroker:
         self._titles[self._key(connection_id, player_name, conversation_id)] = title
 
     def clear_conversation_history(self, connection_id, player_name=None, conversation_id="default"):
-        self._histories.pop(self._key(connection_id, player_name, conversation_id), None)
+        key = self._key(connection_id, player_name, conversation_id)
+        self._histories.pop(key, None)
+        self._generations[key] = self._generations.get(key, 0) + 1
 
 
 def test_conversation_manager_init():
@@ -125,6 +135,248 @@ def test_truncate_to_turns():
     assert truncated[-1].parts[0].content == "assistant-10"
 
 
+def test_split_history_for_compression_keeps_recent_turns():
+    settings = Settings(compression_keep_recent_turns=3)
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+
+    messages = _build_multi_turn(10)
+    older, recent = manager.compressor.split_history(messages)
+
+    assert manager._count_turns(older) == 7
+    assert manager._count_turns(recent) == 3
+    assert recent[0].parts[0].content == "user-8"
+    assert recent[-1].parts[0].content == "assistant-10"
+
+    short_messages = _build_multi_turn(2)
+    older, recent = manager.compressor.split_history(short_messages)
+    assert older == []
+    assert recent == short_messages
+
+    manager = ConversationManager(broker, Settings(compression_keep_recent_turns=0))
+    older, recent = manager.compressor.split_history(messages)
+    assert older == messages
+    assert recent == []
+
+
+def test_create_summary_message_uses_history_summary_marker():
+    settings = Settings()
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+
+    message = manager.compressor.create_summary_message("事实: 玩家在建房子")
+
+    assert isinstance(message, ModelRequest)
+    assert message.parts[0].part_kind == "user-prompt"
+    assert "[历史摘要]" in message.parts[0].content
+    assert "事实: 玩家在建房子" in message.parts[0].content
+
+
+def test_serialize_messages_for_summary_skips_thinking_parts():
+    from pydantic_ai.messages import ThinkingPart
+
+    settings = Settings()
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content="玩家想建一个城堡")]),
+        ModelResponse(parts=[ThinkingPart(content="hidden"), TextPart(content="建议先规划地基")]),
+    ]
+
+    text = manager.compressor.serialize_messages_for_summary(messages)
+
+    assert "用户: 玩家想建一个城堡" in text
+    assert "AI: 建议先规划地基" in text
+    assert "hidden" not in text
+
+
+def test_local_summary_is_structured_and_limited():
+    settings = Settings(compression_summary_max_chars=120)
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+    messages = _build_multi_turn(6)
+
+    summary = manager.compressor.build_local_summary(messages)
+
+    assert summary.startswith("事实:")
+    assert "user-1" in summary
+    assert len(summary) <= 120
+
+    for max_chars in (1, 2, 3):
+        manager = ConversationManager(broker, Settings(compression_summary_max_chars=max_chars))
+        summary = manager.compressor.build_local_summary(messages)
+        assert summary == "事实:"[:max_chars]
+        assert len(summary) <= max_chars
+
+
+@pytest.mark.asyncio
+async def test_llm_summary_uses_plain_agent_without_tools(monkeypatch):
+    settings = Settings(compression_summary_max_chars=2000)
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+    captured = {}
+
+    class FakeResult:
+        output = "事实: 玩家正在建城堡\n偏好: 喜欢石砖"
+
+    class FakeAgent:
+        def __init__(self, *args, **kwargs):
+            captured["agent_kwargs"] = kwargs
+
+        async def run(self, prompt, model=None):
+            captured["prompt"] = prompt
+            captured["model"] = model
+            return FakeResult()
+
+    def fake_get_model(config):
+        captured["provider_model"] = config.model
+        return "fake-model"
+
+    monkeypatch.setattr("core.conversation.Agent", FakeAgent)
+    monkeypatch.setattr("core.conversation.ProviderRegistry.get_model", fake_get_model)
+
+    summary = await manager.compressor.build_llm_summary(
+        messages=_build_multi_turn(2),
+        provider_name="deepseek",
+    )
+
+    assert summary == "事实: 玩家正在建城堡\n偏好: 喜欢石砖"
+    assert captured["model"] == "fake-model"
+    assert captured["provider_model"] == settings.deepseek_model
+    for key in ("toolsets", "tools", "deps_type"):
+        assert key not in captured["agent_kwargs"] or captured["agent_kwargs"][key] is None
+    assert "请总结以下较早的 Minecraft AI 对话" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_compress_history_writes_llm_summary_and_recent_turns(monkeypatch):
+    settings = Settings(
+        max_history_turns=20,
+        compression_enabled=True,
+        compression_keep_recent_turns=4,
+    )
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+    connection_id = uuid4()
+    broker.set_conversation_history(connection_id, "alice", _build_multi_turn(12), "build")
+
+    async def fake_llm_summary(messages, provider_name=None):
+        return "事实: 玩家在建城堡"
+
+    monkeypatch.setattr(manager.compressor, "build_llm_summary", fake_llm_summary)
+
+    success, msg = await manager.compress_history(
+        connection_id,
+        "alice",
+        conversation_id="build",
+        provider_name="deepseek",
+    )
+
+    history = broker.get_conversation_history(connection_id, "alice", "build")
+    assert success is True
+    assert "LLM" in msg
+    assert manager._count_turns(history) == 5
+    assert "[历史摘要]" in history[0].parts[0].content
+    assert "玩家在建城堡" in history[0].parts[0].content
+    assert history[1].parts[0].content == "user-9"
+
+
+@pytest.mark.asyncio
+async def test_compression_only_updates_target_player_conversation(monkeypatch):
+    settings = Settings(compression_keep_recent_turns=2)
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+    connection_id = uuid4()
+    broker.set_conversation_history(connection_id, "alice", _build_multi_turn(8), "build")
+    broker.set_conversation_history(connection_id, "bob", _build_multi_turn(4), "build")
+    broker.set_conversation_history(connection_id, "alice", _build_multi_turn(5), "redstone")
+
+    async def fake_llm_summary(messages, provider_name=None):
+        return "事实: alice build 被压缩"
+
+    monkeypatch.setattr(manager.compressor, "build_llm_summary", fake_llm_summary)
+
+    success, _msg = await manager.compress_history(
+        connection_id,
+        "alice",
+        conversation_id="build",
+        provider_name="deepseek",
+    )
+
+    assert success is True
+    assert (
+        "alice build 被压缩"
+        in broker.get_conversation_history(connection_id, "alice", "build")[0].parts[0].content
+    )
+    assert broker.get_conversation_history(connection_id, "bob", "build")[0].parts[0].content == "user-1"
+    assert broker.get_conversation_history(connection_id, "alice", "redstone")[0].parts[0].content == "user-1"
+
+
+@pytest.mark.asyncio
+async def test_compress_history_falls_back_to_local_summary(monkeypatch):
+    settings = Settings(
+        max_history_turns=20,
+        compression_enabled=True,
+        compression_keep_recent_turns=2,
+    )
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+    connection_id = uuid4()
+    broker.set_conversation_history(connection_id, "alice", _build_multi_turn(8), "build")
+
+    async def failing_llm_summary(messages, provider_name=None):
+        raise TimeoutError("summary timeout")
+
+    monkeypatch.setattr(manager.compressor, "build_llm_summary", failing_llm_summary)
+
+    success, msg = await manager.compress_history(
+        connection_id,
+        "alice",
+        conversation_id="build",
+        provider_name="deepseek",
+    )
+
+    history = broker.get_conversation_history(connection_id, "alice", "build")
+    assert success is True
+    assert "本地回退" in msg
+    assert manager._count_turns(history) == 3
+    assert "事实:" in history[0].parts[0].content
+
+
+@pytest.mark.asyncio
+async def test_compression_skips_stale_generation_write(monkeypatch):
+    settings = Settings(
+        max_history_turns=20,
+        compression_enabled=True,
+        compression_keep_recent_turns=4,
+    )
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+    connection_id = uuid4()
+    broker.set_conversation_history(connection_id, "alice", _build_multi_turn(12), "build")
+
+    async def fake_llm_summary(messages, provider_name=None):
+        broker.clear_conversation_history(connection_id, "alice", "build")
+        broker.set_conversation_history(connection_id, "alice", _build_multi_turn(1), "build")
+        return "事实: 这是一份过期摘要"
+
+    monkeypatch.setattr(manager.compressor, "build_llm_summary", fake_llm_summary)
+
+    success, msg = await manager.compress_history(
+        connection_id,
+        "alice",
+        conversation_id="build",
+        provider_name="deepseek",
+    )
+
+    history = broker.get_conversation_history(connection_id, "alice", "build")
+    assert success is False
+    assert "跳过过期压缩结果" in msg
+    assert manager._count_turns(history) == 1
+    assert history[0].parts[0].content == "user-1"
+    assert "[历史摘要]" not in history[0].parts[0].content
+
+
 def test_extract_keywords():
     """测试提取关键词"""
     settings = Settings()
@@ -160,16 +412,18 @@ def test_summarize_text():
 
 def test_extract_summary():
     """测试提取摘要"""
-    settings = Settings()
+    settings = Settings(compression_keep_recent_turns=20)
     broker = MockBroker()
     manager = ConversationManager(broker, settings)
 
-    # 构建3轮对话
     messages = _build_multi_turn(3)
 
-    # 提取摘要（保留2轮，所以1轮应该被摘要）
     summary = manager._extract_summary(messages, keep_turns=2)
-    assert "user-1" in summary or "assistant-1" in summary
+    assert summary.startswith("事实:")
+    assert "user-1" in summary
+    assert "assistant-1" in summary
+    assert "user-2" not in summary
+    assert "assistant-2" not in summary
 
 
 @pytest.mark.asyncio
@@ -227,8 +481,8 @@ async def test_check_and_compress_force():
 
     connection_id = uuid4()
 
-    # 只构建5轮对话
-    messages = _build_multi_turn(5)
+    # 构建10轮对话，超过默认保留的最近8轮，强制压缩可产生旧历史摘要
+    messages = _build_multi_turn(10)
     broker.set_conversation_history(connection_id, messages)
 
     # 强制压缩
@@ -236,6 +490,20 @@ async def test_check_and_compress_force():
 
     assert success is True
     assert "压缩完成" in msg
+
+
+@pytest.mark.asyncio
+async def test_check_and_compress_disabled_without_force():
+    settings = Settings(compression_enabled=False)
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+    connection_id = uuid4()
+    broker.set_conversation_history(connection_id, _build_multi_turn(25))
+
+    success, msg = await manager.check_and_compress(connection_id, None, force=False)
+
+    assert success is False
+    assert "已禁用" in msg
 
 
 @pytest.mark.asyncio
@@ -273,6 +541,46 @@ async def test_save_and_load_conversation():
     assert len(loaded_messages) == 6  # 3轮 * 2条消息
 
     # 清理测试文件
+    test_file = manager._storage_dir / f"{session_id}.json"
+    if test_file.exists():
+        test_file.unlink()
+
+
+@pytest.mark.asyncio
+async def test_save_and_restore_compressed_summary_message(monkeypatch):
+    settings = Settings(compression_keep_recent_turns=2)
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+    connection_id = uuid4()
+    player_name = "Alice"
+    broker.set_conversation_history(connection_id, player_name, _build_multi_turn(6), "build")
+
+    async def fake_llm_summary(messages, provider_name=None):
+        return "事实: 保存前已压缩"
+
+    monkeypatch.setattr(manager.compressor, "build_llm_summary", fake_llm_summary)
+    await manager.compress_history(connection_id, player_name, conversation_id="build")
+
+    success, session_id = await manager.save_conversation(
+        connection_id=connection_id,
+        player_name=player_name,
+        conversation_id="build",
+    )
+    assert success is True
+
+    broker.clear_conversation_history(connection_id, player_name, "build")
+    success, msg = await manager.restore_conversation(
+        connection_id,
+        session_id,
+        player_name=player_name,
+        conversation_id="build",
+    )
+
+    restored = broker.get_conversation_history(connection_id, player_name, "build")
+    assert success is True
+    assert "已恢复" in msg
+    assert "保存前已压缩" in restored[0].parts[0].content
+
     test_file = manager._storage_dir / f"{session_id}.json"
     if test_file.exists():
         test_file.unlink()
@@ -449,17 +757,15 @@ async def test_restore_conversation():
 
 
 def test_compression_threshold():
-    """测试压缩阈值计算"""
-    settings = Settings(max_history_turns=20)
+    settings = Settings(max_history_turns=20, compression_trigger_ratio=0.8)
     broker = MockBroker()
     manager = ConversationManager(broker, settings)
 
-    assert manager._get_compression_threshold() == 16  # 20 * 0.8
+    assert manager._get_compression_threshold() == 16
 
-    # 测试不同的阈值
-    settings = Settings(max_history_turns=10)
+    settings = Settings(max_history_turns=10, compression_trigger_ratio=0.6)
     manager = ConversationManager(broker, settings)
-    assert manager._get_compression_threshold() == 8  # 10 * 0.8
+    assert manager._get_compression_threshold() == 6
 
 
 def test_truncate_edge_cases():
