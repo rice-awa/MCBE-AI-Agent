@@ -346,6 +346,7 @@ class AgentWorker:
                                     request.player_name,
                                     force=False,
                                     conversation_id=request.conversation_id,
+                                    provider_name=provider_name,
                                 )
                                 if compressed:
                                     logger.debug(
