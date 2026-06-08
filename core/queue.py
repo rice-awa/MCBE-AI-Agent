@@ -491,6 +491,17 @@ class MessageBroker:
             self._conversation_histories.pop(key, None)
             self._conversation_generations[key] = self._conversation_generations.get(key, 0) + 1
 
+        metadata_keys = [
+            key for key in self._conversation_metadata
+            if key[0] == connection_id and key[1] == player
+        ]
+        for key in metadata_keys:
+            self._conversation_metadata.pop(key, None)
+
+        lock_key = make_session_lock_key(connection_id, player_name)
+        self._conversation_short_ids.pop(lock_key, None)
+        self._next_conversation_short_id.pop(lock_key, None)
+
     def list_player_conversations(
         self,
         connection_id: UUID,

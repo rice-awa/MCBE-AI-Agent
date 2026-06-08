@@ -152,12 +152,19 @@ def test_switch_model_clears_all_player_runtime_conversations(tmp_path, monkeypa
         broker.set_conversation_history(state.id, "alice", _build_turn(1), "default")
         broker.set_conversation_history(state.id, "alice", _build_turn(2), "other")
         broker.set_conversation_history(state.id, "bob", _build_turn(3), "default")
+        broker.set_conversation_title(state.id, "alice", "other", "旧标题")
 
         msg = await server._handle_switch_model_locked(state, "ollama", "alice")
+        new_msg = await server._handle_conversation_locked(state, "new fresh", "alice")
 
         assert "已切换" in msg.text
         assert broker.get_conversation_history(state.id, "alice", "default") == []
         assert broker.get_conversation_history(state.id, "alice", "other") == []
+        assert broker.list_player_conversation_metadata(state.id, "alice") == [
+            broker.get_conversation_metadata(state.id, "alice", "fresh")
+        ]
+        assert "#1 fresh" in new_msg.text
         assert broker.get_conversation_history(state.id, "bob", "default") != []
+        assert broker.resolve_conversation_short_id(state.id, "bob", "#1") == "default"
 
     asyncio.run(_run())
