@@ -102,6 +102,76 @@ def test_message_broker_history_per_conversation_isolation() -> None:
     assert broker.get_conversation_history(connection_id, "alice", "build-plan") != []
 
 
+def test_conversation_metadata_assigns_stable_short_ids_per_player() -> None:
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    alice_default = broker.ensure_conversation_metadata(connection_id, "alice", "default")
+    alice_build = broker.ensure_conversation_metadata(connection_id, "alice", "build-plan")
+    alice_default_again = broker.ensure_conversation_metadata(connection_id, "alice", "default")
+    bob_default = broker.ensure_conversation_metadata(connection_id, "bob", "default")
+
+    assert alice_default.short_id == 1
+    assert alice_build.short_id == 2
+    assert alice_default_again is alice_default
+    assert alice_default_again.short_id == 1
+    assert bob_default.short_id == 1
+
+
+def test_resolve_conversation_short_id_accepts_hash_and_plain_number() -> None:
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    broker.ensure_conversation_metadata(connection_id, "alice", "default")
+    build_metadata = broker.ensure_conversation_metadata(connection_id, "alice", "build-plan")
+
+    assert broker.resolve_conversation_short_id(connection_id, "alice", "#2") == "build-plan"
+    assert broker.resolve_conversation_short_id(connection_id, "alice", "2") == "build-plan"
+    assert broker.resolve_conversation_short_id(connection_id, "alice", "abc") is None
+    assert broker.resolve_conversation_short_id(connection_id, "alice", "#999") is None
+    assert broker.resolve_conversation_short_id(connection_id, "bob", str(build_metadata.short_id)) is None
+
+
+def test_list_player_conversation_metadata_includes_short_ids_and_titles() -> None:
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    broker.get_session_lock(connection_id, "alice")
+    broker.set_conversation_history(connection_id, "alice", _build_turn(1), "build-plan")
+    broker.set_conversation_title(connection_id, "alice", "build-plan", "Build Plan")
+    broker.set_conversation_history(connection_id, "alice", _build_turn(2), "redstone")
+    broker.set_conversation_title(connection_id, "alice", "redstone", "Redstone")
+    broker.ensure_conversation_metadata(connection_id, "alice", "metadata-only")
+    broker.set_conversation_history(connection_id, "bob", _build_turn(3), "bob-chat")
+
+    metadata = broker.list_player_conversation_metadata(connection_id, "alice")
+
+    assert [(item.conversation_id, item.short_id, item.title) for item in metadata] == [
+        ("build-plan", 1, "Build Plan"),
+        ("redstone", 2, "Redstone"),
+        ("metadata-only", 3, None),
+        ("default", 4, None),
+    ]
+    assert metadata[0].title_status == "ready"
+    assert metadata[1].title_status == "ready"
+    assert metadata[2].title_status == "pending"
+    assert metadata[3].title_status == "pending"
+
+
+def test_clear_connection_sessions_removes_conversation_metadata() -> None:
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    broker.set_conversation_history(connection_id, "alice", _build_turn(1), "build-plan")
+    broker.set_conversation_title(connection_id, "alice", "build-plan", "Build Plan")
+    assert broker.resolve_conversation_short_id(connection_id, "alice", "#1") == "build-plan"
+
+    broker.clear_connection_sessions(connection_id)
+
+    assert broker.list_player_conversation_metadata(connection_id, "alice") == []
+    assert broker.resolve_conversation_short_id(connection_id, "alice", "#1") is None
+
+
 def test_session_lock_per_player_across_conversations() -> None:
     """同一玩家跨不同对话使用同一把锁；不同玩家使用不同锁，可并行。"""
     broker = MessageBroker()
@@ -251,6 +321,223 @@ def test_worker_tool_events_should_not_be_sent_twice(monkeypatch) -> None:
 
     assert [chunk.chunk_type for chunk in chunks] == ["tool_call", "tool_result", "content"]
     assert [chunk.sequence for chunk in chunks] == [0, 1, 2]
+
+
+def test_worker_generates_title_after_first_completed_turn(monkeypatch) -> None:
+    """首轮完成并写回历史后，应生成并保存对话标题。"""
+
+    import asyncio
+    from types import SimpleNamespace
+
+    from config.settings import Settings
+    from models.messages import ChatRequest
+
+    broker = MessageBroker()
+    connection_id = uuid4()
+    broker.register_connection(connection_id)
+
+    worker = AgentWorker(
+        broker=broker,
+        settings=Settings(max_history_turns=5),
+        worker_id=1,
+    )
+    worker.run_title_generation_inline = True
+
+    completed_messages = _build_turn(1)
+    model = object()
+
+    class _FakeManager:
+        def get_agent(self):
+            return object()
+
+    async def _fake_stream_chat(*args, **kwargs):
+        yield SimpleNamespace(
+            event_type="content",
+            content="完成",
+            metadata={"is_complete": True, "all_messages": completed_messages},
+        )
+
+    async def _fake_generate_title(first_user_message, actual_model):
+        assert first_user_message == "first prompt"
+        assert actual_model is model
+        return "First Prompt"
+
+    async def _fake_check_and_compress(*args, **kwargs):
+        return False, "not compressed"
+
+    monkeypatch.setattr("services.agent.worker.stream_chat", _fake_stream_chat)
+    monkeypatch.setattr("services.agent.core.get_agent_manager", lambda: _FakeManager())
+    monkeypatch.setattr("services.agent.worker.ProviderRegistry.get_model", lambda *_: model)
+    monkeypatch.setattr("services.agent.worker.generate_conversation_title", _fake_generate_title)
+    monkeypatch.setattr(
+        "core.conversation.ConversationManager.check_and_compress",
+        _fake_check_and_compress,
+    )
+
+    request = ChatRequest(
+        connection_id=connection_id,
+        player_name="alice",
+        content="first prompt",
+        use_context=True,
+        conversation_id="current-conversation",
+    )
+    asyncio.run(worker._process_request_locked(request, connection_id))
+
+    metadata = broker.get_conversation_metadata(
+        connection_id,
+        "alice",
+        "current-conversation",
+    )
+    assert metadata.title == "First Prompt"
+    assert metadata.title_status == "ready"
+
+
+def test_worker_does_not_regenerate_title_after_later_turn(monkeypatch) -> None:
+    """已有标题或后续轮次不应再次触发标题生成。"""
+
+    import asyncio
+    from types import SimpleNamespace
+
+    from config.settings import Settings
+    from models.messages import ChatRequest
+
+    broker = MessageBroker()
+    connection_id = uuid4()
+    broker.register_connection(connection_id)
+    broker.set_conversation_title(
+        connection_id,
+        "alice",
+        "current-conversation",
+        "Existing Title",
+    )
+
+    worker = AgentWorker(
+        broker=broker,
+        settings=Settings(max_history_turns=5),
+        worker_id=1,
+    )
+    worker.run_title_generation_inline = True
+
+    completed_messages = []
+    completed_messages.extend(_build_turn(1))
+    completed_messages.extend(_build_turn(2))
+
+    class _FakeManager:
+        def get_agent(self):
+            return object()
+
+    async def _fake_stream_chat(*args, **kwargs):
+        yield SimpleNamespace(
+            event_type="content",
+            content="完成",
+            metadata={"is_complete": True, "all_messages": completed_messages},
+        )
+
+    async def _fake_generate_title(*args, **kwargs):
+        raise AssertionError("title generator should not be called")
+
+    async def _fake_check_and_compress(*args, **kwargs):
+        return False, "not compressed"
+
+    monkeypatch.setattr("services.agent.worker.stream_chat", _fake_stream_chat)
+    monkeypatch.setattr("services.agent.core.get_agent_manager", lambda: _FakeManager())
+    monkeypatch.setattr("services.agent.worker.ProviderRegistry.get_model", lambda *_: object())
+    monkeypatch.setattr("services.agent.worker.generate_conversation_title", _fake_generate_title)
+    monkeypatch.setattr(
+        "core.conversation.ConversationManager.check_and_compress",
+        _fake_check_and_compress,
+    )
+
+    request = ChatRequest(
+        connection_id=connection_id,
+        player_name="alice",
+        content="second prompt",
+        use_context=True,
+        conversation_id="current-conversation",
+    )
+    asyncio.run(worker._process_request_locked(request, connection_id))
+
+    metadata = broker.get_conversation_metadata(
+        connection_id,
+        "alice",
+        "current-conversation",
+    )
+    assert metadata.title == "Existing Title"
+    assert metadata.title_status == "ready"
+
+
+def test_worker_does_not_write_title_after_connection_cleanup(monkeypatch) -> None:
+    """标题后台任务完成时连接已注销，不应重建已清理的元数据。"""
+
+    import asyncio
+
+    from config.settings import Settings
+
+    broker = MessageBroker()
+    connection_id = uuid4()
+    broker.register_connection(connection_id)
+    broker.mark_conversation_title_generating(connection_id, "alice", "current-conversation")
+    broker.unregister_connection(connection_id)
+
+    worker = AgentWorker(
+        broker=broker,
+        settings=Settings(max_history_turns=5),
+        worker_id=1,
+    )
+
+    async def _fake_generate_title(*args, **kwargs):
+        return "Late Title"
+
+    monkeypatch.setattr("services.agent.worker.generate_conversation_title", _fake_generate_title)
+
+    asyncio.run(
+        worker._generate_title_for_conversation(
+            connection_id,
+            "alice",
+            "current-conversation",
+            "first prompt",
+            object(),
+        )
+    )
+
+    assert broker.list_player_conversation_metadata(connection_id, "alice") == []
+
+
+def test_worker_does_not_mark_title_failed_after_connection_cleanup(monkeypatch) -> None:
+    """标题生成失败时连接已注销，不应重建已清理的元数据。"""
+
+    import asyncio
+
+    from config.settings import Settings
+
+    broker = MessageBroker()
+    connection_id = uuid4()
+    broker.register_connection(connection_id)
+    broker.mark_conversation_title_generating(connection_id, "alice", "current-conversation")
+    broker.unregister_connection(connection_id)
+
+    worker = AgentWorker(
+        broker=broker,
+        settings=Settings(max_history_turns=5),
+        worker_id=1,
+    )
+
+    async def _fake_generate_title(*args, **kwargs):
+        raise RuntimeError("late failure")
+
+    monkeypatch.setattr("services.agent.worker.generate_conversation_title", _fake_generate_title)
+
+    asyncio.run(
+        worker._generate_title_for_conversation(
+            connection_id,
+            "alice",
+            "current-conversation",
+            "first prompt",
+            object(),
+        )
+    )
+
+    assert broker.list_player_conversation_metadata(connection_id, "alice") == []
 
 
 def test_worker_persists_completed_history_when_context_disabled(monkeypatch) -> None:
