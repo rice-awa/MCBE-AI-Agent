@@ -13,11 +13,28 @@ from pathlib import Path
 from typing import Any, Literal
 
 import websockets
-from websockets.server import WebSocketServerProtocol, serve
-
-from models.minecraft import MinecraftMessage
 
 Direction = Literal["client_to_server", "server_to_client", "server_to_replay_client"]
+
+
+class RecorderLogger:
+    def __init__(self, component: str) -> None:
+        self.component = component
+
+    def info(self, log_event: str, **fields: Any) -> None:
+        self._emit("INFO", log_event, fields)
+
+    def warning(self, log_event: str, **fields: Any) -> None:
+        self._emit("WARN", log_event, fields)
+
+    def error(self, log_event: str, **fields: Any) -> None:
+        self._emit("ERROR", log_event, fields)
+
+    def _emit(self, level: str, log_event: str, fields: dict[str, Any]) -> None:
+        timestamp = datetime.now().isoformat(timespec="milliseconds")
+        details = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+        suffix = f" {details}" if details else ""
+        print(f"[{timestamp}] [{level}] [{self.component}] {log_event}{suffix}")
 
 
 @dataclass
@@ -64,14 +81,19 @@ class PacketRecord:
         if not binary:
             try:
                 data = json.loads(message)
-                minecraft_message = MinecraftMessage.model_validate(data)
-                header = minecraft_message.header.model_dump(exclude_none=True)
-                body = minecraft_message.body
                 json_valid = True
-                request_id = header.get("requestId")
-                message_purpose = header.get("messagePurpose")
-                event_name = header.get("eventName") or header.get("EventName")
-            except Exception as exc:
+                if isinstance(data, dict):
+                    raw_header = data.get("header")
+                    raw_body = data.get("body", data)
+                    header = raw_header if isinstance(raw_header, dict) else None
+                    body = raw_body if isinstance(raw_body, dict) else {"value": raw_body}
+                    if header is not None:
+                        request_id = header.get("requestId")
+                        message_purpose = header.get("messagePurpose")
+                        event_name = header.get("eventName") or header.get("EventName")
+                else:
+                    body = {"value": data}
+            except json.JSONDecodeError as exc:
                 parse_error = error or f"JSON parse failed: {exc}"
 
         return cls(
@@ -232,18 +254,37 @@ class ProxyRecorder:
         self.listen_port = listen_port
         self.target = target
         self.out_dir = Path(out_dir)
+        self.logger = RecorderLogger("record")
 
     async def start(self) -> None:
-        async with serve(self._handle_client, self.listen_host, self.listen_port, ping_interval=None):
-            print(f"[recorder] 代理已启动: ws://{self.listen_host}:{self.listen_port}")
-            print(f"[recorder] 转发目标: {self.target}")
+        async with websockets.serve(
+            self._handle_client,
+            self.listen_host,
+            self.listen_port,
+            ping_interval=None,
+        ):
+            self.logger.info(
+                "proxy_started",
+                listen=f"ws://{self.listen_host}:{self.listen_port}",
+                target=self.target,
+                out=self.out_dir,
+            )
             await asyncio.Future()
 
     async def _handle_client(self, client_ws: WebSocketServerProtocol) -> None:
         recorder = SessionRecorder(self.out_dir, mode="record")
-        print(f"[recorder] 新会话: {recorder.session_dir}")
+        client_remote = getattr(client_ws, "remote_address", None)
+        self.logger.info(
+            "client_connected",
+            session=recorder.session_id,
+            client=client_remote,
+            target=self.target,
+            dir=recorder.session_dir,
+        )
         try:
+            self.logger.info("target_connecting", session=recorder.session_id, target=self.target)
             async with websockets.connect(self.target, ping_interval=None) as server_ws:
+                self.logger.info("target_connected", session=recorder.session_id, target=self.target)
                 client_to_server = asyncio.create_task(
                     self._forward(
                         source=client_ws,
@@ -273,11 +314,25 @@ class ProxyRecorder:
                     exc = task.exception()
                     if exc is not None:
                         await recorder.record_error(str(exc))
+                        self.logger.error("forward_task_failed", session=recorder.session_id, error=exc)
         except Exception as exc:
             await recorder.record_error(f"目标服务端连接失败或会话异常: {exc}")
+            self.logger.error(
+                "target_connect_failed",
+                session=recorder.session_id,
+                target=self.target,
+                error=exc,
+            )
         finally:
             await recorder.close()
-            print(f"[recorder] 会话结束: {recorder.session_dir}")
+            self.logger.info(
+                "session_closed",
+                session=recorder.session_id,
+                packets=len(recorder.records),
+                bytes=recorder.total_bytes,
+                errors=len(recorder.errors),
+                dir=recorder.session_dir,
+            )
 
     async def _forward(
         self,
@@ -290,12 +345,31 @@ class ProxyRecorder:
     ) -> None:
         try:
             async for message in source:
-                await recorder.record_message(direction=direction, path=path, message=message)
+                record = await recorder.record_message(direction=direction, path=path, message=message)
+                self.logger.info(
+                    "packet_forwarded",
+                    session=recorder.session_id,
+                    seq=record.seq,
+                    direction=direction,
+                    bytes=record.bytes,
+                    json=record.json_valid,
+                    purpose=record.message_purpose,
+                    event=record.event_name,
+                    request_id=record.request_id,
+                )
                 await target.send(message)
-        except websockets.exceptions.ConnectionClosed:
+        except websockets.exceptions.ConnectionClosed as exc:
+            self.logger.info(
+                "endpoint_closed",
+                session=recorder.session_id,
+                direction=direction,
+                code=getattr(exc, "code", None),
+                reason=getattr(exc, "reason", None),
+            )
             return
         except Exception as exc:
             await recorder.record_error(f"{direction} 转发失败: {exc}")
+            self.logger.error("packet_forward_failed", session=recorder.session_id, direction=direction, error=exc)
             raise
 
 
@@ -305,14 +379,24 @@ class ReplayClient:
         self.target = target
         self.speed = speed
         self.out_dir = Path(out_dir)
+        self.logger = RecorderLogger("replay")
 
     async def run(self) -> None:
         packets = load_replay_packets(self.input_path)
         recorder = SessionRecorder(self.out_dir, mode="replay")
-        print(f"[replay] 会话目录: {recorder.session_dir}")
+        self.logger.info(
+            "replay_started",
+            session=recorder.session_id,
+            input=self.input_path,
+            target=self.target,
+            speed=self.speed,
+            packets=len(packets),
+            dir=recorder.session_dir,
+        )
         receiver: asyncio.Task[None] | None = None
         try:
             async with websockets.connect(self.target, ping_interval=None) as websocket:
+                self.logger.info("target_connected", session=recorder.session_id, target=self.target)
                 receiver = asyncio.create_task(self._receive_responses(websocket, recorder))
                 previous: PacketRecord | None = None
                 for packet in packets:
@@ -320,31 +404,66 @@ class ReplayClient:
                     if delay > 0:
                         await asyncio.sleep(delay)
                     await websocket.send(packet.raw)
-                    await recorder.record_message(
+                    record = await recorder.record_message(
                         direction="client_to_server",
                         path="replay->server",
                         message=packet.raw or "",
+                    )
+                    self.logger.info(
+                        "packet_replayed",
+                        session=recorder.session_id,
+                        source_seq=packet.seq,
+                        seq=record.seq,
+                        bytes=record.bytes,
+                        delay=f"{delay:.3f}s",
+                        purpose=record.message_purpose,
+                        event=record.event_name,
+                        request_id=record.request_id,
                     )
                     previous = packet
                 await asyncio.sleep(0.2)
         except Exception as exc:
             await recorder.record_error(f"回放异常: {exc}")
+            self.logger.error("replay_failed", session=recorder.session_id, target=self.target, error=exc)
         finally:
             if receiver is not None:
                 receiver.cancel()
                 await asyncio.gather(receiver, return_exceptions=True)
             await recorder.close()
-            print(f"[replay] 回放完成: {recorder.session_dir}")
+            self.logger.info(
+                "replay_closed",
+                session=recorder.session_id,
+                packets=len(recorder.records),
+                bytes=recorder.total_bytes,
+                errors=len(recorder.errors),
+                dir=recorder.session_dir,
+            )
 
     async def _receive_responses(self, websocket: Any, recorder: SessionRecorder) -> None:
         try:
             async for message in websocket:
-                await recorder.record_message(
+                record = await recorder.record_message(
                     direction="server_to_replay_client",
                     path="server->replay",
                     message=message,
                 )
-        except websockets.exceptions.ConnectionClosed:
+                self.logger.info(
+                    "response_received",
+                    session=recorder.session_id,
+                    seq=record.seq,
+                    bytes=record.bytes,
+                    json=record.json_valid,
+                    purpose=record.message_purpose,
+                    event=record.event_name,
+                    request_id=record.request_id,
+                )
+        except websockets.exceptions.ConnectionClosed as exc:
+            self.logger.info(
+                "target_closed",
+                session=recorder.session_id,
+                code=getattr(exc, "code", None),
+                reason=getattr(exc, "reason", None),
+            )
             return
 
 

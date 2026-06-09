@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -6,7 +7,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tools_mcbe_ws_recorder import PacketRecord, RecorderLogger, SessionRecorder, load_replay_packets, replay_delay
+import tools_mcbe_ws_recorder
+from tools_mcbe_ws_recorder import PacketRecord, ProxyRecorder, RecorderLogger, SessionRecorder, load_replay_packets, replay_delay
 
 
 def test_packet_record_preserves_json_text_frame() -> None:
@@ -43,7 +45,46 @@ def test_packet_record_preserves_json_text_frame() -> None:
     assert record.elapsed_ms == 250
 
 
-def test_packet_record_keeps_invalid_json_text_frame() -> None:
+def test_packet_record_accepts_result_handshake_json() -> None:
+    record = PacketRecord.from_message(
+        seq=1,
+        started_at=0.0,
+        now=0.0,
+        direction="server_to_client",
+        path="server->proxy->mcbe",
+        message='{"Result": "true"}',
+    )
+
+    assert record.json_valid is True
+    assert record.header is None
+    assert record.body == {"Result": "true"}
+    assert record.message_purpose is None
+    assert record.error is None
+
+
+def test_packet_record_accepts_command_response_json() -> None:
+    raw = json.dumps(
+        {
+            "header": {"requestId": "req-2", "messagePurpose": "commandResponse"},
+            "body": {"statusCode": 0},
+        }
+    )
+
+    record = PacketRecord.from_message(
+        seq=1,
+        started_at=0.0,
+        now=0.0,
+        direction="client_to_server",
+        path="mcbe->proxy->server",
+        message=raw,
+    )
+
+    assert record.json_valid is True
+    assert record.header == {"requestId": "req-2", "messagePurpose": "commandResponse"}
+    assert record.body == {"statusCode": 0}
+    assert record.request_id == "req-2"
+    assert record.message_purpose == "commandResponse"
+    assert record.error is None
     record = PacketRecord.from_message(
         seq=1,
         started_at=10.0,
@@ -122,6 +163,12 @@ async def test_session_recorder_writes_jsonl_json_and_summary(tmp_path: Path) ->
     json_rows = json.loads((session_dir / "packets.json").read_text(encoding="utf-8"))
     summary = (session_dir / "SUMMARY.md").read_text(encoding="utf-8")
 
+    assert [row["seq"] for row in jsonl_rows] == [1, 2]
+    assert json_rows == jsonl_rows
+    assert "client_to_server: 1" in summary
+    assert "server_to_client: 1" in summary
+    assert "总包数: 2" in summary
+
 
 def test_recorder_logger_prints_timestamp_level_event_and_fields(capsys: pytest.CaptureFixture[str]) -> None:
     logger = RecorderLogger("record")
@@ -133,4 +180,44 @@ def test_recorder_logger_prints_timestamp_level_event_and_fields(capsys: pytest.
     assert "] [INFO] [record] target_connect_failed" in output
     assert "session=session-a" in output
     assert "target=ws://127.0.0.1:8080" in output
-    assert "error=refused" in output
+
+
+def test_recorder_logger_allows_protocol_event_field(capsys: pytest.CaptureFixture[str]) -> None:
+    logger = RecorderLogger("record")
+
+    logger.info("packet_forwarded", session="session-a", event="PlayerMessage")
+
+    output = capsys.readouterr().out.strip()
+    assert "packet_forwarded" in output
+    assert "event=PlayerMessage" in output
+
+
+@pytest.mark.asyncio
+async def test_proxy_recorder_start_uses_websockets_serve(monkeypatch: pytest.MonkeyPatch) -> None:
+    called = {}
+
+    class FakeServer:
+        async def __aenter__(self) -> "FakeServer":
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+    def fake_serve(handler: object, host: str, port: int, ping_interval: object) -> FakeServer:
+        called["host"] = host
+        called["port"] = port
+        called["ping_interval"] = ping_interval
+        return FakeServer()
+
+    class StopAfterStartFuture:
+        def __await__(self):
+            raise asyncio.CancelledError
+            yield
+
+    monkeypatch.setattr(tools_mcbe_ws_recorder.websockets, "serve", fake_serve)
+    monkeypatch.setattr(tools_mcbe_ws_recorder.asyncio, "Future", StopAfterStartFuture)
+
+    with pytest.raises(asyncio.CancelledError):
+        await ProxyRecorder("127.0.0.1", 18080, "ws://127.0.0.1:8080", "out").start()
+
+    assert called == {"host": "127.0.0.1", "port": 18080, "ping_interval": None}
