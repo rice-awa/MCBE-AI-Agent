@@ -46,7 +46,10 @@
     "runtime_harness": {
       "enabled": true,
       "prompt_enabled": true,
-      "schema_enabled": true
+      "schema_enabled": true,
+      "audit_enabled": true,
+      "audit_path": "logs/runtime_harness_tools.jsonl",
+      "audit_max_records": 5000
     }
   },
   "queue": {

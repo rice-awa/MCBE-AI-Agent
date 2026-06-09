@@ -11,6 +11,7 @@ from config.logging import get_logger
 from config.settings import Settings
 from models.agent import AgentDependencies
 from models.minecraft import MinecraftCommand
+from services.agent.harness.audit import wrap_registered_tools
 from services.agent.harness.prompting import render_schema_description_prefix
 from services.agent.mcwiki import (
     build_mcwiki_url,
@@ -591,6 +592,7 @@ def register_agent_tools(
 
     if _runtime_harness_schema_enabled(settings):
         _enhance_registered_tool_descriptions(chat_agent)
+    wrap_registered_tools(chat_agent._function_toolset, settings)
 
 
 def escape_command_text(text: str) -> str:

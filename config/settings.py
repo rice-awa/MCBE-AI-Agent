@@ -209,6 +209,9 @@ REQUIRED_CONFIG_PATHS = (
     "agent.runtime_harness.enabled",
     "agent.runtime_harness.prompt_enabled",
     "agent.runtime_harness.schema_enabled",
+    "agent.runtime_harness.audit_enabled",
+    "agent.runtime_harness.audit_path",
+    "agent.runtime_harness.audit_max_records",
     "queue.max_size",
     "queue.llm_worker_count",
     "websocket.ping_interval",
@@ -406,6 +409,12 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["runtime_harness_prompt_enabled"] = runtime_harness["prompt_enabled"]
     if "schema_enabled" in runtime_harness:
         result["runtime_harness_schema_enabled"] = runtime_harness["schema_enabled"]
+    if "audit_enabled" in runtime_harness:
+        result["runtime_harness_audit_enabled"] = runtime_harness["audit_enabled"]
+    if "audit_path" in runtime_harness:
+        result["runtime_harness_audit_path"] = runtime_harness["audit_path"]
+    if "audit_max_records" in runtime_harness:
+        result["runtime_harness_audit_max_records"] = runtime_harness["audit_max_records"]
 
     if "max_size" in queue:
         result["queue_max_size"] = queue["max_size"]
@@ -602,6 +611,9 @@ class Settings(BaseSettings):
     runtime_harness_enabled: bool = True
     runtime_harness_prompt_enabled: bool = True
     runtime_harness_schema_enabled: bool = True
+    runtime_harness_audit_enabled: bool = True
+    runtime_harness_audit_path: str = "logs/runtime_harness_tools.jsonl"
+    runtime_harness_audit_max_records: int = Field(default=5000, gt=0)
 
     # 队列配置
     queue_max_size: int = 100

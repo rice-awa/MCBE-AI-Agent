@@ -53,6 +53,9 @@ def test_runtime_harness_settings_loaded_from_json(tmp_path, monkeypatch):
                     "enabled": True,
                     "prompt_enabled": True,
                     "schema_enabled": True,
+                    "audit_enabled": False,
+                    "audit_path": "tmp/audit.jsonl",
+                    "audit_max_records": 12,
                 }
             }
         },
@@ -63,6 +66,9 @@ def test_runtime_harness_settings_loaded_from_json(tmp_path, monkeypatch):
     assert settings.runtime_harness_enabled is True
     assert settings.runtime_harness_prompt_enabled is True
     assert settings.runtime_harness_schema_enabled is True
+    assert settings.runtime_harness_audit_enabled is False
+    assert settings.runtime_harness_audit_path == "tmp/audit.jsonl"
+    assert settings.runtime_harness_audit_max_records == 12
 
 
 def test_agent_compression_settings_are_optional_in_runtime_config(tmp_path, monkeypatch):
