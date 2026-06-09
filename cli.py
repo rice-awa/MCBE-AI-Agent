@@ -1,6 +1,7 @@
 """命令行接口 - 应用主入口"""
 
 import asyncio
+import json
 import signal
 import sys
 from pathlib import Path
@@ -280,6 +281,72 @@ def init():
     except Exception as e:
         click.echo(f"❌ 创建配置文件失败: {e}", err=True)
         sys.exit(1)
+
+
+@cli.group("runtime-harness")
+def runtime_harness():
+    """运行时 Harness 工具。"""
+    pass
+
+
+@runtime_harness.command("analyze")
+@click.option("--recent", default=None, type=click.IntRange(min=1), help="分析最近 N 条审计记录")
+@click.option("--json", "json_output", is_flag=True, default=False, help="输出机器可读 JSON")
+@click.option("--no-llm", is_flag=True, default=False, help="仅输出规则聚合建议")
+def runtime_harness_analyze(recent: int | None, json_output: bool, no_llm: bool):
+    """分析运行时 Harness 审计记录并给出反馈建议。"""
+    from services.agent.harness.analyze import analyze_records, read_recent_records
+
+    settings = get_settings()
+    recent_count = recent if recent is not None else settings.runtime_harness_audit_max_records
+    records = read_recent_records(settings.runtime_harness_audit_path, recent_count)
+    analysis = analyze_records(records)
+    analysis["recent"] = recent_count
+    analysis["audit_path"] = settings.runtime_harness_audit_path
+    analysis["llm_suggestions_used"] = False
+
+    if json_output:
+        click.echo(json.dumps(analysis, ensure_ascii=False, sort_keys=True))
+        return
+
+    _echo_runtime_harness_analysis(analysis, no_llm=no_llm)
+
+
+def _echo_runtime_harness_analysis(analysis: dict[str, Any], *, no_llm: bool) -> None:
+    totals = analysis["totals"]
+    click.echo("=== Runtime Harness 审计分析 ===")
+    click.echo(f"审计文件: {analysis['audit_path']}")
+    click.echo(f"分析范围: 最近 {analysis['recent']} 条")
+    click.echo(f"总调用: {totals['calls']}")
+    click.echo(f"失败率: {analysis['failure_rate']:.2%} ({totals['failures']} 次失败)")
+    click.echo(f"平均耗时: {analysis['average_duration_ms']:.2f} ms")
+    click.echo(f"风险分布: {_format_distribution(analysis['risk_distribution'])}")
+
+    click.echo("\n重点问题工具:")
+    if analysis["top_issue_tools"]:
+        for issue in analysis["top_issue_tools"]:
+            reasons = ", ".join(issue["reasons"])
+            click.echo(
+                f"- {issue['tool_name']}: 调用 {issue['calls']}，"
+                f"失败率 {issue['failure_rate']:.2%}，平均 {issue['average_duration_ms']:.2f} ms，"
+                f"原因 {reasons}"
+            )
+    else:
+        click.echo("- 暂无明显问题工具")
+
+    click.echo("\n反馈建议:")
+    for suggestion in analysis["suggestions"]:
+        click.echo(f"- {suggestion}")
+    if no_llm:
+        click.echo("- 已按 --no-llm 跳过 LLM 建议。")
+    else:
+        click.echo("- 未启用 LLM 建议，本次使用规则模板输出。")
+
+
+def _format_distribution(distribution: dict[str, int]) -> str:
+    if not distribution:
+        return "无"
+    return ", ".join(f"{risk}={count}" for risk, count in sorted(distribution.items()))
 
 
 @cli.group()
