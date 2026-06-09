@@ -242,6 +242,62 @@ python cli.py serve --dev
 - **切勿在生产环境中启用**，否则任何人都可以连接服务器
 - 启用时会在控制台和日志中显示警告信息
 
+## Runtime Harness 审计工具
+
+Runtime Harness 会在 Agent 工具调用时写入隐私友好的 JSONL 摘要，用于定位重复失败、高风险工具调用和高耗时工具，并通过 CLI 生成反馈建议。
+
+### 配置审计
+
+审计配置位于 `config.json` 的 `agent.runtime_harness` 下，默认随 `config.example.json` 启用：
+
+```json
+{
+  "agent": {
+    "runtime_harness": {
+      "enabled": true,
+      "audit_enabled": true,
+      "audit_path": "logs/runtime_harness_tools.jsonl",
+      "audit_max_records": 5000
+    }
+  }
+}
+```
+
+- `enabled`：运行时 Harness 总开关；关闭后提示词、schema 增强和审计都会停止。
+- `audit_enabled`：只控制工具审计写入。
+- `audit_path`：JSONL 审计文件路径。
+- `audit_max_records`：保留最近 N 条记录，超出后自动轮转。
+
+### 查看审计文件
+
+每行是一条工具调用摘要，包含工具名、用途、风险等级、调用状态、耗时、有限会话标识、参数预览和结果摘要。审计不会记录玩家原始消息，也不会记录完整工具返回内容；参数只按工具目录声明的白名单预览，敏感字段会被脱敏。
+
+```bash
+tail -n 20 logs/runtime_harness_tools.jsonl
+```
+
+### 分析审计记录
+
+输出文本报告：
+
+```bash
+python cli.py runtime-harness analyze
+```
+
+常用选项：
+
+```bash
+python cli.py runtime-harness analyze --recent 200
+python cli.py runtime-harness analyze --json
+python cli.py runtime-harness analyze --no-llm
+```
+
+- `--recent N`：分析最近 N 条审计记录；默认使用 `audit_max_records`。
+- `--json`：输出机器可读 JSON，便于脚本或 CI 收集。
+- `--no-llm`：跳过默认 Provider 的 LLM 建议，只输出规则聚合建议。
+
+默认模式会使用当前 `providers.default` 对聚合统计生成 2-4 条中文改进建议。发送给 LLM 的内容只包含总量、失败率、平均耗时、风险分布、重点问题工具和规则建议；如果默认 Provider 不可用，CLI 会保留规则建议并显示回退原因。
+
 ## Addon Bridge 桥接
 
 当前仓库已经接入一条可用的 Python <-> Addon <-> 游戏桥接链路，用于让 Agent 通过 Addon 获取更稳定的游戏内上下文，如玩家背包，实体信息等。打包好的 Addon 可在[release](https://github.com/rice-awa/MCBE-AI-Agent/release)获取
