@@ -1,4 +1,22 @@
-"""MCBE WebSocket 与 Addon bridge 模拟客户端。"""
+"""MCBE WebSocket 与 Addon bridge 模拟客户端。
+
+使用说明：
+1. 先启动 MCBE AI Agent 服务，默认 WebSocket 地址为 ws://127.0.0.1:8080。
+2. simulate-client 会模拟 Minecraft/Addon 客户端连接服务端，发送玩家 PlayerMessage。
+3. 模拟器会接收服务端 commandRequest，并自动回传对应 commandResponse。
+4. 对 scriptevent mcbeai:bridge_request，模拟器会额外用 MCBEAI_TOOL 发送 MCBEAI|RESP|... bridge 响应分片。
+5. replay-record-with-simulation 会从真实录制中提取玩家输入，再补齐 MCBE/Addon 响应闭环。
+6. inspect-record 可检查录制文件里的 commandRequest/commandResponse 配对情况。
+7. 运行真实 LLM 请求时建议加 --wait-after，避免请求未完成就提前断开。
+
+示例命令：
+- 启动服务端：python cli.py serve
+- 运行示例场景：python tools_mcbe_simulator.py simulate-client --target ws://127.0.0.1:8080 --scenario test_scenarios/mcbe_simulation/chat_tool_give_help_and_run_command.json --out test_logs/ws_simulations --wait-after 35
+- 直接发送单条玩家消息：python tools_mcbe_simulator.py simulate-client --target ws://127.0.0.1:8080 --message "AI chat hi" --wait-after 10
+- 回放真实录制并模拟命令响应：python tools_mcbe_simulator.py replay-record-with-simulation --input test_logs/ws_records/20260609_101315/packets.jsonl --target ws://127.0.0.1:8080 --out test_logs/ws_simulations --wait-after 35
+- 检查录制配对：python tools_mcbe_simulator.py inspect-record --input test_logs/ws_records/20260609_101315/packets.jsonl
+- 关闭 tellraw 回声派生：python tools_mcbe_simulator.py simulate-client --message "帮助" --no-tellraw-echo
+"""
 
 from __future__ import annotations
 
