@@ -10,7 +10,7 @@ class MinecraftHeader(BaseModel):
     """Minecraft WebSocket 消息头"""
 
     requestId: str = Field(default_factory=lambda: str(uuid4()))
-    messagePurpose: Literal["subscribe", "commandRequest", "event"] = "commandRequest"
+    messagePurpose: Literal["subscribe", "commandRequest", "commandResponse", "event"] = "commandRequest"
     version: int = 1
     EventName: str | None = None
     eventName: str | None = None  # 事件名称（小写）

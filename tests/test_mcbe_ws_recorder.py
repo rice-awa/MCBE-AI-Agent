@@ -8,6 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tools_mcbe_ws_recorder
+from models.minecraft import MinecraftMessage
 from tools_mcbe_ws_recorder import PacketRecord, ProxyRecorder, RecorderLogger, SessionRecorder, load_replay_packets, replay_delay
 
 
@@ -103,20 +104,96 @@ def test_packet_record_accepts_command_response_json() -> None:
     assert "JSON" in record.error
 
 
-def test_load_replay_packets_selects_client_text_packets_only(tmp_path: Path) -> None:
+def test_minecraft_message_accepts_command_response() -> None:
+    message = MinecraftMessage.model_validate(
+        {
+            "header": {"requestId": "req-2", "messagePurpose": "commandResponse"},
+            "body": {"statusCode": 0, "statusMessage": "commands.give.success"},
+        }
+    )
+
+    assert message.header.messagePurpose == "commandResponse"
+    assert message.body["statusCode"] == 0
+
+
+@pytest.mark.asyncio
+async def test_session_recorder_filters_tool_player_echoes(tmp_path: Path) -> None:
+    recorder = SessionRecorder(
+        base_dir=tmp_path,
+        mode="record",
+        session_id="session-a",
+        ignored_echo_receivers={"MCBEAI_TOOL"},
+    )
+
+    filtered = await recorder.record_message(
+        direction="client_to_server",
+        path="mcbe->proxy->server",
+        message=json.dumps(
+            {
+                "header": {"messagePurpose": "event", "eventName": "PlayerMessage"},
+                "body": {"sender": "外部", "receiver": "MCBEAI_TOOL", "message": "hello"},
+            },
+            ensure_ascii=False,
+        ),
+    )
+    kept = await recorder.record_message(
+        direction="client_to_server",
+        path="mcbe->proxy->server",
+        message=json.dumps(
+            {
+                "header": {"messagePurpose": "event", "eventName": "PlayerMessage"},
+                "body": {"sender": "外部", "receiver": "fantong7038", "message": "hello"},
+            },
+            ensure_ascii=False,
+        ),
+    )
+    await recorder.close()
+
+    rows = json.loads((tmp_path / "session-a" / "packets.json").read_text(encoding="utf-8"))
+
+    assert filtered is None
+    assert kept is not None
+    assert len(rows) == 1
+    assert rows[0]["body"]["receiver"] == "fantong7038"
+
+
+def test_load_replay_packets_selects_player_input_events_only(tmp_path: Path) -> None:
     input_file = tmp_path / "packets.jsonl"
     rows = [
         {"seq": 1, "direction": "server_to_client", "binary": False, "raw": "server"},
         {"seq": 2, "direction": "client_to_server", "binary": True, "raw": None},
-        {"seq": 3, "direction": "client_to_server", "binary": False, "raw": "first"},
-        {"seq": 4, "direction": "client_to_server", "binary": False, "raw": "second"},
+        {
+            "seq": 3,
+            "direction": "client_to_server",
+            "binary": False,
+            "raw": "command-response",
+            "message_purpose": "commandResponse",
+        },
+        {
+            "seq": 4,
+            "direction": "client_to_server",
+            "binary": False,
+            "raw": "server-echo",
+            "message_purpose": "event",
+            "event_name": "PlayerMessage",
+            "body": {"sender": "外部", "receiver": "Steve", "message": "tellraw echo"},
+        },
+        {
+            "seq": 5,
+            "direction": "client_to_server",
+            "binary": False,
+            "raw": "player-input",
+            "message_purpose": "event",
+            "event_name": "PlayerMessage",
+            "body": {"sender": "Steve", "receiver": "", "message": "AI chat hi"},
+        },
     ]
-    input_file.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+    input_file.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows), encoding="utf-8")
 
     packets = load_replay_packets(input_file)
 
-    assert [packet.seq for packet in packets] == [3, 4]
-    assert [packet.raw for packet in packets] == ["first", "second"]
+    assert [packet.seq for packet in packets] == [5]
+    assert [packet.raw for packet in packets] == ["player-input"]
 
 
 def test_replay_delay_respects_speed() -> None:

@@ -1,4 +1,20 @@
-"""MCBE WebSocket 数据包录制与回放工具。"""
+"""MCBE WebSocket 数据包录制与回放工具。
+
+使用说明：
+1. 先启动 MCBE AI Agent 服务，默认 WebSocket 地址为 ws://127.0.0.1:8080。
+2. 启动录制代理后，在 Minecraft 中连接代理地址，而不是直接连接服务端。
+3. 录制结果会写入输出目录下的时间戳会话目录，包含 packets.jsonl、packets.json 和 SUMMARY.md。
+4. record 默认过滤 receiver=MCBEAI_TOOL 的 PlayerMessage 回声；如需调整可使用 --filter-echo-receiver。
+5. replay-server 只回放录制文件中的 client_to_server 文本包，适合复现玩家输入侧数据流。
+
+示例命令：
+- 启动服务端：python cli.py serve
+- 启动录制代理：python tools_mcbe_ws_recorder.py record --listen-host 0.0.0.0 --listen-port 18080 --target ws://127.0.0.1:8080
+- Minecraft 连接代理：/wsserver <本机或服务器IP>:18080
+- 指定多个回声接收者过滤：python tools_mcbe_ws_recorder.py record --filter-echo-receiver MCBEAI_TOOL --filter-echo-receiver SomeBot
+- 关闭默认回声过滤：python tools_mcbe_ws_recorder.py record --filter-echo-receiver ""
+- 回放录制文件：python tools_mcbe_ws_recorder.py replay-server --input test_logs/ws_records/<session>/packets.jsonl --target ws://127.0.0.1:8080 --speed 1.0
+"""
 
 from __future__ import annotations
 
@@ -139,7 +155,13 @@ class PacketRecord:
 
 
 class SessionRecorder:
-    def __init__(self, base_dir: str | Path, mode: str, session_id: str | None = None) -> None:
+    def __init__(
+        self,
+        base_dir: str | Path,
+        mode: str,
+        session_id: str | None = None,
+        ignored_echo_receivers: set[str] | None = None,
+    ) -> None:
         self.base_dir = Path(base_dir)
         self.mode = mode
         self.session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -151,6 +173,8 @@ class SessionRecorder:
         self.direction_counts: Counter[str] = Counter()
         self.total_bytes = 0
         self.errors: list[str] = []
+        self.ignored_echo_receivers = ignored_echo_receivers or set()
+        self.filtered_counts: Counter[str] = Counter()
         self._jsonl_file = (self.session_dir / "packets.jsonl").open("a", encoding="utf-8")
 
     async def record_message(
@@ -160,7 +184,7 @@ class SessionRecorder:
         path: str,
         message: str | bytes,
         error: str | None = None,
-    ) -> PacketRecord:
+    ) -> PacketRecord | None:
         record = PacketRecord.from_message(
             seq=len(self.records) + 1,
             started_at=self.started_at,
@@ -170,8 +194,18 @@ class SessionRecorder:
             message=message,
             error=error,
         )
+        if self._should_filter(record):
+            self.filtered_counts["player_message_echo"] += 1
+            return None
         await self.record_packet(record)
         return record
+
+    def _should_filter(self, record: PacketRecord) -> bool:
+        if not self.ignored_echo_receivers or record.event_name != "PlayerMessage":
+            return False
+        if not isinstance(record.body, dict):
+            return False
+        return record.body.get("receiver") in self.ignored_echo_receivers
 
     async def record_packet(self, record: PacketRecord) -> None:
         self.records.append(record)
@@ -217,6 +251,12 @@ class SessionRecorder:
         else:
             lines.append("- 无")
 
+        lines.extend(["", "## 过滤统计", ""])
+        if self.filtered_counts:
+            lines.extend(f"- {name}: {count}" for name, count in sorted(self.filtered_counts.items()))
+        else:
+            lines.append("- 无")
+
         lines.extend(["", "## 错误", ""])
         if self.errors:
             lines.extend(f"- {item}" for item in self.errors)
@@ -224,6 +264,18 @@ class SessionRecorder:
             lines.append("- 无")
         lines.append("")
         return "\n".join(lines)
+
+
+def is_replayable_player_input(packet: PacketRecord) -> bool:
+    if packet.direction != "client_to_server" or packet.binary or packet.raw is None:
+        return False
+    if packet.message_purpose != "event" or packet.event_name != "PlayerMessage":
+        return False
+    if not isinstance(packet.body, dict):
+        return False
+    sender = packet.body.get("sender")
+    message = packet.body.get("message")
+    return bool(sender) and sender != "外部" and isinstance(message, str) and bool(message)
 
 
 def load_replay_packets(input_path: str | Path) -> list[PacketRecord]:
@@ -234,11 +286,7 @@ def load_replay_packets(input_path: str | Path) -> list[PacketRecord]:
         rows = json.loads(path.read_text(encoding="utf-8"))
 
     packets = [PacketRecord.from_dict(row) for row in rows]
-    return [
-        packet
-        for packet in packets
-        if packet.direction == "client_to_server" and not packet.binary and packet.raw is not None
-    ]
+    return [packet for packet in packets if is_replayable_player_input(packet)]
 
 
 def replay_delay(previous: PacketRecord | None, current: PacketRecord, speed: float) -> float:
@@ -249,11 +297,19 @@ def replay_delay(previous: PacketRecord | None, current: PacketRecord, speed: fl
 
 
 class ProxyRecorder:
-    def __init__(self, listen_host: str, listen_port: int, target: str, out_dir: str | Path) -> None:
+    def __init__(
+        self,
+        listen_host: str,
+        listen_port: int,
+        target: str,
+        out_dir: str | Path,
+        ignored_echo_receivers: set[str] | None = None,
+    ) -> None:
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.target = target
         self.out_dir = Path(out_dir)
+        self.ignored_echo_receivers = ignored_echo_receivers or set()
         self.logger = RecorderLogger("record")
 
     async def start(self) -> None:
@@ -272,7 +328,11 @@ class ProxyRecorder:
             await asyncio.Future()
 
     async def _handle_client(self, client_ws: WebSocketServerProtocol) -> None:
-        recorder = SessionRecorder(self.out_dir, mode="record")
+        recorder = SessionRecorder(
+            self.out_dir,
+            mode="record",
+            ignored_echo_receivers=self.ignored_echo_receivers,
+        )
         client_remote = getattr(client_ws, "remote_address", None)
         self.logger.info(
             "client_connected",
@@ -346,17 +406,25 @@ class ProxyRecorder:
         try:
             async for message in source:
                 record = await recorder.record_message(direction=direction, path=path, message=message)
-                self.logger.info(
-                    "packet_forwarded",
-                    session=recorder.session_id,
-                    seq=record.seq,
-                    direction=direction,
-                    bytes=record.bytes,
-                    json=record.json_valid,
-                    purpose=record.message_purpose,
-                    event=record.event_name,
-                    request_id=record.request_id,
-                )
+                if record is None:
+                    self.logger.info(
+                        "packet_filtered",
+                        session=recorder.session_id,
+                        direction=direction,
+                        reason="player_message_echo",
+                    )
+                else:
+                    self.logger.info(
+                        "packet_forwarded",
+                        session=recorder.session_id,
+                        seq=record.seq,
+                        direction=direction,
+                        bytes=record.bytes,
+                        json=record.json_valid,
+                        purpose=record.message_purpose,
+                        event=record.event_name,
+                        request_id=record.request_id,
+                    )
                 await target.send(message)
         except websockets.exceptions.ConnectionClosed as exc:
             self.logger.info(
@@ -476,6 +544,12 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--listen-port", type=int, default=18080)
     record.add_argument("--target", default="ws://127.0.0.1:8080")
     record.add_argument("--out", default="test_logs/ws_records")
+    record.add_argument(
+        "--filter-echo-receiver",
+        action="append",
+        default=["MCBEAI_TOOL"],
+        help="过滤指定 receiver 的 PlayerMessage 回声；可重复传入，传空字符串关闭默认过滤",
+    )
 
     replay = subparsers.add_parser("replay-server", help="回放录制文件中的客户端侧数据包")
     replay.add_argument("--input", required=True)
@@ -488,7 +562,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def async_main(args: argparse.Namespace) -> None:
     if args.command == "record":
-        await ProxyRecorder(args.listen_host, args.listen_port, args.target, args.out).start()
+        ignored_echo_receivers = {receiver for receiver in args.filter_echo_receiver if receiver}
+        await ProxyRecorder(
+            args.listen_host,
+            args.listen_port,
+            args.target,
+            args.out,
+            ignored_echo_receivers=ignored_echo_receivers,
+        ).start()
     elif args.command == "replay-server":
         await ReplayClient(args.input, args.target, args.speed, args.out).run()
 
