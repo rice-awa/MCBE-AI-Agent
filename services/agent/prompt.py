@@ -34,7 +34,7 @@ BUILTIN_TEMPLATES: dict[str, PromptTemplate] = {
     "default": PromptTemplate(
         name="default",
         description="默认模板",
-        content="""请始终保持积极和专业的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown
+        content="""{system_prompt}
 
 {tool_usage}
 
@@ -340,6 +340,7 @@ class PromptManager:
             "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "context_length": str(context_length),
             "context_usage": context_usage,
+            "system_prompt": settings.system_prompt if settings is not None else Settings().system_prompt,
             "tool_usage": tool_usage,
         }
 

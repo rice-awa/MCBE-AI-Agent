@@ -25,7 +25,7 @@ def render_tool_cards() -> str:
             lines.append(
                 f"- {entry.name} [{entry.intent.value}/{entry.risk.value}]："
                 f"用于{entry.when_to_use.rstrip('。')}；"
-                f"不要用于{entry.when_not_to_use.rstrip('。')}；"
+                f"{entry.when_not_to_use.rstrip('。')}；"
                 f"{entry.parameter_constraints.rstrip('。')}。"
             )
     return "\n".join(lines)

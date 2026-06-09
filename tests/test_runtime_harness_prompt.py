@@ -13,6 +13,29 @@ def test_runtime_harness_prompt_renders_decision_tree_and_cards() -> None:
     assert "run_minecraft_command [改变世界/高]" in prompt
 
 
+def test_runtime_harness_tool_cards_do_not_duplicate_when_not_to_use_prefix() -> None:
+    prompt = render_runtime_harness_prompt()
+
+    assert "不要用于不要用于" not in prompt
+    assert "不要用于不要作为" not in prompt
+
+
+def test_system_prompt_uses_configured_base_prompt() -> None:
+    manager = PromptManager()
+    settings = Settings(system_prompt="请使用配置里的系统提示词")
+
+    prompt = manager.build_system_prompt(
+        connection_id="configured-system-prompt",
+        player_name="TestPlayer",
+        provider="deepseek",
+        model="deepseek-chat",
+        settings=settings,
+    )
+
+    assert "请使用配置里的系统提示词" in prompt
+    assert "请始终保持积极和专业的态度" not in prompt
+
+
 def test_system_prompt_uses_runtime_harness_by_default() -> None:
     manager = PromptManager()
 
