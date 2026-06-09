@@ -77,14 +77,23 @@ class ConversationCompressor:
     def count_turns(self, history: list[ModelMessage]) -> int:
         turns = 0
         for message in history:
+            if self.is_summary_message(message):
+                continue
             for part in getattr(message, "parts", []):
                 if getattr(part, "part_kind", None) == "user-prompt":
                     turns += 1
                     break
         return turns
 
-    def split_history(self, history: list[ModelMessage]) -> tuple[list[ModelMessage], list[ModelMessage]]:
-        return self._split_history_by_keep_turns(history, self.settings.compression_keep_recent_turns)
+    def split_history(
+        self,
+        history: list[ModelMessage],
+        keep_turns: int | None = None,
+    ) -> tuple[list[ModelMessage], list[ModelMessage]]:
+        return self._split_history_by_keep_turns(
+            history,
+            self.settings.compression_keep_recent_turns if keep_turns is None else keep_turns,
+        )
 
     @staticmethod
     def _split_history_by_keep_turns(
@@ -214,6 +223,14 @@ class ConversationCompressor:
 
         return ModelRequest(parts=[UserPromptPart(content=f"[历史摘要]\n{summary.strip()}", part_kind="user-prompt")])
 
+    @staticmethod
+    def is_summary_message(message: ModelMessage) -> bool:
+        return any(
+            getattr(part, "part_kind", None) == "user-prompt"
+            and str(getattr(part, "content", "") or "").lstrip().startswith("[历史摘要]")
+            for part in getattr(message, "parts", [])
+        )
+
 
 class ConversationManager:
     """
@@ -246,6 +263,13 @@ class ConversationManager:
     def _get_compression_threshold(self) -> int:
         """获取压缩触发阈值"""
         return max(1, int(self.settings.max_history_turns * self.settings.compression_trigger_ratio))
+
+    def _get_compression_keep_recent_turns(self, threshold: int | None = None) -> int:
+        threshold = threshold or self._get_compression_threshold()
+        configured_keep_turns = self.settings.compression_keep_recent_turns
+        if threshold <= 1:
+            return 0
+        return min(configured_keep_turns, threshold - 1)
 
     async def check_and_compress(
         self,
@@ -338,7 +362,10 @@ class ConversationManager:
 
         current_turns = self._count_turns(history)
 
-        older_messages, recent_messages = self.compressor.split_history(history)
+        older_messages, recent_messages = self.compressor.split_history(
+            history,
+            keep_turns=self._get_compression_keep_recent_turns(),
+        )
         if not older_messages and not force:
             return False, f"当前 {current_turns} 轮，无需压缩"
         if not older_messages:

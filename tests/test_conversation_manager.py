@@ -275,7 +275,7 @@ async def test_compress_history_writes_llm_summary_and_recent_turns(monkeypatch)
     history = broker.get_conversation_history(connection_id, "alice", "build")
     assert success is True
     assert "LLM" in msg
-    assert manager._count_turns(history) == 5
+    assert manager._count_turns(history) == 4
     assert "[历史摘要]" in history[0].parts[0].content
     assert "玩家在建城堡" in history[0].parts[0].content
     assert history[1].parts[0].content == "user-9"
@@ -313,6 +313,34 @@ async def test_compression_only_updates_target_player_conversation(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_check_and_compress_limits_keep_turns_below_low_threshold(monkeypatch):
+    settings = Settings(max_history_turns=5, compression_keep_recent_turns=8)
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+    connection_id = uuid4()
+    broker.set_conversation_history(connection_id, "alice", _build_multi_turn(5), "build")
+
+    async def fake_llm_summary(messages, provider_name=None):
+        return "事实: 低阈值压缩成功"
+
+    monkeypatch.setattr(manager.compressor, "build_llm_summary", fake_llm_summary)
+
+    success, msg = await manager.check_and_compress(
+        connection_id,
+        "alice",
+        conversation_id="build",
+        provider_name="deepseek",
+    )
+
+    history = broker.get_conversation_history(connection_id, "alice", "build")
+    assert success is True
+    assert "压缩完成" in msg
+    assert manager._count_turns(history) == 3
+    assert "低阈值压缩成功" in history[0].parts[0].content
+    assert history[1].parts[0].content == "user-3"
+
+
+@pytest.mark.asyncio
 async def test_compress_history_falls_back_to_local_summary(monkeypatch):
     settings = Settings(
         max_history_turns=20,
@@ -339,7 +367,7 @@ async def test_compress_history_falls_back_to_local_summary(monkeypatch):
     history = broker.get_conversation_history(connection_id, "alice", "build")
     assert success is True
     assert "本地回退" in msg
-    assert manager._count_turns(history) == 3
+    assert manager._count_turns(history) == 2
     assert "事实:" in history[0].parts[0].content
 
 
