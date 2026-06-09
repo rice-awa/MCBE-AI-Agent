@@ -42,7 +42,12 @@
     "llm_warmup_enabled": true,
     "mcwiki_base_url": "https://mcwiki.rice-awa.top",
     "dedup_external_messages": true,
-    "tool_response_verbose": false
+    "tool_response_verbose": false,
+    "runtime_harness": {
+      "enabled": true,
+      "prompt_enabled": true,
+      "schema_enabled": true
+    }
   },
   "queue": {
     "max_size": 100,
