@@ -206,6 +206,9 @@ REQUIRED_CONFIG_PATHS = (
     "agent.mcwiki_base_url",
     "agent.dedup_external_messages",
     "agent.tool_response_verbose",
+    "agent.runtime_harness.enabled",
+    "agent.runtime_harness.prompt_enabled",
+    "agent.runtime_harness.schema_enabled",
     "queue.max_size",
     "queue.llm_worker_count",
     "websocket.ping_interval",
@@ -395,6 +398,14 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["ollama_model"] = ollama["model"]
 
     result.update(agent)
+
+    runtime_harness = agent.get("runtime_harness", {})
+    if "enabled" in runtime_harness:
+        result["runtime_harness_enabled"] = runtime_harness["enabled"]
+    if "prompt_enabled" in runtime_harness:
+        result["runtime_harness_prompt_enabled"] = runtime_harness["prompt_enabled"]
+    if "schema_enabled" in runtime_harness:
+        result["runtime_harness_schema_enabled"] = runtime_harness["schema_enabled"]
 
     if "max_size" in queue:
         result["queue_max_size"] = queue["max_size"]
@@ -586,6 +597,11 @@ class Settings(BaseSettings):
         alias="DEDUP_EXTERNAL_MESSAGES",
         description="是否排除sender为外部且事件为PlayerMessage的重复消息"
     )
+
+    # 运行时 Harness 配置
+    runtime_harness_enabled: bool = True
+    runtime_harness_prompt_enabled: bool = True
+    runtime_harness_schema_enabled: bool = True
 
     # 队列配置
     queue_max_size: int = 100

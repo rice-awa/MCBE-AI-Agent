@@ -298,7 +298,7 @@ class MockAgent:
 
 
 async def _collect_events(prompt: str, deps: AgentDependencies, model: str) -> list[Any]:
-    return [event async for event in core.stream_chat(prompt, deps, model=model)]
+    return [event async for event in core.stream_chat(prompt, deps, model=model, agent=core.chat_agent)]
 
 
 def _build_deps(stream_sentence_mode: bool) -> AgentDependencies:

@@ -7,6 +7,8 @@ from pydantic import BaseModel
 from pydantic_ai import RunContext
 
 from config.logging import get_logger
+from config.settings import Settings
+from services.agent.harness.prompting import render_runtime_harness_prompt
 
 logger = get_logger(__name__)
 
@@ -294,6 +296,7 @@ class PromptManager:
         model: str,
         context_length: int = 0,
         context_usage: str = "",
+        settings: Settings | None = None,
     ) -> str:
         """
         构建系统提示词
@@ -320,6 +323,14 @@ class PromptManager:
         # 获取变量
         custom_vars = self.get_session_variables(connection_id, player_name)
 
+        tool_usage = TOOL_USAGE_GUIDE
+        if (
+            settings is not None
+            and settings.runtime_harness_enabled
+            and settings.runtime_harness_prompt_enabled
+        ):
+            tool_usage = render_runtime_harness_prompt()
+
         # 构建内置变量
         builtin_vars = {
             "player_name": player_name or "未知玩家",
@@ -329,7 +340,7 @@ class PromptManager:
             "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "context_length": str(context_length),
             "context_usage": context_usage,
-            "tool_usage": TOOL_USAGE_GUIDE,
+            "tool_usage": tool_usage,
         }
 
         # 合并变量（自定义变量优先级更高）
@@ -412,4 +423,5 @@ async def build_dynamic_prompt(ctx: RunContext) -> str:
         model=model,
         context_length=context_info.message_count if context_info else 0,
         context_usage=context_usage,
+        settings=ctx.deps.settings,
     )

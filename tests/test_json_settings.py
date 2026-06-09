@@ -43,6 +43,28 @@ def test_agent_compression_settings_loaded_from_json(tmp_path, monkeypatch):
     assert settings.compression_timeout == 12
 
 
+def test_runtime_harness_settings_loaded_from_json(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    write_json_config(
+        tmp_path,
+        {
+            "agent": {
+                "runtime_harness": {
+                    "enabled": True,
+                    "prompt_enabled": True,
+                    "schema_enabled": True,
+                }
+            }
+        },
+    )
+
+    settings = Settings()
+
+    assert settings.runtime_harness_enabled is True
+    assert settings.runtime_harness_prompt_enabled is True
+    assert settings.runtime_harness_schema_enabled is True
+
+
 def test_agent_compression_settings_are_optional_in_runtime_config(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("SECRET_KEY", "test-secret")
