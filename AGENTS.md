@@ -1,215 +1,41 @@
-# 仓库指南
+# 仓库协作指南
 
-本文件为 AI Agent 在本仓库内协作开发时的统一工作说明。交流与文档统一使用中文。
+本文件面向在本仓库工作的 AI / coding agents。交流、说明和文档默认使用中文。
 
-## 项目概览
+## 必读入口
 
-MCBE AI Agent 是一个 Minecraft Bedrock Edition AI 聊天机器人服务器，基于 PydanticAI 框架构建，采用现代化异步架构。
+- `CONTEXT.md`：项目共享语言与术语边界。涉及需求、设计、架构命名或文档更新前，优先对齐其中术语，避免使用其标注的替代表达。
+- `CLAUDE.md`：Claude Code 专用项目说明，包含当前架构要点、关键文件、配置约定和工具使用要求。
+- `config.example.json` / `.env.example`：配置字段来源；普通配置放 `config.json`，密钥和密码放 `.env`。
 
-- **Python**：3.11+
-- **框架**：PydanticAI >= 1.0.0，Pydantic >= 2.0
-- **主要依赖**：websockets、httpx、PyJWT、structlog、click、pydantic-settings
+## 工作原则
 
-## 项目结构与模块组织
+- 优先做小而完整的改动，避免无关重构和过度抽象。
+- 修改玩家会话、聊天、上下文、模板、变量、模型切换或下行消息路径时，必须显式传递当前事件的 `player_name` / `sender`。
+- 新增或修改下行长文本发送路径时，必须复用 `services/websocket/flow_control.py`，不要在调用点重复实现分片。
+- 添加新功能或修复 bug 前，按 `CLAUDE.md` 要求使用现有工具获取相关库/框架文档。
+- 不提交 `.env`、`config.json`、日志、密钥或其他本地敏感文件。
 
-- `config/`：配置与日志（`settings.py`、`logging.py`）。
-- `models/`：数据模型（WebSocket 消息、Minecraft 协议、Agent 依赖）。
-- `core/`：消息队列与事件系统。
-- `services/`：核心服务（`agent/`、`websocket/`、`auth/`）。
-- `storage/`：存储层（当前为占位）。
-- `tests/`：测试用例目录，文件名建议使用 `test_*.py`。
-- 入口：`main.py`（服务启动）、`cli.py`（命令行）。
-
-## 架构
-
-```text
-Minecraft Client <-> WebSocket Server <-> Message Broker <-> Agent Worker (PydanticAI)
-                              ^                    ^
-                         Connection          Request/Response
-                         Manager              Queues
-```
-
-核心设计：
-
-- **非阻塞**：WebSocket 处理与 LLM 请求完全分离。
-- **消息队列**：使用 `asyncio.Queue` 实现生产者-消费者模式。
-- **类型安全**：使用 Pydantic 进行数据验证和配置管理。
-- **多人会话隔离**：MCBE 单个 `/wsserver` 连接可承载多个玩家，历史、锁、上下文、模型、模板和变量均按 `(connection_id, player_name)` 分桶。
-- **统一流控**：所有下行长文本统一经过 `FlowControlMiddleware` 分片，避免 MCBE 拒绝超长 `commandRequest`。
-
-## 统一流控中间件
-
-`services/websocket/flow_control.py` 提供统一的出站消息分片能力，当前覆盖 `tellraw`、`scriptevent`、AI 响应事件和原始命令包装。
-
-- `chunk_tellraw()`：将游戏内可见文本拆成多条安全的 `tellraw` 命令。
-- `chunk_scriptevent()`：将 Addon/脚本事件载荷拆成多条安全的 `scriptevent` 命令。
-- `chunk_ai_response()`：将 AI 响应编码为 `mcbeai:ai_resp` 分片事件，包含 `id/i/n/p/r/c` 元数据用于客户端重组。
-- `chunk_raw_command()`：只包装原始命令，不做分片；超长命令会抛出 `ValueError`，调用方需要在命令语义层面拆分。
-- `chunk_delay_for()`：集中提供不同分片场景的发送间隔，避免命令洪泛触发 MCBE 看门狗。
-
-流控以 MCBE `commandLine` 实测安全上限 461 字节为硬约束，并结合 `MAX_CHUNK_CONTENT_LENGTH` 字符上限与 `CHUNK_SENTENCE_MODE` 语义分句策略共同决定分片边界。新增或修改下行消息发送路径时，应优先复用该中间件，不要在调用点重新实现分片逻辑。
-
-## 多人会话隔离
-
-MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多名玩家共享同一个 `connection_id`。仓库内玩家相关状态应按 `(connection_id, player_name)` 作为会话键隔离，不能把 `ConnectionState.player_name` 当作真实会话身份来源；它只适合记录最近发言者用于日志或兼容路径。
-
-- `MessageBroker` 的历史、锁、自动压缩上下文都必须传入当前 `player_name`；同玩家串行，不同玩家可并行。
-- `ConnectionState.get_player_session(player_name)` 保存玩家级 `context_enabled`、`current_provider`、`current_template` 和 `custom_variables`。
-- `PromptManager` 模板和变量按玩家分桶；旧 connection 级 API 是匿名桶兼容层。
-- `handle_message`、聊天命令、UI 消息、上下文、模板、设置、切换模型等路径应从本次事件的 `sender` 向下直传 `player_name`。
-- 连接注销时清理该连接下所有玩家桶，避免多人测试后残留历史或锁。
-
-相关分析与修复文档：`claude_md/report/MULTIPLAYER_BUG_REPORT.md`、`claude_md/fix/MULTIPLAYER_SESSION_FIX.md`。
-
-## 关键文件
-
-| 文件 | 用途 |
-| --- | --- |
-| `cli.py` | 应用入口，CLI 命令组 |
-| `config/settings.py` | Pydantic Settings 配置管理 |
-| `core/queue.py` | `MessageBroker` 消息队列；对话历史和会话锁按 `(connection_id, player_name)` 隔离 |
-| `core/conversation.py` | 对话压缩、保存和恢复；按玩家会话桶读写历史 |
-| `services/agent/core.py` | PydanticAI Agent 核心 |
-| `services/agent/providers.py` | LLM Provider 注册表 |
-| `services/agent/prompt.py` | 系统提示词、模板和变量管理；模板/变量按玩家会话隔离 |
-| `services/agent/worker.py` | Agent Worker，消费队列请求；按玩家锁串行化同一玩家请求 |
-| `services/websocket/server.py` | WebSocket 服务器；每条玩家消息必须直传当前 `sender` |
-| `services/websocket/connection.py` | 连接管理；`PlayerSession` 保存玩家级上下文、模型、模板和变量 |
-| `services/websocket/flow_control.py` | 统一流控中间件，负责出站长文本分片与字节安全校验 |
-| `services/agent/tools.py` | Agent Tools（MC 命令执行、MCWiki 搜索） |
-
-## 构建、测试与开发命令
-
-- 安装依赖：`pip install -r requirements.txt`
-- 初始化配置：`python cli.py init`（生成 `.env` 和 `config.json`；先在 `.env` 填写 API Key，再按需修改 `config.json`）。
-- 查看配置：`python cli.py info`
-- 测试 LLM：`python cli.py test-provider deepseek`
-- 启动服务：`python cli.py serve`
-- 运行测试：`pytest`
-
-## 代码风格与命名规范
-
-- Python 3.11，4 空格缩进。
-- 命名：模块/变量使用 `snake_case`，类使用 `PascalCase`，常量使用 `UPPER_CASE`。
-- 格式与静态检查：`ruff`（行宽 100）、`mypy`（严格模式）。
-
-## 测试规范
-
-- 预期使用 `pytest` + `pytest-asyncio`（见 `pyproject.toml`）。
-- 测试目录约定为 `tests/`，文件名建议使用 `test_*.py`。
-- 新增功能或修复 bug 时，请补充对应测试。
-- 如果测试无法运行，需要在交付说明中明确原因和风险。
-
-## 支持的 LLM Provider
-
-- DeepSeek（默认）
-- OpenAI
-- Anthropic
-- Ollama（本地模型）
-
-## 支持的游戏内命令
-
-| 命令 | 说明 |
-| --- | --- |
-| `#登录 <密码>` | 用户认证 |
-| `AGENT 聊天 <消息>` | 与 AI 对话 |
-| `AGENT 脚本 <消息>` | 使用 ScriptEvent 发送 |
-| `AGENT 上下文 <开启/关闭/状态>` | 管理对话上下文 |
-| `切换模型 <提供商>` | 切换 LLM 提供商 |
-| `运行命令 <MC命令>` | 执行 Minecraft 命令 |
-| `帮助` | 显示帮助信息 |
-
-## 配置
-
-项目使用 `config.json` 作为普通配置文件，使用 `.env` 保存敏感内容。运行 `python cli.py init` 会从 `.env.example` 和 `config.example.json` 创建本地文件。
-
-- `.env`：只保存 `SECRET_KEY`、`WEBSOCKET_PASSWORD`、`DEEPSEEK_API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY` 等密钥或密码。
-- `config.json`：保存服务器地址、默认 provider、模型名、队列、日志、MCP、Minecraft 命令和流控配置。
-- JSON 字符串支持 `${VAR}` 引用 `.env` 或进程环境变量；缺失或空值会导致启动失败并显示 JSON 路径和变量名。
-- 不要再把 `HOST`、`PORT`、默认 provider、MCP servers、Minecraft commands 等普通配置写入 `.env`。
-
-## Minecraft 连接示例
-
-```text
-/wsserver <服务器IP>:8080
-#登录 123456
-AGENT 聊天 你好
-```
-
-## Git 工作树开发说明
-
-需要隔离开发新功能、修复 bug 或执行较大实现计划时，优先使用 Git 工作树，避免污染当前工作区。
-
-### 工作树目录选择
-
-按以下优先级选择工作树目录：
-
-1. 如果仓库中存在 `.worktrees/`，优先使用 `.worktrees/`。
-2. 如果不存在 `.worktrees/` 但存在 `worktrees/`，使用 `worktrees/`。
-3. 如果两者都不存在，检查本文件是否指定了工作树目录偏好。
-4. 如果仍无约定，先询问用户再创建。
-
-项目内工作树目录必须被 Git 忽略。创建前使用以下命令验证：
+## 常用命令
 
 ```bash
-git check-ignore -q .worktrees 2>/dev/null || git check-ignore -q worktrees 2>/dev/null
-```
-
-如果目标目录未被忽略，应先将对应目录加入 `.gitignore`，再创建工作树。
-
-### 创建工作树
-
-建议分支命名使用 `feature/<主题>`、`fix/<主题>` 或 `refactor/<主题>`。
-
-```bash
-git worktree add .worktrees/<branch-name> -b <branch-name>
-cd .worktrees/<branch-name>
-```
-
-如果使用 `worktrees/` 作为目录，则替换为：
-
-```bash
-git worktree add worktrees/<branch-name> -b <branch-name>
-cd worktrees/<branch-name>
-```
-
-### 初始化与基线验证
-
-进入工作树后，根据项目文件自动执行必要初始化：
-
-```bash
-pip install -r requirements.txt
+python cli.py init
+python cli.py info
+python cli.py test-provider deepseek
+python cli.py serve
 pytest
 ```
 
-如果基线测试失败，不要直接继续实现；需要先记录失败命令、关键错误与影响范围，并确认这是既有问题还是需要先修复的问题。
+## 代码与测试
 
-### 开发与收尾
+- Python 3.11+，4 空格缩进；模块/变量用 `snake_case`，类用 `PascalCase`，常量用 `UPPER_CASE`。
+- 预期使用 `pytest` + `pytest-asyncio`；新增功能或修复 bug 时补充相邻测试。
+- 如果测试无法运行，交付说明中写明失败命令、关键错误和影响范围。
+- 格式与静态检查以仓库配置为准（如 `ruff`、`mypy`），不要新增未配置的工具链。
 
-- 不要在主工作区和工作树中同时修改同一文件，避免合并冲突。
-- 不要回退或覆盖用户在其他工作区中的改动。
-- 完成后在工作树内运行相关测试与静态检查，并记录结果。
-- 合并或提交前确认工作树状态：`git status --short`。
-- 工作树不再需要时，先确认变更已合并或保留，再执行：`git worktree remove <path>`。
+## Git 与工作树
 
-## Commit 与 Pull Request 规范
-
-- 提交信息遵循 Conventional Commits，例如：`refactor(minecraft): 统一聊天命令前缀为 AGENT`。
-- PR 建议包含：变更摘要、关键配置影响（如 `.env` 字段）、本地测试结果与日志截图（如有 UI 或日志变化）。
-
-## 安全与配置提示
-
-- `.env` 存放敏感配置（API Key、JWT 密钥等），不要提交到版本库。
-- 日志默认写入 `logs/`（如 `logs/mcbe_ai_agent.log`），排查问题时附上关键片段。
-
-## 研究与文档准则
-
-如果用户要求添加新功能或修复 bug，必须先使用现有工具获取相关文档，了解最佳实践后再进行实现。
-
-优先使用 MCP 工具获取最新文档：
-
-- `context7`：获取库/框架的官方文档和代码示例。
-- `firecrawl`：获取网页内容、搜索信息。
-- `WebSearch`：搜索最新技术和解决方案。
-
-避免盲目实现，确保代码符合框架/库的最佳实践。
+- 不要提交或覆盖用户未明确要求处理的改动。
+- 需要隔离开发较大功能或修复时，优先使用已被忽略的 `.worktrees/`。
+- 提交信息遵循 Conventional Commits，例如 `fix(websocket): 避免玩家会话串上下文`。
+- 提交、合并或移除工作树前先检查 `git status --short`。
