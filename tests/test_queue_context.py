@@ -16,6 +16,7 @@ from pydantic_ai.messages import (
 )
 
 from core.queue import MessageBroker
+from models.messages import SystemNotification
 from services.agent.worker import AgentWorker
 
 
@@ -668,3 +669,61 @@ def test_worker_passes_request_provider_to_auto_compression(monkeypatch) -> None
 
     assert captured["provider_name"] == "anthropic"
     assert captured["conversation_id"] == "build"
+
+
+def test_worker_sends_notification_when_auto_compression_runs(monkeypatch) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from config.settings import Settings
+    from models.messages import ChatRequest
+
+    broker = MessageBroker()
+    connection_id = uuid4()
+    response_queue = broker.register_connection(connection_id)
+    worker = AgentWorker(broker=broker, settings=Settings(max_history_turns=5), worker_id=1)
+    completed_messages = []
+    for index in range(1, 6):
+        completed_messages.extend(_build_turn(index))
+
+    class _FakeManager:
+        def get_agent(self):
+            return object()
+
+    async def _fake_stream_chat(*args, **kwargs):
+        yield SimpleNamespace(
+            event_type="content",
+            content="完成",
+            metadata={"is_complete": True, "all_messages": completed_messages},
+        )
+
+    async def _fake_check_and_compress(self, *args, **kwargs):
+        return True, "压缩完成(本地回退摘要): 5轮 -> 3轮"
+
+    monkeypatch.setattr("services.agent.worker.stream_chat", _fake_stream_chat)
+    monkeypatch.setattr("services.agent.core.get_agent_manager", lambda: _FakeManager())
+    monkeypatch.setattr("services.agent.worker.ProviderRegistry.get_model", lambda *_: object())
+    monkeypatch.setattr(
+        "core.conversation.ConversationManager.check_and_compress",
+        _fake_check_and_compress,
+    )
+
+    request = ChatRequest(
+        connection_id=connection_id,
+        player_name="alice",
+        content="test",
+        use_context=True,
+        provider="deepseek",
+        conversation_id="build",
+    )
+    asyncio.run(worker._process_request_locked(request, connection_id))
+
+    notifications = [
+        item
+        for item in list(response_queue._queue)
+        if isinstance(item, SystemNotification)
+    ]
+    assert len(notifications) == 1
+    assert notifications[0].level == "info"
+    assert "对话历史已自动压缩" in notifications[0].message
+    assert "5轮 -> 3轮" in notifications[0].message

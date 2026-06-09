@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 from websockets.server import WebSocketServerProtocol
 
 from core.queue import DEFAULT_CONVERSATION_ID, MessageBroker
-from models.messages import StreamChunk
+from models.messages import StreamChunk, SystemNotification
 from models.minecraft import MinecraftCommand
 from models.agent import MCColor, MCPrefix
 from services.websocket.flow_control import FlowControlMiddleware
@@ -295,6 +295,8 @@ class ConnectionManager:
         """
         if isinstance(response, StreamChunk):
             await self._send_stream_chunk(state, response)
+        elif isinstance(response, SystemNotification):
+            await self._send_system_notification(state, response)
         elif isinstance(response, dict):
             # 处理特殊消息类型
             msg_type = response.get("type")
@@ -357,6 +359,16 @@ class ConnectionManager:
             await self._send_script_event(state, message)
         else:
             await self._send_game_message_with_color(state, message, color)
+
+    async def _send_system_notification(
+        self, state: ConnectionState, notification: SystemNotification
+    ) -> None:
+        color = {
+            "info": MCColor.AQUA,
+            "warning": MCColor.YELLOW,
+            "error": MCColor.RED,
+        }[notification.level]
+        await self._send_game_message_with_color(state, notification.message, color)
 
     def _log_ws_send(
         self, state: ConnectionState, payload: str, source: str

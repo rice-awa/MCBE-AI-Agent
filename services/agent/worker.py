@@ -14,7 +14,7 @@ from services.agent.core import stream_chat, _extract_exception_details
 from services.agent.providers import ProviderRegistry
 from services.agent.title import generate_conversation_title
 from services.addon.service import get_addon_bridge_service
-from models.messages import ChatRequest, StreamChunk
+from models.messages import ChatRequest, StreamChunk, SystemNotification
 from models.agent import (
     AgentDependencies,
     ContextInfo,
@@ -375,6 +375,14 @@ class AgentWorker:
                                     provider_name=provider_name,
                                 )
                                 if compressed:
+                                    await self.broker.send_response(
+                                        connection_id,
+                                        SystemNotification(
+                                            connection_id=connection_id,
+                                            level="info",
+                                            message=f"对话历史已自动压缩，{msg}",
+                                        ),
+                                    )
                                     logger.debug(
                                         "auto_compression_triggered",
                                         worker_id=self.worker_id,
