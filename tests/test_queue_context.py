@@ -1,5 +1,6 @@
 """消息队列上下文管理测试"""
 
+import asyncio
 from pathlib import Path
 import sys
 from uuid import uuid4
@@ -15,8 +16,10 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from core.queue import MessageBroker
-from models.messages import SystemNotification
+from core.queue import MessageBroker, QueueItem
+from config.settings import Settings
+from models.agent import StreamEvent
+from models.messages import ChatRequest, SystemNotification
 from services.agent.worker import AgentWorker
 
 
@@ -214,6 +217,66 @@ def test_conversation_generation_blocks_stale_history_write() -> None:
 
     assert updated is False
     assert broker.get_conversation_history(connection_id, "alice", "default") == []
+
+
+def test_worker_keeps_serial_chat_history_when_requests_share_initial_generation(monkeypatch) -> None:
+    async def _run() -> None:
+        broker = MessageBroker()
+        connection_id = uuid4()
+        broker.register_connection(connection_id)
+        settings = Settings(default_provider="ollama", dev_mode=True)
+        worker = AgentWorker(broker, settings)
+
+        histories = [
+            _build_turn(1),
+            [*_build_turn(1), *_build_turn(2)],
+        ]
+
+        async def fake_stream_chat(*_args, **_kwargs):
+            all_messages = histories.pop(0)
+            yield StreamEvent(
+                event_type="content",
+                content="ok",
+                sequence=0,
+                metadata={"is_complete": True, "all_messages": all_messages},
+            )
+
+        class FakeAgentManager:
+            def get_agent(self):
+                return object()
+
+        monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+        monkeypatch.setattr("services.agent.providers.ProviderRegistry.get_model", lambda _config: object())
+        monkeypatch.setattr("services.agent.core.get_agent_manager", lambda: FakeAgentManager())
+        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _settings: None)
+        monkeypatch.setattr(
+            worker,
+            "_schedule_title_generation",
+            lambda *_args, **_kwargs: asyncio.sleep(0),
+        )
+
+        first = ChatRequest(
+            connection_id=connection_id,
+            content="first",
+            player_name="alice",
+            conversation_generation=0,
+        )
+        second = ChatRequest(
+            connection_id=connection_id,
+            content="second",
+            player_name="alice",
+            conversation_generation=0,
+        )
+
+        await worker._process_request(QueueItem(priority=0, connection_id=connection_id, payload=first))
+        await worker._process_request(QueueItem(priority=0, connection_id=connection_id, payload=second))
+
+        history = broker.get_conversation_history(connection_id, "alice", "default")
+        assert len(history) == 4
+        assert history[0].parts[0].content == "user-1"
+        assert history[2].parts[0].content == "user-2"
+
+    asyncio.run(_run())
 
 
 class _ReasoningNode:

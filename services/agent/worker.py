@@ -142,7 +142,6 @@ class AgentWorker:
             await self._process_request_locked(
                 request,
                 connection_id,
-                conversation_generation=request.conversation_generation,
             )
 
     async def _process_request_locked(

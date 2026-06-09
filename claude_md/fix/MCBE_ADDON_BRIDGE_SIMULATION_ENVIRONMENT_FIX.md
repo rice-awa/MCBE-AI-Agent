@@ -51,3 +51,17 @@ python tools_mcbe_simulator.py inspect-record --input test_logs/ws_records/20260
 ```
 
 输出显示真实录制中 `command_requests=19`、`command_responses=19`、`matched_request_ids=19`、`unmatched_request_ids=[]`，命令类型为 `tellraw: 13`、`scriptevent_ai_resp: 4`、`give: 1`、`say: 1`。
+
+## 后续修正
+
+- `simulate-client` 现在会读取场景文件中的 `player`，并优先使用场景玩家名覆盖 CLI 默认玩家名，避免场景改成 `tester` 时仍发送 `fantong7038`。
+- 常用 Minecraft 命令模拟从只支持 `give` 扩展到 `summon`、`tp`、`teleport`、`time`、`weather`、`effect`、`gamemode`、`setblock`、`fill`、`kill`、`clear`、`title`、`playsound`、`particle`、`locate`、`xp`、`enchant`、`difficulty`、`gamerule`、`spawnpoint`、`setworldspawn`、`scoreboard`、`tag`、`execute` 等常见命令。
+- `run_world_command` bridge fallback 复用同一套命令模拟结果，避免常用命令在普通工具失败后 bridge 仍返回 unsupported。
+- 本次失败场景的根因不是模拟器未发送 `commandResponse`，而是场景快速发送 `AI 对话 status` 时，服务端 `handle_conversation()` 等待同玩家会话锁，堵住 WebSocket 读循环，导致已到达 socket 的 `commandResponse` 无法在工具 10 秒超时前被读取。
+- `AI 对话 status` 属于只读状态查询，现在绕过会话锁直接生成状态响应，避免阻塞同连接上的 commandResponse 处理；会修改状态的对话命令仍继续持有同玩家会话锁。
+- 新增回归测试 `test_conversation_status_does_not_block_command_response`，覆盖会话锁被占用时仍能处理 commandResponse 的场景。
+- 最新相关验证：`pytest tests/test_websocket_conversation_commands.py tests/test_connection_manager.py tests/test_mcbe_simulator.py -q`，结果 `20 passed, 4 warnings`。
+- 快速连续发送多条 `AI chat` 时，后续请求会携带入队瞬间的旧 `conversation_generation`；虽然同玩家请求已由 worker 串行处理，但完成写历史时仍用旧 generation 校验，导致正常串行聊天被误判为 stale 并出现 `chat_history_stale_write_skipped`。
+- `AgentWorker` 现在在持有同玩家会话锁后读取当前对话 generation 作为本轮写入基线，不再使用入队时旧 generation；`MessageBroker.set_conversation_history(..., expected_generation=...)` 仍保留对清空、压缩等真正过期写入的保护。
+- 新增回归测试 `test_worker_keeps_serial_chat_history_when_requests_share_initial_generation`，覆盖两条同玩家聊天共享初始 generation 时历史仍保留完整轮次。
+- 最新 stale 写入验证：`pytest tests/test_queue_context.py tests/test_conversation_manager.py tests/test_websocket_conversation_commands.py tests/test_connection_manager.py tests/test_mcbe_simulator.py -q`，结果 `73 passed, 4 warnings`。

@@ -1,4 +1,5 @@
-"""MCBE WebSocket 与 Addon bridge 模拟客户端。
+"""
+MCBE WebSocket 与 Addon bridge 模拟客户端。
 
 使用说明：
 1. 先启动 MCBE AI Agent 服务，默认 WebSocket 地址为 ws://127.0.0.1:8080。
@@ -23,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,42 @@ COMMAND_VERSION = 17039360
 
 ITEM_NAME_MAP = {
     "diamond": "钻石",
+}
+
+
+@dataclass(frozen=True)
+class Scenario:
+    player: str | None
+    messages: list[str]
+    command_response_delay: float = 0.05
+
+
+COMMON_SUCCESS_COMMANDS = {
+    "summon": "已模拟执行命令: summon",
+    "tp": "已模拟执行命令: tp",
+    "teleport": "已模拟执行命令: teleport",
+    "time": "已模拟执行命令: time",
+    "weather": "已模拟执行命令: weather",
+    "effect": "已模拟执行命令: effect",
+    "gamemode": "已模拟执行命令: gamemode",
+    "setblock": "已模拟执行命令: setblock",
+    "fill": "已模拟执行命令: fill",
+    "kill": "已模拟执行命令: kill",
+    "clear": "已模拟执行命令: clear",
+    "title": "已模拟执行命令: title",
+    "playsound": "已模拟执行命令: playsound",
+    "particle": "已模拟执行命令: particle",
+    "locate": "已模拟执行命令: locate",
+    "xp": "已模拟执行命令: xp",
+    "give": "已模拟执行命令: give",
+    "enchant": "已模拟执行命令: enchant",
+    "difficulty": "已模拟执行命令: difficulty",
+    "gamerule": "已模拟执行命令: gamerule",
+    "spawnpoint": "已模拟执行命令: spawnpoint",
+    "setworldspawn": "已模拟执行命令: setworldspawn",
+    "scoreboard": "已模拟执行命令: scoreboard",
+    "tag": "已模拟执行命令: tag",
+    "execute": "已模拟执行命令: execute",
 }
 
 
@@ -126,21 +164,44 @@ def inspect_record(input_path: str | Path) -> dict[str, Any]:
     }
 
 
-def load_scenario_messages(scenario_path: str | Path) -> list[str]:
+def load_scenario(scenario_path: str | Path) -> Scenario:
     data = json.loads(Path(scenario_path).read_text(encoding="utf-8"))
-    steps = data.get("steps", []) if isinstance(data, dict) else []
+    if not isinstance(data, dict):
+        return Scenario(player=None, messages=[])
+
+    steps = data.get("steps", [])
     messages: list[str] = []
-    for step in steps:
+    for step in steps if isinstance(steps, list) else []:
         if isinstance(step, str):
             messages.append(step)
         elif isinstance(step, dict):
             message = step.get("send_player_message", step.get("message"))
             if isinstance(message, str):
                 messages.append(message)
-    return messages
+
+    player = data.get("player")
+    simulation = data.get("simulation") if isinstance(data.get("simulation"), dict) else {}
+    delay_ms = simulation.get("command_response_delay_ms", 50)
+    command_response_delay = max(float(delay_ms), 0.0) / 1000 if isinstance(delay_ms, (int, float)) else 0.05
+    return Scenario(
+        player=player if isinstance(player, str) and player else None,
+        messages=messages,
+        command_response_delay=command_response_delay,
+    )
+
+
+def load_scenario_messages(scenario_path: str | Path) -> list[str]:
+    return load_scenario(scenario_path).messages
+
+
+def resolve_player_name(cli_player: str, scenario_player: str | None) -> str:
+    return scenario_player or cli_player
 
 
 class AddonBridgeSimulator:
+    def __init__(self, player_name: str = "Player") -> None:
+        self.player_name = player_name
+
     def handle_request(self, payload: dict[str, Any]) -> str:
         request_id = str(payload.get("request_id") or "")
         capability = payload.get("capability")
@@ -149,6 +210,12 @@ class AddonBridgeSimulator:
         if capability == "run_world_command":
             command = str(capability_payload.get("command") or "")
             response_payload = self._handle_run_world_command(command)
+        elif capability == "get_inventory_snapshot":
+            response_payload = self._handle_inventory_snapshot(capability_payload)
+        elif capability == "get_player_snapshot":
+            response_payload = self._handle_player_snapshot(capability_payload)
+        elif capability == "find_entities":
+            response_payload = self._handle_find_entities(capability_payload)
         else:
             response_payload = {
                 "ok": False,
@@ -166,6 +233,54 @@ class AddonBridgeSimulator:
         body = McbeCommandSimulator.command_result_for(command)
         return {"ok": body.get("statusCode") == 0, "payload": body}
 
+    def _target_name(self, payload: dict[str, Any]) -> str:
+        target = payload.get("target")
+        return target if isinstance(target, str) and target not in {"@a", "@p", "@s"} else self.player_name
+
+    def _handle_inventory_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        target = self._target_name(payload)
+        return {
+            "ok": True,
+            "payload": {
+                "target": target,
+                "inventory": [
+                    {"slot": 0, "typeId": "minecraft:diamond", "amount": 64},
+                    {"slot": 1, "typeId": "minecraft:sheep_spawn_egg", "amount": 1},
+                ],
+            },
+        }
+
+    def _handle_player_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        target = self._target_name(payload)
+        return {
+            "ok": True,
+            "payload": {
+                "players": [
+                    {
+                        "name": target,
+                        "dimension": "minecraft:overworld",
+                        "location": {"x": 0, "y": 64, "z": 0},
+                        "health": 20,
+                    }
+                ]
+            },
+        }
+
+    def _handle_find_entities(self, payload: dict[str, Any]) -> dict[str, Any]:
+        entity_type = payload.get("entity_type") or payload.get("type") or "minecraft:sheep"
+        return {
+            "ok": True,
+            "payload": {
+                "entities": [
+                    {
+                        "typeId": str(entity_type),
+                        "nameTag": "Simulated Entity",
+                        "location": {"x": 2, "y": 64, "z": 2},
+                    }
+                ]
+            },
+        }
+
 
 class McbeCommandSimulator:
     def __init__(
@@ -177,7 +292,7 @@ class McbeCommandSimulator:
         emit_say_event: bool = True,
     ) -> None:
         self.player_name = player_name
-        self.addon_bridge = addon_bridge or AddonBridgeSimulator()
+        self.addon_bridge = addon_bridge or AddonBridgeSimulator(player_name=player_name)
         self.emit_tellraw_echo = emit_tellraw_echo
         self.emit_say_event = emit_say_event
 
@@ -239,8 +354,11 @@ class McbeCommandSimulator:
 
     @staticmethod
     def command_result_for(command_line: str) -> dict[str, Any]:
-        if command_line.startswith("give "):
+        command_name = command_line.split(maxsplit=1)[0] if command_line.strip() else ""
+        if command_name == "give":
             return McbeCommandSimulator._give_result(command_line)
+        if command_name in COMMON_SUCCESS_COMMANDS:
+            return {"statusCode": 0, "statusMessage": COMMON_SUCCESS_COMMANDS[command_name]}
         return {"statusCode": -1, "statusMessage": f"Simulated command failed: unsupported command: {command_line}"}
 
     @staticmethod
@@ -290,10 +408,12 @@ class SimulatedMcbeClient:
         player_name: str,
         emit_tellraw_echo: bool = True,
         emit_say_event: bool = True,
+        command_response_delay: float = 0.05,
     ) -> None:
         self.target = target
         self.out_dir = Path(out_dir)
         self.player_name = player_name
+        self.command_response_delay = command_response_delay
         self.logger = RecorderLogger("simulate")
         self.dispatcher = CommandRequestDispatcher(
             McbeCommandSimulator(
@@ -363,6 +483,8 @@ class SimulatedMcbeClient:
             except json.JSONDecodeError:
                 continue
             for response in self.dispatcher.handle(data):
+                if self.command_response_delay > 0:
+                    await asyncio.sleep(self.command_response_delay)
                 await websocket.send(response)
                 record = await recorder.record_message(direction="client_to_server", path="sim->server", message=response)
                 self.logger.info(
@@ -377,17 +499,20 @@ async def async_main(args: argparse.Namespace) -> None:
         print(json.dumps(inspect_record(args.input), ensure_ascii=False, indent=2))
         return
 
+    scenario = load_scenario(args.scenario) if getattr(args, "scenario", None) else Scenario(player=None, messages=[])
+    player_name = resolve_player_name(args.player, scenario.player)
+    command_response_delay = args.command_response_delay if args.command_response_delay is not None else scenario.command_response_delay
     client = SimulatedMcbeClient(
         target=args.target,
         out_dir=args.out,
-        player_name=args.player,
+        player_name=player_name,
         emit_tellraw_echo=not args.no_tellraw_echo,
         emit_say_event=not args.no_say_event,
+        command_response_delay=command_response_delay,
     )
     if args.command == "simulate-client":
         messages = list(args.message or [])
-        if args.scenario:
-            messages.extend(load_scenario_messages(args.scenario))
+        messages.extend(scenario.messages)
         await client.run_messages(messages, speed=args.speed, wait_after=args.wait_after)
     elif args.command == "replay-record-with-simulation":
         await client.replay_record(args.input, speed=args.speed, wait_after=args.wait_after)
@@ -404,6 +529,7 @@ def build_parser() -> argparse.ArgumentParser:
     simulate.add_argument("--scenario")
     simulate.add_argument("--speed", type=float, default=1.0)
     simulate.add_argument("--wait-after", type=float, default=1.0)
+    simulate.add_argument("--command-response-delay", type=float)
     simulate.add_argument("--out", default="test_logs/ws_simulations")
     simulate.add_argument("--no-tellraw-echo", action="store_true")
     simulate.add_argument("--no-say-event", action="store_true")
@@ -414,13 +540,14 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--player", default="fantong7038")
     replay.add_argument("--speed", type=float, default=1.0)
     replay.add_argument("--wait-after", type=float, default=1.0)
+    replay.add_argument("--command-response-delay", type=float)
     replay.add_argument("--out", default="test_logs/ws_simulations")
     replay.add_argument("--no-tellraw-echo", action="store_true")
     replay.add_argument("--no-say-event", action="store_true")
 
     inspect = subparsers.add_parser("inspect-record", help="分析录制文件中的 commandRequest/commandResponse 配对")
     inspect.add_argument("--input", required=True)
-    inspect.set_defaults(target="", out="test_logs/ws_simulations", player="fantong7038", no_tellraw_echo=False, no_say_event=False)
+    inspect.set_defaults(target="", out="test_logs/ws_simulations", player="fantong7038", no_tellraw_echo=False, no_say_event=False, command_response_delay=None)
 
     return parser
 

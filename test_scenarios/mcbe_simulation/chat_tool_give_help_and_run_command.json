@@ -1,10 +1,14 @@
 {
   "name": "chat_tool_give_help_and_run_command",
   "player": "tester",
+  "simulation": {"command_response_delay_ms": 80},
   "steps": [
     {"send_player_message": "AI chat hi"},
     {"send_player_message": "AI chat 给我64颗钻石"},
+    {"send_player_message": "AI chat 给我只羊"},
+    {"send_player_message": "AI chat 看看我的背包有什么"},
     {"send_player_message": "帮助"},
-    {"send_player_message": "运行命令 say hi"}
+    {"send_player_message": "运行命令 say hi"},
+    {"send_player_message": "AI 对话 status"}
   ]
 }
