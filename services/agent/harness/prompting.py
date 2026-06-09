@@ -34,7 +34,7 @@ def render_tool_cards() -> str:
 def render_runtime_harness_prompt() -> str:
     return "\n\n".join(
         (
-            "你可以使用工具与 Minecraft 交互。先判断玩家意图，再选择风险最低且能完成目标的工具。",
+            "你可以使用工具与 MCBE 交互。先判断玩家意图，再选择风险最低且能完成目标的工具。",
             render_tool_decision_tree(),
             render_tool_cards(),
         )

@@ -84,7 +84,7 @@ def register_agent_tools(
         commands: list[str],
     ) -> str:
         """
-        批量执行 Minecraft 命令
+        批量执行 Minecraft 命令，注意一定要遵循MCBE的语法
 
         Args:
             ctx: 运行上下文

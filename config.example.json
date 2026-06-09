@@ -30,7 +30,7 @@
     }
   },
   "agent": {
-    "system_prompt": "请始终保持积极和专业的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown",
+    "system_prompt": "你是一个MCBE助手，请始终保持积极友好的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown",
     "enable_reasoning_output": true,
     "max_history_turns": 20,
     "compression_enabled": true,
