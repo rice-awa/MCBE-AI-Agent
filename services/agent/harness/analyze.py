@@ -7,6 +7,8 @@ from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Any
 
+from config.settings import Settings
+
 from services.agent.harness.catalog import ToolRisk, get_tool_entry
 
 AuditRecord = dict[str, Any]
@@ -52,7 +54,87 @@ def analyze_records(records: list[AuditRecord]) -> dict[str, Any]:
         "top_issue_tools": top_issue_tools,
         "suggestions": _rule_suggestions(total, failures, risk_distribution, top_issue_tools),
         "llm_suggestions_used": False,
+        "llm_suggestions_fallback": None,
     }
+
+
+async def apply_llm_suggestions(analysis: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    """使用默认 Provider 生成隐私友好的审计建议，失败时回退规则建议。"""
+    try:
+        prompt = _build_llm_prompt(analysis)
+        model = _get_default_model(settings)
+        from pydantic_ai import Agent
+
+        agent = Agent(
+            model,
+            output_type=str,
+            instructions=(
+                "你是 MCBE AI Agent 运行时 Harness 审计助手。"
+                "仅基于聚合统计给出 2-4 条中文、可执行、隐私安全的改进建议；"
+                "不要臆造原始参数、玩家内容或具体审计明细。"
+            ),
+            toolsets=None,
+        )
+        result = await agent.run(prompt)
+        suggestions = _parse_llm_suggestions(result.output)
+        if not suggestions:
+            raise ValueError("LLM 未返回有效建议")
+    except Exception as exc:
+        analysis["llm_suggestions_used"] = False
+        analysis["llm_suggestions_fallback"] = str(exc)
+        return analysis
+
+    analysis["suggestions"] = suggestions
+    analysis["llm_suggestions_used"] = True
+    analysis["llm_suggestions_fallback"] = None
+    return analysis
+
+
+def _build_llm_prompt(analysis: dict[str, Any]) -> str:
+    payload = {
+        "totals": analysis.get("totals", {}),
+        "failure_rate": analysis.get("failure_rate", 0.0),
+        "average_duration_ms": analysis.get("average_duration_ms", 0.0),
+        "risk_distribution": analysis.get("risk_distribution", {}),
+        "top_issue_tools": [
+            {
+                "tool_name": issue.get("tool_name"),
+                "calls": issue.get("calls"),
+                "failures": issue.get("failures"),
+                "failure_rate": issue.get("failure_rate"),
+                "average_duration_ms": issue.get("average_duration_ms"),
+                "risk": issue.get("risk"),
+                "reasons": issue.get("reasons", []),
+            }
+            for issue in analysis.get("top_issue_tools", [])[:5]
+        ],
+        "rule_suggestions": analysis.get("suggestions", []),
+    }
+    return (
+        "请基于以下运行时 Harness 聚合审计摘要提出改进建议。"
+        "摘要不包含原始工具参数、玩家消息或工具返回内容；不要要求查看这些隐私数据。\n"
+        f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
+    )
+
+
+def _get_default_model(settings: Settings) -> Any:
+    from services.agent.providers import ProviderRegistry
+
+    provider_config = settings.get_provider_config(settings.default_provider)
+    return ProviderRegistry.get_model(provider_config)
+
+
+def _parse_llm_suggestions(output: str) -> list[str]:
+    suggestions: list[str] = []
+    for line in output.splitlines():
+        suggestion = line.strip()
+        while suggestion[:1] in {"-", "*", "•"}:
+            suggestion = suggestion[1:].strip()
+        if len(suggestion) >= 2 and suggestion[0].isdigit() and suggestion[1] in {".", "、"}:
+            suggestion = suggestion[2:].strip()
+        if suggestion:
+            suggestions.append(suggestion)
+    return suggestions or ([output.strip()] if output.strip() else [])
 
 
 def _top_issue_tools(records: list[AuditRecord]) -> list[dict[str, Any]]:

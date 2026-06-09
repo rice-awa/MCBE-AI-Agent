@@ -1,8 +1,11 @@
 """运行时 Harness 审计分析测试。"""
 
 import json
+from types import SimpleNamespace
 
-from services.agent.harness.analyze import analyze_records, read_recent_records
+import pytest
+
+from services.agent.harness.analyze import analyze_records, apply_llm_suggestions, read_recent_records
 
 
 def write_jsonl(path, records):
@@ -111,3 +114,90 @@ def test_analyze_records_empty_has_zero_totals_and_suggestion():
     assert analysis["risk_distribution"] == {}
     assert analysis["top_issue_tools"] == []
     assert analysis["suggestions"] == ["暂无审计记录；先保持审计开启并积累工具调用样本。"]
+
+
+@pytest.mark.asyncio
+async def test_apply_llm_suggestions_uses_default_provider_without_tools(monkeypatch):
+    analysis = analyze_records([
+        audit_record(
+            "run_minecraft_commands",
+            risk="危险",
+            status="failure",
+            success="failure",
+            duration_ms=3000,
+            failure_reason="参数 commands 无效",
+        ),
+    ])
+    analysis["raw_player_message"] = "secret player message"
+    analysis["parameters"] = {"command": "secret command"}
+    settings = SimpleNamespace(
+        default_provider="deepseek",
+        get_provider_config=lambda provider: SimpleNamespace(name=provider, model="deepseek-chat"),
+    )
+    captured = {}
+
+    def fake_get_model(provider_config):
+        captured["provider_config"] = provider_config
+        return "fake-model"
+
+    class FakeAgent:
+        def __init__(self, model, *, output_type, instructions, toolsets):
+            captured["model"] = model
+            captured["output_type"] = output_type
+            captured["instructions"] = instructions
+            captured["toolsets"] = toolsets
+
+        async def run(self, prompt):
+            captured["prompt"] = prompt
+            return SimpleNamespace(output="- 收窄高失败工具的使用条件\n2. 强化危险工具调用确认")
+
+    from services.agent.providers import ProviderRegistry
+    import pydantic_ai
+
+    monkeypatch.setattr(ProviderRegistry, "get_model", staticmethod(fake_get_model))
+    monkeypatch.setattr(pydantic_ai, "Agent", FakeAgent)
+
+    result = await apply_llm_suggestions(analysis, settings)
+
+    assert result["suggestions"] == [
+        "收窄高失败工具的使用条件",
+        "强化危险工具调用确认",
+    ]
+    assert result["llm_suggestions_used"] is True
+    assert result["llm_suggestions_fallback"] is None
+    assert captured["provider_config"].name == "deepseek"
+    assert captured["model"] == "fake-model"
+    assert captured["output_type"] is str
+    assert captured["toolsets"] is None
+    assert "secret" not in captured["prompt"]
+    assert "raw_player_message" not in captured["prompt"]
+    assert "parameters" not in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_apply_llm_suggestions_falls_back_to_rule_suggestions(monkeypatch):
+    analysis = analyze_records([])
+    rule_suggestions = list(analysis["suggestions"])
+    settings = SimpleNamespace(
+        default_provider="deepseek",
+        get_provider_config=lambda provider: SimpleNamespace(name=provider),
+    )
+
+    class FailingAgent:
+        def __init__(self, model, *, output_type, instructions, toolsets):
+            pass
+
+        async def run(self, prompt):
+            raise RuntimeError("model unavailable")
+
+    from services.agent.providers import ProviderRegistry
+    import pydantic_ai
+
+    monkeypatch.setattr(ProviderRegistry, "get_model", staticmethod(lambda provider_config: "fake-model"))
+    monkeypatch.setattr(pydantic_ai, "Agent", FailingAgent)
+
+    result = await apply_llm_suggestions(analysis, settings)
+
+    assert result["suggestions"] == rule_suggestions
+    assert result["llm_suggestions_used"] is False
+    assert result["llm_suggestions_fallback"] == "model unavailable"

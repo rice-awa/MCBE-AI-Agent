@@ -7,6 +7,7 @@ from click.testing import CliRunner
 
 import cli as cli_module
 from cli import cli
+import services.agent.harness.analyze as analyze_module
 
 
 def test_runtime_harness_analyze_json_handles_missing_audit_file(tmp_path, monkeypatch):
@@ -72,7 +73,12 @@ def test_runtime_harness_analyze_default_recent_uses_configured_max(tmp_path, mo
         runtime_harness_audit_path=str(tmp_path / "missing.jsonl"),
         runtime_harness_audit_max_records=5000,
     )
+
+    async def fake_apply_llm_suggestions(analysis, settings):
+        return analysis
+
     monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(analyze_module, "apply_llm_suggestions", fake_apply_llm_suggestions)
 
     result = CliRunner().invoke(cli, ["runtime-harness", "analyze", "--json"])
 
@@ -82,7 +88,7 @@ def test_runtime_harness_analyze_default_recent_uses_configured_max(tmp_path, mo
     assert payload["llm_suggestions_used"] is False
 
 
-def test_runtime_harness_analyze_default_mode_uses_rule_fallback(tmp_path, monkeypatch):
+def test_runtime_harness_analyze_default_mode_uses_llm_helper(tmp_path, monkeypatch):
     audit_path = tmp_path / "runtime_harness_tools.jsonl"
     audit_path.write_text(
         json.dumps({
@@ -102,15 +108,66 @@ def test_runtime_harness_analyze_default_mode_uses_rule_fallback(tmp_path, monke
         runtime_harness_audit_path=str(audit_path),
         runtime_harness_audit_max_records=5000,
     )
+    async def fake_apply_llm_suggestions(analysis, settings):
+        analysis["suggestions"] = ["LLM 聚合建议：收窄高失败工具使用条件。"]
+        analysis["llm_suggestions_used"] = True
+        analysis["llm_suggestions_fallback"] = None
+        return analysis
+
     monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(analyze_module, "apply_llm_suggestions", fake_apply_llm_suggestions)
 
     result = CliRunner().invoke(cli, ["runtime-harness", "analyze", "--recent", "1"])
 
     assert result.exit_code == 0
-    assert "未启用 LLM 建议，本次使用规则模板输出。" in result.output
+    assert "LLM 聚合建议：收窄高失败工具使用条件。" in result.output
+    assert "已使用默认 Provider 生成 LLM 建议" in result.output
+
+    json_result = CliRunner().invoke(cli, ["runtime-harness", "analyze", "--recent", "1", "--json"])
+
+    assert json_result.exit_code == 0
+    payload = json.loads(json_result.output)
+    assert payload["suggestions"] == ["LLM 聚合建议：收窄高失败工具使用条件。"]
+    assert payload["llm_suggestions_used"] is True
+
+
+def test_runtime_harness_analyze_default_mode_falls_back_when_llm_helper_fails(tmp_path, monkeypatch):
+    audit_path = tmp_path / "runtime_harness_tools.jsonl"
+    audit_path.write_text(
+        json.dumps({
+            "tool_name": "query_minecraft_state",
+            "risk": "低",
+            "status": "success",
+            "duration_ms": 100,
+            "result": {
+                "success": "success",
+                "result_preview": "ok",
+                "failure_reason": None,
+            },
+        }, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    settings = SimpleNamespace(
+        runtime_harness_audit_path=str(audit_path),
+        runtime_harness_audit_max_records=5000,
+    )
+
+    async def fake_apply_llm_suggestions(analysis, settings):
+        analysis["llm_suggestions_used"] = False
+        analysis["llm_suggestions_fallback"] = "model unavailable"
+        return analysis
+
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(analyze_module, "apply_llm_suggestions", fake_apply_llm_suggestions)
+
+    result = CliRunner().invoke(cli, ["runtime-harness", "analyze", "--recent", "1"])
+
+    assert result.exit_code == 0
+    assert "LLM 建议生成失败，已回退规则模板输出: model unavailable" in result.output
 
     json_result = CliRunner().invoke(cli, ["runtime-harness", "analyze", "--recent", "1", "--json"])
 
     assert json_result.exit_code == 0
     payload = json.loads(json_result.output)
     assert payload["llm_suggestions_used"] is False
+    assert payload["llm_suggestions_fallback"] == "model unavailable"

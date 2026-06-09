@@ -1,6 +1,7 @@
 """运行时 Harness 工具审计测试。"""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -97,6 +98,21 @@ def test_records_rotate_after_exceeding_max_records(tmp_path):
 
     records = read_jsonl(audit_path)
     assert [record["index"] for record in records] == [2, 3, 4]
+
+
+def test_concurrent_records_do_not_lose_writes(tmp_path):
+    audit_path = tmp_path / "runtime_harness_tools.jsonl"
+    record_count = 50
+
+    def write_record(index: int) -> None:
+        write_audit_record({"index": index}, audit_path, max_records=record_count)
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        list(executor.map(write_record, range(record_count)))
+
+    records = read_jsonl(audit_path)
+    assert len(records) == record_count
+    assert sorted(record["index"] for record in records) == list(range(record_count))
 
 
 @pytest.mark.asyncio

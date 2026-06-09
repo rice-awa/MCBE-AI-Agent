@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
+import tempfile
+import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -35,6 +38,9 @@ _FAILURE_PREFIXES = (
     "查询实体失败",
     "执行世界命令失败",
 )
+
+_AUDIT_WRITE_LOCKS: dict[Path, threading.Lock] = {}
+_AUDIT_WRITE_LOCKS_GUARD = threading.Lock()
 
 
 def audit_enabled(settings: Settings | None) -> bool:
@@ -117,10 +123,45 @@ def summarize_result(
 def write_audit_record(record: AuditRecord, path: str | Path, max_records: int) -> None:
     audit_path = Path(path)
     audit_path.parent.mkdir(parents=True, exist_ok=True)
-    existing = audit_path.read_text(encoding="utf-8").splitlines() if audit_path.exists() else []
-    lines = [*existing, json.dumps(record, ensure_ascii=False, default=str)]
-    retained = lines[-max(1, max_records):]
-    audit_path.write_text("\n".join(retained) + "\n", encoding="utf-8")
+    with _audit_write_lock(audit_path):
+        existing = audit_path.read_text(encoding="utf-8").splitlines() if audit_path.exists() else []
+        lines = [*existing, json.dumps(record, ensure_ascii=False, default=str)]
+        retained = lines[-max(1, max_records):]
+        _atomic_write_text(audit_path, "\n".join(retained) + "\n")
+
+
+def _audit_write_lock(audit_path: Path) -> threading.Lock:
+    resolved = audit_path.resolve(strict=False)
+    with _AUDIT_WRITE_LOCKS_GUARD:
+        lock = _AUDIT_WRITE_LOCKS.get(resolved)
+        if lock is None:
+            lock = threading.Lock()
+            _AUDIT_WRITE_LOCKS[resolved] = lock
+        return lock
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_name = temp_file.name
+            temp_file.write(content)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
 
 
 def wrap_tool_function(tool_name: str, function: ToolFunction, settings: Settings | None) -> ToolFunction:

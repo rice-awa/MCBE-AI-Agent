@@ -295,7 +295,7 @@ def runtime_harness():
 @click.option("--no-llm", is_flag=True, default=False, help="仅输出规则聚合建议")
 def runtime_harness_analyze(recent: int | None, json_output: bool, no_llm: bool):
     """分析运行时 Harness 审计记录并给出反馈建议。"""
-    from services.agent.harness.analyze import analyze_records, read_recent_records
+    from services.agent.harness.analyze import analyze_records, apply_llm_suggestions, read_recent_records
 
     settings = get_settings()
     recent_count = recent if recent is not None else settings.runtime_harness_audit_max_records
@@ -303,7 +303,8 @@ def runtime_harness_analyze(recent: int | None, json_output: bool, no_llm: bool)
     analysis = analyze_records(records)
     analysis["recent"] = recent_count
     analysis["audit_path"] = settings.runtime_harness_audit_path
-    analysis["llm_suggestions_used"] = False
+    if not no_llm:
+        analysis = asyncio.run(apply_llm_suggestions(analysis, settings))
 
     if json_output:
         click.echo(json.dumps(analysis, ensure_ascii=False, sort_keys=True))
@@ -339,8 +340,14 @@ def _echo_runtime_harness_analysis(analysis: dict[str, Any], *, no_llm: bool) ->
         click.echo(f"- {suggestion}")
     if no_llm:
         click.echo("- 已按 --no-llm 跳过 LLM 建议。")
+    elif analysis.get("llm_suggestions_used"):
+        click.echo("- 已使用默认 Provider 生成 LLM 建议。")
     else:
-        click.echo("- 未启用 LLM 建议，本次使用规则模板输出。")
+        fallback = analysis.get("llm_suggestions_fallback")
+        if fallback:
+            click.echo(f"- LLM 建议生成失败，已回退规则模板输出: {fallback}")
+        else:
+            click.echo("- 未启用 LLM 建议，本次使用规则模板输出。")
 
 
 def _format_distribution(distribution: dict[str, int]) -> str:
