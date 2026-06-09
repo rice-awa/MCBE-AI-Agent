@@ -8,8 +8,10 @@ from typing import Any
 from pydantic_ai import Agent, RunContext
 
 from config.logging import get_logger
+from config.settings import Settings
 from models.agent import AgentDependencies
 from models.minecraft import MinecraftCommand
+from services.agent.harness.prompting import render_schema_description_prefix
 from services.agent.mcwiki import (
     build_mcwiki_url,
     build_page_url,
@@ -20,7 +22,24 @@ from services.agent.mcwiki import (
 logger = get_logger(__name__)
 
 
-def register_agent_tools(chat_agent: Agent[AgentDependencies, str]) -> None:
+def _runtime_harness_schema_enabled(settings: Settings | None) -> bool:
+    if settings is None:
+        return True
+    return settings.runtime_harness_enabled and settings.runtime_harness_schema_enabled
+
+
+def _enhance_registered_tool_descriptions(chat_agent: Agent[AgentDependencies, str]) -> None:
+    for tool_name, tool in chat_agent._function_toolset.tools.items():
+        description = tool.description or ""
+        if description.startswith("[运行时 Harness]"):
+            continue
+        tool.description = render_schema_description_prefix(tool_name) + description.strip()
+
+
+def register_agent_tools(
+    chat_agent: Agent[AgentDependencies, str],
+    settings: Settings | None = None,
+) -> None:
     """注册 Agent 工具到指定的 Agent 实例"""
 
     @chat_agent.tool
@@ -569,6 +588,9 @@ def register_agent_tools(chat_agent: Agent[AgentDependencies, str]) -> None:
         except Exception as e:
             logger.error("agent_tool_error", tool="run_world_command", error=str(e))
             return f"执行世界命令失败: {str(e)}"
+
+    if _runtime_harness_schema_enabled(settings):
+        _enhance_registered_tool_descriptions(chat_agent)
 
 
 def escape_command_text(text: str) -> str:

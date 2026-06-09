@@ -76,7 +76,7 @@ class ChatAgentManager:
             return await build_dynamic_prompt(ctx)
 
         # 注册基础工具
-        register_agent_tools(agent)
+        register_agent_tools(agent, settings=self._settings)
 
         return agent
 

@@ -6,12 +6,52 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
+from pydantic_ai import Agent
+
+from config.settings import Settings
+from models.agent import AgentDependencies
+from services.agent.harness.prompting import render_schema_description_prefix
 from services.agent.tools import (
     build_actionbar_command,
     build_tellraw_command,
     build_title_commands,
     escape_command_text,
+    register_agent_tools,
 )
+
+
+def test_schema_description_prefix_contains_catalog_fields() -> None:
+    prefix = render_schema_description_prefix("run_minecraft_command")
+
+    assert "[运行时 Harness]" in prefix
+    assert "意图: 改变世界" in prefix
+    assert "风险: 高" in prefix
+    assert "适用:" in prefix
+    assert "禁用:" in prefix
+    assert "参数:" in prefix
+
+
+def test_registered_tool_description_includes_runtime_harness_prefix() -> None:
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent, settings=Settings())
+
+    description = agent._function_toolset.tools["run_minecraft_command"].description
+
+    assert description is not None
+    assert description.startswith("[运行时 Harness]")
+    assert "执行 Minecraft 命令" in description
+
+
+def test_registered_tool_description_can_skip_runtime_harness_prefix() -> None:
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    settings = Settings(runtime_harness_schema_enabled=False)
+    register_agent_tools(agent, settings=settings)
+
+    description = agent._function_toolset.tools["run_minecraft_command"].description
+
+    assert description is not None
+    assert not description.startswith("[运行时 Harness]")
+    assert "执行 Minecraft 命令" in description
 
 
 def test_escape_command_text() -> None:
