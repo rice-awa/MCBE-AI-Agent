@@ -528,9 +528,14 @@ class WebSocketServer:
         self, state: Any, option: str, player_name: str | None = None
     ) -> None:
         """处理对话管理：新建、切换、清除、压缩、保存、恢复、列表和删除。"""
-        lock = self.broker.get_session_lock(state.id, player_name)
-        async with lock:
+        parts = option.strip().split(None, 1) if option.strip() else []
+        action = parts[0].lower() if parts else "状态"
+        if action in ("状态", "status", ""):
             msg = await self._handle_conversation_locked(state, option, player_name)
+        else:
+            lock = self.broker.get_session_lock(state.id, player_name)
+            async with lock:
+                msg = await self._handle_conversation_locked(state, option, player_name)
 
         await self._send_ws_payload(state, msg, source="conversation")
 

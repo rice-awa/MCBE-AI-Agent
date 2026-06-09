@@ -9,11 +9,21 @@ sys.path.append(str(ROOT))
 
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
+from tools_mcbe_simulator import build_player_message, build_command_response
+
 from config.settings import Settings
 from core.queue import MessageBroker
 from services.auth.jwt_handler import JWTHandler
 from services.websocket.connection import ConnectionState
 from services.websocket.server import WebSocketServer
+
+
+class DummyWebSocket:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, payload: str) -> None:
+        self.sent.append(payload)
 
 
 def _build_turn(index: int) -> list[ModelRequest | ModelResponse]:
@@ -25,11 +35,42 @@ def _build_turn(index: int) -> list[ModelRequest | ModelResponse]:
 
 def _server(tmp_path, monkeypatch) -> tuple[WebSocketServer, MessageBroker, ConnectionState]:
     monkeypatch.chdir(tmp_path)
-    settings = Settings(default_provider="ollama")
+    settings = Settings(default_provider="ollama", dev_mode=True)
     broker = MessageBroker()
     state = ConnectionState()
+    state.authenticated = True
+    state.websocket = DummyWebSocket()
     broker.register_connection(state.id)
     return WebSocketServer(broker, settings, JWTHandler(settings)), broker, state
+
+
+def test_conversation_status_does_not_block_command_response(tmp_path, monkeypatch):
+    async def _run() -> None:
+        server, broker, state = _server(tmp_path, monkeypatch)
+        lock = broker.get_session_lock(state.id, "alice")
+        result_future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        state.pending_command_futures["req-give"] = result_future
+
+        async with lock:
+            status_task = asyncio.create_task(
+                server.handle_message(state, build_player_message("alice", "AI 对话 status"))
+            )
+            await asyncio.sleep(0)
+            await server.handle_message(
+                state,
+                build_command_response(
+                    "req-give",
+                    {"statusCode": 0, "statusMessage": "给予 alice 钻石 * 64 效果"},
+                ),
+            )
+
+            assert result_future.done()
+            assert result_future.result() == "给予 alice 钻石 * 64 效果"
+            assert status_task.done()
+
+        await status_task
+
+    asyncio.run(_run())
 
 
 def test_conversation_new_rejects_existing_id_without_overwrite(tmp_path, monkeypatch):
