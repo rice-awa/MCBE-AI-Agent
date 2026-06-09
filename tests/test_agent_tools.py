@@ -1,11 +1,15 @@
 """Agent 工具函数测试"""
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
+from uuid import uuid4
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
+import pytest
 from pydantic_ai import Agent
 
 from config.settings import Settings
@@ -52,6 +56,40 @@ def test_registered_tool_description_can_skip_runtime_harness_prefix() -> None:
     assert description is not None
     assert not description.startswith("[运行时 Harness]")
     assert "执行 Minecraft 命令" in description
+
+
+async def _noop_send_to_game(message: str) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_registered_tool_function_writes_audit_jsonl(tmp_path) -> None:
+    audit_path = tmp_path / "tools.jsonl"
+    settings = Settings(runtime_harness_audit_path=str(audit_path))
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent, settings=settings)
+
+    async def run_command(command: str) -> str:
+        return "ok"
+
+    deps = AgentDependencies(
+        connection_id=uuid4(),
+        player_name="Alex",
+        settings=settings,
+        http_client=SimpleNamespace(),
+        send_to_game=_noop_send_to_game,
+        run_command=run_command,
+        provider="ollama",
+    )
+    ctx = SimpleNamespace(deps=deps)
+
+    result = await agent._function_toolset.tools["run_minecraft_command"].function(ctx, "say hi")
+
+    assert result == "ok"
+    records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    assert records[0]["tool_name"] == "run_minecraft_command"
+    assert records[0]["player_name"] == "Alex"
+    assert records[0]["parameters"] == {"command": "say hi"}
 
 
 def test_escape_command_text() -> None:

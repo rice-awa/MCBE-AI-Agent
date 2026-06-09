@@ -1,0 +1,154 @@
+"""运行时 Harness 工具审计测试。"""
+
+import json
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+
+from config.settings import Settings
+from services.agent.harness.audit import (
+    preview_parameters,
+    wrap_tool_function,
+    write_audit_record,
+)
+from services.agent.harness.catalog import ToolCatalogEntry
+
+
+class DummyDeps:
+    def __init__(self, settings: Settings) -> None:
+        self.connection_id = uuid4()
+        self.player_name = "Steve"
+        self.provider = "deepseek"
+        self.settings = settings
+
+
+def read_jsonl(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.mark.asyncio
+async def test_successful_tool_call_writes_jsonl(tmp_path):
+    audit_path = tmp_path / "runtime_harness_tools.jsonl"
+    settings = Settings(runtime_harness_audit_path=str(audit_path))
+
+    async def fake_tool(ctx, command: str):
+        return "命令执行成功"
+
+    wrapped = wrap_tool_function("run_minecraft_command", fake_tool, settings)
+    ctx = SimpleNamespace(deps=DummyDeps(settings))
+
+    result = await wrapped(ctx, "say hello")
+
+    assert result == "命令执行成功"
+    records = read_jsonl(audit_path)
+    assert len(records) == 1
+    record = records[0]
+    assert record["tool_name"] == "run_minecraft_command"
+    assert record["status"] == "success"
+    assert record["player_name"] == "Steve"
+    assert record["provider"] == "deepseek"
+    assert record["parameters"] == {"command": "say hello"}
+    assert record["result"]["success"] == "success"
+    assert record["result"]["result_preview"] is None
+    assert record["result"]["failure_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_failed_tool_call_writes_jsonl(tmp_path):
+    audit_path = tmp_path / "runtime_harness_tools.jsonl"
+    settings = Settings(runtime_harness_audit_path=str(audit_path))
+
+    async def fake_tool(ctx, command: str):
+        raise RuntimeError("boom")
+
+    wrapped = wrap_tool_function("run_minecraft_command", fake_tool, settings)
+    ctx = SimpleNamespace(deps=DummyDeps(settings))
+
+    with pytest.raises(RuntimeError):
+        await wrapped(ctx, command="say fail")
+
+    records = read_jsonl(audit_path)
+    assert len(records) == 1
+    record = records[0]
+    assert record["status"] == "failure"
+    assert record["parameters"] == {"command": "say fail"}
+    assert record["result"]["success"] == "failure"
+    assert record["result"]["failure_reason"] == "boom"
+
+
+def test_parameter_redaction_and_truncation_work():
+    parameters = {
+        "command": "x" * 130,
+        "raw_player_message": "do not record",
+    }
+
+    preview = preview_parameters("run_minecraft_command", parameters)
+
+    assert preview == {"command": "x" * 120 + "..."}
+    assert "raw_player_message" not in preview
+
+
+def test_records_rotate_after_exceeding_max_records(tmp_path):
+    audit_path = tmp_path / "runtime_harness_tools.jsonl"
+
+    for index in range(5):
+        write_audit_record({"index": index}, audit_path, max_records=3)
+
+    records = read_jsonl(audit_path)
+    assert [record["index"] for record in records] == [2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_settings_none_wrapper_does_not_write_jsonl(tmp_path):
+    audit_path = tmp_path / "runtime_harness_tools.jsonl"
+    deps_settings = Settings(runtime_harness_audit_path=str(audit_path))
+
+    async def fake_tool(ctx, command: str):
+        return "private command output"
+
+    wrapped = wrap_tool_function("run_minecraft_command", fake_tool, None)
+    ctx = SimpleNamespace(deps=DummyDeps(deps_settings))
+
+    assert await wrapped(ctx, command="say hidden") == "private command output"
+    assert not audit_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_returned_failure_string_records_failure_reason(tmp_path):
+    audit_path = tmp_path / "runtime_harness_tools.jsonl"
+    settings = Settings(runtime_harness_audit_path=str(audit_path))
+
+    async def fake_tool(ctx, command: str):
+        return "命令执行失败: denied"
+
+    wrapped = wrap_tool_function("run_minecraft_command", fake_tool, settings)
+    ctx = SimpleNamespace(deps=DummyDeps(settings))
+
+    assert await wrapped(ctx, command="say fail") == "命令执行失败: denied"
+
+    records = read_jsonl(audit_path)
+    assert len(records) == 1
+    record = records[0]
+    assert record["status"] == "success"
+    assert record["result"]["success"] == "failure"
+    assert record["result"]["result_preview"] is None
+    assert record["result"]["failure_reason"] == "命令执行失败: denied"
+
+
+@pytest.mark.asyncio
+async def test_audit_disabled_does_not_write_jsonl(tmp_path):
+    audit_path = tmp_path / "runtime_harness_tools.jsonl"
+    settings = Settings(
+        runtime_harness_audit_enabled=False,
+        runtime_harness_audit_path=str(audit_path),
+    )
+
+    async def fake_tool(ctx, command: str):
+        return "ok"
+
+    wrapped = wrap_tool_function("run_minecraft_command", fake_tool, settings)
+    ctx = SimpleNamespace(deps=DummyDeps(settings))
+
+    assert await wrapped(ctx, command="say hidden") == "ok"
+    assert not audit_path.exists()
