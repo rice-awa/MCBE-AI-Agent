@@ -1,7 +1,7 @@
 """运行时 Harness 提示注入测试。"""
 
 from config.settings import Settings
-from services.agent.harness.prompting import render_runtime_harness_prompt
+from services.agent.harness import render_runtime_harness_prompt
 from services.agent.prompt import PromptManager, PromptTemplate, TOOL_USAGE_GUIDE
 
 
