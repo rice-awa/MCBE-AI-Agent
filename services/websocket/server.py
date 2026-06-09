@@ -530,16 +530,16 @@ class WebSocketServer:
         """处理对话管理：新建、切换、清除、压缩、保存、恢复、列表和删除。"""
         parts = option.strip().split(None, 1) if option.strip() else []
         action = parts[0].lower() if parts else "状态"
-        if action in ("状态", "status", ""):
-            msg = await self._handle_conversation_locked(state, option, player_name)
+        if action in ("状态", "status", "", "list", "列表", "已保存", "saved"):
+            msg = await self._handle_conversation(state, option, player_name)
         else:
             lock = self.broker.get_session_lock(state.id, player_name)
             async with lock:
-                msg = await self._handle_conversation_locked(state, option, player_name)
+                msg = await self._handle_conversation(state, option, player_name)
 
         await self._send_ws_payload(state, msg, source="conversation")
 
-    async def _handle_conversation_locked(
+    async def _handle_conversation(
         self, state: Any, option: str, player_name: str | None = None
     ) -> TellrawMessage:
         from core.conversation import get_conversation_manager
@@ -727,28 +727,30 @@ class WebSocketServer:
         self, state: Any, provider: str, player_name: str | None = None
     ) -> None:
         """处理模型切换（按玩家分桶）"""
+        available = self.settings.list_available_providers()
+        if provider.lower() not in available:
+            msg = self.protocol_handler.create_error_message(
+                f"不可用的提供商。可用: {', '.join(available)}"
+            )
+            await self._send_ws_payload(state, msg, source="switch_model")
+            return
+
         lock = self.broker.get_session_lock(state.id, player_name)
         async with lock:
-            msg = await self._handle_switch_model_locked(state, provider, player_name)
+            msg = await self._handle_switch_model(state, provider, player_name)
 
         await self._send_ws_payload(state, msg, source="switch_model")
 
-    async def _handle_switch_model_locked(
+    async def _handle_switch_model(
         self, state: Any, provider: str, player_name: str | None = None
     ) -> TellrawMessage:
-        available = self.settings.list_available_providers()
         session = state.get_player_session(player_name)
 
-        if provider.lower() in available:
-            session.current_provider = provider.lower()
-            self.broker.clear_player_conversation_histories(state.id, player_name)
-            config = self.settings.get_provider_config(provider.lower())
-            return self.protocol_handler.create_success_message(
-                f"已切换到 {provider}/{config.model}，该玩家的运行时对话历史已清理"
-            )
-
-        return self.protocol_handler.create_error_message(
-            f"不可用的提供商。可用: {', '.join(available)}"
+        session.current_provider = provider.lower()
+        self.broker.clear_player_conversation_histories(state.id, player_name)
+        config = self.settings.get_provider_config(provider.lower())
+        return self.protocol_handler.create_success_message(
+            f"已切换到 {provider}/{config.model}，该玩家的运行时对话历史已清理"
         )
 
     async def handle_template(

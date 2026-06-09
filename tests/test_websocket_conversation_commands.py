@@ -78,7 +78,7 @@ def test_conversation_new_rejects_existing_id_without_overwrite(tmp_path, monkey
         server, broker, state = _server(tmp_path, monkeypatch)
         broker.set_conversation_history(state.id, "alice", _build_turn(1), "build")
 
-        msg = await server._handle_conversation_locked(state, "new build", "alice")
+        msg = await server._handle_conversation(state, "new build", "alice")
 
         history = broker.get_conversation_history(state.id, "alice", "build")
         assert "已存在" in msg.text
@@ -92,9 +92,9 @@ def test_conversation_new_generates_unique_ids_with_short_ids(tmp_path, monkeypa
     async def _run() -> None:
         server, _broker, state = _server(tmp_path, monkeypatch)
 
-        first = await server._handle_conversation_locked(state, "new", "alice")
+        first = await server._handle_conversation(state, "new", "alice")
         first_id = state.get_player_session("alice").active_conversation_id
-        second = await server._handle_conversation_locked(state, "new", "alice")
+        second = await server._handle_conversation(state, "new", "alice")
         second_id = state.get_player_session("alice").active_conversation_id
 
         assert "已新建" in first.text
@@ -121,7 +121,7 @@ def test_conversation_list_displays_short_ids_titles_current_and_counts(tmp_path
         broker.ensure_conversation_metadata(state.id, "alice", "build")
         broker.set_conversation_title(state.id, "alice", "mine", "挖矿计划")
 
-        msg = await server._handle_conversation_locked(state, "list", "alice")
+        msg = await server._handle_conversation(state, "list", "alice")
 
         assert "#1 build * - 未命名 - 2 条消息" in msg.text
         assert "#2 mine - 挖矿计划 - 4 条消息" in msg.text
@@ -144,7 +144,7 @@ def test_conversation_switch_short_id_uses_mapped_long_id(tmp_path, monkeypatch)
         broker.ensure_conversation_metadata(state.id, "alice", "first")
         broker.ensure_conversation_metadata(state.id, "alice", "build")
 
-        msg = await server._handle_conversation_locked(state, "switch #2", "alice")
+        msg = await server._handle_conversation(state, "switch #2", "alice")
 
         assert session.active_conversation_id == "build"
         assert "已切换到对话: #2 build" in msg.text
@@ -158,7 +158,7 @@ def test_conversation_switch_new_id_creates_empty_conversation_with_short_id(tmp
         server, broker, state = _server(tmp_path, monkeypatch)
         session = state.get_player_session("alice")
 
-        msg = await server._handle_conversation_locked(state, "switch build", "alice")
+        msg = await server._handle_conversation(state, "switch build", "alice")
 
         assert session.active_conversation_id == "build"
         assert broker.get_conversation_history(state.id, "alice", "build") == []
@@ -176,8 +176,8 @@ def test_conversation_switch_short_id_is_isolated_by_player(tmp_path, monkeypatc
         broker.set_conversation_history(state.id, "alice", _build_turn(1), "alice-build")
         broker.set_conversation_history(state.id, "bob", _build_turn(2), "bob-build")
 
-        alice_msg = await server._handle_conversation_locked(state, "switch #1", "alice")
-        bob_msg = await server._handle_conversation_locked(state, "switch #1", "bob")
+        alice_msg = await server._handle_conversation(state, "switch #1", "alice")
+        bob_msg = await server._handle_conversation(state, "switch #1", "bob")
 
         assert alice_session.active_conversation_id == "alice-build"
         assert bob_session.active_conversation_id == "bob-build"
@@ -195,8 +195,8 @@ def test_switch_model_clears_all_player_runtime_conversations(tmp_path, monkeypa
         broker.set_conversation_history(state.id, "bob", _build_turn(3), "default")
         broker.set_conversation_title(state.id, "alice", "other", "旧标题")
 
-        msg = await server._handle_switch_model_locked(state, "ollama", "alice")
-        new_msg = await server._handle_conversation_locked(state, "new fresh", "alice")
+        msg = await server._handle_switch_model(state, "ollama", "alice")
+        new_msg = await server._handle_conversation(state, "new fresh", "alice")
 
         assert "已切换" in msg.text
         assert broker.get_conversation_history(state.id, "alice", "default") == []
