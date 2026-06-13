@@ -12,7 +12,7 @@ from websockets.server import WebSocketServerProtocol, serve
 from core.queue import MessageBroker, normalize_conversation_id
 from services.addon.service import get_addon_bridge_service
 from services.websocket.connection import ConnectionManager
-from services.websocket.flow_control import FlowControlMiddleware
+from services.websocket.delivery import McbeOutboundDelivery
 from services.websocket.minecraft import MinecraftProtocolHandler, TellrawMessage
 from services.auth.jwt_handler import JWTHandler
 from config.settings import Settings
@@ -893,14 +893,7 @@ class WebSocketServer:
             await self._send_ws_payload(state, msg, source="run_command")
             return
 
-        from models.minecraft import MinecraftCommand
-
-        cmd = MinecraftCommand.create_raw(command)
-        await self._send_ws_payload(
-            state,
-            cmd.model_dump_json(exclude_none=True),
-            source="run_command",
-        )
+        await self._delivery(state).send_raw_command(command, source="run_command")
 
         logger.info(
             "command_executed",
@@ -1048,44 +1041,22 @@ class WebSocketServer:
     ) -> None:
         """统一发送 WebSocket 响应并记录原始输出。
 
-        - TellrawMessage: 走 FlowControlMiddleware.chunk_tellraw 自动分片，
+        - TellrawMessage: 走出站投递 Adapter 自动分片，
           从源头消除"反向解析自家产物"的反模式。
         - str: 用于订阅消息、初始化等已序列化 payload，原样发送。
         """
         if isinstance(payload, TellrawMessage):
-            payloads = FlowControlMiddleware.chunk_tellraw(
-                payload.text, color=payload.color
+            await self._delivery(state).send_tellraw(
+                payload.text,
+                color=payload.color,
+                source=source,
             )
-            chunk_delay = FlowControlMiddleware.chunk_delay_for("tellraw")
-            for idx, p in enumerate(payloads):
-                await state.websocket.send(p)
-                self._log_ws_send(
-                    state,
-                    p,
-                    source=f"{source}_chunked" if len(payloads) > 1 else source,
-                )
-                if len(payloads) > 1 and idx < len(payloads) - 1:
-                    await asyncio.sleep(chunk_delay)
             return
 
-        await state.websocket.send(payload)
-        self._log_ws_send(state, payload, source=source)
+        await self._delivery(state).send_payload(payload, source=source)
 
-    def _log_ws_send(self, state: Any, payload: str, source: str) -> None:
-        """记录 ws 发送，附带 commandLine 字节长度便于观察分片命中率。"""
-        command_line_len = 0
-        try:
-            data = json.loads(payload)
-            command_line_len = len(
-                data.get("body", {}).get("commandLine", "").encode("utf-8")
-            )
-        except (json.JSONDecodeError, AttributeError, TypeError):
-            pass
-
-        ws_raw_logger.info(
-            "websocket_response_sent",
-            connection_id=str(state.id),
-            source=source,
-            payload=payload,
-            command_line_bytes=command_line_len,
+    def _delivery(self, state: Any) -> McbeOutboundDelivery:
+        return McbeOutboundDelivery(
+            connection_id=state.id,
+            send_payload=state.websocket.send,
         )

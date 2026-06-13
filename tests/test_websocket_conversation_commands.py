@@ -181,6 +181,21 @@ def test_conversation_switch_short_id_is_isolated_by_player(tmp_path, monkeypatc
 
     asyncio.run(_run())
 
+def test_handle_run_command_rejects_too_long_raw_command(tmp_path, monkeypatch):
+    async def _run() -> None:
+        server, _broker, state = _server(tmp_path, monkeypatch)
+
+        try:
+            await server.handle_run_command(state, "say " + "X" * 1000)
+        except ValueError as exc:
+            assert "raw command too long" in str(exc)
+        else:
+            raise AssertionError("long raw command should be rejected")
+
+        assert state.websocket.sent == []
+
+    asyncio.run(_run())
+
 
 def test_switch_model_clears_all_player_runtime_conversations(tmp_path, monkeypatch):
     async def _run() -> None:
