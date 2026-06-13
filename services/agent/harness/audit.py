@@ -16,6 +16,7 @@ from typing import Any
 
 from config.settings import Settings
 from services.agent.harness.catalog import ParameterPreviewPolicy, get_tool_entry
+from services.agent.tool_results import ToolResult
 
 AuditRecord = dict[str, Any]
 ToolFunction = Callable[..., Any]
@@ -109,6 +110,13 @@ def summarize_result(
             "success": "failure",
             "result_preview": None,
             "failure_reason": str(exception),
+        }
+
+    if isinstance(result, ToolResult):
+        return {
+            "success": result.status,
+            "result_preview": None,
+            "failure_reason": result.failure_reason if not result.success else None,
         }
 
     text = str(result) if result is not None else ""

@@ -13,6 +13,7 @@ from models.agent import AgentDependencies
 from models.minecraft import MinecraftCommand
 from services.agent.harness.audit import wrap_registered_tools
 from services.agent.harness.prompting import render_schema_description_prefix
+from services.agent.tool_results import ToolResult
 from services.agent.mcwiki import (
     build_mcwiki_url,
     build_page_url,
@@ -35,6 +36,31 @@ def _enhance_registered_tool_descriptions(chat_agent: Agent[AgentDependencies, s
         if description.startswith("[运行时 Harness]"):
             continue
         tool.description = render_schema_description_prefix(tool_name) + description.strip()
+
+
+def _stringify_tool_results(chat_agent: Agent[AgentDependencies, str]) -> None:
+    for tool in chat_agent._function_toolset.tools.values():
+        function = getattr(tool, "function", None)
+        if function is None or getattr(function, "_tool_result_stringified", False):
+            continue
+
+        async def wrapper(*args: Any, _function=function, **kwargs: Any) -> str:
+            result = await _function(*args, **kwargs)
+            return str(result)
+
+        setattr(wrapper, "_tool_result_stringified", True)
+        tool.function = wrapper
+        function_schema = getattr(tool, "function_schema", None)
+        if function_schema is not None and hasattr(function_schema, "function"):
+            function_schema.function = wrapper
+
+
+def _tool_success(text: str) -> ToolResult:
+    return ToolResult.success(text)
+
+
+def _tool_failure(text: str) -> ToolResult:
+    return ToolResult.failure(text)
 
 
 def register_agent_tools(
@@ -69,14 +95,14 @@ def register_agent_tools(
             result = await ctx.deps.run_command(command)
             # 简化返回：仅返回游戏原始响应，避免重复显示命令
             # 工具调用名称和参数已通过 tool_call 事件显示
-            return result if result else "命令执行成功"
+            return _tool_success(result if result else "命令执行成功")
         except Exception as e:
             logger.error(
                 "agent_tool_error",
                 tool="run_minecraft_command",
                 error=str(e),
             )
-            return f"命令执行失败: {str(e)}"
+            return _tool_failure(f"命令执行失败: {str(e)}")
 
     @chat_agent.tool
     async def run_minecraft_commands(
@@ -101,12 +127,14 @@ def register_agent_tools(
         )
 
         results: list[str] = []
+        failed = False
         for index, command in enumerate(commands, start=1):
             try:
                 result = await ctx.deps.run_command(command)
                 output = result if result else "命令执行成功"
                 results.append(f"{index}. {command}: {output}")
             except Exception as e:
+                failed = True
                 logger.error(
                     "agent_tool_error",
                     tool="run_minecraft_commands",
@@ -114,7 +142,8 @@ def register_agent_tools(
                     error=str(e),
                 )
                 results.append(f"{index}. {command}: 命令执行失败: {str(e)}")
-        return "\n".join(results) if results else "没有可执行的命令"
+        text = "\n".join(results) if results else "没有可执行的命令"
+        return _tool_failure(text) if failed else _tool_success(text)
 
     @chat_agent.tool
     async def send_game_message(
@@ -139,14 +168,14 @@ def register_agent_tools(
 
         try:
             await ctx.deps.send_to_game(message)
-            return "消息已发送到游戏"
+            return _tool_success("消息已发送到游戏")
         except Exception as e:
             logger.error(
                 "agent_tool_error",
                 tool="send_game_message",
                 error=str(e),
             )
-            return f"消息发送失败: {str(e)}"
+            return _tool_failure(f"消息发送失败: {str(e)}")
 
     @chat_agent.tool
     async def send_colored_message(
@@ -175,14 +204,14 @@ def register_agent_tools(
         try:
             command = build_tellraw_command(message, color)
             await ctx.deps.run_command(command)
-            return "彩色消息已发送"
+            return _tool_success("彩色消息已发送")
         except Exception as e:
             logger.error(
                 "agent_tool_error",
                 tool="send_colored_message",
                 error=str(e),
             )
-            return f"彩色消息发送失败: {str(e)}"
+            return _tool_failure(f"彩色消息发送失败: {str(e)}")
 
     @chat_agent.tool
     async def send_title_message(
@@ -217,14 +246,14 @@ def register_agent_tools(
             commands = build_title_commands(title, subtitle, fade_in, stay, fade_out)
             for command in commands:
                 await ctx.deps.run_command(command)
-            return "标题消息已发送"
+            return _tool_success("标题消息已发送")
         except Exception as e:
             logger.error(
                 "agent_tool_error",
                 tool="send_title_message",
                 error=str(e),
             )
-            return f"标题发送失败: {str(e)}"
+            return _tool_failure(f"标题发送失败: {str(e)}")
 
     @chat_agent.tool
     async def send_actionbar_message(
@@ -250,14 +279,14 @@ def register_agent_tools(
         try:
             command = build_actionbar_command(message)
             await ctx.deps.run_command(command)
-            return "Actionbar 消息已发送"
+            return _tool_success("Actionbar 消息已发送")
         except Exception as e:
             logger.error(
                 "agent_tool_error",
                 tool="send_actionbar_message",
                 error=str(e),
             )
-            return f"Actionbar 发送失败: {str(e)}"
+            return _tool_failure(f"Actionbar 发送失败: {str(e)}")
 
     @chat_agent.tool
     async def send_script_event(
@@ -286,14 +315,14 @@ def register_agent_tools(
         try:
             command = MinecraftCommand.create_scriptevent(content, message_id).body.commandLine
             await ctx.deps.run_command(command)
-            return "脚本事件已发送"
+            return _tool_success("脚本事件已发送")
         except Exception as e:
             logger.error(
                 "agent_tool_error",
                 tool="send_script_event",
                 error=str(e),
             )
-            return f"脚本事件发送失败: {str(e)}"
+            return _tool_failure(f"脚本事件发送失败: {str(e)}")
 
     @chat_agent.tool
     async def fetch_url_text(
@@ -320,22 +349,22 @@ def register_agent_tools(
         )
 
         if not url.startswith(("http://", "https://")):
-            return "仅支持 http 或 https URL"
+            return _tool_failure("仅支持 http 或 https URL")
 
         try:
             response = await ctx.deps.http_client.get(url)
             response.raise_for_status()
             text = response.text.strip()
             if len(text) > max_chars:
-                return text[:max_chars] + "..."
-            return text
+                return _tool_success(text[:max_chars] + "...")
+            return _tool_success(text)
         except Exception as e:
             logger.error(
                 "agent_tool_error",
                 tool="fetch_url_text",
                 error=str(e),
             )
-            return f"请求失败: {str(e)}"
+            return _tool_failure(f"请求失败: {str(e)}")
 
     @chat_agent.tool
     async def mcwiki_search(
@@ -382,16 +411,16 @@ def register_agent_tools(
                 tool="mcwiki_search",
                 error=str(e),
             )
-            return f"搜索请求失败: {str(e)}"
+            return _tool_failure(f"搜索请求失败: {str(e)}")
 
         if not payload.get("success"):
             error = payload.get("error", {})
             message = error.get("message", "搜索失败")
-            return f"搜索失败: {message}"
+            return _tool_failure(f"搜索失败: {message}")
 
         results = payload.get("data", {}).get("results", [])
         if not results:
-            return "未找到相关条目。"
+            return _tool_success("未找到相关条目。")
 
         lines = ["搜索结果："]
         for index, item in enumerate(results, start=1):
@@ -404,7 +433,7 @@ def register_agent_tools(
             if snippet:
                 line += f"\n   摘要: {snippet}"
             lines.append(line)
-        return "\n".join(lines)
+        return _tool_success("\n".join(lines))
 
     @chat_agent.tool
     async def mcwiki_get_page(
@@ -458,12 +487,12 @@ def register_agent_tools(
                 tool="mcwiki_get_page",
                 error=str(e),
             )
-            return f"页面请求失败: {str(e)}"
+            return _tool_failure(f"页面请求失败: {str(e)}")
 
         if not payload.get("success"):
             error = payload.get("error", {})
             message = error.get("message", "页面获取失败")
-            return f"页面获取失败: {message}"
+            return _tool_failure(f"页面获取失败: {message}")
 
         page = payload.get("data", {}).get("page", {})
         title = page.get("title", page_name)
@@ -481,7 +510,7 @@ def register_agent_tools(
             text_content = content.get("markdown") or content.get("html") or ""
 
         if not text_content:
-            return f"页面 {title} 内容为空或解析失败。"
+            return _tool_failure(f"页面 {title} 内容为空或解析失败。")
 
         text_content = text_content.strip()
         if len(text_content) > max_chars:
@@ -490,7 +519,7 @@ def register_agent_tools(
         header = f"页面: {title}"
         if url_item:
             header += f" - {url_item}"
-        return f"{header}\n{text_content}"
+        return _tool_success(f"{header}\n{text_content}")
 
     @chat_agent.tool
     async def list_available_providers(
@@ -506,7 +535,7 @@ def register_agent_tools(
             Provider 列表描述
         """
         providers = ctx.deps.settings.list_available_providers()
-        return "可用 Provider: " + ", ".join(providers)
+        return _tool_success("可用 Provider: " + ", ".join(providers))
 
     @chat_agent.tool
     async def get_player_snapshot(
@@ -515,17 +544,17 @@ def register_agent_tools(
     ) -> str:
         """通过 addon 桥接获取玩家快照。"""
         if ctx.deps.addon_bridge is None:
-            return "Addon 桥接不可用"
+            return _tool_failure("Addon 桥接不可用")
 
         try:
             result = await ctx.deps.addon_bridge.request(
                 "get_player_snapshot",
                 {"target": target},
             )
-            return json.dumps(result.get("payload", result), ensure_ascii=False)
+            return _tool_success(json.dumps(result.get("payload", result), ensure_ascii=False))
         except Exception as e:
             logger.error("agent_tool_error", tool="get_player_snapshot", error=str(e))
-            return f"获取玩家快照失败: {str(e)}"
+            return _tool_failure(f"获取玩家快照失败: {str(e)}")
 
     @chat_agent.tool
     async def get_inventory_snapshot(
@@ -534,17 +563,17 @@ def register_agent_tools(
     ) -> str:
         """通过 addon 桥接获取背包快照。"""
         if ctx.deps.addon_bridge is None:
-            return "Addon 桥接不可用"
+            return _tool_failure("Addon 桥接不可用")
 
         try:
             result = await ctx.deps.addon_bridge.request(
                 "get_inventory_snapshot",
                 {"target": target},
             )
-            return json.dumps(result.get("payload", result), ensure_ascii=False)
+            return _tool_success(json.dumps(result.get("payload", result), ensure_ascii=False))
         except Exception as e:
             logger.error("agent_tool_error", tool="get_inventory_snapshot", error=str(e))
-            return f"获取背包快照失败: {str(e)}"
+            return _tool_failure(f"获取背包快照失败: {str(e)}")
 
     @chat_agent.tool
     async def find_entities(
@@ -555,7 +584,7 @@ def register_agent_tools(
     ) -> str:
         """通过 addon 桥接查询实体快照。"""
         if ctx.deps.addon_bridge is None:
-            return "Addon 桥接不可用"
+            return _tool_failure("Addon 桥接不可用")
 
         try:
             result = await ctx.deps.addon_bridge.request(
@@ -566,10 +595,10 @@ def register_agent_tools(
                     "target": target,
                 },
             )
-            return json.dumps(result.get("payload", result), ensure_ascii=False)
+            return _tool_success(json.dumps(result.get("payload", result), ensure_ascii=False))
         except Exception as e:
             logger.error("agent_tool_error", tool="find_entities", error=str(e))
-            return f"查询实体失败: {str(e)}"
+            return _tool_failure(f"查询实体失败: {str(e)}")
 
     @chat_agent.tool
     async def run_world_command(
@@ -578,21 +607,22 @@ def register_agent_tools(
     ) -> str:
         """通过 addon 桥接受控执行世界命令。(仅当run_minecraft_command工具无法使用才用)"""
         if ctx.deps.addon_bridge is None:
-            return "Addon 桥接不可用"
+            return _tool_failure("Addon 桥接不可用")
 
         try:
             result = await ctx.deps.addon_bridge.request(
                 "run_world_command",
                 {"command": command},
             )
-            return json.dumps(result.get("payload", result), ensure_ascii=False)
+            return _tool_success(json.dumps(result.get("payload", result), ensure_ascii=False))
         except Exception as e:
             logger.error("agent_tool_error", tool="run_world_command", error=str(e))
-            return f"执行世界命令失败: {str(e)}"
+            return _tool_failure(f"执行世界命令失败: {str(e)}")
 
     if _runtime_harness_schema_enabled(settings):
         _enhance_registered_tool_descriptions(chat_agent)
     wrap_registered_tools(chat_agent._function_toolset, settings)
+    _stringify_tool_results(chat_agent)
 
 
 def escape_command_text(text: str) -> str:

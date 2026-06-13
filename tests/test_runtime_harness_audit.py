@@ -10,10 +10,12 @@ import pytest
 from config.settings import Settings
 from services.agent.harness.audit import (
     preview_parameters,
+    summarize_result,
     wrap_tool_function,
     write_audit_record,
 )
 from services.agent.harness.catalog import ToolCatalogEntry
+from services.agent.tool_results import ToolResult
 
 
 class DummyDeps:
@@ -150,6 +152,29 @@ async def test_returned_failure_string_records_failure_reason(tmp_path):
     assert record["result"]["success"] == "failure"
     assert record["result"]["result_preview"] is None
     assert record["result"]["failure_reason"] == "命令执行失败: denied"
+
+
+def test_summarize_result_uses_structured_tool_result_status() -> None:
+    result = ToolResult.failure("命令执行失败: denied")
+
+    summary = summarize_result(result=result)
+
+    assert str(result) == "命令执行失败: denied"
+    assert summary == {
+        "success": "failure",
+        "result_preview": None,
+        "failure_reason": "命令执行失败: denied",
+    }
+
+
+def test_summarize_result_uses_structured_tool_result_success() -> None:
+    summary = summarize_result(result=ToolResult.success("命令执行失败: literal output"))
+
+    assert summary == {
+        "success": "success",
+        "result_preview": None,
+        "failure_reason": None,
+    }
 
 
 @pytest.mark.asyncio
