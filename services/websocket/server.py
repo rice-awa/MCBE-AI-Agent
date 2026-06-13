@@ -437,8 +437,13 @@ class WebSocketServer:
             return
 
         # 创建聊天请求（使用本次事件的真实 sender，而非缓存的 state.player_name）
+        active_conversation_id = self.broker.get_active_conversation_id(state.id, player_name)
         chat_req = self.protocol_handler.create_chat_request(
-            state, content, delivery=delivery, player_name=player_name
+            state,
+            content,
+            delivery=delivery,
+            player_name=player_name,
+            conversation_id=active_conversation_id,
         )
         self.broker.ensure_conversation(
             state.id, chat_req.player_name, chat_req.conversation_id
@@ -481,7 +486,7 @@ class WebSocketServer:
             )
         elif action in ("状态", "status", ""):
             status = "启用" if session.context_enabled else "关闭"
-            conversation_id = normalize_conversation_id(session.active_conversation_id)
+            conversation_id = self.broker.get_active_conversation_id(state.id, player_name)
             history = self.broker.get_conversation_history(
                 state.id, player_name, conversation_id
             )
@@ -551,7 +556,7 @@ class WebSocketServer:
         parts = option.strip().split(None, 1) if option.strip() else []
         action = parts[0].lower() if parts else "状态"
         arg = parts[1].strip() if len(parts) > 1 else ""
-        conversation_id = normalize_conversation_id(session.active_conversation_id)
+        conversation_id = self.broker.get_active_conversation_id(state.id, actor)
 
         if action in ("new", "新建", "创建"):
             new_id = self._generate_unique_conversation_id(state.id, actor, arg)
@@ -560,7 +565,7 @@ class WebSocketServer:
                 return self.protocol_handler.create_error_message(
                     f"对话 {target_id} 已存在，请使用 AGENT 对话 switch {target_id} 切换"
                 )
-            session.active_conversation_id = new_id
+            self.broker.set_active_conversation_id(state.id, actor, new_id)
             self.broker.set_conversation_history(state.id, actor, [], new_id)
             metadata = self.broker.ensure_conversation_metadata(state.id, actor, new_id)
             return self.protocol_handler.create_success_message(
@@ -576,7 +581,7 @@ class WebSocketServer:
             was_existing = self.broker.conversation_exists(state.id, actor, target_id)
             if not was_existing:
                 self.broker.set_conversation_history(state.id, actor, [], target_id)
-            session.active_conversation_id = target_id
+            self.broker.set_active_conversation_id(state.id, actor, target_id)
             history = self.broker.get_conversation_history(state.id, actor, target_id)
             turns = self._count_conversation_turns(history)
             metadata = self.broker.ensure_conversation_metadata(state.id, actor, target_id)

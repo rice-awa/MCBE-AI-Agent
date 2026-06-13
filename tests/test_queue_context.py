@@ -188,6 +188,24 @@ def test_session_lock_per_player_across_conversations() -> None:
     assert default_lock is other_conversation_lock
     assert default_lock is not bob_lock
 
+
+def test_active_conversation_id_is_owned_by_player_session_store() -> None:
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    assert broker.get_active_conversation_id(connection_id, "alice") == "default"
+    assert broker.set_active_conversation_id(connection_id, "alice", "build") == "build"
+    assert broker.set_active_conversation_id(connection_id, "bob", "mine") == "mine"
+
+    assert broker.get_active_conversation_id(connection_id, "alice") == "build"
+    assert broker.get_active_conversation_id(connection_id, "bob") == "mine"
+
+    broker.clear_player_conversation_histories(connection_id, "alice")
+
+    assert broker.get_active_conversation_id(connection_id, "alice") == "default"
+    assert broker.get_active_conversation_id(connection_id, "bob") == "mine"
+
+
 def test_session_lock_per_player() -> None:
     """同一玩家拿到同一把锁；不同玩家拿到不同锁，可并行。"""
     broker = MessageBroker()

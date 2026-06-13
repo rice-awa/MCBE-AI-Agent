@@ -90,12 +90,12 @@ def test_conversation_new_rejects_existing_id_without_overwrite(tmp_path, monkey
 
 def test_conversation_new_generates_unique_ids_with_short_ids(tmp_path, monkeypatch):
     async def _run() -> None:
-        server, _broker, state = _server(tmp_path, monkeypatch)
+        server, broker, state = _server(tmp_path, monkeypatch)
 
         first = await server._handle_conversation(state, "new", "alice")
-        first_id = state.get_player_session("alice").active_conversation_id
+        first_id = broker.get_active_conversation_id(state.id, "alice")
         second = await server._handle_conversation(state, "new", "alice")
-        second_id = state.get_player_session("alice").active_conversation_id
+        second_id = broker.get_active_conversation_id(state.id, "alice")
 
         assert "已新建" in first.text
         assert f"#1 {first_id}" in first.text
@@ -109,8 +109,7 @@ def test_conversation_new_generates_unique_ids_with_short_ids(tmp_path, monkeypa
 def test_conversation_list_displays_short_ids_titles_current_and_counts(tmp_path, monkeypatch):
     async def _run() -> None:
         server, broker, state = _server(tmp_path, monkeypatch)
-        session = state.get_player_session("alice")
-        session.active_conversation_id = "build"
+        broker.set_active_conversation_id(state.id, "alice", "build")
         broker.set_conversation_history(state.id, "alice", _build_turn(1), "build")
         broker.set_conversation_history(
             state.id,
@@ -132,8 +131,7 @@ def test_conversation_list_displays_short_ids_titles_current_and_counts(tmp_path
 def test_conversation_switch_short_id_uses_mapped_long_id(tmp_path, monkeypatch):
     async def _run() -> None:
         server, broker, state = _server(tmp_path, monkeypatch)
-        session = state.get_player_session("alice")
-        session.active_conversation_id = "first"
+        broker.set_active_conversation_id(state.id, "alice", "first")
         broker.set_conversation_history(state.id, "alice", _build_turn(1), "first")
         broker.set_conversation_history(
             state.id,
@@ -146,7 +144,7 @@ def test_conversation_switch_short_id_uses_mapped_long_id(tmp_path, monkeypatch)
 
         msg = await server._handle_conversation(state, "switch #2", "alice")
 
-        assert session.active_conversation_id == "build"
+        assert broker.get_active_conversation_id(state.id, "alice") == "build"
         assert "已切换到对话: #2 build" in msg.text
         assert "（2轮）" in msg.text
 
@@ -156,11 +154,10 @@ def test_conversation_switch_short_id_uses_mapped_long_id(tmp_path, monkeypatch)
 def test_conversation_switch_new_id_creates_empty_conversation_with_short_id(tmp_path, monkeypatch):
     async def _run() -> None:
         server, broker, state = _server(tmp_path, monkeypatch)
-        session = state.get_player_session("alice")
 
         msg = await server._handle_conversation(state, "switch build", "alice")
 
-        assert session.active_conversation_id == "build"
+        assert broker.get_active_conversation_id(state.id, "alice") == "build"
         assert broker.get_conversation_history(state.id, "alice", "build") == []
         assert "已创建并切换到新会话" in msg.text
         assert "#1 build" in msg.text
@@ -171,16 +168,14 @@ def test_conversation_switch_new_id_creates_empty_conversation_with_short_id(tmp
 def test_conversation_switch_short_id_is_isolated_by_player(tmp_path, monkeypatch):
     async def _run() -> None:
         server, broker, state = _server(tmp_path, monkeypatch)
-        alice_session = state.get_player_session("alice")
-        bob_session = state.get_player_session("bob")
         broker.set_conversation_history(state.id, "alice", _build_turn(1), "alice-build")
         broker.set_conversation_history(state.id, "bob", _build_turn(2), "bob-build")
 
         alice_msg = await server._handle_conversation(state, "switch #1", "alice")
         bob_msg = await server._handle_conversation(state, "switch #1", "bob")
 
-        assert alice_session.active_conversation_id == "alice-build"
-        assert bob_session.active_conversation_id == "bob-build"
+        assert broker.get_active_conversation_id(state.id, "alice") == "alice-build"
+        assert broker.get_active_conversation_id(state.id, "bob") == "bob-build"
         assert "#1 alice-build" in alice_msg.text
         assert "#1 bob-build" in bob_msg.text
 

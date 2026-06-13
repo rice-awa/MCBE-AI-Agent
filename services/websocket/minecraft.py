@@ -113,6 +113,7 @@ class MinecraftProtocolHandler:
         provider: str | None = None,
         delivery: str | None = None,
         player_name: str | None = None,
+        conversation_id: str = "default",
     ) -> ChatRequest:
         """
         创建聊天请求
@@ -123,6 +124,7 @@ class MinecraftProtocolHandler:
             provider: 可选的 LLM 提供商
             delivery: 下行通道
             player_name: 本次消息真实发送者；缺省时回退到 state.player_name
+            conversation_id: 调用方按玩家状态解析出的当前对话 ID
 
         Returns:
             ChatRequest 对象
@@ -137,7 +139,7 @@ class MinecraftProtocolHandler:
             use_context=session.context_enabled,
             provider=provider or session.current_provider,
             delivery=delivery or "tellraw",
-            conversation_id=session.active_conversation_id,
+            conversation_id=conversation_id,
         )
 
     def get_help_text(self) -> str:
