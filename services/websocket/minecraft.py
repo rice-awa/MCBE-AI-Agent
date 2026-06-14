@@ -28,6 +28,7 @@ class TellrawMessage:
 
     text: str
     color: str
+    target: str = "@a"
 
 
 class MinecraftProtocolHandler:
@@ -166,23 +167,38 @@ class MinecraftProtocolHandler:
 
         return "\n".join(lines)
 
-    def create_error_message(self, error: str) -> "TellrawMessage":
+    def create_error_message(
+        self,
+        error: str,
+        target: str = "@a",
+    ) -> "TellrawMessage":
         """创建错误消息（结构化，由发送层统一分片）。"""
         return TellrawMessage(
             text=f"{self.config.error_prefix}{error}",
             color=self.config.error_color,
+            target=target,
         )
 
-    def create_info_message(self, info: str) -> "TellrawMessage":
+    def create_info_message(
+        self,
+        info: str,
+        target: str = "@a",
+    ) -> "TellrawMessage":
         """创建信息消息（结构化，由发送层统一分片）。"""
         return TellrawMessage(
             text=f"{self.config.info_prefix}{info}",
             color=self.config.info_color,
+            target=target,
         )
 
-    def create_success_message(self, message: str) -> "TellrawMessage":
+    def create_success_message(
+        self,
+        message: str,
+        target: str = "@a",
+    ) -> "TellrawMessage":
         """创建成功消息（结构化，由发送层统一分片）。"""
         return TellrawMessage(
             text=f"{self.config.success_prefix}{message}",
             color=self.config.success_color,
+            target=target,
         )

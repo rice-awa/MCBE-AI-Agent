@@ -77,7 +77,11 @@ class FlowControlMiddleware:
 
     @classmethod
     def chunk_tellraw(
-        cls, message: str, color: str = "§a", max_length: int | None = None
+        cls,
+        message: str,
+        color: str = "§a",
+        max_length: int | None = None,
+        target: str = "@a",
     ) -> list[str]:
         """将长 tellraw 消息分片为多个 commandRequest JSON 字符串列表。
 
@@ -89,12 +93,16 @@ class FlowControlMiddleware:
             return []
 
         max_len = cls._get_max_length(max_length)
-        byte_budget = _COMMAND_LINE_BYTE_BUDGET - _WRAPPER_OVERHEAD_TELLRAW
+        byte_budget = (
+            _COMMAND_LINE_BYTE_BUDGET
+            - _WRAPPER_OVERHEAD_TELLRAW
+            - len(target.encode("utf-8"))
+        )
         text_parts = cls._split_text(message, max_len, byte_budget)
 
         payloads: list[str] = []
         for part in text_parts:
-            command = MinecraftCommand.create_tellraw(part, color=color)
+            command = MinecraftCommand.create_tellraw(part, color=color, target=target)
             payload = command.model_dump_json(exclude_none=True)
             cls._assert_byte_safe(payload)
             payloads.append(payload)

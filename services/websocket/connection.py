@@ -354,7 +354,12 @@ class ConnectionManager:
         if chunk.delivery == "scriptevent":
             await self._send_script_event(state, message)
         else:
-            await self._send_game_message_with_color(state, message, color)
+            await self._send_game_message_with_color(
+                state,
+                message,
+                color,
+                player_name=chunk.player_name,
+            )
 
     async def _send_system_notification(
         self, state: ConnectionState, notification: SystemNotification
@@ -364,7 +369,12 @@ class ConnectionManager:
             "warning": MCColor.YELLOW,
             "error": MCColor.RED,
         }[notification.level]
-        await self._send_game_message_with_color(state, notification.message, color)
+        await self._send_game_message_with_color(
+            state,
+            notification.message,
+            color,
+            player_name=notification.player_name,
+        )
 
     def _delivery(self, state: ConnectionState) -> McbeOutboundDelivery:
         return McbeOutboundDelivery(
@@ -373,23 +383,37 @@ class ConnectionManager:
         )
 
     async def _send_game_message(
-        self, state: ConnectionState, message: str
+        self,
+        state: ConnectionState,
+        message: str,
+        player_name: str | None = None,
     ) -> None:
         """向游戏发送消息（使用默认绿色）"""
-        await self._send_game_message_with_color(state, message, MCColor.GREEN)
+        await self._send_game_message_with_color(
+            state,
+            message,
+            MCColor.GREEN,
+            player_name=player_name,
+        )
 
     async def _send_game_message_with_color(
-        self, state: ConnectionState, message: str, color: str
+        self,
+        state: ConnectionState,
+        message: str,
+        color: str,
+        player_name: str | None = None,
     ) -> None:
         """向游戏发送消息（使用指定颜色）"""
         if not state.websocket:
             return
 
         try:
+            target = player_name or "@a"
             chunk_count = await self._delivery(state).send_tellraw(
                 message,
                 color=color,
                 source="stream_tellraw",
+                target=target,
             )
 
             logger.debug(

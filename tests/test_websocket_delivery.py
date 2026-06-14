@@ -33,6 +33,25 @@ async def test_delivery_chunks_tellraw_through_flow_control(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_delivery_chunks_tellraw_to_target_player(monkeypatch) -> None:
+    monkeypatch.setattr("services.websocket.delivery.asyncio.sleep", _no_sleep)
+    sender = DummySender()
+    delivery = McbeOutboundDelivery(connection_id="conn", send_payload=sender.send)
+
+    count = await delivery.send_tellraw(
+        "只给 Alice",
+        color="§a",
+        source="test_tellraw",
+        target="Alice",
+    )
+
+    assert count == 1
+    command_line = json.loads(sender.payloads[0])["body"]["commandLine"]
+    assert command_line.startswith("tellraw Alice ")
+    assert "@a" not in command_line
+
+
+@pytest.mark.asyncio
 async def test_delivery_syncs_ai_response_with_chunk_metadata(monkeypatch) -> None:
     monkeypatch.setattr("services.websocket.delivery.asyncio.sleep", _no_sleep)
     sender = DummySender()

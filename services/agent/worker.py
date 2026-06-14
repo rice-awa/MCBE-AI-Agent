@@ -236,7 +236,7 @@ class AgentWorker:
                 error=str(e),
             )
             # 发送错误消息
-            await self._send_error_chunk(connection_id, str(e), 0)
+            await self._send_error_chunk(connection_id, request.player_name, str(e), 0)
             return
 
         # 流式处理
@@ -288,6 +288,7 @@ class AgentWorker:
                         content=tool_msg,
                         sequence=sequence,
                         delivery=request.delivery,
+                        player_name=request.player_name,
                         tool_name=tool_name,
                         tool_args=tool_args,
                     )
@@ -311,6 +312,7 @@ class AgentWorker:
                             content=tool_result_msg,
                             sequence=sequence,
                             delivery=request.delivery,
+                            player_name=request.player_name,
                             tool_name=tool_name,
                             tool_result_preview=truncate_text(result_content, 80),
                         )
@@ -380,6 +382,7 @@ class AgentWorker:
                                             connection_id=connection_id,
                                             level="info",
                                             message=f"对话历史已自动压缩，{msg}",
+                                            player_name=request.player_name,
                                         ),
                                     )
                                     logger.debug(
@@ -442,6 +445,7 @@ class AgentWorker:
                         content=event.content,
                         sequence=sequence,
                         delivery=request.delivery,
+                        player_name=request.player_name,
                     )
                     await self.broker.send_response(connection_id, chunk)
                     sequence += 1
@@ -455,6 +459,7 @@ class AgentWorker:
                             content=event.content,
                             sequence=sequence,
                             delivery=request.delivery,
+                            player_name=request.player_name,
                         )
                         await self.broker.send_response(connection_id, chunk)
                         sequence += 1
@@ -485,7 +490,12 @@ class AgentWorker:
                 error=error_detail,
                 exc_info=True,
             )
-            await self._send_error_chunk(connection_id, error_detail, sequence)
+            await self._send_error_chunk(
+                connection_id,
+                request.player_name,
+                error_detail,
+                sequence,
+            )
 
     async def _generate_title_for_conversation(
         self,
@@ -797,7 +807,11 @@ class AgentWorker:
         )
 
     async def _send_error_chunk(
-        self, connection_id: UUID, error: str, sequence: int
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        error: str,
+        sequence: int,
     ) -> None:
         """发送错误消息块"""
         chunk = StreamChunk(
@@ -805,5 +819,6 @@ class AgentWorker:
             chunk_type="error",
             content=f"错误: {error}",
             sequence=sequence,
+            player_name=player_name,
         )
         await self.broker.send_response(connection_id, chunk)

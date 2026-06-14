@@ -6,6 +6,17 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, Field
 
 
+_TELLRAW_TARGET_SAFE_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.@[]=,!")
+
+
+def _sanitize_tellraw_target(target: str) -> str:
+    target = target.strip() or "@a"
+    if all(char in _TELLRAW_TARGET_SAFE_CHARS for char in target):
+        return target
+    escaped = target.replace('\\', '\\\\').replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 class MinecraftHeader(BaseModel):
     """Minecraft WebSocket 消息头"""
 
@@ -55,7 +66,12 @@ class MinecraftCommand(BaseModel):
     body: MinecraftCommandBody
 
     @classmethod
-    def create_tellraw(cls, message: str, color: str = "§a") -> "MinecraftCommand":
+    def create_tellraw(
+        cls,
+        message: str,
+        color: str = "§a",
+        target: str = "@a",
+    ) -> "MinecraftCommand":
         """创建 tellraw 命令"""
         # 转义特殊字符
         safe_message = (
@@ -63,7 +79,8 @@ class MinecraftCommand(BaseModel):
             .replace(":", "：")
             .replace("%", "\\%")
         )
-        command_line = f'tellraw @a {{"rawtext":[{{"text":"{color}{safe_message}"}}]}}'
+        safe_target = _sanitize_tellraw_target(target)
+        command_line = f'tellraw {safe_target} {{"rawtext":[{{"text":"{color}{safe_message}"}}]}}'
         return cls(
             body=MinecraftCommandBody(
                 origin=MinecraftOrigin(type="say"),

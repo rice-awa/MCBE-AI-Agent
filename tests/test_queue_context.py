@@ -391,7 +391,12 @@ def test_worker_tool_events_should_not_be_sent_twice(monkeypatch) -> None:
     monkeypatch.setattr("services.agent.core.get_agent_manager", lambda: _FakeManager())
     monkeypatch.setattr("services.agent.worker.ProviderRegistry.get_model", lambda *_: object())
 
-    request = ChatRequest(connection_id=connection_id, content="test", use_context=False)
+    request = ChatRequest(
+        connection_id=connection_id,
+        content="test",
+        player_name="Alice",
+        use_context=False,
+    )
     asyncio.run(worker._process_request_locked(request, connection_id))
 
     queue = broker.get_response_queue(connection_id)
@@ -403,6 +408,7 @@ def test_worker_tool_events_should_not_be_sent_twice(monkeypatch) -> None:
 
     assert [chunk.chunk_type for chunk in chunks] == ["tool_call", "tool_result", "content"]
     assert [chunk.sequence for chunk in chunks] == [0, 1, 2]
+    assert [chunk.player_name for chunk in chunks] == ["Alice", "Alice", "Alice"]
 
 
 def test_worker_generates_title_after_first_completed_turn(monkeypatch) -> None:

@@ -37,9 +37,19 @@ class McbeOutboundDelivery:
         """发送已构造好的 payload，用于订阅、初始化等非长文本路径。"""
         await self._send_one(payload, source)
 
-    async def send_tellraw(self, message: str, color: str, source: str) -> int:
+    async def send_tellraw(
+        self,
+        message: str,
+        color: str,
+        source: str,
+        target: str = "@a",
+    ) -> int:
         """发送 tellraw 文本并返回实际 payload 数量。"""
-        payloads = FlowControlMiddleware.chunk_tellraw(message, color=color)
+        payloads = FlowControlMiddleware.chunk_tellraw(
+            message,
+            color=color,
+            target=target,
+        )
         await self._send_chunked(payloads, "tellraw", source)
         return len(payloads)
 

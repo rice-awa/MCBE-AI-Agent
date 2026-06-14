@@ -338,6 +338,8 @@ class WebSocketServer:
             player_name: 触发本次命令的玩家名（多人会话隔离的关键参数）
         """
         # 登录命令不需要认证
+        if player_name:
+            state.player_name = player_name
         if cmd_type == "login":
             await self.handle_login(state, content)
             return
@@ -1048,6 +1050,7 @@ class WebSocketServer:
                 payload.text,
                 color=payload.color,
                 source=source,
+                target=payload.target if payload.target != "@a" else state.player_name or "@a",
             )
             return
 
