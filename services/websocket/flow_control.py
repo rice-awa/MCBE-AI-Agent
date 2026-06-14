@@ -152,7 +152,9 @@ class FlowControlMiddleware:
                 "cannot be safely chunked — split at the caller level"
             )
         cmd = MinecraftCommand.create_raw(command)
-        return [cmd.model_dump_json(exclude_none=True)]
+        payload = cmd.model_dump_json(exclude_none=True)
+        cls._assert_byte_safe(payload)
+        return [payload]
 
     @classmethod
     def chunk_ai_response(

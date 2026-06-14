@@ -1,5 +1,6 @@
 """LLM Provider 注册表"""
 
+import hashlib
 import json
 from typing import Any
 
@@ -229,6 +230,7 @@ class RuntimeAdapterRegistry:
                 config.model,
                 config.base_url or "",
                 str(config.timeout),
+                RuntimeAdapterRegistry._credential_fingerprint(config.api_key),
             ]
         )
 
@@ -243,8 +245,15 @@ class RuntimeAdapterRegistry:
                 config.model,
                 config.base_url or "",
                 str(config.timeout),
+                RuntimeAdapterRegistry._credential_fingerprint(config.api_key),
             ]
         )
+
+    @staticmethod
+    def _credential_fingerprint(api_key: str | None) -> str:
+        if not api_key:
+            return ""
+        return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
     def _get_or_create_http_client(
         self,

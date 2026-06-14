@@ -38,6 +38,45 @@ def test_runtime_adapter_registry_caches_models_per_config(monkeypatch):
     assert len(created) == 1
 
 
+def test_runtime_adapter_registry_separates_models_by_api_key(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    created = []
+
+    def fake_create(config):
+        model = object()
+        created.append((config.api_key, model))
+        return model
+
+    monkeypatch.setattr(registry, "_create_deepseek_model", fake_create)
+
+    first = registry.get_model(provider_config(api_key="old-key"))
+    second = registry.get_model(provider_config(api_key="new-key"))
+
+    assert first is not second
+    assert [key for key, _model in created] == ["old-key", "new-key"]
+
+
+def test_runtime_adapter_registry_separates_http_clients_by_api_key(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    created = []
+
+    def fake_create(config, provider_name):
+        client = object()
+        created.append((config.api_key, provider_name, client))
+        return client
+
+    monkeypatch.setattr(registry, "_create_llm_http_client", fake_create)
+
+    first = registry._get_or_create_http_client(provider_config(api_key="old-key"), "deepseek")
+    second = registry._get_or_create_http_client(provider_config(api_key="new-key"), "deepseek")
+
+    assert first is not second
+    assert [(key, provider) for key, provider, _client in created] == [
+        ("old-key", "deepseek"),
+        ("new-key", "deepseek"),
+    ]
+
+
 def test_runtime_adapter_registry_reuses_http_clients_per_config(monkeypatch):
     registry = RuntimeAdapterRegistry()
     created = []

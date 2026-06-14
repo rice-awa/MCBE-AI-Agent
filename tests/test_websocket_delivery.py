@@ -88,6 +88,17 @@ async def test_delivery_rejects_too_long_raw_command() -> None:
 
 
 @pytest.mark.asyncio
+async def test_delivery_rejects_raw_command_over_byte_budget() -> None:
+    sender = DummySender()
+    delivery = McbeOutboundDelivery(connection_id="conn", send_payload=sender.send)
+
+    with pytest.raises(ValueError, match="byte budget"):
+        await delivery.send_raw_command("say " + "中" * 200)
+
+    assert sender.payloads == []
+
+
+@pytest.mark.asyncio
 async def test_delivery_registers_raw_command_before_send() -> None:
     events: list[str] = []
 
