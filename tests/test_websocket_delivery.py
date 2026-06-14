@@ -33,6 +33,42 @@ async def test_delivery_chunks_tellraw_through_flow_control(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_delivery_chunks_tellraw_after_message_escaping(monkeypatch) -> None:
+    monkeypatch.setattr("services.websocket.delivery.asyncio.sleep", _no_sleep)
+    sender = DummySender()
+    delivery = McbeOutboundDelivery(connection_id="conn", send_payload=sender.send)
+
+    count = await delivery.send_tellraw('":"%' * 180, color="§a", source="escaped_tellraw")
+
+    assert count == len(sender.payloads)
+    assert count >= 2
+    for payload in sender.payloads:
+        command_line = json.loads(payload)["body"]["commandLine"]
+        assert len(command_line.encode("utf-8")) <= 461
+
+
+@pytest.mark.asyncio
+async def test_delivery_chunks_tellraw_with_quoted_target_budget(monkeypatch) -> None:
+    monkeypatch.setattr("services.websocket.delivery.asyncio.sleep", _no_sleep)
+    sender = DummySender()
+    delivery = McbeOutboundDelivery(connection_id="conn", send_payload=sender.send)
+
+    count = await delivery.send_tellraw(
+        "中" * 300,
+        color="§a",
+        source="quoted_target",
+        target='Alice The "Builder"',
+    )
+
+    assert count == len(sender.payloads)
+    assert count >= 2
+    for payload in sender.payloads:
+        command_line = json.loads(payload)["body"]["commandLine"]
+        assert 'tellraw "Alice The \\"Builder\\"" ' in command_line
+        assert len(command_line.encode("utf-8")) <= 461
+
+
+@pytest.mark.asyncio
 async def test_delivery_chunks_tellraw_to_target_player(monkeypatch) -> None:
     monkeypatch.setattr("services.websocket.delivery.asyncio.sleep", _no_sleep)
     sender = DummySender()

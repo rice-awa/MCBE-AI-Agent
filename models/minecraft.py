@@ -9,12 +9,20 @@ from pydantic import BaseModel, Field
 _TELLRAW_TARGET_SAFE_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.@[]=,!")
 
 
-def _sanitize_tellraw_target(target: str) -> str:
+def sanitize_tellraw_target(target: str) -> str:
     target = target.strip() or "@a"
     if all(char in _TELLRAW_TARGET_SAFE_CHARS for char in target):
         return target
     escaped = target.replace('\\', '\\\\').replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _sanitize_tellraw_target(target: str) -> str:
+    return sanitize_tellraw_target(target)
+
+
+def sanitize_tellraw_text(message: str) -> str:
+    return message.replace('"', '\\"').replace(":", "：").replace("%", "\\%")
 
 
 class MinecraftHeader(BaseModel):
@@ -73,13 +81,8 @@ class MinecraftCommand(BaseModel):
         target: str = "@a",
     ) -> "MinecraftCommand":
         """创建 tellraw 命令"""
-        # 转义特殊字符
-        safe_message = (
-            message.replace('"', '\\"')
-            .replace(":", "：")
-            .replace("%", "\\%")
-        )
-        safe_target = _sanitize_tellraw_target(target)
+        safe_message = sanitize_tellraw_text(message)
+        safe_target = sanitize_tellraw_target(target)
         command_line = f'tellraw {safe_target} {{"rawtext":[{{"text":"{color}{safe_message}"}}]}}'
         return cls(
             body=MinecraftCommandBody(

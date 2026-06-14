@@ -52,3 +52,18 @@ def test_resolve_parsed_command_returns_none_for_non_command() -> None:
 
     assert registry.resolve_parsed("hello") is None
     assert registry.resolve("hello") == (None, "hello")
+
+
+def test_resolve_parsed_command_requires_prefix_boundary() -> None:
+    registry = CommandRegistry(COMMANDS)
+
+    assert registry.resolve_parsed("AGENT 聊天室 hello") is None
+    assert registry.resolve_parsed("#登录密码") is None
+    assert registry.resolve_parsed("AGENT 聊天\thello").content == "hello"
+
+
+def test_resolve_parsed_command_requires_alias_boundary() -> None:
+    registry = CommandRegistry(COMMANDS)
+
+    assert registry.resolve_parsed("askew question") is None
+    assert registry.resolve_parsed("ask\tquestion").content == "question"

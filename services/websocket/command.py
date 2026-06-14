@@ -70,10 +70,18 @@ class CommandRegistry:
             return None, message
         return parsed.type, parsed.content
 
+    @staticmethod
+    def _matches_token(message: str, token: str) -> bool:
+        if message == token:
+            return True
+        if not message.startswith(token):
+            return False
+        return len(message) > len(token) and message[len(token)].isspace()
+
     def resolve_parsed(self, message: str) -> ParsedCommand | None:
         """解析消息，返回带匹配来源的 typed command。"""
         for prefix, cmd_config in self._commands.items():
-            if message.startswith(prefix):
+            if self._matches_token(message, prefix):
                 content = message[len(prefix):].strip()
                 return ParsedCommand(
                     type=cmd_config.type,
@@ -83,7 +91,7 @@ class CommandRegistry:
                 )
 
         for alias, main_prefix in self._alias_map.items():
-            if message.startswith(alias):
+            if self._matches_token(message, alias):
                 content = message[len(alias):].strip()
                 cmd_config = self._commands[main_prefix]
                 return ParsedCommand(

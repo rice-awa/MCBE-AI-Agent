@@ -508,6 +508,7 @@ class _HandlerContext:
     serialized_usage: dict[str, Any] | None = None
     tool_events: list[dict[str, Any]] = field(default_factory=list)  # 记录工具调用事件
     tool_results: dict[str, str] = field(default_factory=dict)  # 记录工具返回结果，key=tool_call_id
+    tool_call_names: dict[str, str] = field(default_factory=dict)  # tool_call_id -> tool_name
 
 
 async def _send_content_event(
@@ -662,6 +663,7 @@ async def stream_response_handler(
                                     "args": event.part.args,
                                 }
                                 ctx.tool_events.append(tool_info)
+                                ctx.tool_call_names[event.part.tool_call_id] = event.part.tool_name
                                 logger.info(
                                     "agent_tool_call",
                                     tool=event.part.tool_name,
@@ -699,7 +701,7 @@ async def stream_response_handler(
                                     sequence=ctx.sequence,
                                     metadata={
                                         "tool_call_id": event.tool_call_id,
-                                        "tool_name": event.tool_call_id.split("_")[0] if "_" in event.tool_call_id else None,
+                                        "tool_name": ctx.tool_call_names.get(event.tool_call_id),
                                     },
                                 )
                                 ctx.sequence += 1

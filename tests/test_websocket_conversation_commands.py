@@ -1,6 +1,7 @@
 """WebSocket 对话管理命令回归测试。"""
 
 import asyncio
+import json
 from pathlib import Path
 import sys
 
@@ -181,18 +182,30 @@ def test_conversation_switch_short_id_is_isolated_by_player(tmp_path, monkeypatc
 
     asyncio.run(_run())
 
-def test_handle_run_command_rejects_too_long_raw_command(tmp_path, monkeypatch):
+def test_send_ws_payload_preserves_broadcast_tellraw_target(tmp_path, monkeypatch):
+    async def _run() -> None:
+        server, _broker, state = _server(tmp_path, monkeypatch)
+        state.player_name = "Alice"
+        msg = server.protocol_handler.create_info_message("broadcast")
+
+        await server._send_ws_payload(state, msg, source="broadcast_test")
+
+        command_line = json.loads(state.websocket.sent[-1])["body"]["commandLine"]
+        assert command_line.startswith("tellraw @a ")
+        assert not command_line.startswith("tellraw Alice ")
+
+    asyncio.run(_run())
+
+
+def test_handle_run_command_reports_too_long_raw_command(tmp_path, monkeypatch):
     async def _run() -> None:
         server, _broker, state = _server(tmp_path, monkeypatch)
 
-        try:
-            await server.handle_run_command(state, "say " + "X" * 1000)
-        except ValueError as exc:
-            assert "raw command too long" in str(exc)
-        else:
-            raise AssertionError("long raw command should be rejected")
+        await server.handle_run_command(state, "say " + "X" * 1000)
 
-        assert state.websocket.sent == []
+        assert state.websocket.sent
+        command_line = json.loads(state.websocket.sent[-1])["body"]["commandLine"]
+        assert "raw command too long" in command_line
 
     asyncio.run(_run())
 

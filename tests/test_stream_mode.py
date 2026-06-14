@@ -301,6 +301,15 @@ async def _collect_events(prompt: str, deps: AgentDependencies, model: str) -> l
     return [event async for event in core.stream_chat(prompt, deps, model=model, agent=core.chat_agent)]
 
 
+async def _collect_stream_chat_events(
+    prompt: str,
+    deps: AgentDependencies,
+    model: object,
+    agent: MockAgent,
+) -> list[Any]:
+    return [event async for event in core.stream_chat(prompt, deps, model=model, agent=agent)]
+
+
 def _build_deps(stream_sentence_mode: bool) -> AgentDependencies:
     return AgentDependencies(
         connection_id=uuid4(),
@@ -380,6 +389,31 @@ def test_stream_sentence_mode_false_should_batch_after_complete(monkeypatch) -> 
     assert "".join(event.content for event in content_events) == full_response
     assert events[-1].metadata is not None
     assert events[-1].metadata.get("is_complete") is True
+
+
+def test_stream_chat_tool_result_uses_tool_name_from_call_event(monkeypatch) -> None:
+    _patch_isinstance_for_events(monkeypatch)
+
+    agent = MockAgent(
+        tool_events=[
+            make_function_tool_call_event(
+                "run_minecraft_command",
+                {"command": "give @s diamond"},
+            ),
+            make_function_tool_result_event("test_call_id", "已执行命令: /give @s diamond"),
+        ],
+        result_output="已给你钻石。",
+    )
+
+    events = asyncio.run(
+        _collect_stream_chat_events("hello", _build_deps(True), object(), agent)
+    )
+    result_events = [event for event in events if event.event_type == "tool_result"]
+
+    assert len(result_events) == 1
+    assert result_events[0].metadata is not None
+    assert result_events[0].metadata["tool_call_id"] == "test_call_id"
+    assert result_events[0].metadata["tool_name"] == "run_minecraft_command"
 
 
 def test_tool_call_should_be_recorded_in_tool_events(monkeypatch) -> None:

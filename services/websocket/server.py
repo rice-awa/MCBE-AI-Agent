@@ -893,7 +893,12 @@ class WebSocketServer:
             await self._send_ws_payload(state, msg, source="run_command")
             return
 
-        await self._delivery(state).send_raw_command(command, source="run_command")
+        try:
+            await self._delivery(state).send_raw_command(command, source="run_command")
+        except ValueError as exc:
+            msg = self.protocol_handler.create_error_message(str(exc))
+            await self._send_ws_payload(state, msg, source="run_command")
+            return
 
         logger.info(
             "command_executed",
@@ -1050,7 +1055,7 @@ class WebSocketServer:
                 payload.text,
                 color=payload.color,
                 source=source,
-                target=payload.target if payload.target != "@a" else state.player_name or "@a",
+                target=payload.target,
             )
             return
 
