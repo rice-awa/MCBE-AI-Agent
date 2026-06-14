@@ -364,7 +364,7 @@ class WebSocketServer:
             "switch_model": lambda: self.handle_switch_model(state, content, player_name=player_name),
             "help": lambda: self.handle_help(state),
             "save": lambda: self.handle_save(state, player_name=player_name),
-            "run_command": lambda: self.handle_run_command(state, content),
+            "run_command": lambda: self.handle_run_command(state, content, player_name=player_name),
         }
         if handler := command_handlers.get(cmd_type):
             await handler()
@@ -886,17 +886,23 @@ class WebSocketServer:
         """兼容旧保存命令：保存当前活动对话。"""
         await self.handle_conversation(state, "save", player_name=player_name)
 
-    async def handle_run_command(self, state: Any, command: str) -> None:
+    async def handle_run_command(
+        self,
+        state: Any,
+        command: str,
+        player_name: str | None = None,
+    ) -> None:
         """执行游戏命令"""
+        target = player_name or state.player_name or "@a"
         if not command:
-            msg = self.protocol_handler.create_error_message("请输入命令")
+            msg = self.protocol_handler.create_error_message("请输入命令", target=target)
             await self._send_ws_payload(state, msg, source="run_command")
             return
 
         try:
             await self._delivery(state).send_raw_command(command, source="run_command")
         except ValueError as exc:
-            msg = self.protocol_handler.create_error_message(str(exc))
+            msg = self.protocol_handler.create_error_message(str(exc), target=target)
             await self._send_ws_payload(state, msg, source="run_command")
             return
 

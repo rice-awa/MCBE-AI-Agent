@@ -210,6 +210,24 @@ def test_handle_run_command_reports_too_long_raw_command(tmp_path, monkeypatch):
     asyncio.run(_run())
 
 
+def test_run_command_length_error_is_sent_to_sender(tmp_path, monkeypatch):
+    async def _run() -> None:
+        server, _broker, state = _server(tmp_path, monkeypatch)
+
+        await server.handle_command(
+            state,
+            "run_command",
+            "say " + "X" * 1000,
+            player_name="Alice",
+        )
+
+        command_line = json.loads(state.websocket.sent[-1])["body"]["commandLine"]
+        assert command_line.startswith("tellraw Alice ")
+        assert "raw command too long" in command_line
+
+    asyncio.run(_run())
+
+
 def test_switch_model_clears_all_player_runtime_conversations(tmp_path, monkeypatch):
     async def _run() -> None:
         server, broker, state = _server(tmp_path, monkeypatch)
