@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Protocol, cast
 
 from pydantic_ai import Agent, RunContext
 
 from config.logging import get_logger
-from config.settings import Settings
 from models.agent import AgentDependencies
 from models.minecraft import MinecraftCommand
 from services.agent.harness.audit import wrap_registered_tools
@@ -24,7 +23,22 @@ from services.agent.mcwiki import (
 logger = get_logger(__name__)
 
 
-def _runtime_harness_schema_enabled(settings: Settings | None) -> bool:
+class ToolRegistrationSettings(Protocol):
+    runtime_harness_enabled: bool
+    runtime_harness_schema_enabled: bool
+    runtime_harness_audit_enabled: bool
+    runtime_harness_audit_path: str
+    runtime_harness_audit_max_records: int
+
+
+class AgentToolSettings(Protocol):
+    mcwiki_base_url: str
+
+    def list_available_providers(self) -> list[str]:
+        ...
+
+
+def _runtime_harness_schema_enabled(settings: ToolRegistrationSettings | None) -> bool:
     if settings is None:
         return True
     return settings.runtime_harness_enabled and settings.runtime_harness_schema_enabled
@@ -65,7 +79,7 @@ def _tool_failure(text: str) -> ToolResult:
 
 def register_agent_tools(
     chat_agent: Agent[AgentDependencies, str],
-    settings: Settings | None = None,
+    settings: ToolRegistrationSettings | None = None,
 ) -> None:
     """注册 Agent 工具到指定的 Agent 实例"""
 
@@ -396,7 +410,8 @@ def register_agent_tools(
             connection_id=str(ctx.deps.connection_id),
         )
 
-        base_url = ctx.deps.settings.mcwiki_base_url
+        tool_settings = cast(AgentToolSettings, ctx.deps.settings)
+        base_url = tool_settings.mcwiki_base_url
         search_limit = normalize_limit(limit, default=5)
         params = build_search_params(query, search_limit, namespaces, use_cache, pretty)
         url = build_mcwiki_url(base_url, "api/search")
@@ -467,7 +482,8 @@ def register_agent_tools(
             connection_id=str(ctx.deps.connection_id),
         )
 
-        base_url = ctx.deps.settings.mcwiki_base_url
+        tool_settings = cast(AgentToolSettings, ctx.deps.settings)
+        base_url = tool_settings.mcwiki_base_url
         url = build_page_url(base_url, page_name)
         params = {
             "format": format,
@@ -534,7 +550,7 @@ def register_agent_tools(
         Returns:
             Provider 列表描述
         """
-        providers = ctx.deps.settings.list_available_providers()
+        providers = cast(AgentToolSettings, ctx.deps.settings).list_available_providers()
         return _tool_success("可用 Provider: " + ", ".join(providers))
 
     @chat_agent.tool

@@ -12,7 +12,7 @@ sys.path.append(str(ROOT))
 import pytest
 from pydantic_ai import Agent
 
-from config.settings import Settings
+from config.settings import LLMProviderConfig, Settings
 from models.agent import AgentDependencies
 from services.agent.harness.prompting import render_schema_description_prefix
 from services.agent.tools import (
@@ -58,8 +58,94 @@ def test_registered_tool_description_can_skip_runtime_harness_prefix() -> None:
     assert "执行 Minecraft 命令" in description
 
 
+class _FakeResponse:
+    def __init__(self, payload: dict):
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class _FakeHttpClient:
+    def __init__(self, payload: dict):
+        self.payload = payload
+        self.requests: list[tuple[str, dict | None]] = []
+
+    async def get(self, url: str, params: dict | None = None):
+        self.requests.append((url, params))
+        return _FakeResponse(self.payload)
+
+
+class _NarrowRuntimeSettings:
+    default_provider = "deepseek"
+    system_prompt = "test prompt"
+    stream_sentence_mode = True
+    mcwiki_base_url = "https://wiki.example.test"
+    runtime_harness_enabled = True
+    runtime_harness_prompt_enabled = True
+    runtime_harness_schema_enabled = False
+    runtime_harness_audit_enabled = False
+    runtime_harness_audit_path = "unused.jsonl"
+    runtime_harness_audit_max_records = 1
+
+    def get_provider_config(self, provider_name: str | None = None) -> LLMProviderConfig:
+        return LLMProviderConfig(
+            name=provider_name or self.default_provider,
+            api_key="test-key",
+            model="test-model",
+            enabled=True,
+        )
+
+    def list_available_providers(self) -> list[str]:
+        return ["deepseek", "ollama"]
+
+
 async def _noop_send_to_game(message: str) -> None:
     return None
+
+
+async def _noop_command(_: str) -> str:
+    return "ok"
+
+
+@pytest.mark.asyncio
+async def test_agent_tools_accept_narrow_runtime_settings() -> None:
+    settings = _NarrowRuntimeSettings()
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent, settings=settings)
+    http_client = _FakeHttpClient(
+        {
+            "success": True,
+            "data": {
+                "results": [
+                    {
+                        "title": "Stone",
+                        "url": "https://wiki.example.test/Stone",
+                        "snippet": "block",
+                    }
+                ]
+            },
+        }
+    )
+    deps = AgentDependencies(
+        connection_id=uuid4(),
+        player_name="Alex",
+        settings=settings,
+        http_client=http_client,
+        send_to_game=_noop_send_to_game,
+        run_command=_noop_command,
+    )
+    ctx = SimpleNamespace(deps=deps)
+
+    providers = await agent._function_toolset.tools["list_available_providers"].function(ctx)
+    search = await agent._function_toolset.tools["mcwiki_search"].function(ctx, "stone")
+
+    assert providers == "可用 Provider: deepseek, ollama"
+    assert "Stone" in search
+    assert http_client.requests[0][0] == "https://wiki.example.test/api/search"
 
 
 @pytest.mark.asyncio

@@ -4,7 +4,7 @@ import asyncio
 import re
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import asdict, dataclass, field, is_dataclass
-from typing import Any
+from typing import Any, Protocol, cast
 
 from pydantic_ai import (
     Agent,
@@ -25,6 +25,11 @@ from services.agent.tools import register_agent_tools
 from services.agent.prompt import build_dynamic_prompt
 
 logger = get_logger(__name__)
+
+
+class StreamModeSettings(Protocol):
+    stream_sentence_mode: bool
+
 
 TOOL_USAGE_GUIDE = """
 你可以使用工具与 Minecraft 交互。
@@ -861,7 +866,7 @@ async def stream_chat(
     Yields:
         StreamEvent: 流式事件
     """
-    use_stream_mode = deps.settings.stream_sentence_mode
+    use_stream_mode = cast(StreamModeSettings, deps.settings).stream_sentence_mode
     ctx = _HandlerContext()
 
     try:
