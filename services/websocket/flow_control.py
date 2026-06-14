@@ -77,24 +77,27 @@ class FlowControlMiddleware:
 
     @classmethod
     def chunk_tellraw(
-        cls, message: str, color: str = "§a", max_length: int | None = None
+        cls,
+        message: str,
+        color: str = "§a",
+        max_length: int | None = None,
+        target: str = "@a",
     ) -> list[str]:
         """将长 tellraw 消息分片为多个 commandRequest JSON 字符串列表。
 
         空文本约定返回 []，由调用方决定是否仍要发送。
         每条 JSON 的 commandLine 中的 text 内容不超过 max_length 字符，
-        且 commandLine 字节数 ≤ 461 B（MCBE 实测安全上限）。
+        且最终 create_tellraw commandLine 字节数 ≤ 461 B（MCBE 实测安全上限）。
         """
         if not message:
             return []
 
         max_len = cls._get_max_length(max_length)
-        byte_budget = _COMMAND_LINE_BYTE_BUDGET - _WRAPPER_OVERHEAD_TELLRAW
-        text_parts = cls._split_text(message, max_len, byte_budget)
+        text_parts = cls._split_tellraw_text(message, color=color, target=target, max_length=max_len)
 
         payloads: list[str] = []
         for part in text_parts:
-            command = MinecraftCommand.create_tellraw(part, color=color)
+            command = MinecraftCommand.create_tellraw(part, color=color, target=target)
             payload = command.model_dump_json(exclude_none=True)
             cls._assert_byte_safe(payload)
             payloads.append(payload)
@@ -144,7 +147,9 @@ class FlowControlMiddleware:
                 "cannot be safely chunked — split at the caller level"
             )
         cmd = MinecraftCommand.create_raw(command)
-        return [cmd.model_dump_json(exclude_none=True)]
+        payload = cmd.model_dump_json(exclude_none=True)
+        cls._assert_byte_safe(payload)
+        return [payload]
 
     @classmethod
     def chunk_ai_response(
@@ -189,6 +194,41 @@ class FlowControlMiddleware:
             payloads.append(payload)
 
         return payloads
+
+    @classmethod
+    def _split_tellraw_text(
+        cls,
+        text: str,
+        color: str,
+        target: str,
+        max_length: int,
+    ) -> list[str]:
+        """按最终 create_tellraw commandLine 的真实 UTF-8 字节数切分文本。"""
+        chunks: list[str] = []
+        buffer = ""
+        for ch in text:
+            tentative = buffer + ch
+            if len(tentative) <= max_length and cls._tellraw_command_fits(tentative, color, target):
+                buffer = tentative
+                continue
+            if buffer:
+                chunks.append(buffer)
+                buffer = ch
+                if len(buffer) <= max_length and cls._tellraw_command_fits(buffer, color, target):
+                    continue
+            if not cls._tellraw_command_fits(buffer, color, target):
+                raise ValueError(
+                    "tellraw wrapper exceeds byte budget; target/color leave no room for content"
+                )
+        if buffer:
+            chunks.append(buffer)
+        return chunks if chunks else [""]
+
+    @staticmethod
+    def _tellraw_command_fits(text: str, color: str, target: str) -> bool:
+        command = MinecraftCommand.create_tellraw(text, color=color, target=target)
+        command_line = command.body.commandLine
+        return len(command_line.encode("utf-8")) <= _COMMAND_LINE_BYTE_BUDGET
 
     @classmethod
     def _split_text(

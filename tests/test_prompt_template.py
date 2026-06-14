@@ -1,7 +1,32 @@
 """测试提示词模板功能"""
 
 import pytest
-from datetime import datetime
+
+from config.settings import LLMProviderConfig
+
+
+class _NarrowRuntimeSettings:
+    default_provider = "deepseek"
+    system_prompt = "narrow system prompt"
+    stream_sentence_mode = True
+    mcwiki_base_url = "https://wiki.example.test"
+    runtime_harness_enabled = False
+    runtime_harness_prompt_enabled = True
+    runtime_harness_schema_enabled = False
+    runtime_harness_audit_enabled = False
+    runtime_harness_audit_path = "unused.jsonl"
+    runtime_harness_audit_max_records = 1
+
+    def get_provider_config(self, provider_name: str | None = None) -> LLMProviderConfig:
+        return LLMProviderConfig(
+            name=provider_name or self.default_provider,
+            api_key="test-key",
+            model="narrow-model",
+            enabled=True,
+        )
+
+    def list_available_providers(self) -> list[str]:
+        return ["deepseek"]
 
 
 class TestPromptTemplate:
@@ -181,6 +206,27 @@ class TestPromptManager:
         assert "TestPlayer" in prompt
         assert "deepseek" in prompt
         assert "deepseek-chat" in prompt
+
+    def test_build_system_prompt_accepts_narrow_runtime_settings(self):
+        """测试构建系统提示词不需要完整 Settings"""
+        from services.agent.prompt import PromptManager
+
+        manager = PromptManager()
+        conn_id = "test-connection-narrow-settings"
+        manager.set_connection_template(conn_id, "default")
+
+        prompt = manager.build_system_prompt(
+            connection_id=conn_id,
+            player_name="TestPlayer",
+            provider="deepseek",
+            model="narrow-model",
+            context_length=5,
+            settings=_NarrowRuntimeSettings(),
+        )
+
+        assert "narrow system prompt" in prompt
+        assert "TestPlayer" in prompt
+        assert "narrow-model" in prompt
 
     def test_build_system_prompt_with_custom_variables(self):
         """测试使用自定义变量构建提示词"""

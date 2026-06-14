@@ -12,13 +12,20 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-from config.settings import Settings
 from services.agent.harness.catalog import ParameterPreviewPolicy, get_tool_entry
+from services.agent.tool_results import ToolResult
 
 AuditRecord = dict[str, Any]
 ToolFunction = Callable[..., Any]
+
+
+class AuditSettings(Protocol):
+    runtime_harness_enabled: bool
+    runtime_harness_audit_enabled: bool
+    runtime_harness_audit_path: str
+    runtime_harness_audit_max_records: int
 
 
 _FAILURE_PREFIXES = (
@@ -43,7 +50,7 @@ _AUDIT_WRITE_LOCKS: dict[Path, threading.Lock] = {}
 _AUDIT_WRITE_LOCKS_GUARD = threading.Lock()
 
 
-def audit_enabled(settings: Settings | None) -> bool:
+def audit_enabled(settings: AuditSettings | None) -> bool:
     if settings is None:
         return False
     return settings.runtime_harness_enabled and settings.runtime_harness_audit_enabled
@@ -111,6 +118,13 @@ def summarize_result(
             "failure_reason": str(exception),
         }
 
+    if isinstance(result, ToolResult):
+        return {
+            "success": result.status,
+            "result_preview": None,
+            "failure_reason": result.failure_reason if not result.success else None,
+        }
+
     text = str(result) if result is not None else ""
     failure_reason = _failure_reason_from_text(text)
     return {
@@ -164,7 +178,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
                 pass
 
 
-def wrap_tool_function(tool_name: str, function: ToolFunction, settings: Settings | None) -> ToolFunction:
+def wrap_tool_function(tool_name: str, function: ToolFunction, settings: AuditSettings | None) -> ToolFunction:
     signature = inspect.signature(function)
     is_async = inspect.iscoroutinefunction(function)
 
@@ -212,7 +226,7 @@ def wrap_tool_function(tool_name: str, function: ToolFunction, settings: Setting
     return sync_wrapper
 
 
-def wrap_registered_tools(toolset: Any, settings: Settings | None) -> None:
+def wrap_registered_tools(toolset: Any, settings: AuditSettings | None) -> None:
     for tool_name, tool in getattr(toolset, "tools", {}).items():
         function = getattr(tool, "function", None)
         if function is None or getattr(function, "_runtime_harness_audited", False):
@@ -226,7 +240,7 @@ def wrap_registered_tools(toolset: Any, settings: Settings | None) -> None:
 
 
 def _write_record(
-    settings: Settings | None,
+    settings: AuditSettings | None,
     tool_name: str,
     parameters: dict[str, Any],
     ctx: Any | None,

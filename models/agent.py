@@ -8,8 +8,6 @@ from uuid import UUID
 
 import httpx
 
-from config.settings import Settings
-
 
 # Minecraft 颜色代码常量
 class MCColor:
@@ -123,7 +121,7 @@ class AgentDependencies:
 
     connection_id: UUID
     player_name: str
-    settings: Settings
+    settings: Any
     http_client: httpx.AsyncClient
     send_to_game: Callable[[str], Awaitable[None]]
     run_command: Callable[[str], Awaitable[str]]

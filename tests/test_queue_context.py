@@ -140,7 +140,6 @@ def test_list_player_conversation_metadata_includes_short_ids_and_titles() -> No
     broker = MessageBroker()
     connection_id = uuid4()
 
-    broker.get_session_lock(connection_id, "alice")
     broker.set_conversation_history(connection_id, "alice", _build_turn(1), "build-plan")
     broker.set_conversation_title(connection_id, "alice", "build-plan", "Build Plan")
     broker.set_conversation_history(connection_id, "alice", _build_turn(2), "redstone")
@@ -154,12 +153,10 @@ def test_list_player_conversation_metadata_includes_short_ids_and_titles() -> No
         ("build-plan", 1, "Build Plan"),
         ("redstone", 2, "Redstone"),
         ("metadata-only", 3, None),
-        ("default", 4, None),
     ]
     assert metadata[0].title_status == "ready"
     assert metadata[1].title_status == "ready"
     assert metadata[2].title_status == "pending"
-    assert metadata[3].title_status == "pending"
 
 
 def test_clear_connection_sessions_removes_conversation_metadata() -> None:
@@ -176,6 +173,21 @@ def test_clear_connection_sessions_removes_conversation_metadata() -> None:
     assert broker.resolve_conversation_short_id(connection_id, "alice", "#1") is None
 
 
+def test_clear_player_conversations_does_not_recreate_default_from_lock() -> None:
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    broker.get_session_lock(connection_id, "alice")
+    broker.set_conversation_history(connection_id, "alice", _build_turn(1), "default")
+    broker.set_conversation_history(connection_id, "alice", _build_turn(2), "other")
+
+    broker.clear_player_conversation_histories(connection_id, "alice")
+
+    assert broker.list_player_conversation_metadata(connection_id, "alice") == []
+    assert broker.list_player_conversations(connection_id, "alice") == []
+    assert broker.resolve_conversation_short_id(connection_id, "alice", "#1") is None
+
+
 def test_session_lock_per_player_across_conversations() -> None:
     """同一玩家跨不同对话使用同一把锁；不同玩家使用不同锁，可并行。"""
     broker = MessageBroker()
@@ -187,6 +199,24 @@ def test_session_lock_per_player_across_conversations() -> None:
 
     assert default_lock is other_conversation_lock
     assert default_lock is not bob_lock
+
+
+def test_active_conversation_id_is_owned_by_player_session_store() -> None:
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    assert broker.get_active_conversation_id(connection_id, "alice") == "default"
+    assert broker.set_active_conversation_id(connection_id, "alice", "build") == "build"
+    assert broker.set_active_conversation_id(connection_id, "bob", "mine") == "mine"
+
+    assert broker.get_active_conversation_id(connection_id, "alice") == "build"
+    assert broker.get_active_conversation_id(connection_id, "bob") == "mine"
+
+    broker.clear_player_conversation_histories(connection_id, "alice")
+
+    assert broker.get_active_conversation_id(connection_id, "alice") == "default"
+    assert broker.get_active_conversation_id(connection_id, "bob") == "mine"
+
 
 def test_session_lock_per_player() -> None:
     """同一玩家拿到同一把锁；不同玩家拿到不同锁，可并行。"""
@@ -275,6 +305,59 @@ def test_worker_keeps_serial_chat_history_when_requests_share_initial_generation
         assert len(history) == 4
         assert history[0].parts[0].content == "user-1"
         assert history[2].parts[0].content == "user-2"
+
+    asyncio.run(_run())
+
+def test_worker_skips_history_write_when_request_generation_is_stale(monkeypatch) -> None:
+    async def _run() -> None:
+        broker = MessageBroker()
+        connection_id = uuid4()
+        broker.register_connection(connection_id)
+        settings = Settings(default_provider="ollama", dev_mode=True)
+        worker = AgentWorker(broker, settings)
+
+        async def fake_stream_chat(*_args, **_kwargs):
+            yield StreamEvent(
+                event_type="content",
+                content="old response",
+                sequence=0,
+                metadata={"is_complete": True, "all_messages": _build_turn(9)},
+            )
+
+        class FakeAgentManager:
+            def get_agent(self):
+                return object()
+
+        monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+        monkeypatch.setattr("services.agent.providers.ProviderRegistry.get_model", lambda _config: object())
+        monkeypatch.setattr("services.agent.core.get_agent_manager", lambda: FakeAgentManager())
+        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _settings: None)
+        monkeypatch.setattr(
+            worker,
+            "_schedule_title_generation",
+            lambda *_args, **_kwargs: asyncio.sleep(0),
+        )
+
+        request = ChatRequest(
+            connection_id=connection_id,
+            content="old",
+            player_name="alice",
+            conversation_id="default",
+            conversation_generation=broker.get_conversation_generation(
+                connection_id,
+                "alice",
+                "default",
+            ),
+        )
+        broker.clear_conversation_history(connection_id, "alice", "default")
+
+        await worker._process_request_locked(
+            request,
+            connection_id,
+            conversation_generation=request.conversation_generation,
+        )
+
+        assert broker.get_conversation_history(connection_id, "alice", "default") == []
 
     asyncio.run(_run())
 
@@ -373,7 +456,12 @@ def test_worker_tool_events_should_not_be_sent_twice(monkeypatch) -> None:
     monkeypatch.setattr("services.agent.core.get_agent_manager", lambda: _FakeManager())
     monkeypatch.setattr("services.agent.worker.ProviderRegistry.get_model", lambda *_: object())
 
-    request = ChatRequest(connection_id=connection_id, content="test", use_context=False)
+    request = ChatRequest(
+        connection_id=connection_id,
+        content="test",
+        player_name="Alice",
+        use_context=False,
+    )
     asyncio.run(worker._process_request_locked(request, connection_id))
 
     queue = broker.get_response_queue(connection_id)
@@ -385,6 +473,7 @@ def test_worker_tool_events_should_not_be_sent_twice(monkeypatch) -> None:
 
     assert [chunk.chunk_type for chunk in chunks] == ["tool_call", "tool_result", "content"]
     assert [chunk.sequence for chunk in chunks] == [0, 1, 2]
+    assert [chunk.player_name for chunk in chunks] == ["Alice", "Alice", "Alice"]
 
 
 def test_worker_generates_title_after_first_completed_turn(monkeypatch) -> None:
@@ -553,6 +642,47 @@ def test_worker_does_not_write_title_after_connection_cleanup(monkeypatch) -> No
         return "Late Title"
 
     monkeypatch.setattr("services.agent.worker.generate_conversation_title", _fake_generate_title)
+
+    asyncio.run(
+        worker._generate_title_for_conversation(
+            connection_id,
+            "alice",
+            "current-conversation",
+            "first prompt",
+            object(),
+        )
+    )
+
+    assert broker.list_player_conversation_metadata(connection_id, "alice") == []
+
+
+def test_title_generation_does_not_recreate_metadata_after_unregister(monkeypatch) -> None:
+    """标题生成完成和连接注销交错时，不应重建已清理的元数据。"""
+
+    import asyncio
+
+    from config.settings import Settings
+
+    broker = MessageBroker()
+    connection_id = uuid4()
+    broker.register_connection(connection_id)
+    broker.mark_conversation_title_generating(connection_id, "alice", "current-conversation")
+
+    worker = AgentWorker(
+        broker=broker,
+        settings=Settings(max_history_turns=5),
+        worker_id=1,
+    )
+
+    async def _fake_generate_title(*args, **kwargs):
+        return "Late Title"
+
+    def _unregister_during_check(actual_connection_id):
+        broker.unregister_connection(actual_connection_id)
+        return False
+
+    monkeypatch.setattr("services.agent.worker.generate_conversation_title", _fake_generate_title)
+    monkeypatch.setattr(broker, "has_connection", _unregister_during_check)
 
     asyncio.run(
         worker._generate_title_for_conversation(

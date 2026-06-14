@@ -480,16 +480,11 @@ class MCPManager:
             return False
 
 
-# 全局单例
-_mcp_manager: MCPManager | None = None
-
-
 def get_mcp_manager(settings: Settings | None = None) -> MCPManager:
-    """获取 MCP 管理器单例"""
-    global _mcp_manager
-    if _mcp_manager is None:
-        _mcp_manager = MCPManager(settings)
-    return _mcp_manager
+    """获取 Agent runtime 维护的 MCP 管理器。"""
+    from services.agent.runtime import get_agent_runtime
+
+    return get_agent_runtime().get_mcp_manager(settings)
 
 
 # ============ 兼容旧接口 ============

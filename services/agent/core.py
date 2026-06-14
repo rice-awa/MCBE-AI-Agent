@@ -4,7 +4,7 @@ import asyncio
 import re
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import asdict, dataclass, field, is_dataclass
-from typing import Any
+from typing import Any, Protocol, cast
 
 from pydantic_ai import (
     Agent,
@@ -25,6 +25,11 @@ from services.agent.tools import register_agent_tools
 from services.agent.prompt import build_dynamic_prompt
 
 logger = get_logger(__name__)
+
+
+class StreamModeSettings(Protocol):
+    stream_sentence_mode: bool
+
 
 TOOL_USAGE_GUIDE = """
 你可以使用工具与 Minecraft 交互。
@@ -47,6 +52,7 @@ class ChatAgentManager:
 
     def __init__(self):
         self._agent: Agent[AgentDependencies, str] | None = None
+        self._fallback_agent: Agent[AgentDependencies, str] | None = None
         self._mcp_toolsets: list[Any] = []
         self._initialized = False
         self._settings: Settings | None = None
@@ -166,6 +172,15 @@ class ChatAgentManager:
         """是否已初始化"""
         return self._initialized
 
+    def reset(self) -> None:
+        """重置 Agent 管理器状态，供运行时关闭后重新初始化。"""
+        self._agent = None
+        self._fallback_agent = None
+        self._mcp_toolsets = []
+        self._settings = None
+        self._initialized = False
+        self._mcp_available = True
+
     def mark_mcp_failed(self) -> None:
         """
         标记 MCP 为不可用状态
@@ -185,17 +200,37 @@ class ChatAgentManager:
         """MCP 是否可用"""
         return self._mcp_available
 
+    def get_fallback_agent(self) -> Agent[AgentDependencies, str]:
+        """获取无 MCP 工具集的降级 Agent 实例。"""
+        if self._fallback_agent is None:
+            logger.info("creating_fallback_agent_without_mcp")
+            self._fallback_agent = self._create_agent(toolsets=None)
+        return self._fallback_agent
 
-# 全局 Agent 管理器实例
-_agent_manager: ChatAgentManager | None = None
+    def get_active_agent(
+        self,
+        agent: Agent[AgentDependencies, str] | None = None,
+        *,
+        connection_id: str | None = None,
+        mode: str = "stream",
+    ) -> Agent[AgentDependencies, str]:
+        if agent is not None:
+            return agent
+        if not self._mcp_available:
+            logger.info(
+                "mcp_already_failed_using_fallback",
+                connection_id=connection_id,
+                mode=mode,
+            )
+            return self.get_fallback_agent()
+        return self.get_agent()
 
 
 def get_agent_manager() -> ChatAgentManager:
     """获取 Agent 管理器单例"""
-    global _agent_manager
-    if _agent_manager is None:
-        _agent_manager = ChatAgentManager()
-    return _agent_manager
+    from services.agent.runtime import get_agent_runtime
+
+    return get_agent_runtime().get_agent_manager()
 
 
 # 为了向后兼容，保留 chat_agent 变量（推荐使用 get_agent_manager）
@@ -307,28 +342,6 @@ def _is_mcp_timeout_error(exc: BaseException) -> bool:
     )
 
     return (is_timeout and is_mcp_related) or is_exception_group_with_timeout
-
-
-# 缓存降级 Agent 实例
-_fallback_agent: Agent[AgentDependencies, str] | None = None
-
-
-def _create_fallback_agent() -> Agent[AgentDependencies, str]:
-    """
-    创建无 MCP 工具集的降级 Agent
-
-    当 MCP 连接失败时，使用此 Agent 继续处理请求。
-
-    Returns:
-        无 MCP 工具集的 Agent 实例
-    """
-    global _fallback_agent
-    if _fallback_agent is None:
-        logger.info("creating_fallback_agent_without_mcp")
-        # 使用 get_agent_manager() 获取单例，避免创建新实例
-        agent_manager = get_agent_manager()
-        _fallback_agent = agent_manager._create_agent(toolsets=None)
-    return _fallback_agent
 
 
 def _extract_exception_details(exc: BaseException) -> str:
@@ -495,6 +508,7 @@ class _HandlerContext:
     serialized_usage: dict[str, Any] | None = None
     tool_events: list[dict[str, Any]] = field(default_factory=list)  # 记录工具调用事件
     tool_results: dict[str, str] = field(default_factory=dict)  # 记录工具返回结果，key=tool_call_id
+    tool_call_names: dict[str, str] = field(default_factory=dict)  # tool_call_id -> tool_name
 
 
 async def _send_content_event(
@@ -550,16 +564,11 @@ async def stream_response_handler(
 
     agent_manager = get_agent_manager()
 
-    # 检查 MCP 是否可用，如果之前已失败，直接使用降级 Agent
-    if not agent_manager.is_mcp_available and agent is None:
-        logger.info(
-            "mcp_already_failed_using_fallback",
-            connection_id=str(deps.connection_id),
-        )
-        active_agent = _create_fallback_agent()
-    else:
-        # 使用传入的 agent 或从管理器获取
-        active_agent = agent or agent_manager.get_agent()
+    active_agent = agent_manager.get_active_agent(
+        agent,
+        connection_id=str(deps.connection_id),
+        mode="stream",
+    )
 
     try:
         # 使用 agent.iter() 进行细粒度节点控制
@@ -654,6 +663,7 @@ async def stream_response_handler(
                                     "args": event.part.args,
                                 }
                                 ctx.tool_events.append(tool_info)
+                                ctx.tool_call_names[event.part.tool_call_id] = event.part.tool_name
                                 logger.info(
                                     "agent_tool_call",
                                     tool=event.part.tool_name,
@@ -691,7 +701,7 @@ async def stream_response_handler(
                                     sequence=ctx.sequence,
                                     metadata={
                                         "tool_call_id": event.tool_call_id,
-                                        "tool_name": event.tool_call_id.split("_")[0] if "_" in event.tool_call_id else None,
+                                        "tool_name": ctx.tool_call_names.get(event.tool_call_id),
                                     },
                                 )
                                 ctx.sequence += 1
@@ -727,9 +737,9 @@ async def stream_response_handler(
                 connection_id=str(deps.connection_id),
             )
             # 标记 MCP 为不可用，后续请求将直接使用降级 Agent
-            get_agent_manager().mark_mcp_failed()
+            agent_manager.mark_mcp_failed()
             # 降级到无 MCP 工具集的模式
-            fallback_agent = _create_fallback_agent()
+            fallback_agent = agent_manager.get_fallback_agent()
             async for event in stream_response_handler(
                 prompt, deps, model, message_history, ctx, fallback_agent
             ):
@@ -781,16 +791,11 @@ async def non_stream_response_handler(
 
     agent_manager = get_agent_manager()
 
-    # 检查 MCP 是否可用，如果之前已失败，直接使用降级 Agent
-    if not agent_manager.is_mcp_available and agent is None:
-        logger.info(
-            "mcp_already_failed_using_fallback_non_stream",
-            connection_id=str(deps.connection_id),
-        )
-        active_agent = _create_fallback_agent()
-    else:
-        # 使用传入的 agent 或从管理器获取
-        active_agent = agent or agent_manager.get_agent()
+    active_agent = agent_manager.get_active_agent(
+        agent,
+        connection_id=str(deps.connection_id),
+        mode="non_stream",
+    )
 
     try:
         result = await active_agent.run(
@@ -827,9 +832,9 @@ async def non_stream_response_handler(
                 connection_id=str(deps.connection_id),
             )
             # 标记 MCP 为不可用，后续请求将直接使用降级 Agent
-            get_agent_manager().mark_mcp_failed()
+            agent_manager.mark_mcp_failed()
             # 降级到无 MCP 工具集的模式
-            fallback_agent = _create_fallback_agent()
+            fallback_agent = agent_manager.get_fallback_agent()
             async for event in non_stream_response_handler(
                 prompt, deps, model, message_history, ctx, fallback_agent
             ):
@@ -872,7 +877,7 @@ async def stream_chat(
     Yields:
         StreamEvent: 流式事件
     """
-    use_stream_mode = deps.settings.stream_sentence_mode
+    use_stream_mode = cast(StreamModeSettings, deps.settings).stream_sentence_mode
     ctx = _HandlerContext()
 
     try:

@@ -13,7 +13,7 @@ from config.settings import get_settings
 from config.logging import setup_logging, get_logger
 from core.queue import MessageBroker
 from services.agent.worker import AgentWorker
-from services.agent.providers import ProviderRegistry
+from services.agent.runtime import get_agent_runtime
 from services.websocket.server import WebSocketServer
 from services.auth.jwt_handler import JWTHandler
 
@@ -54,33 +54,16 @@ class Application:
             sentence_mode=self.settings.chunk_sentence_mode,
         )
 
-        # 预热 LLM 模型
-        await ProviderRegistry.warmup_models(self.settings)
-
-        # 异步初始化 MCP 管理器
-        from services.agent.mcp import get_mcp_manager
-        mcp_manager = get_mcp_manager(self.settings)
-        mcp_connected = await mcp_manager.initialize()
-
-        mcp_status = mcp_manager.get_status_summary()
+        agent_runtime = get_agent_runtime()
+        mcp_connected = await agent_runtime.initialize(self.settings)
+        mcp_status = agent_runtime.get_mcp_manager(self.settings).get_status_summary()
         logger.info(
-            "mcp_initialization_complete",
-            enabled=mcp_status["enabled"],
-            connected=mcp_status["active_servers"],
-            total=mcp_status["total_servers"],
-        )
-
-        # 初始化 Agent 管理器（使用已连接的 MCP 工具集）
-        from services.agent.core import get_agent_manager
-        agent_manager = get_agent_manager()
-        await agent_manager.initialize(
-            self.settings,
-            mcp_toolsets=mcp_manager.get_toolsets_for_agent(),
-        )
-        logger.info(
-            "agent_manager_initialized",
-            mcp_toolsets_count=len(agent_manager.mcp_toolsets),
-            mcp_connected=mcp_connected,
+            "agent_runtime_initialized",
+            mcp_enabled=mcp_status["enabled"],
+            mcp_connected=mcp_status["active_servers"],
+            mcp_total=mcp_status["total_servers"],
+            mcp_has_active_server=mcp_connected,
+            mcp_toolsets_count=len(agent_runtime.get_agent_manager().mcp_toolsets),
         )
 
         # 启动 Agent Workers
@@ -108,13 +91,8 @@ class Application:
         for worker in self.workers:
             await worker.stop()
 
-        # 关闭 MCP 管理器
-        from services.agent.mcp import get_mcp_manager
-        mcp_manager = get_mcp_manager(self.settings)
-        await mcp_manager.shutdown()
-
-        # 关闭 Provider 维护的 HTTP 客户端
-        await ProviderRegistry.shutdown()
+        # 关闭 Agent runtime 维护的 MCP 和 Provider 资源
+        await get_agent_runtime().shutdown()
 
         logger.info("application_stopped")
 

@@ -12,7 +12,7 @@ from models.minecraft import (
 )
 from models.messages import ChatRequest
 from services.websocket.connection import ConnectionState
-from services.websocket.command import CommandRegistry
+from services.websocket.command import CommandRegistry, ParsedCommand
 from config.logging import get_logger
 from config.settings import MinecraftConfig
 
@@ -28,6 +28,7 @@ class TellrawMessage:
 
     text: str
     color: str
+    target: str = "@a"
 
 
 class MinecraftProtocolHandler:
@@ -103,8 +104,11 @@ class MinecraftProtocolHandler:
         Returns:
             (命令类型, 内容) 元组
         """
-        # 使用 CommandRegistry 进行命令解析（支持别名）
         return self.command_registry.resolve(message)
+
+    def parse_typed_command(self, message: str) -> ParsedCommand | None:
+        """解析命令并返回 typed command；非命令返回 None。"""
+        return self.command_registry.resolve_parsed(message)
 
     @staticmethod
     def create_chat_request(
@@ -113,6 +117,7 @@ class MinecraftProtocolHandler:
         provider: str | None = None,
         delivery: str | None = None,
         player_name: str | None = None,
+        conversation_id: str = "default",
     ) -> ChatRequest:
         """
         创建聊天请求
@@ -123,6 +128,7 @@ class MinecraftProtocolHandler:
             provider: 可选的 LLM 提供商
             delivery: 下行通道
             player_name: 本次消息真实发送者；缺省时回退到 state.player_name
+            conversation_id: 调用方按玩家状态解析出的当前对话 ID
 
         Returns:
             ChatRequest 对象
@@ -137,7 +143,7 @@ class MinecraftProtocolHandler:
             use_context=session.context_enabled,
             provider=provider or session.current_provider,
             delivery=delivery or "tellraw",
-            conversation_id=session.active_conversation_id,
+            conversation_id=conversation_id,
         )
 
     def get_help_text(self) -> str:
@@ -161,23 +167,38 @@ class MinecraftProtocolHandler:
 
         return "\n".join(lines)
 
-    def create_error_message(self, error: str) -> "TellrawMessage":
+    def create_error_message(
+        self,
+        error: str,
+        target: str = "@a",
+    ) -> "TellrawMessage":
         """创建错误消息（结构化，由发送层统一分片）。"""
         return TellrawMessage(
             text=f"{self.config.error_prefix}{error}",
             color=self.config.error_color,
+            target=target,
         )
 
-    def create_info_message(self, info: str) -> "TellrawMessage":
+    def create_info_message(
+        self,
+        info: str,
+        target: str = "@a",
+    ) -> "TellrawMessage":
         """创建信息消息（结构化，由发送层统一分片）。"""
         return TellrawMessage(
             text=f"{self.config.info_prefix}{info}",
             color=self.config.info_color,
+            target=target,
         )
 
-    def create_success_message(self, message: str) -> "TellrawMessage":
+    def create_success_message(
+        self,
+        message: str,
+        target: str = "@a",
+    ) -> "TellrawMessage":
         """创建成功消息（结构化，由发送层统一分片）。"""
         return TellrawMessage(
             text=f"{self.config.success_prefix}{message}",
             color=self.config.success_color,
+            target=target,
         )

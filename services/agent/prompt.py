@@ -1,16 +1,28 @@
 """提示词模板管理器"""
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol, cast
 
 from pydantic import BaseModel
 from pydantic_ai import RunContext
 
 from config.logging import get_logger
-from config.settings import Settings
+from config.settings import LLMProviderConfig, Settings
 from services.agent.harness.prompting import render_runtime_harness_prompt
 
 logger = get_logger(__name__)
+
+DEFAULT_SYSTEM_PROMPT = Settings.model_fields["system_prompt"].default
+
+
+class PromptSettings(Protocol):
+    system_prompt: str
+    runtime_harness_enabled: bool
+    runtime_harness_prompt_enabled: bool
+
+    def get_provider_config(self, provider_name: str | None = None) -> LLMProviderConfig:
+        ...
+
 
 # 工具使用指南 - 延迟导入避免循环依赖
 TOOL_USAGE_GUIDE = """你可以使用工具与 Minecraft 交互。
@@ -296,7 +308,7 @@ class PromptManager:
         model: str,
         context_length: int = 0,
         context_usage: str = "",
-        settings: Settings | None = None,
+        settings: PromptSettings | None = None,
     ) -> str:
         """
         构建系统提示词
@@ -340,7 +352,7 @@ class PromptManager:
             "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "context_length": str(context_length),
             "context_usage": context_usage,
-            "system_prompt": settings.system_prompt if settings is not None else Settings().system_prompt,
+            "system_prompt": settings.system_prompt if settings is not None else DEFAULT_SYSTEM_PROMPT,
             "tool_usage": tool_usage,
         }
 
@@ -401,8 +413,9 @@ async def build_dynamic_prompt(ctx: RunContext) -> str:
     # 从 deps 获取必要信息
     connection_id = str(ctx.deps.connection_id)
     player_name = ctx.deps.player_name
+    settings = cast(PromptSettings, ctx.deps.settings)
     provider = ctx.deps.provider or "deepseek"
-    model = ctx.deps.settings.get_provider_config(provider).model if provider else "deepseek-chat"
+    model = settings.get_provider_config(provider).model if provider else "deepseek-chat"
 
     # 获取上下文使用信息
     context_info = None
@@ -424,5 +437,5 @@ async def build_dynamic_prompt(ctx: RunContext) -> str:
         model=model,
         context_length=context_info.message_count if context_info else 0,
         context_usage=context_usage,
-        settings=ctx.deps.settings,
+        settings=settings,
     )

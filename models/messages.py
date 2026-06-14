@@ -50,6 +50,7 @@ class StreamChunk(BaseMessage):
     content: str
     sequence: int
     delivery: Literal["tellraw", "scriptevent"] = "tellraw"
+    player_name: str | None = None
     # 工具相关元数据
     tool_name: str | None = None
     tool_args: dict | None = None
@@ -62,6 +63,7 @@ class SystemNotification(BaseMessage):
     type: Literal["notification"] = "notification"
     level: Literal["info", "warning", "error"]
     message: str
+    player_name: str | None = None
 
 
 class ErrorMessage(BaseMessage):

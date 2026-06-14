@@ -153,7 +153,9 @@ class AgentWorker:
         """处理单个请求（已持有会话锁）"""
         if conversation_generation is None:
             conversation_generation = self.broker.get_conversation_generation(
-                connection_id, request.player_name, request.conversation_id
+                connection_id,
+                request.player_name,
+                request.conversation_id,
             )
 
         logger.info(
@@ -236,7 +238,7 @@ class AgentWorker:
                 error=str(e),
             )
             # 发送错误消息
-            await self._send_error_chunk(connection_id, str(e), 0)
+            await self._send_error_chunk(connection_id, request.player_name, str(e), 0)
             return
 
         # 流式处理
@@ -246,12 +248,8 @@ class AgentWorker:
         reasoning_parts: list[str] = []
         start_time = time.monotonic()
 
-        # 获取已初始化的 Agent 实例（带有 MCP 工具集）
-        from services.agent.core import get_agent_manager, _is_mcp_timeout_error
+        from services.agent.core import _is_mcp_timeout_error
         from services.agent.mcp import get_mcp_manager
-
-        agent_manager = get_agent_manager()
-        agent = agent_manager.get_agent()
 
         # 尝试获取 MCP 管理器以跟踪服务器状态
         mcp_manager = get_mcp_manager(self.settings)
@@ -262,7 +260,6 @@ class AgentWorker:
                 deps,
                 model,
                 message_history=message_history,
-                agent=agent,
             ):
                 event_count += 1
                 if event.event_type == "content" and event.content:
@@ -288,6 +285,7 @@ class AgentWorker:
                         content=tool_msg,
                         sequence=sequence,
                         delivery=request.delivery,
+                        player_name=request.player_name,
                         tool_name=tool_name,
                         tool_args=tool_args,
                     )
@@ -311,6 +309,7 @@ class AgentWorker:
                             content=tool_result_msg,
                             sequence=sequence,
                             delivery=request.delivery,
+                            player_name=request.player_name,
                             tool_name=tool_name,
                             tool_result_preview=truncate_text(result_content, 80),
                         )
@@ -380,6 +379,7 @@ class AgentWorker:
                                             connection_id=connection_id,
                                             level="info",
                                             message=f"对话历史已自动压缩，{msg}",
+                                            player_name=request.player_name,
                                         ),
                                     )
                                     logger.debug(
@@ -442,6 +442,7 @@ class AgentWorker:
                         content=event.content,
                         sequence=sequence,
                         delivery=request.delivery,
+                        player_name=request.player_name,
                     )
                     await self.broker.send_response(connection_id, chunk)
                     sequence += 1
@@ -455,6 +456,7 @@ class AgentWorker:
                             content=event.content,
                             sequence=sequence,
                             delivery=request.delivery,
+                            player_name=request.player_name,
                         )
                         await self.broker.send_response(connection_id, chunk)
                         sequence += 1
@@ -485,7 +487,12 @@ class AgentWorker:
                 error=error_detail,
                 exc_info=True,
             )
-            await self._send_error_chunk(connection_id, error_detail, sequence)
+            await self._send_error_chunk(
+                connection_id,
+                request.player_name,
+                error_detail,
+                sequence,
+            )
 
     async def _generate_title_for_conversation(
         self,
@@ -498,14 +505,14 @@ class AgentWorker:
         """为首轮完成后的对话生成标题。"""
         try:
             title = await generate_conversation_title(first_user_message, model)
-            if not self.broker.has_connection(connection_id):
-                return
-            self.broker.set_conversation_title(
+            metadata = self.broker.set_conversation_title_if_connected(
                 connection_id,
                 player_name,
                 conversation_id,
                 title,
             )
+            if metadata is None:
+                return
             logger.info(
                 "conversation_title_generated",
                 worker_id=self.worker_id,
@@ -797,7 +804,11 @@ class AgentWorker:
         )
 
     async def _send_error_chunk(
-        self, connection_id: UUID, error: str, sequence: int
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        error: str,
+        sequence: int,
     ) -> None:
         """发送错误消息块"""
         chunk = StreamChunk(
@@ -805,5 +816,6 @@ class AgentWorker:
             chunk_type="error",
             content=f"错误: {error}",
             sequence=sequence,
+            player_name=player_name,
         )
         await self.broker.send_response(connection_id, chunk)
