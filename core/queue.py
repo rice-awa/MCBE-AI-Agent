@@ -289,6 +289,23 @@ class MessageBroker:
             title,
         )
 
+    def set_conversation_title_if_connected(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        conversation_id: str | None,
+        title: str,
+    ) -> ConversationMetadata | None:
+        """仅当连接仍注册时设置对话标题，避免清理后重建元数据。"""
+        if not self.has_connection(connection_id):
+            return None
+        return self.sessions.set_conversation_title(
+            connection_id,
+            player_name,
+            conversation_id,
+            title,
+        )
+
     def mark_conversation_title_generating(
         self,
         connection_id: UUID,

@@ -140,7 +140,6 @@ def test_list_player_conversation_metadata_includes_short_ids_and_titles() -> No
     broker = MessageBroker()
     connection_id = uuid4()
 
-    broker.get_session_lock(connection_id, "alice")
     broker.set_conversation_history(connection_id, "alice", _build_turn(1), "build-plan")
     broker.set_conversation_title(connection_id, "alice", "build-plan", "Build Plan")
     broker.set_conversation_history(connection_id, "alice", _build_turn(2), "redstone")
@@ -154,12 +153,10 @@ def test_list_player_conversation_metadata_includes_short_ids_and_titles() -> No
         ("build-plan", 1, "Build Plan"),
         ("redstone", 2, "Redstone"),
         ("metadata-only", 3, None),
-        ("default", 4, None),
     ]
     assert metadata[0].title_status == "ready"
     assert metadata[1].title_status == "ready"
     assert metadata[2].title_status == "pending"
-    assert metadata[3].title_status == "pending"
 
 
 def test_clear_connection_sessions_removes_conversation_metadata() -> None:
@@ -173,6 +170,21 @@ def test_clear_connection_sessions_removes_conversation_metadata() -> None:
     broker.clear_connection_sessions(connection_id)
 
     assert broker.list_player_conversation_metadata(connection_id, "alice") == []
+    assert broker.resolve_conversation_short_id(connection_id, "alice", "#1") is None
+
+
+def test_clear_player_conversations_does_not_recreate_default_from_lock() -> None:
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    broker.get_session_lock(connection_id, "alice")
+    broker.set_conversation_history(connection_id, "alice", _build_turn(1), "default")
+    broker.set_conversation_history(connection_id, "alice", _build_turn(2), "other")
+
+    broker.clear_player_conversation_histories(connection_id, "alice")
+
+    assert broker.list_player_conversation_metadata(connection_id, "alice") == []
+    assert broker.list_player_conversations(connection_id, "alice") == []
     assert broker.resolve_conversation_short_id(connection_id, "alice", "#1") is None
 
 
@@ -283,7 +295,7 @@ def test_worker_keeps_serial_chat_history_when_requests_share_initial_generation
             connection_id=connection_id,
             content="second",
             player_name="alice",
-            conversation_generation=1,
+            conversation_generation=0,
         )
 
         await worker._process_request(QueueItem(priority=0, connection_id=connection_id, payload=first))
@@ -339,7 +351,11 @@ def test_worker_skips_history_write_when_request_generation_is_stale(monkeypatch
         )
         broker.clear_conversation_history(connection_id, "alice", "default")
 
-        await worker._process_request_locked(request, connection_id)
+        await worker._process_request_locked(
+            request,
+            connection_id,
+            conversation_generation=request.conversation_generation,
+        )
 
         assert broker.get_conversation_history(connection_id, "alice", "default") == []
 
@@ -626,6 +642,47 @@ def test_worker_does_not_write_title_after_connection_cleanup(monkeypatch) -> No
         return "Late Title"
 
     monkeypatch.setattr("services.agent.worker.generate_conversation_title", _fake_generate_title)
+
+    asyncio.run(
+        worker._generate_title_for_conversation(
+            connection_id,
+            "alice",
+            "current-conversation",
+            "first prompt",
+            object(),
+        )
+    )
+
+    assert broker.list_player_conversation_metadata(connection_id, "alice") == []
+
+
+def test_title_generation_does_not_recreate_metadata_after_unregister(monkeypatch) -> None:
+    """标题生成完成和连接注销交错时，不应重建已清理的元数据。"""
+
+    import asyncio
+
+    from config.settings import Settings
+
+    broker = MessageBroker()
+    connection_id = uuid4()
+    broker.register_connection(connection_id)
+    broker.mark_conversation_title_generating(connection_id, "alice", "current-conversation")
+
+    worker = AgentWorker(
+        broker=broker,
+        settings=Settings(max_history_turns=5),
+        worker_id=1,
+    )
+
+    async def _fake_generate_title(*args, **kwargs):
+        return "Late Title"
+
+    def _unregister_during_check(actual_connection_id):
+        broker.unregister_connection(actual_connection_id)
+        return False
+
+    monkeypatch.setattr("services.agent.worker.generate_conversation_title", _fake_generate_title)
+    monkeypatch.setattr(broker, "has_connection", _unregister_during_check)
 
     asyncio.run(
         worker._generate_title_for_conversation(

@@ -152,7 +152,11 @@ class AgentWorker:
     ) -> None:
         """处理单个请求（已持有会话锁）"""
         if conversation_generation is None:
-            conversation_generation = request.conversation_generation
+            conversation_generation = self.broker.get_conversation_generation(
+                connection_id,
+                request.player_name,
+                request.conversation_id,
+            )
 
         logger.info(
             "processing_chat_request",
@@ -244,12 +248,8 @@ class AgentWorker:
         reasoning_parts: list[str] = []
         start_time = time.monotonic()
 
-        # 获取已初始化的 Agent 实例（带有 MCP 工具集）
-        from services.agent.core import get_agent_manager, _is_mcp_timeout_error
+        from services.agent.core import _is_mcp_timeout_error
         from services.agent.mcp import get_mcp_manager
-
-        agent_manager = get_agent_manager()
-        agent = agent_manager.get_agent()
 
         # 尝试获取 MCP 管理器以跟踪服务器状态
         mcp_manager = get_mcp_manager(self.settings)
@@ -260,7 +260,6 @@ class AgentWorker:
                 deps,
                 model,
                 message_history=message_history,
-                agent=agent,
             ):
                 event_count += 1
                 if event.event_type == "content" and event.content:
@@ -506,14 +505,14 @@ class AgentWorker:
         """为首轮完成后的对话生成标题。"""
         try:
             title = await generate_conversation_title(first_user_message, model)
-            if not self.broker.has_connection(connection_id):
-                return
-            self.broker.set_conversation_title(
+            metadata = self.broker.set_conversation_title_if_connected(
                 connection_id,
                 player_name,
                 conversation_id,
                 title,
             )
+            if metadata is None:
+                return
             logger.info(
                 "conversation_title_generated",
                 worker_id=self.worker_id,

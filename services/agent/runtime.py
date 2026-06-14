@@ -52,6 +52,12 @@ class AgentRuntime:
     async def shutdown(self) -> None:
         if self.mcp_manager is not None:
             await self.mcp_manager.shutdown()
+            self.mcp_manager = None
+        if self.chat_agent_manager is not None:
+            reset = getattr(self.chat_agent_manager, "reset", None)
+            if reset is not None:
+                reset()
+            self.chat_agent_manager = None
         await self.runtime_adapters.shutdown()
 
 

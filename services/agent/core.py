@@ -172,6 +172,15 @@ class ChatAgentManager:
         """是否已初始化"""
         return self._initialized
 
+    def reset(self) -> None:
+        """重置 Agent 管理器状态，供运行时关闭后重新初始化。"""
+        self._agent = None
+        self._fallback_agent = None
+        self._mcp_toolsets = []
+        self._settings = None
+        self._initialized = False
+        self._mcp_available = True
+
     def mark_mcp_failed(self) -> None:
         """
         标记 MCP 为不可用状态

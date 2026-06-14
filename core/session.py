@@ -224,10 +224,6 @@ class ConversationSessionStore:
             if cid == connection_id and pname == player:
                 conversation_ids.add(conversation_id)
 
-        for cid, pname in self._session_locks.keys():
-            if cid == connection_id and pname == player:
-                conversation_ids.add(DEFAULT_CONVERSATION_ID)
-
         metadata_items = [
             self.ensure_conversation_metadata(connection_id, player, conversation_id)
             for conversation_id in conversation_ids
@@ -350,9 +346,6 @@ class ConversationSessionStore:
                 conversations[conversation_id] = len(
                     self._conversation_histories[(cid, pname, conversation_id)]
                 )
-        for cid, pname in self._session_locks.keys():
-            if cid == connection_id and pname == player:
-                conversations.setdefault(DEFAULT_CONVERSATION_ID, 0)
         return sorted(conversations.items())
 
     def list_session_players(self, connection_id: UUID) -> list[str]:
