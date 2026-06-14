@@ -543,3 +543,37 @@ def test_non_stream_mode_should_populate_tool_events_from_messages(monkeypatch) 
     assert len(tool_events_list) == 1
     assert tool_events_list[0]["tool_name"] == "run_minecraft_command"
     assert tool_events_list[0]["args"] == {"command": "time set day"}
+
+
+def test_chat_agent_manager_caches_fallback_agent_after_mcp_failure(monkeypatch) -> None:
+    manager = core.ChatAgentManager()
+    created = []
+
+    def fake_create_agent(toolsets=None):
+        agent = SimpleNamespace(toolsets=toolsets)
+        created.append(agent)
+        return agent
+
+    monkeypatch.setattr(manager, "_create_agent", fake_create_agent)
+
+    manager.mark_mcp_failed()
+    first = manager.get_active_agent(connection_id="connection", mode="stream")
+    second = manager.get_active_agent(connection_id="connection", mode="non_stream")
+
+    assert first is second
+    assert first.toolsets is None
+    assert created == [first]
+
+
+def test_chat_agent_manager_explicit_agent_overrides_fallback(monkeypatch) -> None:
+    manager = core.ChatAgentManager()
+    explicit_agent = SimpleNamespace(name="explicit")
+
+    def fail_create_agent(toolsets=None):
+        raise AssertionError("fallback should not be created")
+
+    monkeypatch.setattr(manager, "_create_agent", fail_create_agent)
+
+    manager.mark_mcp_failed()
+
+    assert manager.get_active_agent(explicit_agent) is explicit_agent

@@ -11,21 +11,22 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from config.logging import get_logger
 from config.settings import LLMProviderConfig, Settings
-from core.exceptions import ProviderNotFoundError, ProviderNotConfiguredError
+from core.exceptions import ProviderNotConfiguredError, ProviderNotFoundError
 
 logger = get_logger(__name__)
 llm_raw_logger = get_logger("llm.raw")
 
 
-class ProviderRegistry:
-    """LLM Provider 注册表 - 支持多种 LLM"""
+class RuntimeAdapterRegistry:
+    """Owns LLM model adapters and their HTTP client lifecycle."""
 
-    _model_cache: dict[str, Model] = {}
-    _http_client_cache: dict[str, httpx.AsyncClient] = {}
     _raw_body_max_chars = 20_000
 
-    @classmethod
-    def get_model(cls, config: LLMProviderConfig) -> Model:
+    def __init__(self) -> None:
+        self._model_cache: dict[str, Model] = {}
+        self._http_client_cache: dict[str, httpx.AsyncClient] = {}
+
+    def get_model(self, config: LLMProviderConfig) -> Model:
         """
         根据配置获取模型实例
 
@@ -40,7 +41,7 @@ class ProviderRegistry:
             ProviderNotConfiguredError: 提供商未正确配置
         """
         provider_name = config.name.lower()
-        cache_key = cls._build_model_cache_key(config)
+        cache_key = self._build_model_cache_key(config)
 
         if not config.enabled:
             raise ProviderNotConfiguredError(
@@ -48,22 +49,22 @@ class ProviderRegistry:
                 details={"reason": "提供商未启用"},
             )
 
-        if cached_model := cls._model_cache.get(cache_key):
+        if cached_model := self._model_cache.get(cache_key):
             return cached_model
 
         try:
             if provider_name == "deepseek":
-                model = cls._create_deepseek_model(config)
+                model = self._create_deepseek_model(config)
             elif provider_name == "openai":
-                model = cls._create_openai_model(config)
+                model = self._create_openai_model(config)
             elif provider_name == "anthropic":
-                model = cls._create_anthropic_model(config)
+                model = self._create_anthropic_model(config)
             elif provider_name == "ollama":
-                model = cls._create_ollama_model(config)
+                model = self._create_ollama_model(config)
             else:
                 raise ProviderNotFoundError(provider_name)
 
-            cls._model_cache[cache_key] = model
+            self._model_cache[cache_key] = model
             return model
 
         except Exception as e:
@@ -74,8 +75,7 @@ class ProviderRegistry:
             )
             raise
 
-    @classmethod
-    def _create_deepseek_model(cls, config: LLMProviderConfig) -> Model:
+    def _create_deepseek_model(self, config: LLMProviderConfig) -> Model:
         """创建 DeepSeek 模型"""
         if not config.api_key:
             raise ProviderNotConfiguredError(
@@ -85,7 +85,7 @@ class ProviderRegistry:
 
         logger.info("creating_deepseek_model", model=config.model)
 
-        http_client = cls._get_or_create_http_client(config, "deepseek")
+        http_client = self._get_or_create_http_client(config, "deepseek")
 
         return OpenAIChatModel(
             config.model,
@@ -95,8 +95,7 @@ class ProviderRegistry:
             ),
         )
 
-    @classmethod
-    def _create_openai_model(cls, config: LLMProviderConfig) -> Model:
+    def _create_openai_model(self, config: LLMProviderConfig) -> Model:
         """创建 OpenAI 模型"""
         if not config.api_key:
             raise ProviderNotConfiguredError(
@@ -108,7 +107,7 @@ class ProviderRegistry:
 
         provider_kwargs: dict[str, Any] = {
             "api_key": config.api_key,
-            "http_client": cls._get_or_create_http_client(config, "openai"),
+            "http_client": self._get_or_create_http_client(config, "openai"),
         }
         if config.base_url:
             provider_kwargs["base_url"] = config.base_url
@@ -118,8 +117,7 @@ class ProviderRegistry:
             provider=OpenAIProvider(**provider_kwargs),
         )
 
-    @classmethod
-    def _create_anthropic_model(cls, config: LLMProviderConfig) -> Model:
+    def _create_anthropic_model(self, config: LLMProviderConfig) -> Model:
         """创建 Anthropic 模型"""
         if not config.api_key:
             raise ProviderNotConfiguredError(
@@ -129,12 +127,11 @@ class ProviderRegistry:
 
         logger.info("creating_anthropic_model", model=config.model)
 
-        # 直接使用 Anthropic 模型字符串，PydanticAI 会自动处理
         from pydantic_ai.models.anthropic import AnthropicModel
+
         return AnthropicModel(config.model, api_key=config.api_key)
 
-    @classmethod
-    def _create_ollama_model(cls, config: LLMProviderConfig) -> Model:
+    def _create_ollama_model(self, config: LLMProviderConfig) -> Model:
         """创建 Ollama 模型"""
         logger.info(
             "creating_ollama_model",
@@ -143,48 +140,44 @@ class ProviderRegistry:
         )
 
         from pydantic_ai.models.ollama import OllamaModel
+
         return OllamaModel(
             config.model,
             base_url=config.base_url or "http://localhost:11434",
         )
 
-    @classmethod
-    def list_providers(cls) -> list[str]:
+    @staticmethod
+    def list_providers() -> list[str]:
         """列出所有支持的提供商"""
         return ["deepseek", "openai", "anthropic", "ollama"]
 
-    @classmethod
-    async def warmup_models(cls, settings: Settings) -> None:
+    async def warmup_models(self, settings: Settings) -> None:
         """
         预热 LLM 模型，提前创建默认 provider 的模型实例
-        
+
         Args:
             settings: 应用配置
         """
         if not settings.llm_warmup_enabled:
             logger.info("llm_warmup_disabled")
             return
-        
+
         logger.info(
             "llm_warmup_starting",
             default_provider=settings.default_provider,
         )
-        
+
         try:
-            # 获取默认 provider 配置
             provider_config = settings.get_provider_config(settings.default_provider)
-            
-            # 创建模型实例（这会初始化客户端）
-            cls.get_model(provider_config)
-            
+            self.get_model(provider_config)
+
             logger.info(
                 "llm_warmup_completed",
                 provider=settings.default_provider,
                 model=provider_config.model,
             )
-            
+
         except Exception as e:
-            # 预热失败不影响启动，记录警告即可
             logger.warning(
                 "llm_warmup_failed",
                 provider=settings.default_provider,
@@ -192,10 +185,9 @@ class ProviderRegistry:
                 exc_info=True,
             )
 
-    @classmethod
-    async def shutdown(cls) -> None:
-        """关闭 ProviderRegistry 维护的 HTTP 客户端。"""
-        for cache_key, client in list(cls._http_client_cache.items()):
+    async def shutdown(self) -> None:
+        """关闭 registry 维护的 HTTP 客户端。"""
+        for cache_key, client in list(self._http_client_cache.items()):
             try:
                 await client.aclose()
             except Exception as e:
@@ -205,11 +197,11 @@ class ProviderRegistry:
                     error=str(e),
                 )
 
-        cls._http_client_cache.clear()
-        cls._model_cache.clear()
+        self._http_client_cache.clear()
+        self._model_cache.clear()
 
-    @classmethod
-    def get_model_string(cls, config: LLMProviderConfig) -> str:
+    @staticmethod
+    def get_model_string(config: LLMProviderConfig) -> str:
         """
         获取模型字符串（用于 Agent 初始化）
 
@@ -222,15 +214,14 @@ class ProviderRegistry:
         provider_name = config.name.lower()
         if provider_name in ["deepseek", "openai"]:
             return f"{provider_name}:{config.model}"
-        elif provider_name == "anthropic":
+        if provider_name == "anthropic":
             return f"anthropic:{config.model}"
-        elif provider_name == "ollama":
+        if provider_name == "ollama":
             return f"ollama:{config.model}"
-        else:
-            return config.model
+        return config.model
 
-    @classmethod
-    def _build_model_cache_key(cls, config: LLMProviderConfig) -> str:
+    @staticmethod
+    def _build_model_cache_key(config: LLMProviderConfig) -> str:
         """根据 provider 配置构建模型缓存键。"""
         return ":".join(
             [
@@ -241,9 +232,8 @@ class ProviderRegistry:
             ]
         )
 
-    @classmethod
+    @staticmethod
     def _build_http_client_cache_key(
-        cls,
         config: LLMProviderConfig,
         provider_name: str,
     ) -> str:
@@ -256,23 +246,21 @@ class ProviderRegistry:
             ]
         )
 
-    @classmethod
     def _get_or_create_http_client(
-        cls,
+        self,
         config: LLMProviderConfig,
         provider_name: str,
     ) -> httpx.AsyncClient:
-        cache_key = cls._build_http_client_cache_key(config, provider_name)
-        if cached_client := cls._http_client_cache.get(cache_key):
+        cache_key = self._build_http_client_cache_key(config, provider_name)
+        if cached_client := self._http_client_cache.get(cache_key):
             return cached_client
 
-        client = cls._create_llm_http_client(config, provider_name)
-        cls._http_client_cache[cache_key] = client
+        client = self._create_llm_http_client(config, provider_name)
+        self._http_client_cache[cache_key] = client
         return client
 
-    @classmethod
     def _create_llm_http_client(
-        cls,
+        self,
         config: LLMProviderConfig,
         provider_name: str,
     ) -> httpx.AsyncClient:
@@ -285,15 +273,14 @@ class ProviderRegistry:
                 model=config.model,
                 method=request.method,
                 url=str(request.url),
-                headers=cls._sanitize_headers(dict(request.headers)),
-                body=cls._format_raw_body(request.content),
+                headers=self._sanitize_headers(dict(request.headers)),
+                body=self._format_raw_body(request.content),
             )
 
         async def on_response(response: httpx.Response) -> None:
             try:
-                # 读取并缓存响应体，确保后续消费不会丢失。
                 await response.aread()
-                body = cls._format_raw_body(response.content)
+                body = self._format_raw_body(response.content)
             except Exception as e:
                 body = f"<response_read_error: {str(e)}>"
 
@@ -303,7 +290,7 @@ class ProviderRegistry:
                 model=config.model,
                 status_code=response.status_code,
                 url=str(response.request.url),
-                headers=cls._sanitize_headers(dict(response.headers)),
+                headers=self._sanitize_headers(dict(response.headers)),
                 body=body,
             )
 
@@ -312,8 +299,7 @@ class ProviderRegistry:
             event_hooks={"request": [on_request], "response": [on_response]},
         )
 
-    @classmethod
-    def _format_raw_body(cls, content: bytes | str | None) -> str | None:
+    def _format_raw_body(self, content: bytes | str | None) -> str | None:
         if content is None:
             return None
 
@@ -326,17 +312,16 @@ class ProviderRegistry:
         if not text:
             return None
 
-        # JSON 内容优先格式化，便于排障。
         try:
             parsed = json.loads(text)
             text = json.dumps(parsed, ensure_ascii=False)
         except Exception:
             pass
 
-        if len(text) > cls._raw_body_max_chars:
+        if len(text) > self._raw_body_max_chars:
             return (
-                text[: cls._raw_body_max_chars]
-                + f"...<truncated:{len(text) - cls._raw_body_max_chars}>"
+                text[: self._raw_body_max_chars]
+                + f"...<truncated:{len(text) - self._raw_body_max_chars}>"
             )
 
         return text
@@ -351,3 +336,37 @@ class ProviderRegistry:
             else:
                 sanitized[key] = value
         return sanitized
+
+
+class ProviderRegistry:
+    """Compatibility facade for the process default runtime adapter registry."""
+
+    _default_runtime_adapters = RuntimeAdapterRegistry()
+
+    @classmethod
+    def get_runtime_adapters(cls) -> RuntimeAdapterRegistry:
+        return cls._default_runtime_adapters
+
+    @classmethod
+    def set_runtime_adapters(cls, runtime_adapters: RuntimeAdapterRegistry) -> None:
+        cls._default_runtime_adapters = runtime_adapters
+
+    @classmethod
+    def get_model(cls, config: LLMProviderConfig) -> Model:
+        return cls._default_runtime_adapters.get_model(config)
+
+    @classmethod
+    def list_providers(cls) -> list[str]:
+        return cls._default_runtime_adapters.list_providers()
+
+    @classmethod
+    async def warmup_models(cls, settings: Settings) -> None:
+        await cls._default_runtime_adapters.warmup_models(settings)
+
+    @classmethod
+    async def shutdown(cls) -> None:
+        await cls._default_runtime_adapters.shutdown()
+
+    @classmethod
+    def get_model_string(cls, config: LLMProviderConfig) -> str:
+        return cls._default_runtime_adapters.get_model_string(config)
