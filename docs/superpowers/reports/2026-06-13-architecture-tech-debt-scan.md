@@ -1,5 +1,7 @@
 # 架构技术债扫描报告
 
+> 状态说明：这是 2026-06-13 重构前的架构债务扫描输入，保留用于追溯背景；它不代表 `tech-debt-scan-plan` 分支实现后的最终验证状态。最终审查请看 `docs/superpowers/reports/2026-06-14-tech-debt-scan-plan-review.md`，修复执行请看 `docs/superpowers/plans/2026-06-14-tech-debt-scan-plan-review-fixes.md`。
+
 日期：2026-06-13
 
 目标：对当前 MCBE Chat Agent 与运行时 Harness 代码做只读架构技术债扫描，产出可执行的技术债候选清单和优先级建议。
