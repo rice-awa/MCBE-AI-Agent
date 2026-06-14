@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from config.settings import LLMProviderConfig
 from services.agent.providers import ProviderRegistry, RuntimeAdapterRegistry
+from services.agent.runtime import AgentRuntime, get_agent_runtime, set_agent_runtime
 
 
 def provider_config(**overrides):
@@ -93,3 +94,44 @@ def test_provider_registry_facade_delegates_to_runtime_adapter():
         assert ProviderRegistry.get_model_string(config) == "fake:fake-model"
     finally:
         ProviderRegistry.set_runtime_adapters(original)
+
+
+def test_agent_runtime_owns_provider_registry_facade():
+    original = get_agent_runtime()
+    runtime_adapters = SimpleNamespace(
+        get_model=lambda config: ("runtime-model", config.name),
+        list_providers=lambda: ["runtime"],
+        warmup_models=lambda settings: None,
+        shutdown=lambda: None,
+        get_model_string=lambda config: f"runtime:{config.model}",
+    )
+    runtime = AgentRuntime(runtime_adapters=runtime_adapters)
+    try:
+        set_agent_runtime(runtime)
+        config = provider_config(name="runtime", model="runtime-model")
+
+        assert ProviderRegistry.get_runtime_adapters() is runtime_adapters
+        assert ProviderRegistry.get_model(config) == ("runtime-model", "runtime")
+        assert ProviderRegistry.list_providers() == ["runtime"]
+        assert ProviderRegistry.get_model_string(config) == "runtime:runtime-model"
+    finally:
+        set_agent_runtime(original)
+
+
+def test_agent_runtime_caches_chat_agent_manager(monkeypatch):
+    created = []
+
+    class FakeChatAgentManager:
+        def __init__(self):
+            created.append(self)
+
+    import services.agent.core as agent_core
+
+    monkeypatch.setattr(agent_core, "ChatAgentManager", FakeChatAgentManager)
+
+    runtime = AgentRuntime()
+    first = runtime.get_agent_manager()
+    second = runtime.get_agent_manager()
+
+    assert first is second
+    assert created == [first]

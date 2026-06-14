@@ -341,32 +341,34 @@ class RuntimeAdapterRegistry:
 class ProviderRegistry:
     """Compatibility facade for the process default runtime adapter registry."""
 
-    _default_runtime_adapters = RuntimeAdapterRegistry()
-
     @classmethod
     def get_runtime_adapters(cls) -> RuntimeAdapterRegistry:
-        return cls._default_runtime_adapters
+        from services.agent.runtime import get_agent_runtime
+
+        return get_agent_runtime().runtime_adapters
 
     @classmethod
     def set_runtime_adapters(cls, runtime_adapters: RuntimeAdapterRegistry) -> None:
-        cls._default_runtime_adapters = runtime_adapters
+        from services.agent.runtime import get_agent_runtime
+
+        get_agent_runtime().runtime_adapters = runtime_adapters
 
     @classmethod
     def get_model(cls, config: LLMProviderConfig) -> Model:
-        return cls._default_runtime_adapters.get_model(config)
+        return cls.get_runtime_adapters().get_model(config)
 
     @classmethod
     def list_providers(cls) -> list[str]:
-        return cls._default_runtime_adapters.list_providers()
+        return cls.get_runtime_adapters().list_providers()
 
     @classmethod
     async def warmup_models(cls, settings: Settings) -> None:
-        await cls._default_runtime_adapters.warmup_models(settings)
+        await cls.get_runtime_adapters().warmup_models(settings)
 
     @classmethod
     async def shutdown(cls) -> None:
-        await cls._default_runtime_adapters.shutdown()
+        await cls.get_runtime_adapters().shutdown()
 
     @classmethod
     def get_model_string(cls, config: LLMProviderConfig) -> str:
-        return cls._default_runtime_adapters.get_model_string(config)
+        return cls.get_runtime_adapters().get_model_string(config)

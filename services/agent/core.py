@@ -212,16 +212,11 @@ class ChatAgentManager:
         return self.get_agent()
 
 
-# 全局 Agent 管理器实例
-_agent_manager: ChatAgentManager | None = None
-
-
 def get_agent_manager() -> ChatAgentManager:
     """获取 Agent 管理器单例"""
-    global _agent_manager
-    if _agent_manager is None:
-        _agent_manager = ChatAgentManager()
-    return _agent_manager
+    from services.agent.runtime import get_agent_runtime
+
+    return get_agent_runtime().get_agent_manager()
 
 
 # 为了向后兼容，保留 chat_agent 变量（推荐使用 get_agent_manager）
