@@ -48,8 +48,55 @@ def test_unregister_should_resolve_pending_and_queued_command_futures() -> None:
 
 
 class _DummyWebSocket:
+    def __init__(self) -> None:
+        self.closed = False
+
     async def send(self, payload: str) -> None:
         return None
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def test_shutdown_all_should_unregister_broker_sessions_and_resolve_futures() -> None:
+    async def _run() -> None:
+        broker = MessageBroker()
+        manager = ConnectionManager(broker)
+
+        state = ConnectionState(websocket=_DummyWebSocket())
+        state.response_queue = broker.register_connection(state.id)
+        state.get_player_session("Alice")
+        broker.set_conversation_history(state.id, "Alice", [])
+
+        loop = asyncio.get_running_loop()
+        pending_future: asyncio.Future[str] = loop.create_future()
+        queued_future: asyncio.Future[str] = loop.create_future()
+
+        state.pending_command_futures["req-1"] = pending_future
+        await state.response_queue.put(
+            {
+                "type": "run_command",
+                "command": "say hi",
+                "result_future": queued_future,
+            }
+        )
+
+        manager._connections[state.id] = state
+        manager._sender_tasks[state.id] = asyncio.create_task(asyncio.sleep(60))
+
+        await manager.shutdown_all()
+
+        assert state.websocket.closed
+        assert pending_future.done()
+        assert pending_future.result() == "命令执行失败: 连接已关闭"
+        assert queued_future.done()
+        assert queued_future.result() == "命令执行失败: 连接已关闭"
+        assert manager.connection_count == 0
+        assert manager._sender_tasks == {}
+        assert broker.get_response_queue(state.id) is None
+        assert broker.list_session_players(state.id) == []
+
+    asyncio.run(_run())
 
 
 def test_run_command_should_drop_cancelled_future_from_pending_map() -> None:

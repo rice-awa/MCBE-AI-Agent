@@ -190,16 +190,8 @@ class ConnectionManager:
             connection_count=len(self._connections)
         )
 
-        # 取消所有响应发送任务
-        for connection_id, task in list(self._sender_tasks.items()):
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        # 关闭所有 WebSocket 连接
         for state in list(self._connections.values()):
+            await self.unregister(state.id)
             if state.websocket:
                 try:
                     await state.websocket.close()
@@ -209,10 +201,6 @@ class ConnectionManager:
                         connection_id=str(state.id),
                         error=str(e)
                     )
-
-        # 清空所有连接
-        self._connections.clear()
-        self._sender_tasks.clear()
 
         logger.info("all_connections_closed")
 
