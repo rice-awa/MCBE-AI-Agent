@@ -132,14 +132,15 @@ class TestChunkTellraw:
         assert data["header"]["messagePurpose"] == "commandRequest"
 
     def test_tellraw_preserves_color(self):
-        """每个分片应保持相同颜色。"""
+        """每个分片应保持相同颜色并满足真实 commandLine 字节预算。"""
         text = "A" * 500 + "。" + "B" * 100
         payloads = FlowControlMiddleware.chunk_tellraw(text, color="§c")
-        assert len(payloads) == 3
+        assert len(payloads) >= 2
         for payload in payloads:
             data = json.loads(payload)
             cmd_line = data["body"]["commandLine"]
             assert "§c" in cmd_line
+            assert len(cmd_line.encode("utf-8")) <= 461
 
 
 class TestChunkScriptevent:
