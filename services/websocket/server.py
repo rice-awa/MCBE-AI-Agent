@@ -215,23 +215,21 @@ class WebSocketServer:
                 state.player_name = player_event.sender
 
             # 解析命令
-            cmd_type, content = self.protocol_handler.parse_command(
-                player_event.message
-            )
+            command = self.protocol_handler.parse_typed_command(player_event.message)
 
-            if not cmd_type:
+            if command is None:
                 return  # 不是命令，忽略
 
             logger.info(
                 "command_received",
                 connection_id=str(state.id),
-                command=cmd_type,
+                command=command.type,
                 player=player_event.sender,
             )
 
             # 处理命令（player_name 直传，避免连接级状态串扰）
             await self.handle_command(
-                state, cmd_type, content, player_name=player_event.sender
+                state, command.type, command.content, player_name=player_event.sender
             )
 
         except json.JSONDecodeError:
@@ -351,39 +349,39 @@ class WebSocketServer:
             return
 
         # 路由到具体处理器
-        if cmd_type == "chat":
-            await self.handle_chat(
-                state, content, delivery="tellraw", player_name=player_name
-            )
-            # 聊天框用户消息同步到 Addon UI 历史记录
-            await self.broker.send_response(state.id, {
-                "type": "ai_response_sync",
-                "player_name": player_name or state.player_name or "Player",
-                "role": "user",
-                "text": content,
-            })
-        elif cmd_type == "chat_script":
-            await self.handle_chat(
+        command_handlers = {
+            "chat": lambda: self._handle_chat_command(state, content, player_name),
+            "chat_script": lambda: self.handle_chat(
                 state, content, delivery="scriptevent", player_name=player_name
-            )
-        elif cmd_type == "context":
-            await self.handle_context(state, content, player_name=player_name)
-        elif cmd_type == "conversation":
-            await self.handle_conversation(state, content, player_name=player_name)
-        elif cmd_type == "template":
-            await self.handle_template(state, content, player_name=player_name)
-        elif cmd_type == "setting":
-            await self.handle_setting(state, content, player_name=player_name)
-        elif cmd_type == "mcp":
-            await self.handle_mcp(state, content)
-        elif cmd_type == "switch_model":
-            await self.handle_switch_model(state, content, player_name=player_name)
-        elif cmd_type == "help":
-            await self.handle_help(state)
-        elif cmd_type == "save":
-            await self.handle_save(state, player_name=player_name)
-        elif cmd_type == "run_command":
-            await self.handle_run_command(state, content)
+            ),
+            "context": lambda: self.handle_context(state, content, player_name=player_name),
+            "conversation": lambda: self.handle_conversation(state, content, player_name=player_name),
+            "template": lambda: self.handle_template(state, content, player_name=player_name),
+            "setting": lambda: self.handle_setting(state, content, player_name=player_name),
+            "mcp": lambda: self.handle_mcp(state, content),
+            "switch_model": lambda: self.handle_switch_model(state, content, player_name=player_name),
+            "help": lambda: self.handle_help(state),
+            "save": lambda: self.handle_save(state, player_name=player_name),
+            "run_command": lambda: self.handle_run_command(state, content),
+        }
+        if handler := command_handlers.get(cmd_type):
+            await handler()
+
+    async def _handle_chat_command(
+        self,
+        state: Any,
+        content: str,
+        player_name: str | None,
+    ) -> None:
+        await self.handle_chat(
+            state, content, delivery="tellraw", player_name=player_name
+        )
+        await self.broker.send_response(state.id, {
+            "type": "ai_response_sync",
+            "player_name": player_name or state.player_name or "Player",
+            "role": "user",
+            "text": content,
+        })
 
     async def handle_login(self, state: Any, password: str) -> None:
         """处理登录"""

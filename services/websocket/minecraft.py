@@ -12,7 +12,7 @@ from models.minecraft import (
 )
 from models.messages import ChatRequest
 from services.websocket.connection import ConnectionState
-from services.websocket.command import CommandRegistry
+from services.websocket.command import CommandRegistry, ParsedCommand
 from config.logging import get_logger
 from config.settings import MinecraftConfig
 
@@ -103,8 +103,11 @@ class MinecraftProtocolHandler:
         Returns:
             (命令类型, 内容) 元组
         """
-        # 使用 CommandRegistry 进行命令解析（支持别名）
         return self.command_registry.resolve(message)
+
+    def parse_typed_command(self, message: str) -> ParsedCommand | None:
+        """解析命令并返回 typed command；非命令返回 None。"""
+        return self.command_registry.resolve_parsed(message)
 
     @staticmethod
     def create_chat_request(

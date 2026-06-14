@@ -1,9 +1,20 @@
 """命令注册表 - 管理命令和别名"""
 
+from dataclasses import dataclass
+
 from config.settings import MinecraftCommandConfig, MinecraftConfig
 from config.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class ParsedCommand:
+    type: str
+    content: str
+    prefix: str
+    raw: str
+    matched_alias: str | None = None
 
 
 class CommandRegistry:
@@ -54,20 +65,36 @@ class CommandRegistry:
 
     def resolve(self, message: str) -> tuple[str | None, str]:
         """解析消息，返回 (命令类型, 内容)"""
-        # 1. 尝试直接匹配
+        parsed = self.resolve_parsed(message)
+        if parsed is None:
+            return None, message
+        return parsed.type, parsed.content
+
+    def resolve_parsed(self, message: str) -> ParsedCommand | None:
+        """解析消息，返回带匹配来源的 typed command。"""
         for prefix, cmd_config in self._commands.items():
             if message.startswith(prefix):
                 content = message[len(prefix):].strip()
-                return cmd_config.type, content
+                return ParsedCommand(
+                    type=cmd_config.type,
+                    content=content,
+                    prefix=prefix,
+                    raw=message,
+                )
 
-        # 2. 尝试别名匹配
         for alias, main_prefix in self._alias_map.items():
             if message.startswith(alias):
                 content = message[len(alias):].strip()
                 cmd_config = self._commands[main_prefix]
-                return cmd_config.type, content
+                return ParsedCommand(
+                    type=cmd_config.type,
+                    content=content,
+                    prefix=main_prefix,
+                    raw=message,
+                    matched_alias=alias,
+                )
 
-        return None, message
+        return None
 
     def add_alias(self, command_prefix: str, alias: str) -> bool:
         """动态添加别名"""
