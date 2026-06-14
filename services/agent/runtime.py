@@ -10,6 +10,7 @@ from services.agent.providers import RuntimeAdapterRegistry
 
 if TYPE_CHECKING:
     from services.agent.core import ChatAgentManager
+    from services.agent.mcp import MCPManager
 
 
 @dataclass
@@ -18,6 +19,7 @@ class AgentRuntime:
 
     runtime_adapters: Any = field(default_factory=RuntimeAdapterRegistry)
     chat_agent_manager: ChatAgentManager | None = None
+    mcp_manager: MCPManager | None = None
 
     def get_agent_manager(self) -> ChatAgentManager:
         if self.chat_agent_manager is None:
@@ -26,10 +28,30 @@ class AgentRuntime:
             self.chat_agent_manager = ChatAgentManager()
         return self.chat_agent_manager
 
+    def get_mcp_manager(self, settings: Settings | None = None) -> MCPManager:
+        if self.mcp_manager is None:
+            from services.agent.mcp import MCPManager
+
+            self.mcp_manager = MCPManager(settings)
+        return self.mcp_manager
+
+    async def initialize(self, settings: Settings) -> bool:
+        await self.warmup_models(settings)
+        mcp_manager = self.get_mcp_manager(settings)
+        mcp_connected = await mcp_manager.initialize()
+        agent_manager = self.get_agent_manager()
+        await agent_manager.initialize(
+            settings,
+            mcp_toolsets=mcp_manager.get_toolsets_for_agent(),
+        )
+        return mcp_connected
+
     async def warmup_models(self, settings: Settings) -> None:
         await self.runtime_adapters.warmup_models(settings)
 
     async def shutdown(self) -> None:
+        if self.mcp_manager is not None:
+            await self.mcp_manager.shutdown()
         await self.runtime_adapters.shutdown()
 
 

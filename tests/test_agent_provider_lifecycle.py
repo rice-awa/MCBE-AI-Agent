@@ -135,3 +135,60 @@ def test_agent_runtime_caches_chat_agent_manager(monkeypatch):
 
     assert first is second
     assert created == [first]
+
+
+def test_agent_runtime_initializes_adapters_mcp_and_agent_manager():
+    calls = []
+    settings = SimpleNamespace()
+
+    class FakeRuntimeAdapters:
+        async def warmup_models(self, received_settings):
+            calls.append(("warmup", received_settings))
+
+    class FakeMCPManager:
+        async def initialize(self):
+            calls.append(("mcp_initialize",))
+            return True
+
+        def get_toolsets_for_agent(self):
+            calls.append(("mcp_toolsets",))
+            return ["toolset"]
+
+    class FakeChatAgentManager:
+        async def initialize(self, received_settings, mcp_toolsets):
+            calls.append(("agent_initialize", received_settings, mcp_toolsets))
+
+    runtime = AgentRuntime(
+        runtime_adapters=FakeRuntimeAdapters(),
+        mcp_manager=FakeMCPManager(),
+        chat_agent_manager=FakeChatAgentManager(),
+    )
+
+    assert asyncio.run(runtime.initialize(settings)) is True
+    assert calls == [
+        ("warmup", settings),
+        ("mcp_initialize",),
+        ("mcp_toolsets",),
+        ("agent_initialize", settings, ["toolset"]),
+    ]
+
+
+def test_agent_runtime_shutdown_closes_mcp_before_adapters():
+    calls = []
+
+    class FakeRuntimeAdapters:
+        async def shutdown(self):
+            calls.append("adapters_shutdown")
+
+    class FakeMCPManager:
+        async def shutdown(self):
+            calls.append("mcp_shutdown")
+
+    runtime = AgentRuntime(
+        runtime_adapters=FakeRuntimeAdapters(),
+        mcp_manager=FakeMCPManager(),
+    )
+
+    asyncio.run(runtime.shutdown())
+
+    assert calls == ["mcp_shutdown", "adapters_shutdown"]
