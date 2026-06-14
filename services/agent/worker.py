@@ -152,9 +152,7 @@ class AgentWorker:
     ) -> None:
         """处理单个请求（已持有会话锁）"""
         if conversation_generation is None:
-            conversation_generation = self.broker.get_conversation_generation(
-                connection_id, request.player_name, request.conversation_id
-            )
+            conversation_generation = request.conversation_generation
 
         logger.info(
             "processing_chat_request",

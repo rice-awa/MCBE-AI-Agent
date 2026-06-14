@@ -283,7 +283,7 @@ def test_worker_keeps_serial_chat_history_when_requests_share_initial_generation
             connection_id=connection_id,
             content="second",
             player_name="alice",
-            conversation_generation=0,
+            conversation_generation=1,
         )
 
         await worker._process_request(QueueItem(priority=0, connection_id=connection_id, payload=first))
@@ -293,6 +293,55 @@ def test_worker_keeps_serial_chat_history_when_requests_share_initial_generation
         assert len(history) == 4
         assert history[0].parts[0].content == "user-1"
         assert history[2].parts[0].content == "user-2"
+
+    asyncio.run(_run())
+
+def test_worker_skips_history_write_when_request_generation_is_stale(monkeypatch) -> None:
+    async def _run() -> None:
+        broker = MessageBroker()
+        connection_id = uuid4()
+        broker.register_connection(connection_id)
+        settings = Settings(default_provider="ollama", dev_mode=True)
+        worker = AgentWorker(broker, settings)
+
+        async def fake_stream_chat(*_args, **_kwargs):
+            yield StreamEvent(
+                event_type="content",
+                content="old response",
+                sequence=0,
+                metadata={"is_complete": True, "all_messages": _build_turn(9)},
+            )
+
+        class FakeAgentManager:
+            def get_agent(self):
+                return object()
+
+        monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+        monkeypatch.setattr("services.agent.providers.ProviderRegistry.get_model", lambda _config: object())
+        monkeypatch.setattr("services.agent.core.get_agent_manager", lambda: FakeAgentManager())
+        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _settings: None)
+        monkeypatch.setattr(
+            worker,
+            "_schedule_title_generation",
+            lambda *_args, **_kwargs: asyncio.sleep(0),
+        )
+
+        request = ChatRequest(
+            connection_id=connection_id,
+            content="old",
+            player_name="alice",
+            conversation_id="default",
+            conversation_generation=broker.get_conversation_generation(
+                connection_id,
+                "alice",
+                "default",
+            ),
+        )
+        broker.clear_conversation_history(connection_id, "alice", "default")
+
+        await worker._process_request_locked(request, connection_id)
+
+        assert broker.get_conversation_history(connection_id, "alice", "default") == []
 
     asyncio.run(_run())
 
