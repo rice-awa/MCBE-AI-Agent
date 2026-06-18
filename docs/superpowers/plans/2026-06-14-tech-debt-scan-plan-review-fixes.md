@@ -1,5 +1,7 @@
 # tech-debt-scan-plan 审查问题修复计划
 
+> **历史状态：** 本文档为历史/已被取代参考，不再代表当前修复计划。当前跟进以 `docs/superpowers/plans/2026-06-19-pr24-review-followups.md` 和 `docs/superpowers/reports/2026-06-18-pr-24-code-review.md` 为准。
+
 > **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [ ]`）语法来跟踪进度。
 
 **目标：** 修复 `docs/superpowers/reports/2026-06-14-tech-debt-scan-plan-review.md` 中列出的重构回归风险，并为每个风险点补充回归测试。

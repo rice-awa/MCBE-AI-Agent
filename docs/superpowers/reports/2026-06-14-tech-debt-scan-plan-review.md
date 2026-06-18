@@ -1,5 +1,7 @@
 # tech-debt-scan-plan 分支重构代码审查报告
 
+> **历史状态：** 本文档为历史/已被取代参考，不再代表当前修复计划。当前跟进以 `docs/superpowers/plans/2026-06-19-pr24-review-followups.md` 和 `docs/superpowers/reports/2026-06-18-pr-24-code-review.md` 为准。
+
 - 审查日期：2026-06-14
 - 审查分支：`tech-debt-scan-plan`
 - 对比基线：`master...HEAD`

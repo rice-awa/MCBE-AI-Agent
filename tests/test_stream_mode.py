@@ -8,6 +8,15 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+from pydantic_ai import (
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    PartDeltaEvent,
+    PartStartEvent,
+    TextPartDelta,
+)
+from pydantic_ai.messages import TextPart, ToolCallPart, ToolReturnPart
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 
@@ -19,59 +28,64 @@ async def _noop(_: str) -> None:
     return None
 
 
-# ============== Mock 事件类（使用 SimpleNamespace） ==============
-# 使用 SimpleNamespace 创建对象，在测试中通过 monkeypatch isinstance 来通过类型检查
+# ============== Mock 事件类（使用 PydanticAI 真实事件类型） ==============
+# 使用真实事件对象避免全局 monkeypatch builtins.isinstance，同时保持测试聚焦 stream mode 行为。
 
 
-def make_text_part(content: str = "") -> SimpleNamespace:
+def make_text_part(content: str = "") -> TextPart:
     """创建模拟 TextPart"""
-    return SimpleNamespace(content=content)
+    return TextPart(content)
 
 
-def make_text_part_delta(content_delta: str) -> SimpleNamespace:
+def make_text_part_delta(content_delta: str) -> TextPartDelta:
     """创建模拟 TextPartDelta"""
-    return SimpleNamespace(content_delta=content_delta)
+    return TextPartDelta(content_delta)
 
 
-def make_part_start_event(index: int, content: str = "") -> SimpleNamespace:
+def make_part_start_event(index: int, content: str = "") -> PartStartEvent:
     """创建模拟 PartStartEvent"""
-    return SimpleNamespace(index=index, part=make_text_part(content))
+    return PartStartEvent(index=index, part=make_text_part(content))
 
 
-def make_part_delta_event(index: int, content_delta: str) -> SimpleNamespace:
+def make_part_delta_event(index: int, content_delta: str) -> PartDeltaEvent:
     """创建模拟 PartDeltaEvent"""
-    return SimpleNamespace(index=index, delta=make_text_part_delta(content_delta))
+    return PartDeltaEvent(index=index, delta=make_text_part_delta(content_delta))
 
 
 def make_tool_part(
-    tool_name: str = "run_minecraft_command", args: dict = None
-) -> SimpleNamespace:
+    tool_name: str = "run_minecraft_command", args: dict | None = None
+) -> ToolCallPart:
     """创建模拟 ToolCallPart"""
-    return SimpleNamespace(
+    return ToolCallPart(
         tool_name=tool_name,
         tool_call_id="test_call_id",
         args=args or {"command": "give @s diamond"},
-        part_kind="tool-call",
     )
 
 
-def make_tool_result(content: str = "命令执行成功") -> SimpleNamespace:
+def make_tool_result(
+    tool_call_id: str = "test_call_id", content: str = "命令执行成功"
+) -> ToolReturnPart:
     """创建模拟工具结果"""
-    return SimpleNamespace(content=content)
+    return ToolReturnPart(
+        tool_name="run_minecraft_command",
+        content=content,
+        tool_call_id=tool_call_id,
+    )
 
 
 def make_function_tool_call_event(
-    tool_name: str = "run_minecraft_command", args: dict = None
-) -> SimpleNamespace:
+    tool_name: str = "run_minecraft_command", args: dict | None = None
+) -> FunctionToolCallEvent:
     """创建模拟 FunctionToolCallEvent"""
-    return SimpleNamespace(part=make_tool_part(tool_name, args))
+    return FunctionToolCallEvent(make_tool_part(tool_name, args))
 
 
 def make_function_tool_result_event(
     tool_call_id: str = "test_call_id", result_content: str = "命令执行成功"
-) -> SimpleNamespace:
+) -> FunctionToolResultEvent:
     """创建模拟 FunctionToolResultEvent"""
-    return SimpleNamespace(tool_call_id=tool_call_id, result=make_tool_result(result_content))
+    return FunctionToolResultEvent(part=make_tool_result(tool_call_id, result_content))
 
 
 # ============== Mock 节点流 ==============
@@ -321,31 +335,10 @@ def _build_deps(stream_sentence_mode: bool) -> AgentDependencies:
     )
 
 
-def _patch_isinstance_for_events(monkeypatch):
-    """Patch isinstance to make mock events pass type checks"""
+def _patch_agent_node_adapter(monkeypatch) -> None:
+    """Patch core.Agent only so mock nodes use the same node-class adapter as production."""
 
     monkeypatch.setattr(core, "Agent", MockAgent)
-    original_isinstance = isinstance
-
-    def custom_isinstance(obj, classinfo):
-        # Handle PartStartEvent check
-        if classinfo.__name__ == "PartStartEvent" if hasattr(classinfo, "__name__") else False:
-            return hasattr(obj, "index") and hasattr(obj, "part")
-        # Handle PartDeltaEvent check
-        if classinfo.__name__ == "PartDeltaEvent" if hasattr(classinfo, "__name__") else False:
-            return hasattr(obj, "index") and hasattr(obj, "delta")
-        # Handle TextPartDelta check
-        if classinfo.__name__ == "TextPartDelta" if hasattr(classinfo, "__name__") else False:
-            return hasattr(obj, "content_delta")
-        # Handle FunctionToolCallEvent check
-        if classinfo.__name__ == "FunctionToolCallEvent" if hasattr(classinfo, "__name__") else False:
-            return hasattr(obj, "part") and hasattr(obj.part, "tool_name")
-        # Handle FunctionToolResultEvent check
-        if classinfo.__name__ == "FunctionToolResultEvent" if hasattr(classinfo, "__name__") else False:
-            return hasattr(obj, "tool_call_id") and hasattr(obj, "result")
-        return original_isinstance(obj, classinfo)
-
-    monkeypatch.setattr("builtins.isinstance", custom_isinstance)
 
 
 # ============== 测试用例 ==============
@@ -353,7 +346,7 @@ def _patch_isinstance_for_events(monkeypatch):
 
 def test_stream_sentence_mode_true_should_stream_by_sentence(monkeypatch) -> None:
     """流式模式：按完整句子发送"""
-    _patch_isinstance_for_events(monkeypatch)
+    _patch_agent_node_adapter(monkeypatch)
 
     mock_agent = MockAgent(
         text_chunks=["你好", "，世界。", "再见", "！"],
@@ -371,7 +364,7 @@ def test_stream_sentence_mode_true_should_stream_by_sentence(monkeypatch) -> Non
 
 def test_stream_sentence_mode_false_should_batch_after_complete(monkeypatch) -> None:
     """非流式模式：完整响应后分批发送"""
-    _patch_isinstance_for_events(monkeypatch)
+    _patch_agent_node_adapter(monkeypatch)
 
     sentence_1 = ("甲" * 50) + "。"
     sentence_2 = ("乙" * 50) + "。"
@@ -392,7 +385,7 @@ def test_stream_sentence_mode_false_should_batch_after_complete(monkeypatch) -> 
 
 
 def test_stream_chat_tool_result_uses_tool_name_from_call_event(monkeypatch) -> None:
-    _patch_isinstance_for_events(monkeypatch)
+    _patch_agent_node_adapter(monkeypatch)
 
     agent = MockAgent(
         tool_events=[
@@ -418,7 +411,7 @@ def test_stream_chat_tool_result_uses_tool_name_from_call_event(monkeypatch) -> 
 
 def test_tool_call_should_be_recorded_in_tool_events(monkeypatch) -> None:
     """工具调用事件应被记录在 tool_events 中"""
-    _patch_isinstance_for_events(monkeypatch)
+    _patch_agent_node_adapter(monkeypatch)
 
     tool_events = [
         make_function_tool_call_event("run_minecraft_command", {"command": "give @s diamond"}),
@@ -444,7 +437,7 @@ def test_tool_call_should_be_recorded_in_tool_events(monkeypatch) -> None:
 
 def test_tool_chain_no_longer_needs_manual_fallback(monkeypatch) -> None:
     """工具链不再需要手动回退（框架自动处理）"""
-    _patch_isinstance_for_events(monkeypatch)
+    _patch_agent_node_adapter(monkeypatch)
 
     tool_events = [
         make_function_tool_call_event("run_minecraft_command", {"command": "give @s diamond"}),
@@ -480,7 +473,7 @@ def test_iter_sentence_batches_should_fallback_for_long_sentence() -> None:
 
 def test_empty_text_chunks_should_not_yield_content_events(monkeypatch) -> None:
     """空文本列表不应产生内容事件"""
-    _patch_isinstance_for_events(monkeypatch)
+    _patch_agent_node_adapter(monkeypatch)
 
     mock_agent = MockAgent(text_chunks=[], result_output="")
     monkeypatch.setattr(core, "chat_agent", mock_agent)
@@ -496,7 +489,7 @@ def test_empty_text_chunks_should_not_yield_content_events(monkeypatch) -> None:
 
 def test_non_stream_mode_uses_run_method(monkeypatch) -> None:
     """非流式模式应使用 run() 方法"""
-    _patch_isinstance_for_events(monkeypatch)
+    _patch_agent_node_adapter(monkeypatch)
 
     mock_agent = MockAgent(result_output="这是一个测试响应。")
     monkeypatch.setattr(core, "chat_agent", mock_agent)
@@ -511,7 +504,7 @@ def test_non_stream_mode_uses_run_method(monkeypatch) -> None:
 
 def test_multiple_tool_calls_should_all_be_recorded(monkeypatch) -> None:
     """多个工具调用事件都应被记录"""
-    _patch_isinstance_for_events(monkeypatch)
+    _patch_agent_node_adapter(monkeypatch)
 
     tool_events = [
         make_function_tool_call_event("run_minecraft_command", {"command": "give @s diamond"}),
@@ -537,7 +530,7 @@ def test_multiple_tool_calls_should_all_be_recorded(monkeypatch) -> None:
 
 def test_stream_sentence_mode_should_not_flush_incomplete_tail_between_request_nodes(monkeypatch) -> None:
     """流式模式：跨 ModelRequestNode 的半句不应提前发送"""
-    _patch_isinstance_for_events(monkeypatch)
+    _patch_agent_node_adapter(monkeypatch)
 
     request_node_events = [
         [make_part_start_event(0, ""), make_part_delta_event(0, "你好")],
@@ -558,7 +551,7 @@ def test_stream_sentence_mode_should_not_flush_incomplete_tail_between_request_n
 
 def test_non_stream_mode_should_populate_tool_events_from_messages(monkeypatch) -> None:
     """非流式模式：应从结果消息中回填工具调用元数据"""
-    _patch_isinstance_for_events(monkeypatch)
+    _patch_agent_node_adapter(monkeypatch)
 
     result_messages = [
         SimpleNamespace(parts=[make_tool_part("run_minecraft_command", {"command": "time set day"})])
