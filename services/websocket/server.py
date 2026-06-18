@@ -1015,6 +1015,9 @@ class WebSocketServer:
                 else:
                     success = manager.reload_toolset(arg)
                     if success:
+                        from services.agent.runtime import get_agent_runtime
+
+                        get_agent_runtime().refresh_mcp_tools(self.settings)
                         msg = self.protocol_handler.create_success_message(
                             f"服务器 {arg} 配置已重新加载"
                         )
