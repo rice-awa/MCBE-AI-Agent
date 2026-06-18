@@ -7,13 +7,14 @@ from uuid import uuid4
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.append(str(ROOT))
+sys.path.insert(0, str(ROOT))
 
 import pytest
 from pydantic_ai import Agent
 
 from config.settings import LLMProviderConfig, Settings
 from models.agent import AgentDependencies
+from models.minecraft import MinecraftCommand
 from services.agent.harness.prompting import render_schema_description_prefix
 from services.agent.tools import (
     build_actionbar_command,
@@ -206,6 +207,108 @@ async def test_registered_tool_audit_uses_structured_failure(tmp_path) -> None:
     assert records[0]["result"]["success"] == "failure"
     assert records[0]["result"]["failure_reason"] == "仅支持 http 或 https URL"
 
+@pytest.mark.asyncio
+async def test_message_tools_default_to_triggering_player() -> None:
+    settings = Settings(runtime_harness_audit_enabled=False)
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent, settings=settings)
+    commands: list[str] = []
+
+    async def run_command(command: str) -> str:
+        commands.append(command)
+        return "ok"
+
+    deps = AgentDependencies(
+        connection_id=uuid4(),
+        player_name="Alex",
+        settings=settings,
+        http_client=SimpleNamespace(),
+        send_to_game=_noop_send_to_game,
+        run_command=run_command,
+    )
+    ctx = SimpleNamespace(deps=deps)
+
+    await agent._function_toolset.tools["send_game_message"].function(ctx, "plain")
+    await agent._function_toolset.tools["send_colored_message"].function(ctx, "hello")
+    await agent._function_toolset.tools["send_title_message"].function(ctx, "title")
+    await agent._function_toolset.tools["send_actionbar_message"].function(ctx, "hint")
+
+    assert commands[0].startswith("tellraw Alex")
+    assert commands[1].startswith("tellraw Alex")
+    assert commands[2] == 'title Alex title "title"'
+    assert commands[3] == "title Alex times 10 70 20"
+    assert commands[4] == 'title Alex actionbar "hint"'
+
+
+@pytest.mark.asyncio
+async def test_message_tools_use_all_players_only_when_broadcast_true() -> None:
+    settings = Settings(runtime_harness_audit_enabled=False)
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent, settings=settings)
+    commands: list[str] = []
+
+    async def run_command(command: str) -> str:
+        commands.append(command)
+        return "ok"
+
+    deps = AgentDependencies(
+        connection_id=uuid4(),
+        player_name="Alex",
+        settings=settings,
+        http_client=SimpleNamespace(),
+        send_to_game=_noop_send_to_game,
+        run_command=run_command,
+    )
+    ctx = SimpleNamespace(deps=deps)
+
+    await agent._function_toolset.tools["send_game_message"].function(ctx, "plain", broadcast=True)
+    await agent._function_toolset.tools["send_colored_message"].function(ctx, "hello", broadcast=True)
+    await agent._function_toolset.tools["send_title_message"].function(ctx, "title", broadcast=True)
+    await agent._function_toolset.tools["send_actionbar_message"].function(ctx, "hint", broadcast=True)
+
+    assert commands[0].startswith("tellraw @a")
+    assert commands[1].startswith("tellraw @a")
+    assert commands[2] == 'title @a title "title"'
+    assert commands[3] == "title @a times 10 70 20"
+    assert commands[4] == 'title @a actionbar "hint"'
+
+
+@pytest.mark.asyncio
+async def test_send_script_event_rejects_invalid_message_id() -> None:
+    settings = Settings(runtime_harness_audit_enabled=False)
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent, settings=settings)
+    commands: list[str] = []
+
+    async def run_command(command: str) -> str:
+        commands.append(command)
+        return "ok"
+
+    deps = AgentDependencies(
+        connection_id=uuid4(),
+        player_name="Alex",
+        settings=settings,
+        http_client=SimpleNamespace(),
+        send_to_game=_noop_send_to_game,
+        run_command=run_command,
+    )
+    ctx = SimpleNamespace(deps=deps)
+
+    result = await agent._function_toolset.tools["send_script_event"].function(
+        ctx,
+        "payload",
+        "server:data; say hacked",
+    )
+
+    assert "脚本事件发送失败" in result
+    assert commands == []
+
+
+def test_create_scriptevent_rejects_uppercase_message_id() -> None:
+    for message_id in ("Server:Data", "MCBEAI:AI_RESP"):
+        with pytest.raises(ValueError):
+            MinecraftCommand.create_scriptevent("payload", message_id)
+
 
 def test_escape_command_text() -> None:
     assert escape_command_text('Hello "MC"') == 'Hello \\"MC\\"'
@@ -213,18 +316,24 @@ def test_escape_command_text() -> None:
 
 
 def test_build_title_commands() -> None:
-    commands = build_title_commands("主标题", "副标题", 10, 70, 20)
+    commands = build_title_commands("主标题", "副标题", 10, 70, 20, "Alex")
+    assert commands[0] == 'title Alex title "主标题"'
+    assert commands[1] == 'title Alex subtitle "副标题"'
+    assert commands[2] == "title Alex times 10 70 20"
+
+
+def test_build_title_commands_broadcast_target() -> None:
+    commands = build_title_commands("主标题", None, 10, 70, 20, "@a")
     assert commands[0] == 'title @a title "主标题"'
-    assert commands[1] == 'title @a subtitle "副标题"'
-    assert commands[2] == "title @a times 10 70 20"
+    assert commands[1] == "title @a times 10 70 20"
 
 
 def test_build_actionbar_command() -> None:
-    command = build_actionbar_command("提示")
-    assert command == 'title @a actionbar "提示"'
+    command = build_actionbar_command("提示", "Alex")
+    assert command == 'title Alex actionbar "提示"'
 
 
 def test_build_tellraw_command() -> None:
-    command = build_tellraw_command("测试", "§b")
-    assert command.startswith("tellraw @a")
+    command = build_tellraw_command("测试", "§b", "Alex")
+    assert command.startswith("tellraw Alex")
     assert "§b" in command
