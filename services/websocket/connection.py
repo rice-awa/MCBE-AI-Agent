@@ -10,6 +10,7 @@ from websockets.server import WebSocketServerProtocol
 from core.queue import MessageBroker
 from models.messages import StreamChunk, SystemNotification
 from models.agent import MCColor, MCPrefix
+from services.agent.prompt import get_prompt_manager
 from services.websocket.delivery import AiResponseSync, McbeOutboundDelivery
 from config.logging import get_logger
 
@@ -128,6 +129,9 @@ class ConnectionManager:
 
             self._fail_pending_command_futures(state)
             self._fail_queued_command_futures(state)
+
+            # 清理提示词管理器中该连接下所有玩家的模板和变量状态
+            get_prompt_manager().clear_connection(str(connection_id))
 
             # 从消息代理注销
             self.broker.unregister_connection(connection_id)
