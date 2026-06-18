@@ -475,6 +475,9 @@ class WebSocketServer:
         chat_req.conversation_generation = self.broker.get_conversation_generation(
             state.id, chat_req.player_name, chat_req.conversation_id
         )
+        chat_req.conversation_invalidation_epoch = self.broker.get_conversation_invalidation_epoch(
+            state.id, chat_req.player_name, chat_req.conversation_id
+        )
 
         # 提交到消息队列（非阻塞！）
         try:
@@ -589,6 +592,7 @@ class WebSocketServer:
                 return self.protocol_handler.create_error_message(
                     f"对话 {target_id} 已存在，请使用 AGENT 对话 switch {target_id} 切换"
                 )
+            self.broker.bump_conversation_invalidation_epoch(state.id, actor, conversation_id)
             self.broker.set_active_conversation_id(state.id, actor, new_id)
             self.broker.set_conversation_history(state.id, actor, [], new_id)
             metadata = self.broker.ensure_conversation_metadata(state.id, actor, new_id)
@@ -603,6 +607,9 @@ class WebSocketServer:
             resolved_id = self.broker.resolve_conversation_short_id(state.id, actor, arg)
             target_id = normalize_conversation_id(resolved_id or arg)
             was_existing = self.broker.conversation_exists(state.id, actor, target_id)
+            self.broker.bump_conversation_invalidation_epoch(state.id, actor, conversation_id)
+            if target_id != conversation_id:
+                self.broker.bump_conversation_invalidation_epoch(state.id, actor, target_id)
             if not was_existing:
                 self.broker.set_conversation_history(state.id, actor, [], target_id)
             self.broker.set_active_conversation_id(state.id, actor, target_id)

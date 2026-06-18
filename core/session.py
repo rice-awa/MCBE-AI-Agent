@@ -53,7 +53,10 @@ class ConversationSessionStore:
 
     def __init__(self) -> None:
         self._conversation_histories: dict[SessionKey, list[ModelMessage]] = {}
+        # History revision：普通聊天/压缩等历史写入递增，作为兼容 API 保留。
         self._conversation_generations: dict[SessionKey, int] = {}
+        # Invalidation epoch：仅管理操作递增，用于阻止旧队列请求重建已失效历史。
+        self._conversation_invalidation_epochs: dict[SessionKey, int] = {}
         self._conversation_metadata: dict[SessionKey, ConversationMetadata] = {}
         self._conversation_short_ids: dict[SessionLockKey, dict[int, str]] = {}
         self._next_conversation_short_id: dict[SessionLockKey, int] = {}
@@ -236,9 +239,31 @@ class ConversationSessionStore:
         player_name: str | None,
         conversation_id: str | None = None,
     ) -> int:
-        """获取对话桶版本，用于避免过期请求覆盖后续管理命令。"""
+        """获取对话历史 revision；普通历史写入会递增，兼容既有 API。"""
         key = make_session_key(connection_id, player_name, conversation_id)
         return self._conversation_generations.get(key, 0)
+
+    def get_conversation_invalidation_epoch(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        conversation_id: str | None = None,
+    ) -> int:
+        """获取对话失效 epoch；仅管理操作递增，用于 stale guard。"""
+        key = make_session_key(connection_id, player_name, conversation_id)
+        return self._conversation_invalidation_epochs.get(key, 0)
+
+    def bump_conversation_invalidation_epoch(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        conversation_id: str | None = None,
+    ) -> int:
+        """递增指定对话的失效 epoch，并返回新值。"""
+        key = make_session_key(connection_id, player_name, conversation_id)
+        next_epoch = self._conversation_invalidation_epochs.get(key, 0) + 1
+        self._conversation_invalidation_epochs[key] = next_epoch
+        return next_epoch
 
     def ensure_conversation(
         self,
@@ -251,6 +276,7 @@ class ConversationSessionStore:
         self.ensure_conversation_metadata(connection_id, player_name, conversation_id)
         self._conversation_histories.setdefault(key, [])
         self._conversation_generations.setdefault(key, 0)
+        self._conversation_invalidation_epochs.setdefault(key, 0)
 
     def conversation_exists(
         self,
@@ -280,15 +306,21 @@ class ConversationSessionStore:
         history: list[ModelMessage],
         conversation_id: str | None = None,
         expected_generation: int | None = None,
+        expected_invalidation_epoch: int | None = None,
     ) -> bool:
         """更新 (连接, 玩家, 对话) 维度的对话历史。"""
         key = make_session_key(connection_id, player_name, conversation_id)
+        current_invalidation_epoch = self._conversation_invalidation_epochs.get(key, 0)
+        if expected_invalidation_epoch is not None and current_invalidation_epoch != expected_invalidation_epoch:
+            return False
+
         self.ensure_conversation_metadata(connection_id, player_name, conversation_id)
         current_generation = self._conversation_generations.get(key, 0)
         if expected_generation is not None and current_generation != expected_generation:
             return False
         self._conversation_histories[key] = list(history)
         self._conversation_generations[key] = current_generation + 1
+        self._conversation_invalidation_epochs.setdefault(key, current_invalidation_epoch)
         return True
 
     def clear_conversation_history(
@@ -301,6 +333,7 @@ class ConversationSessionStore:
         key = make_session_key(connection_id, player_name, conversation_id)
         self._conversation_histories.pop(key, None)
         self._conversation_generations[key] = self._conversation_generations.get(key, 0) + 1
+        self._conversation_invalidation_epochs[key] = self._conversation_invalidation_epochs.get(key, 0) + 1
 
     def clear_player_conversation_histories(
         self,
@@ -317,9 +350,14 @@ class ConversationSessionStore:
             key for key in self._conversation_generations
             if key[0] == connection_id and key[1] == player
         ]
-        for key in set(history_keys + generation_keys):
+        invalidation_keys = [
+            key for key in self._conversation_invalidation_epochs
+            if key[0] == connection_id and key[1] == player
+        ]
+        for key in set(history_keys + generation_keys + invalidation_keys):
             self._conversation_histories.pop(key, None)
             self._conversation_generations[key] = self._conversation_generations.get(key, 0) + 1
+            self._conversation_invalidation_epochs[key] = self._conversation_invalidation_epochs.get(key, 0) + 1
 
         metadata_keys = [
             key for key in self._conversation_metadata
@@ -368,6 +406,10 @@ class ConversationSessionStore:
         generation_keys = [key for key in self._conversation_generations if key[0] == connection_id]
         for key in generation_keys:
             self._conversation_generations.pop(key, None)
+
+        invalidation_keys = [key for key in self._conversation_invalidation_epochs if key[0] == connection_id]
+        for key in invalidation_keys:
+            self._conversation_invalidation_epochs.pop(key, None)
 
         lock_keys = [key for key in self._session_locks if key[0] == connection_id]
         for key in lock_keys:

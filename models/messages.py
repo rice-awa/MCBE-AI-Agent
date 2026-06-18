@@ -25,7 +25,10 @@ class ChatRequest(BaseMessage):
     provider: str | None = None  # 可选指定 LLM 提供商
     delivery: Literal["tellraw", "scriptevent"] = "tellraw"
     conversation_id: str = "default"
+    # 历史 revision，保留兼容 API；普通聊天写回会递增。
     conversation_generation: int = 0
+    # 管理操作失效 epoch；clear/switch/new/restore/switch_model 等运行时状态变更会递增。
+    conversation_invalidation_epoch: int = 0
 
 
 class ChatResponse(BaseMessage):

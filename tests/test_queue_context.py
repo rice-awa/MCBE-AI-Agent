@@ -6,7 +6,7 @@ import sys
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.append(str(ROOT))
+sys.path.insert(0, str(ROOT))
 
 from pydantic_ai.messages import (
     ModelRequest,
@@ -230,11 +230,11 @@ def test_session_lock_per_player() -> None:
     assert lock_alice is lock_alice_again
     assert lock_alice is not lock_bob
 
-def test_conversation_generation_blocks_stale_history_write() -> None:
+def test_conversation_invalidation_epoch_blocks_stale_history_write() -> None:
     broker = MessageBroker()
     connection_id = uuid4()
 
-    generation = broker.get_conversation_generation(connection_id, "alice", "default")
+    epoch = broker.get_conversation_invalidation_epoch(connection_id, "alice", "default")
     broker.clear_conversation_history(connection_id, "alice", "default")
 
     updated = broker.set_conversation_history(
@@ -242,11 +242,35 @@ def test_conversation_generation_blocks_stale_history_write() -> None:
         "alice",
         _build_turn(1),
         "default",
-        expected_generation=generation,
+        expected_invalidation_epoch=epoch,
     )
 
     assert updated is False
     assert broker.get_conversation_history(connection_id, "alice", "default") == []
+
+
+def test_conversation_generation_remains_history_revision_api() -> None:
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    generation = broker.get_conversation_generation(connection_id, "alice", "default")
+    assert generation == 0
+    assert broker.set_conversation_history(
+        connection_id,
+        "alice",
+        _build_turn(1),
+        "default",
+        expected_generation=generation,
+    ) is True
+    assert broker.get_conversation_generation(connection_id, "alice", "default") == 1
+
+    assert broker.set_conversation_history(
+        connection_id,
+        "alice",
+        _build_turn(2),
+        "default",
+        expected_generation=generation,
+    ) is False
 
 
 def test_worker_keeps_serial_chat_history_when_requests_share_initial_generation(monkeypatch) -> None:
@@ -290,12 +314,14 @@ def test_worker_keeps_serial_chat_history_when_requests_share_initial_generation
             content="first",
             player_name="alice",
             conversation_generation=0,
+            conversation_invalidation_epoch=0,
         )
         second = ChatRequest(
             connection_id=connection_id,
             content="second",
             player_name="alice",
             conversation_generation=0,
+            conversation_invalidation_epoch=0,
         )
 
         await worker._process_request(QueueItem(priority=0, connection_id=connection_id, payload=first))
@@ -308,7 +334,7 @@ def test_worker_keeps_serial_chat_history_when_requests_share_initial_generation
 
     asyncio.run(_run())
 
-def test_worker_skips_history_write_when_request_generation_is_stale(monkeypatch) -> None:
+def test_worker_skips_history_write_when_request_invalidation_epoch_is_stale(monkeypatch) -> None:
     async def _run() -> None:
         broker = MessageBroker()
         connection_id = uuid4()
@@ -348,6 +374,11 @@ def test_worker_skips_history_write_when_request_generation_is_stale(monkeypatch
                 "alice",
                 "default",
             ),
+            conversation_invalidation_epoch=broker.get_conversation_invalidation_epoch(
+                connection_id,
+                "alice",
+                "default",
+            ),
         )
         broker.clear_conversation_history(connection_id, "alice", "default")
 
@@ -361,6 +392,29 @@ def test_worker_skips_history_write_when_request_generation_is_stale(monkeypatch
 
     asyncio.run(_run())
 
+
+def test_stale_history_write_after_clear_player_does_not_recreate_runtime_metadata() -> None:
+    broker = MessageBroker()
+    connection_id = uuid4()
+
+    broker.ensure_conversation(connection_id, "alice", "default")
+    epoch = broker.get_conversation_invalidation_epoch(connection_id, "alice", "default")
+    assert broker.list_player_conversation_metadata(connection_id, "alice")
+
+    broker.clear_player_conversation_histories(connection_id, "alice")
+
+    updated = broker.set_conversation_history(
+        connection_id,
+        "alice",
+        _build_turn(1),
+        "default",
+        expected_invalidation_epoch=epoch,
+    )
+
+    assert updated is False
+    assert broker.list_player_conversation_metadata(connection_id, "alice") == []
+    assert broker.list_player_conversations(connection_id, "alice") == []
+    assert broker.resolve_conversation_short_id(connection_id, "alice", "#1") is None
 
 class _ReasoningNode:
     def __init__(self, reasoning_content: str) -> None:
