@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -321,6 +322,24 @@ class WebSocketServer:
 
         return False
 
+    def _reply_target(self, state: Any, player_name: str | None) -> str:
+        """返回玩家命令响应目标；state.player_name 仅作为旧调用路径的回退。"""
+        if player_name:
+            return player_name
+        legacy_player_name = getattr(state, "player_name", None)
+        return legacy_player_name or "@a"
+
+    async def _send_player_reply(
+        self,
+        state: Any,
+        msg: TellrawMessage,
+        source: str,
+        player_name: str | None,
+    ) -> None:
+        """发送由玩家消息触发的命令响应，默认只发给触发玩家。"""
+        target = self._reply_target(state, player_name)
+        await self._send_ws_payload(state, replace(msg, target=target), source=source)
+
     async def handle_command(
         self,
         state: Any,
@@ -341,13 +360,13 @@ class WebSocketServer:
         if player_name:
             state.player_name = player_name
         if cmd_type == "login":
-            await self.handle_login(state, content)
+            await self.handle_login(state, content, player_name=player_name)
             return
 
         # 其他命令需要认证（开发模式下跳过）
         if not self.dev_mode and not await self.check_auth(state):
             error_msg = self.protocol_handler.create_error_message("请先登录")
-            await self._send_ws_payload(state, error_msg, source="auth")
+            await self._send_player_reply(state, error_msg, source="auth", player_name=player_name)
             return
 
         # 路由到具体处理器
@@ -360,9 +379,9 @@ class WebSocketServer:
             "conversation": lambda: self.handle_conversation(state, content, player_name=player_name),
             "template": lambda: self.handle_template(state, content, player_name=player_name),
             "setting": lambda: self.handle_setting(state, content, player_name=player_name),
-            "mcp": lambda: self.handle_mcp(state, content),
+            "mcp": lambda: self.handle_mcp(state, content, player_name=player_name),
             "switch_model": lambda: self.handle_switch_model(state, content, player_name=player_name),
-            "help": lambda: self.handle_help(state),
+            "help": lambda: self.handle_help(state, player_name=player_name),
             "save": lambda: self.handle_save(state, player_name=player_name),
             "run_command": lambda: self.handle_run_command(state, content, player_name=player_name),
         }
@@ -385,21 +404,26 @@ class WebSocketServer:
             "text": content,
         })
 
-    async def handle_login(self, state: Any, password: str) -> None:
+    async def handle_login(
+        self,
+        state: Any,
+        password: str,
+        player_name: str | None = None,
+    ) -> None:
         """处理登录"""
         # 开发模式下跳过登录验证
         if self.dev_mode:
             msg = self.protocol_handler.create_info_message(
                 "开发模式: 无需登录，已自动认证"
             )
-            await self._send_ws_payload(state, msg, source="login")
+            await self._send_player_reply(state, msg, source="login", player_name=player_name)
             return
 
         if self.jwt_handler.verify_password(password):
             # 检查是否已有有效 token
             if self.jwt_handler.is_token_valid(str(state.id)):
                 msg = self.protocol_handler.create_info_message("您已登录")
-                await self._send_ws_payload(state, msg, source="login")
+                await self._send_player_reply(state, msg, source="login", player_name=player_name)
                 return
 
             # 生成新 token
@@ -408,12 +432,12 @@ class WebSocketServer:
             state.authenticated = True
 
             msg = self.protocol_handler.create_success_message("登录成功！")
-            await self._send_ws_payload(state, msg, source="login")
+            await self._send_player_reply(state, msg, source="login", player_name=player_name)
 
             logger.info("user_authenticated", connection_id=str(state.id))
         else:
             msg = self.protocol_handler.create_error_message("密码错误")
-            await self._send_ws_payload(state, msg, source="login")
+            await self._send_player_reply(state, msg, source="login", player_name=player_name)
 
     async def check_auth(self, state: Any) -> bool:
         """检查认证状态"""
@@ -433,7 +457,7 @@ class WebSocketServer:
         """处理聊天请求（非阻塞）"""
         if not content:
             msg = self.protocol_handler.create_error_message("请输入聊天内容")
-            await self._send_ws_payload(state, msg, source="chat")
+            await self._send_player_reply(state, msg, source="chat", player_name=player_name)
             return
 
         # 创建聊天请求（使用本次事件的真实 sender，而非缓存的 state.player_name）
@@ -465,7 +489,7 @@ class WebSocketServer:
             msg = self.protocol_handler.create_error_message(
                 "服务器繁忙，请稍后重试"
             )
-            await self._send_ws_payload(state, msg, source="chat")
+            await self._send_player_reply(state, msg, source="chat", player_name=player_name)
 
     async def handle_context(
         self, state: Any, option: str, player_name: str | None = None
@@ -527,7 +551,7 @@ class WebSocketServer:
                 "对话的新建/切换/清除/保存/恢复请使用: AGENT 对话 <new/switch/clear/...>"
             )
 
-        await self._send_ws_payload(state, msg, source="context")
+        await self._send_player_reply(state, msg, source="context", player_name=player_name)
 
     async def handle_conversation(
         self, state: Any, option: str, player_name: str | None = None
@@ -542,7 +566,7 @@ class WebSocketServer:
             async with lock:
                 msg = await self._handle_conversation(state, option, player_name)
 
-        await self._send_ws_payload(state, msg, source="conversation")
+        await self._send_player_reply(state, msg, source="conversation", player_name=player_name)
 
     async def _handle_conversation(
         self, state: Any, option: str, player_name: str | None = None
@@ -737,14 +761,14 @@ class WebSocketServer:
             msg = self.protocol_handler.create_error_message(
                 f"不可用的提供商。可用: {', '.join(available)}"
             )
-            await self._send_ws_payload(state, msg, source="switch_model")
+            await self._send_player_reply(state, msg, source="switch_model", player_name=player_name)
             return
 
         lock = self.broker.get_session_lock(state.id, player_name)
         async with lock:
             msg = await self._handle_switch_model(state, provider, player_name)
 
-        await self._send_ws_payload(state, msg, source="switch_model")
+        await self._send_player_reply(state, msg, source="switch_model", player_name=player_name)
 
     async def _handle_switch_model(
         self, state: Any, provider: str, player_name: str | None = None
@@ -808,7 +832,7 @@ class WebSocketServer:
                     f"模板不存在: {template_name}\n可用: {templates}"
                 )
 
-        await self._send_ws_payload(state, msg, source="template")
+        await self._send_player_reply(state, msg, source="template", player_name=player_name)
 
     async def handle_setting(
         self, state: Any, content: str, player_name: str | None = None
@@ -823,7 +847,7 @@ class WebSocketServer:
 
         if not content:
             msg = self.protocol_handler.create_error_message("请输入设置项")
-            await self._send_ws_payload(state, msg, source="setting")
+            await self._send_player_reply(state, msg, source="setting", player_name=player_name)
             return
 
         parts = content.strip().split(None, 1)
@@ -831,7 +855,7 @@ class WebSocketServer:
             msg = self.protocol_handler.create_error_message(
                 "用法: AGENT 设置 变量 <名称> <值>\n      AGENT 设置 别名 <名称> <别名>"
             )
-            await self._send_ws_payload(state, msg, source="setting")
+            await self._send_player_reply(state, msg, source="setting", player_name=player_name)
             return
 
         setting_type = parts[0]
@@ -852,7 +876,7 @@ class WebSocketServer:
                     msg = self.protocol_handler.create_error_message(
                         "用法: AGENT 设置 变量 <名称> <值>"
                     )
-                    await self._send_ws_payload(state, msg, source="setting")
+                    await self._send_player_reply(state, msg, source="setting", player_name=player_name)
                     return
                 name = var_parts[0]
                 value = var_parts[1]
@@ -874,13 +898,13 @@ class WebSocketServer:
                 "未知的设置类型，请使用: 变量"
             )
 
-        await self._send_ws_payload(state, msg, source="setting")
+        await self._send_player_reply(state, msg, source="setting", player_name=player_name)
 
-    async def handle_help(self, state: Any) -> None:
+    async def handle_help(self, state: Any, player_name: str | None = None) -> None:
         """显示帮助"""
         help_text = self.protocol_handler.get_help_text()
         msg = self.protocol_handler.create_info_message(help_text)
-        await self._send_ws_payload(state, msg, source="help")
+        await self._send_player_reply(state, msg, source="help", player_name=player_name)
 
     async def handle_save(self, state: Any, player_name: str | None = None) -> None:
         """兼容旧保存命令：保存当前活动对话。"""
@@ -893,17 +917,16 @@ class WebSocketServer:
         player_name: str | None = None,
     ) -> None:
         """执行游戏命令"""
-        target = player_name or state.player_name or "@a"
         if not command:
-            msg = self.protocol_handler.create_error_message("请输入命令", target=target)
-            await self._send_ws_payload(state, msg, source="run_command")
+            msg = self.protocol_handler.create_error_message("请输入命令")
+            await self._send_player_reply(state, msg, source="run_command", player_name=player_name)
             return
 
         try:
             await self._delivery(state).send_raw_command(command, source="run_command")
         except ValueError as exc:
-            msg = self.protocol_handler.create_error_message(str(exc), target=target)
-            await self._send_ws_payload(state, msg, source="run_command")
+            msg = self.protocol_handler.create_error_message(str(exc))
+            await self._send_player_reply(state, msg, source="run_command", player_name=player_name)
             return
 
         logger.info(
@@ -912,7 +935,12 @@ class WebSocketServer:
             command=command,
         )
 
-    async def handle_mcp(self, state: Any, content: str) -> None:
+    async def handle_mcp(
+        self,
+        state: Any,
+        content: str,
+        player_name: str | None = None,
+    ) -> None:
         """处理 MCP 服务器管理命令"""
         from services.agent.mcp import get_mcp_manager, MCPConnectionStatus
 
@@ -1001,7 +1029,7 @@ class WebSocketServer:
                 "  reload <名称> - 重新加载服务器配置"
             )
 
-        await self._send_ws_payload(state, msg, source="mcp")
+        await self._send_player_reply(state, msg, source="mcp", player_name=player_name)
 
     async def _handle_ui_chat_message(
         self, connection_id: UUID, player_name: str, message: str
@@ -1029,7 +1057,7 @@ class WebSocketServer:
         # 与普通聊天命令保持一致：非开发模式必须先通过登录认证
         if not self.dev_mode and not await self.check_auth(state):
             error_msg = self.protocol_handler.create_error_message("请先登录")
-            await self._send_ws_payload(state, error_msg, source="auth")
+            await self._send_player_reply(state, error_msg, source="auth", player_name=player_name)
             return
 
         # 把 UI 玩家发出的"用户消息"回流到 Addon 历史（与聊天框命令保持一致）

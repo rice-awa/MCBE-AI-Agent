@@ -3,6 +3,7 @@
 import json
 import re
 import uuid
+from collections.abc import Callable
 
 from models.minecraft import MinecraftCommand
 
@@ -15,16 +16,6 @@ _SENTENCE_DELIMITER_RE = re.compile(r"([。！？.!?\n])")
 #   首次失败 commandLine: 462 B
 # 取 461 为硬上限；超过此值 server 会拒绝 commandRequest
 _COMMAND_LINE_BYTE_BUDGET = 461
-
-# 各类命令的包装开销（实测 + 余量），用于推导文本载荷的字节上限
-# 实测值（命令空文本时的 commandLine 字节数）:
-#   tellraw + §a: 39 B
-#   scriptevent + 'server:data': 24 B
-#   scriptevent + 'mcbeai:ai_resp' + 空 ai_resp JSON 包装: 107 B
-# 各取 +20 B 余量以容纳玩家名、转义、色码切换等动态字段
-_WRAPPER_OVERHEAD_TELLRAW = 60
-_WRAPPER_OVERHEAD_SCRIPTEVENT = 50
-_WRAPPER_OVERHEAD_AI_RESPONSE = 130
 
 
 class FlowControlMiddleware:
@@ -116,12 +107,18 @@ class FlowControlMiddleware:
         每条 commandLine 中的 content 部分不超过 max_length 字符，
         且 commandLine 字节数 ≤ 461 B（MCBE 实测安全上限）。
         """
+        # Validate even empty content so invalid message_id is always rejected
+        # before callers decide whether to send zero chunks.
+        MinecraftCommand.create_scriptevent("", message_id)
         if not content:
             return []
 
         max_len = cls._get_max_length(max_length)
-        byte_budget = _COMMAND_LINE_BYTE_BUDGET - _WRAPPER_OVERHEAD_SCRIPTEVENT
-        text_parts = cls._split_text(content, max_len, byte_budget)
+        text_parts = cls._split_by_command_fit(
+            content,
+            max_len,
+            lambda part: MinecraftCommand.create_scriptevent(part, message_id).body.commandLine,
+        )
 
         payloads: list[str] = []
         for part in text_parts:
@@ -140,15 +137,15 @@ class FlowControlMiddleware:
         原始命令不能在动词之外的位置被截断，否则后续分片会成为非法命令。
         因此此方法**不进行分片**：长度超限时抛 ValueError，由调用方决策。
         """
-        max_len = cls._get_max_length(max_length)
-        if len(command) > max_len:
-            raise ValueError(
-                f"raw command too long ({len(command)} > {max_len}); "
-                "cannot be safely chunked — split at the caller level"
-            )
         cmd = MinecraftCommand.create_raw(command)
         payload = cmd.model_dump_json(exclude_none=True)
-        cls._assert_byte_safe(payload)
+        command_line_bytes = len(cmd.body.commandLine.encode("utf-8"))
+        if command_line_bytes > _COMMAND_LINE_BYTE_BUDGET:
+            raise ValueError(
+                f"raw command too long in bytes "
+                f"({command_line_bytes} > {_COMMAND_LINE_BYTE_BUDGET}); "
+                "cannot be safely chunked"
+            )
         return [payload]
 
     @classmethod
@@ -168,32 +165,94 @@ class FlowControlMiddleware:
         """
         max_len = cls._get_max_length(max_length)
         msg_id = f"resp-{uuid.uuid4().hex[:8]}"
-        byte_budget = _COMMAND_LINE_BYTE_BUDGET - _WRAPPER_OVERHEAD_AI_RESPONSE
 
-        text_parts = cls._split_text(text, max_len, byte_budget) if text else [""]
-        if not text_parts:
-            text_parts = [""]
+        text_parts = [text] if text else [""]
+        total_hint = 1
+        while True:
+            refined_parts: list[str] = []
+            for part in text_parts:
+                refined_parts.extend(
+                    cls._split_ai_response_text(
+                        part,
+                        max_len,
+                        msg_id=msg_id,
+                        player_name=player_name,
+                        role=role,
+                        total_hint=total_hint,
+                    )
+                )
+
+            actual_total = len(refined_parts)
+            if actual_total == total_hint:
+                text_parts = refined_parts
+                break
+            text_parts = refined_parts
+            total_hint = actual_total
+
         total = len(text_parts)
-
         payloads: list[str] = []
         for idx, content in enumerate(text_parts, start=1):
-            inner = {
-                "id": msg_id,
-                "i": idx,
-                "n": total,
-                "p": player_name,
-                "r": role,
-                "c": content,
-            }
-            cmd = MinecraftCommand.create_scriptevent(
-                json.dumps(inner, ensure_ascii=False),
-                "mcbeai:ai_resp",
+            cmd = cls._create_ai_response_command(
+                msg_id=msg_id,
+                index=idx,
+                total=total,
+                player_name=player_name,
+                role=role,
+                content=content,
             )
             payload = cmd.model_dump_json(exclude_none=True)
             cls._assert_byte_safe(payload)
             payloads.append(payload)
 
         return payloads
+
+    @classmethod
+    def _create_ai_response_command(
+        cls,
+        *,
+        msg_id: str,
+        index: int,
+        total: int,
+        player_name: str,
+        role: str,
+        content: str,
+    ) -> MinecraftCommand:
+        inner = {
+            "id": msg_id,
+            "i": index,
+            "n": total,
+            "p": player_name,
+            "r": role,
+            "c": content,
+        }
+        return MinecraftCommand.create_scriptevent(
+            json.dumps(inner, ensure_ascii=False, separators=(",", ":")),
+            "mcbeai:ai_resp",
+        )
+
+    @classmethod
+    def _split_ai_response_text(
+        cls,
+        text: str,
+        max_length: int,
+        *,
+        msg_id: str,
+        player_name: str,
+        role: str,
+        total_hint: int,
+    ) -> list[str]:
+        return cls._split_by_command_fit(
+            text,
+            max_length,
+            lambda part: cls._create_ai_response_command(
+                msg_id=msg_id,
+                index=total_hint,
+                total=total_hint,
+                player_name=player_name,
+                role=role,
+                content=part,
+            ).body.commandLine,
+        )
 
     @classmethod
     def _split_tellraw_text(
@@ -216,10 +275,9 @@ class FlowControlMiddleware:
                 buffer = ch
                 if len(buffer) <= max_length and cls._tellraw_command_fits(buffer, color, target):
                     continue
-            if not cls._tellraw_command_fits(buffer, color, target):
-                raise ValueError(
-                    "tellraw wrapper exceeds byte budget; target/color leave no room for content"
-                )
+            raise ValueError(
+                "tellraw wrapper exceeds byte budget; target/color leave no room for content"
+            )
         if buffer:
             chunks.append(buffer)
         return chunks if chunks else [""]
@@ -228,6 +286,35 @@ class FlowControlMiddleware:
     def _tellraw_command_fits(text: str, color: str, target: str) -> bool:
         command = MinecraftCommand.create_tellraw(text, color=color, target=target)
         command_line = command.body.commandLine
+        return len(command_line.encode("utf-8")) <= _COMMAND_LINE_BYTE_BUDGET
+
+    @classmethod
+    def _split_by_command_fit(
+        cls,
+        text: str,
+        max_length: int,
+        command_line_for: Callable[[str], str],
+    ) -> list[str]:
+        """Split text by probing the final commandLine UTF-8 byte length."""
+        chunks: list[str] = []
+        buffer = ""
+        for ch in text:
+            tentative = buffer + ch
+            if len(tentative) <= max_length and cls._command_line_fits(command_line_for(tentative)):
+                buffer = tentative
+                continue
+            if buffer:
+                chunks.append(buffer)
+                buffer = ch
+                if len(buffer) <= max_length and cls._command_line_fits(command_line_for(buffer)):
+                    continue
+            raise ValueError("command wrapper exceeds byte budget; no room for content")
+        if buffer:
+            chunks.append(buffer)
+        return chunks if chunks else [""]
+
+    @staticmethod
+    def _command_line_fits(command_line: str) -> bool:
         return len(command_line.encode("utf-8")) <= _COMMAND_LINE_BYTE_BUDGET
 
     @classmethod
@@ -245,7 +332,7 @@ class FlowControlMiddleware:
         sentence_mode=False 时跳过语义合并，仍受双重约束。
         """
         if byte_budget is None:
-            byte_budget = _COMMAND_LINE_BYTE_BUDGET - _WRAPPER_OVERHEAD_TELLRAW
+            byte_budget = _COMMAND_LINE_BYTE_BUDGET
 
         if not text:
             return [""]
