@@ -77,6 +77,12 @@ class MinecraftConfig(BaseModel):
             "description": "MCP 服务器管理",
             "usage": "<list/status/reload>"
         },
+        "AGENT 广播": {
+            "type": "ai_broadcast",
+            "aliases": ["AGENT broadcast", "AI 广播", "AI broadcast"],
+            "description": "控制多人 AI 聊天广播",
+            "usage": "<状态/关闭/全服 开启|关闭/玩家 <玩家名> 开启|关闭>"
+        },
         "运行命令": {
             "type": "run_command",
             "aliases": ["runcmd", "cmd"],
@@ -103,6 +109,8 @@ class MinecraftConfig(BaseModel):
         "chat_script": ("使用脚本事件发送", "<内容>"),
         "conversation": ("管理对话", "<new/switch/clear/status/list/save/restore>"),
         "context": ("管理上下文开关", "<启用/关闭/状态>"),
+        "mcp": ("MCP 服务器管理", "<list/status/reload>"),
+        "ai_broadcast": ("控制多人 AI 聊天广播", "<状态/关闭/全服 开启|关闭/玩家 <玩家名> 开启|关闭>"),
         "switch_model": ("切换 LLM", "<provider>"),
         "save": ("保存当前对话历史", None),
         "run_command": ("执行游戏命令", "<命令>"),

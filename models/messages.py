@@ -29,6 +29,7 @@ class ChatRequest(BaseMessage):
     conversation_generation: int = 0
     # 管理操作失效 epoch；clear/switch/new/restore/switch_model 等运行时状态变更会递增。
     conversation_invalidation_epoch: int = 0
+    broadcast_ai_chat: bool = False
 
 
 class ChatResponse(BaseMessage):
@@ -54,6 +55,7 @@ class StreamChunk(BaseMessage):
     sequence: int
     delivery: Literal["tellraw", "scriptevent"] = "tellraw"
     player_name: str | None = None
+    target: str | None = None
     # 工具相关元数据
     tool_name: str | None = None
     tool_args: dict | None = None
@@ -82,7 +84,7 @@ class CommandRequest(BaseMessage):
     """命令请求"""
 
     type: Literal["command"] = "command"
-    command_type: Literal["login", "save", "context", "conversation", "run_command", "switch_model", "help"]
+    command_type: Literal["login", "save", "context", "conversation", "run_command", "switch_model", "help", "ai_broadcast"]
     content: str | None = None
 
 

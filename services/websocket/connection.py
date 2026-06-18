@@ -46,6 +46,8 @@ class ConnectionState:
     connected_at: datetime = field(default_factory=datetime.now)
     response_queue: asyncio.Queue | None = None
     pending_command_futures: dict[str, asyncio.Future[str]] = field(default_factory=dict)
+    ai_broadcast_all: bool = False
+    ai_broadcast_players: set[str] = field(default_factory=set)
     # 按玩家隔离的会话状态
     _player_sessions: dict[str, PlayerSession] = field(default_factory=dict)
 
@@ -57,6 +59,11 @@ class ConnectionState:
             session = PlayerSession(player_name=key)
             self._player_sessions[key] = session
         return session
+
+    def should_broadcast_ai_chat(self, player_name: str | None) -> bool:
+        if self.ai_broadcast_all:
+            return True
+        return bool(player_name and player_name in self.ai_broadcast_players)
 
     def all_player_sessions(self) -> list[PlayerSession]:
         """快照式列出连接下所有玩家会话。"""
@@ -350,7 +357,7 @@ class ConnectionManager:
                 state,
                 message,
                 color,
-                player_name=chunk.player_name,
+                player_name=chunk.target or chunk.player_name,
             )
 
     async def _send_system_notification(

@@ -380,6 +380,7 @@ class WebSocketServer:
             "template": lambda: self.handle_template(state, content, player_name=player_name),
             "setting": lambda: self.handle_setting(state, content, player_name=player_name),
             "mcp": lambda: self.handle_mcp(state, content, player_name=player_name),
+            "ai_broadcast": lambda: self.handle_ai_broadcast(state, content, player_name=player_name),
             "switch_model": lambda: self.handle_switch_model(state, content, player_name=player_name),
             "help": lambda: self.handle_help(state, player_name=player_name),
             "save": lambda: self.handle_save(state, player_name=player_name),
@@ -478,6 +479,7 @@ class WebSocketServer:
         chat_req.conversation_invalidation_epoch = self.broker.get_conversation_invalidation_epoch(
             state.id, chat_req.player_name, chat_req.conversation_id
         )
+        chat_req.broadcast_ai_chat = delivery == "tellraw" and state.should_broadcast_ai_chat(chat_req.player_name)
 
         # 提交到消息队列（非阻塞！）
         try:
@@ -940,6 +942,73 @@ class WebSocketServer:
             "command_executed",
             connection_id=str(state.id),
             command=command,
+        )
+
+    async def handle_ai_broadcast(
+        self,
+        state: Any,
+        content: str,
+        player_name: str | None = None,
+    ) -> None:
+        """处理 AI 聊天广播策略。"""
+        msg = self._handle_ai_broadcast(state, content)
+        await self._send_player_reply(state, msg, source="ai_broadcast", player_name=player_name)
+
+    def _handle_ai_broadcast(self, state: Any, content: str) -> TellrawMessage:
+        parts = content.strip().split()
+        action = parts[0].lower() if parts else "状态"
+
+        if action in ("状态", "status", ""):
+            mode = "开启" if state.ai_broadcast_all else "关闭"
+            players = "、".join(sorted(state.ai_broadcast_players)) or "无"
+            return self.protocol_handler.create_info_message(
+                f"AI 广播状态:\n全服广播: {mode}\n指定玩家: {players}"
+            )
+
+        if action in ("关闭", "off", "disable"):
+            state.ai_broadcast_all = False
+            state.ai_broadcast_players.clear()
+            return self.protocol_handler.create_success_message("AI 广播已关闭")
+
+        if action in ("全服", "all"):
+            if len(parts) < 2:
+                return self.protocol_handler.create_error_message(
+                    "用法: AGENT 广播 全服 <开启|关闭>"
+                )
+            toggle = parts[1].lower()
+            if toggle in ("开启", "启用", "on", "enable"):
+                state.ai_broadcast_all = True
+                return self.protocol_handler.create_success_message("AI 全服广播已开启")
+            if toggle in ("关闭", "off", "disable"):
+                state.ai_broadcast_all = False
+                return self.protocol_handler.create_success_message("AI 全服广播已关闭")
+            return self.protocol_handler.create_error_message(
+                "用法: AGENT 广播 全服 <开启|关闭>"
+            )
+
+        if action in ("玩家", "player"):
+            if len(parts) < 3:
+                return self.protocol_handler.create_error_message(
+                    "用法: AGENT 广播 玩家 <玩家名> <开启|关闭>"
+                )
+            target_player = parts[1]
+            toggle = parts[2].lower()
+            if toggle in ("开启", "启用", "on", "enable"):
+                state.ai_broadcast_players.add(target_player)
+                return self.protocol_handler.create_success_message(
+                    f"已开启 {target_player} 的 AI 聊天广播"
+                )
+            if toggle in ("关闭", "off", "disable"):
+                state.ai_broadcast_players.discard(target_player)
+                return self.protocol_handler.create_success_message(
+                    f"已关闭 {target_player} 的 AI 聊天广播"
+                )
+            return self.protocol_handler.create_error_message(
+                "用法: AGENT 广播 玩家 <玩家名> <开启|关闭>"
+            )
+
+        return self.protocol_handler.create_error_message(
+            "用法: AGENT 广播 <状态|关闭|全服 开启|关闭|玩家 <玩家名> 开启|关闭>"
         )
 
     async def handle_mcp(
