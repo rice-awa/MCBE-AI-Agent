@@ -68,11 +68,14 @@ class ChatAgentManager:
         Args:
             toolsets: MCP 工具集列表
         """
+        settings = self._settings or get_settings()
+        default_provider_config = settings.get_provider_config(settings.default_provider)
         agent = Agent[AgentDependencies, str](
-            "deepseek:deepseek-chat",  # 默认模型，运行时可覆盖
+            f"{settings.default_provider}:{default_provider_config.model}",  # 默认模型，运行时可覆盖
             deps_type=AgentDependencies,
             output_type=str,
-            retries=2,
+            defer_model_check=True,
+            retries=settings.agent_retries,
             toolsets=toolsets,
         )
 

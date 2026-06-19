@@ -3,15 +3,33 @@
 from pydantic_ai import Agent
 from pydantic_ai.models import Model
 
-_TITLE_AGENT = Agent(
-    "deepseek:deepseek-chat",
-    output_type=str,
-    system_prompt=(
-        "你是 Minecraft AI 助手的对话标题生成器。"
-        "请根据用户第一条消息生成简短中文标题，只输出标题本身。"
-    ),
-    defer_model_check=True,
-)
+from config.settings import get_settings
+
+
+def _get_title_agent_model() -> str:
+    settings = get_settings()
+    provider_config = settings.get_provider_config(settings.default_provider)
+    return f"{settings.default_provider}:{provider_config.model}"
+
+
+_TITLE_AGENT: Agent | None = None
+
+
+def _get_title_agent() -> Agent:
+    """懒加载标题 Agent，避免模块导入时读取配置。"""
+    global _TITLE_AGENT
+    if _TITLE_AGENT is None:
+        _TITLE_AGENT = Agent(
+            _get_title_agent_model(),
+            output_type=str,
+            system_prompt=(
+                "你是 Minecraft AI 助手的对话标题生成器。"
+                "请根据用户第一条消息生成简短中文标题，只输出标题本身。"
+            ),
+            defer_model_check=True,
+        )
+    return _TITLE_AGENT
+
 
 _SURROUNDING_TITLE_CHARS = " \t\r\n\f\v\"'`“”‘’「」『』《》〈〉【】（）()[]{}"
 _UNNAMED_TITLE = "未命名"
@@ -37,5 +55,5 @@ async def generate_conversation_title(first_user_message: str, model: Model) -> 
         "不要标点符号、引号、解释或多余内容。\n"
         f"用户第一条消息：{first_user_message}"
     )
-    result = await _TITLE_AGENT.run(prompt, model=model)
+    result = await _get_title_agent().run(prompt, model=model)
     return clean_conversation_title(result.output, first_user_message)

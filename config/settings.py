@@ -223,6 +223,7 @@ REQUIRED_CONFIG_PATHS = (
     "agent.system_prompt",
     "agent.enable_reasoning_output",
     "agent.max_history_turns",
+    "agent.agent_retries",
     "agent.stream_sentence_mode",
     "agent.llm_warmup_enabled",
     "agent.mcwiki_base_url",
@@ -605,6 +606,7 @@ class Settings(BaseSettings):
     system_prompt: str = "请始终保持积极和专业的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown"
     enable_reasoning_output: bool = True
     max_history_turns: int = 20
+    agent_retries: int = Field(default=2, ge=0)
 
     # 对话压缩配置
     compression_enabled: bool = True
