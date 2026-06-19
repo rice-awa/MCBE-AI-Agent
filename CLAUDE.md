@@ -52,7 +52,16 @@ Minecraft Client ←→ WebSocket Server ←→ Message Broker ←→ Agent Work
 - `chunk_raw_command()`：只包装原始命令，不做语义不安全的截断；超长时抛出 `ValueError`。
 - `chunk_delay_for()`：统一提供 tellraw、scriptevent、AI 响应等场景的分片发送间隔。
 
-流控同时受 MCBE `commandLine` 461 字节实测安全上限、`MAX_CHUNK_CONTENT_LENGTH` 字符上限和 `CHUNK_SENTENCE_MODE` 语义分句策略约束。新增下行发送路径时应复用该中间件，不要在调用点重复实现分片逻辑。
+流控参数全部可通过设置配置：
+
+- `flow_control.command_line_byte_budget`（默认 461）：MCBE `commandLine` 实测安全字节上限
+- `flow_control.max_chunk_content_length`（默认 400）：单条消息内容字符上限
+- `flow_control.chunk_sentence_mode`（默认 true）：是否优先按句子语义分片
+- `flow_control.chunk_delays.tellraw / scriptevent / ai_resp / ai_resp_prelude`（默认 0.05 / 0.05 / 0.15 / 0.5）：各场景分片发送间隔
+- `flow_control.non_stream_batch_max_chars`（默认 150）：非流式模式下每批发送最大字符数
+- `flow_control.non_stream_send_delay`（默认 0.1）：非流式模式下批次间发送间隔
+
+新增下行发送路径时应复用该中间件，不要在调用点重复实现分片逻辑。
 
 ## Multiplayer Session Isolation
 
@@ -84,6 +93,7 @@ MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多
 | `cli.py` | 应用入口，CLI 命令组 |
 | `config/settings.py` | Pydantic Settings 配置管理 |
 | `core/queue.py` | MessageBroker 消息队列；对话历史和会话锁按 `(connection_id, player_name)` 隔离 |
+| `models/constants.py` | 跨模块共享的语义常量（默认玩家键、对话 ID、显示名），由 `core/session.py` 导出 |
 | `core/conversation.py` | 对话历史压缩、保存和恢复，按玩家会话桶读写 |
 | `services/agent/core.py` | PydanticAI Agent 核心 |
 | `services/agent/providers.py` | LLM Provider 注册表 |
@@ -127,13 +137,18 @@ MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多
 
 普通配置在 `config.json` 中维护，包括：
 - `server.host` / `server.port`
+- `auth.jwt_secret` / `auth.jwt_expiration` / `auth.jwt_algorithm` / `auth.default_password`；`jwt_secret` 和 `default_password` 通过 `${...}` 引用 `.env`
 - `providers.default` 与各 provider 的 `model`、`base_url`、`api_key`；`api_key` 字段通常写 `${...}` 引用 `.env` 中的密钥，不要直接写明文密钥。
+- `agent.agent_retries` / `agent.worker_http_timeout` / `agent.worker_poll_timeout` / `agent.run_command_timeout` / `agent.system_prompt` / `agent.max_history_turns` / `agent.compression_*` / `agent.stream_sentence_mode` / `agent.llm_warmup_enabled`
 - `queue.llm_worker_count` / `queue.max_size`
-- `agent.*`
-- `logging.*`
+- `flow_control.command_line_byte_budget` / `flow_control.chunk_delays.*` / `flow_control.non_stream_*` / `flow_control.max_chunk_content_length` / `flow_control.chunk_sentence_mode`
+- `addon.protocol.bridge_message_id` / `bridge_prefix` / `ui_chat_prefix` / `bridge_tool_player_name` / `ai_resp_message_id`
+- `storage.conversations_dir` / `storage.tokens_file`
+- `logging.level` / `logging.enable_file_logging` / `logging.log_dir` / `logging.files.*` / `logging.rotation_*`
 - `mcp.enabled` / `mcp.servers`
 - `minecraft.commands`
-- `flow_control.max_chunk_content_length` / `flow_control.chunk_sentence_mode`
+- `websocket.*`
+- `model_metadata.*`
 
 JSON 字符串可以通过 `${VAR}` 引用 `.env` 或进程环境变量。缺失或空值会导致启动失败并显示 JSON 路径和变量名。新增普通配置应进入 `config.json`，不要添加新的普通 `.env` 字段。
 
