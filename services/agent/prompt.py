@@ -8,6 +8,7 @@ from pydantic_ai import RunContext
 
 from config.logging import get_logger
 from config.settings import LLMProviderConfig, Settings
+from core.session import DEFAULT_PLAYER_KEY
 from services.agent.harness.prompting import render_runtime_harness_prompt
 
 logger = get_logger(__name__)
@@ -89,7 +90,7 @@ class PromptManager:
     - 处理模板变量替换
     """
 
-    DEFAULT_PLAYER_KEY = "__anonymous__"
+    DEFAULT_PLAYER_KEY = DEFAULT_PLAYER_KEY
 
     def __init__(self):
         self._templates: dict[str, PromptTemplate] = BUILTIN_TEMPLATES.copy()

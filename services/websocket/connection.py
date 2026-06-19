@@ -8,6 +8,8 @@ from uuid import UUID, uuid4
 from websockets.server import WebSocketServerProtocol
 
 from core.queue import MessageBroker
+from core.session import DEFAULT_PLAYER_KEY
+from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
 from models.messages import StreamChunk, SystemNotification
 from models.agent import MCColor, MCPrefix
 from services.agent.prompt import get_prompt_manager
@@ -53,7 +55,7 @@ class ConnectionState:
 
     def get_player_session(self, player_name: str | None) -> PlayerSession:
         """获取指定玩家的会话状态；不存在则按默认值创建。"""
-        key = player_name or "__anonymous__"
+        key = player_name or DEFAULT_PLAYER_KEY
         session = self._player_sessions.get(key)
         if session is None:
             session = PlayerSession(player_name=key)
@@ -494,7 +496,7 @@ class ConnectionManager:
         为避免看门狗踢出，assistant 响应先等 tellraw 流式发送完毕，
         各分片之间插入延迟，避免命令洪泛。
         """
-        player_name = response.get("player_name", "Player")
+        player_name = response.get("player_name", DEFAULT_PLAYER_DISPLAY_NAME)
         role = response.get("role", "assistant")
         text = response.get("text", "")
 

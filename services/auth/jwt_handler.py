@@ -3,7 +3,6 @@
 import hashlib
 import json
 import time
-from pathlib import Path
 from typing import Optional
 
 import jwt
@@ -22,7 +21,7 @@ class JWTHandler:
         self.secret_key = settings.jwt_secret
         self.expiration = settings.jwt_expiration
         self.default_password = settings.default_password
-        self.token_file = Path("data/tokens.json")
+        self.token_file = settings.storage.tokens_file
         self.tokens: list[dict[str, str]] = []
         self._load_tokens()
 
@@ -80,7 +79,7 @@ class JWTHandler:
             "exp": time.time() + self.expiration,
             "iat": time.time(),
         }
-        token = jwt.encode(payload, self.secret_key, algorithm="HS256")
+        token = jwt.encode(payload, self.secret_key, algorithm=self.settings.jwt_algorithm)
         logger.debug("token_generated")
         return token
 
@@ -95,7 +94,7 @@ class JWTHandler:
             是否有效
         """
         try:
-            jwt.decode(token, self.secret_key, algorithms=["HS256"])
+            jwt.decode(token, self.secret_key, algorithms=[self.settings.jwt_algorithm])
             return True
         except jwt.ExpiredSignatureError:
             logger.debug("token_expired")

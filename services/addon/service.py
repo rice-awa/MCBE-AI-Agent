@@ -8,9 +8,7 @@ from typing import Any, Awaitable, Callable, Protocol
 from uuid import UUID
 
 from services.addon.protocol import (
-    BRIDGE_PREFIX,
-    BRIDGE_TOOL_PLAYER_NAME,
-    UI_CHAT_PREFIX,
+    _protocol,
     encode_bridge_request,
 )
 from services.addon.session import AddonBridgeSession
@@ -93,11 +91,13 @@ class AddonBridgeService:
 
     def is_bridge_chat_message(self, sender: str, message: str) -> bool:
         """判断玩家聊天消息是否为 addon 回传分片。"""
-        return sender == BRIDGE_TOOL_PLAYER_NAME and message.startswith(BRIDGE_PREFIX)
+        p = _protocol()
+        return sender == p.bridge_tool_player_name and message.startswith(p.bridge_prefix)
 
     def is_ui_chat_message(self, sender: str, message: str) -> bool:
         """判断玩家聊天消息是否为 UI 聊天分片。"""
-        return sender == BRIDGE_TOOL_PLAYER_NAME and message.startswith(UI_CHAT_PREFIX)
+        p = _protocol()
+        return sender == p.bridge_tool_player_name and message.startswith(p.ui_chat_prefix)
 
     def handle_player_message(self, connection_id: UUID, sender: str, message: str) -> bool:
         """处理来自模拟玩家的回传消息。"""

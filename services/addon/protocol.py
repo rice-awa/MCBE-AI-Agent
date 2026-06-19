@@ -3,6 +3,7 @@
 import json
 from json import JSONDecodeError
 
+from config.settings import AddonProtocolConfig, get_settings
 from models.addon_bridge import AddonBridgeChunk, AddonBridgeResponse, UiChatChunk, UiChatMessage
 
 BRIDGE_MESSAGE_ID = "mcbeai:bridge_request"
@@ -11,6 +12,15 @@ UI_CHAT_PREFIX = "MCBEAI|UI_CHAT"
 BRIDGE_TOOL_PLAYER_NAME = "MCBEAI_TOOL"
 
 AI_RESP_MESSAGE_ID = "mcbeai:ai_resp"
+
+
+def _protocol() -> AddonProtocolConfig:
+    """运行时读取 Addon 协议标识配置。
+
+    使用函数而非模块常量，避免在 import 期固化值，让 config.json 中的
+    addon.protocol.* 在 get_settings() 初始化后真正生效。
+    """
+    return get_settings().addon.protocol
 
 
 def _default_ai_resp_chunk_length() -> int:
@@ -35,7 +45,7 @@ def encode_bridge_request(request_id: str, capability: str, payload: dict) -> st
         "capability": capability,
         "payload": payload,
     }
-    return f"scriptevent {BRIDGE_MESSAGE_ID} {json.dumps(body, ensure_ascii=False)}"
+    return f"scriptevent {_protocol().bridge_message_id} {json.dumps(body, ensure_ascii=False)}"
 
 
 def decode_bridge_chat_chunk(chunk: str) -> AddonBridgeChunk:
@@ -45,9 +55,10 @@ def decode_bridge_chat_chunk(chunk: str) -> AddonBridgeChunk:
         raise ValueError("Invalid bridge chunk format")
 
     namespace, prefix, request_id, part, content = parts
-    if namespace != "MCBEAI":
+    expected_namespace, _, expected_prefix = _protocol().bridge_prefix.partition("|")
+    if namespace != expected_namespace:
         raise ValueError("Invalid bridge chunk namespace")
-    if prefix != "RESP":
+    if prefix != expected_prefix:
         raise ValueError("Invalid bridge chunk prefix")
 
     if not request_id:
@@ -129,9 +140,10 @@ def decode_ui_chat_chunk(chunk: str) -> UiChatChunk:
         raise ValueError("Invalid UI chat chunk format")
 
     namespace, prefix, msg_id, part, content = parts
-    if namespace != "MCBEAI":
+    expected_namespace, _, expected_prefix = _protocol().ui_chat_prefix.partition("|")
+    if namespace != expected_namespace:
         raise ValueError("Invalid UI chat chunk namespace")
-    if prefix != "UI_CHAT":
+    if prefix != expected_prefix:
         raise ValueError("Invalid UI chat chunk prefix")
 
     if not msg_id:

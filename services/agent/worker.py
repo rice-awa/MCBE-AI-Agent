@@ -14,6 +14,7 @@ from services.agent.core import stream_chat, _extract_exception_details
 from services.agent.providers import ProviderRegistry
 from services.agent.title import generate_conversation_title
 from services.addon.service import get_addon_bridge_service
+from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
 from models.messages import ChatRequest, StreamChunk, SystemNotification
 from models.agent import (
     AgentDependencies,
@@ -62,7 +63,7 @@ class AgentWorker:
             return
 
         self._running = True
-        self._http_client = httpx.AsyncClient(timeout=60)
+        self._http_client = httpx.AsyncClient(timeout=self.settings.worker_http_timeout)
 
         logger.info("worker_started", worker_id=self.worker_id)
 
@@ -100,7 +101,7 @@ class AgentWorker:
                 try:
                     item = await asyncio.wait_for(
                         self.broker.get_request(),
-                        timeout=1.0
+                        timeout=self.settings.worker_poll_timeout
                     )
                 except asyncio.TimeoutError:
                     # 超时后继续循环，检查 _running 状态
@@ -206,7 +207,7 @@ class AgentWorker:
         # 构建依赖
         deps = AgentDependencies(
             connection_id=connection_id,
-            player_name=request.player_name or "Player",
+            player_name=request.player_name or DEFAULT_PLAYER_DISPLAY_NAME,
             settings=self.settings,
             http_client=self._http_client,  # type: ignore
             send_to_game=self._create_send_callback(connection_id),
@@ -223,7 +224,7 @@ class AgentWorker:
                 SystemNotification(
                     connection_id=connection_id,
                     level="info",
-                    message=f"AI正在为{request.player_name or 'Player'}思考",
+                    message=f"AI正在为{request.player_name or DEFAULT_PLAYER_DISPLAY_NAME}思考",
                     player_name="@a",
                 ),
             )
@@ -435,7 +436,7 @@ class AgentWorker:
                     if response_text:
                         await self.broker.send_response(connection_id, {
                             "type": "ai_response_sync",
-                            "player_name": request.player_name or "Player",
+                            "player_name": request.player_name or DEFAULT_PLAYER_DISPLAY_NAME,
                             "role": "assistant",
                             "text": response_text,
                         })
@@ -852,7 +853,7 @@ class AgentWorker:
                 return "命令执行失败: 连接不存在"
 
             try:
-                return await asyncio.wait_for(future, timeout=10.0)
+                return await asyncio.wait_for(future, timeout=self.settings.run_command_timeout)
             except asyncio.TimeoutError:
                 return "命令执行超时: 未收到游戏侧 commandResponse"
 

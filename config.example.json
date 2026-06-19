@@ -6,6 +6,7 @@
   "auth": {
     "jwt_secret": "${SECRET_KEY}",
     "jwt_expiration": 1800,
+    "jwt_algorithm": "HS256",
     "default_password": "${WEBSOCKET_PASSWORD}"
   },
   "providers": {
@@ -33,6 +34,10 @@
     "system_prompt": "你是一个MCBE助手，请始终保持积极友好的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown",
     "enable_reasoning_output": true,
     "max_history_turns": 20,
+    "agent_retries": 2,
+    "worker_http_timeout": 60,
+    "worker_poll_timeout": 1.0,
+    "run_command_timeout": 10.0,
     "compression_enabled": true,
     "compression_trigger_ratio": 0.8,
     "compression_keep_recent_turns": 8,
@@ -153,16 +158,47 @@
     "enabled": false,
     "servers": {}
   },
+  "addon": {
+    "protocol": {
+      "bridge_message_id": "mcbeai:bridge_request",
+      "bridge_prefix": "MCBEAI|RESP",
+      "ui_chat_prefix": "MCBEAI|UI_CHAT",
+      "bridge_tool_player_name": "MCBEAI_TOOL",
+      "ai_resp_message_id": "mcbeai:ai_resp"
+    }
+  },
   "logging": {
     "level": "INFO",
     "enable_file_logging": true,
     "enable_ws_raw_log": false,
-    "enable_llm_raw_log": false
+    "enable_llm_raw_log": false,
+    "log_dir": "logs",
+    "files": {
+      "app": "app.log",
+      "websocket_raw": "websocket.log",
+      "llm_raw": "llm.log"
+    },
+    "rotation_when": "midnight",
+    "rotation_interval": 1,
+    "rotation_backup_count": 30
+  },
+  "storage": {
+    "conversations_dir": "data/conversations",
+    "tokens_file": "data/tokens.json"
   },
   "dev_mode": false,
   "flow_control": {
     "max_chunk_content_length": 400,
-    "chunk_sentence_mode": true
+    "chunk_sentence_mode": true,
+    "command_line_byte_budget": 461,
+    "chunk_delays": {
+      "tellraw": 0.05,
+      "scriptevent": 0.05,
+      "ai_resp": 0.15,
+      "ai_resp_prelude": 0.5
+    },
+    "non_stream_batch_max_chars": 150,
+    "non_stream_send_delay": 0.1
   },
   "model_metadata": {
     "enabled": true,

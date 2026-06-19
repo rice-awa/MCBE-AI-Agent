@@ -16,6 +16,7 @@ from services.websocket.connection import ConnectionManager
 from services.websocket.delivery import McbeOutboundDelivery
 from services.websocket.minecraft import MinecraftProtocolHandler, TellrawMessage
 from services.auth.jwt_handler import JWTHandler
+from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
 from config.settings import Settings
 from config.logging import get_logger
 
@@ -400,7 +401,7 @@ class WebSocketServer:
         )
         await self.broker.send_response(state.id, {
             "type": "ai_response_sync",
-            "player_name": player_name or state.player_name or "Player",
+            "player_name": player_name or state.player_name or DEFAULT_PLAYER_DISPLAY_NAME,
             "role": "user",
             "text": content,
         })
@@ -1142,7 +1143,7 @@ class WebSocketServer:
         # 把 UI 玩家发出的"用户消息"回流到 Addon 历史（与聊天框命令保持一致）
         await self.broker.send_response(state.id, {
             "type": "ai_response_sync",
-            "player_name": player_name or "Player",
+            "player_name": player_name or DEFAULT_PLAYER_DISPLAY_NAME,
             "role": "user",
             "text": message,
         })

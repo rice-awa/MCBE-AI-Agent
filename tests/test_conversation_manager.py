@@ -104,6 +104,73 @@ def test_conversation_manager_init():
     assert manager._get_compression_threshold() == 16  # 20 * 0.8
 
 
+def test_conversation_manager_uses_configured_storage_dir(tmp_path):
+    """ConversationManager 应从 settings.storage.conversations_dir 读取存储目录。"""
+    from config.settings import StorageConfig
+
+    storage_dir = tmp_path / "custom_convs"
+    settings = Settings(storage=StorageConfig(conversations_dir=storage_dir))
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+
+    assert manager._storage_dir == storage_dir
+    assert storage_dir.exists()
+
+
+def test_jwt_handler_uses_configured_tokens_file(tmp_path):
+    """JWTHandler 应从 settings.storage.tokens_file 读取令牌文件路径。"""
+    from config.settings import StorageConfig
+    from services.auth.jwt_handler import JWTHandler
+
+    tokens_file = tmp_path / "custom_tokens.json"
+    settings = Settings(storage=StorageConfig(tokens_file=tokens_file))
+    handler = JWTHandler(settings)
+
+    assert handler.token_file == tokens_file
+    handler.save_token("uuid-1", "tok-1")
+    assert tokens_file.exists()
+    data = json.loads(tokens_file.read_text(encoding="utf-8"))
+    assert data == [{"uuid": "uuid-1", "token": "tok-1"}]
+
+
+def test_jwt_handler_uses_configured_algorithm(tmp_path):
+    """JWTHandler 应使用 settings.jwt_algorithm 编码与校验令牌。"""
+    import jwt as jwt_lib
+
+    from config.settings import StorageConfig
+    from services.auth.jwt_handler import JWTHandler
+
+    tokens_file = tmp_path / "tokens.json"
+    settings = Settings(
+        jwt_secret="test-secret",
+        jwt_algorithm="HS512",
+        storage=StorageConfig(tokens_file=tokens_file),
+    )
+    handler = JWTHandler(settings)
+
+    token = handler.generate_token()
+    assert handler.verify_token(token) is True
+
+    decoded_header = jwt_lib.get_unverified_header(token)
+    assert decoded_header["alg"] == "HS512"
+
+    forged = jwt_lib.encode({"exp": 9999999999, "iat": 0}, "test-secret", algorithm="HS256")
+    assert handler.verify_token(forged) is False
+
+
+def test_jwt_handler_default_algorithm_is_hs256(tmp_path):
+    """默认 jwt_algorithm 应为 HS256，保持与历史行为兼容。"""
+    from config.settings import StorageConfig
+    from services.auth.jwt_handler import JWTHandler
+
+    settings = Settings(storage=StorageConfig(tokens_file=tmp_path / "tokens.json"))
+    assert settings.jwt_algorithm == "HS256"
+    handler = JWTHandler(settings)
+
+    token = handler.generate_token()
+    assert handler.verify_token(token) is True
+
+
 def test_count_turns():
     """测试计算对话轮次"""
     settings = Settings()

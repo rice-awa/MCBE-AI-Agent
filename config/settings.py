@@ -223,6 +223,7 @@ REQUIRED_CONFIG_PATHS = (
     "agent.system_prompt",
     "agent.enable_reasoning_output",
     "agent.max_history_turns",
+    "agent.agent_retries",
     "agent.stream_sentence_mode",
     "agent.llm_warmup_enabled",
     "agent.mcwiki_base_url",
@@ -393,6 +394,8 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["jwt_secret"] = auth["jwt_secret"]
     if "jwt_expiration" in auth:
         result["jwt_expiration"] = auth["jwt_expiration"]
+    if "jwt_algorithm" in auth:
+        result["jwt_algorithm"] = auth["jwt_algorithm"]
     if "default_password" in auth:
         result["default_password"] = auth["default_password"]
 
@@ -454,8 +457,14 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["minecraft"] = data["minecraft"]
     if "mcp" in data:
         result["mcp"] = data["mcp"]
+    if "addon" in data:
+        result["addon"] = data["addon"]
     if "model_metadata" in data:
         result["model_metadata"] = data["model_metadata"]
+    if "logging" in data:
+        result["logging"] = data["logging"]
+    if "storage" in data:
+        result["storage"] = data["storage"]
 
     if "level" in logging_config:
         result["log_level"] = logging_config["level"]
@@ -473,6 +482,8 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["max_chunk_content_length"] = flow_control["max_chunk_content_length"]
     if "chunk_sentence_mode" in flow_control:
         result["chunk_sentence_mode"] = flow_control["chunk_sentence_mode"]
+    if "flow_control" in data:
+        result["flow_control"] = data["flow_control"]
 
     return result
 
@@ -519,6 +530,26 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 }
 
 
+class FlowControlDelayConfig(BaseModel):
+    """流控分片间延迟配置（秒）"""
+
+    tellraw: float = 0.05
+    scriptevent: float = 0.05
+    ai_resp: float = 0.15
+    ai_resp_prelude: float = 0.5
+
+
+class FlowControlConfig(BaseModel):
+    """流控中间件配置"""
+
+    command_line_byte_budget: int = 461
+    chunk_delays: FlowControlDelayConfig = Field(default_factory=FlowControlDelayConfig)
+    # 非流式模式：按句子分批的最大字符数（避免单次 WebSocket 发送过大）
+    non_stream_batch_max_chars: int = 150
+    # 非流式模式：每个包之间的发送延迟（秒，避免 MC 崩溃）
+    non_stream_send_delay: float = 0.1
+
+
 class WebSocketConfig(BaseModel):
     """WebSocket 服务器配置"""
 
@@ -544,6 +575,47 @@ class MCPConfig(BaseModel):
 
     enabled: bool = False
     servers: dict[str, MCPServerConfig] = {}  # 服务器名称 -> 配置
+
+
+class AddonProtocolConfig(BaseModel):
+    """Addon 桥接协议标识配置"""
+
+    bridge_message_id: str = "mcbeai:bridge_request"
+    bridge_prefix: str = "MCBEAI|RESP"
+    ui_chat_prefix: str = "MCBEAI|UI_CHAT"
+    bridge_tool_player_name: str = "MCBEAI_TOOL"
+    ai_resp_message_id: str = "mcbeai:ai_resp"
+
+
+class AddonConfig(BaseModel):
+    """Addon 桥接配置"""
+
+    protocol: AddonProtocolConfig = Field(default_factory=AddonProtocolConfig)
+
+
+class LoggingFilesConfig(BaseModel):
+    """日志文件名配置"""
+
+    app: str = "app.log"
+    websocket_raw: str = "websocket.log"
+    llm_raw: str = "llm.log"
+
+
+class LoggingConfig(BaseModel):
+    """日志路径与轮转配置（与 Settings 顶层扁平字段 log_level/enable_* 共存）"""
+
+    log_dir: Path = Path("logs")
+    files: LoggingFilesConfig = Field(default_factory=LoggingFilesConfig)
+    rotation_when: str = "midnight"
+    rotation_interval: int = 1
+    rotation_backup_count: int = 30
+
+
+class StorageConfig(BaseModel):
+    """持久化存储路径配置"""
+
+    conversations_dir: Path = Path("data/conversations")
+    tokens_file: Path = Path("data/tokens.json")
 
 
 class Settings(BaseSettings):
@@ -578,6 +650,7 @@ class Settings(BaseSettings):
     # 认证配置
     jwt_secret: str = Field(default="change-me-in-production", alias="SECRET_KEY")
     jwt_expiration: int = 1800  # 30分钟
+    jwt_algorithm: str = "HS256"
     default_password: str = Field(default="123456", alias="WEBSOCKET_PASSWORD")
 
     # LLM 配置
@@ -605,6 +678,10 @@ class Settings(BaseSettings):
     system_prompt: str = "请始终保持积极和专业的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown"
     enable_reasoning_output: bool = True
     max_history_turns: int = 20
+    agent_retries: int = Field(default=2, ge=0)
+    worker_http_timeout: int = Field(default=60, ge=1)
+    worker_poll_timeout: float = Field(default=1.0, gt=0)
+    run_command_timeout: float = Field(default=10.0, gt=0)
 
     # 对话压缩配置
     compression_enabled: bool = True
@@ -657,11 +734,17 @@ class Settings(BaseSettings):
     # MCP 配置
     mcp: MCPConfig = Field(default_factory=MCPConfig)
 
+    # Addon 桥接配置
+    addon: AddonConfig = Field(default_factory=AddonConfig)
+
     # 模型元数据配置
     model_metadata: ModelMetadataConfig = Field(default_factory=ModelMetadataConfig)
 
     # 运行时附加的 models.dev 元数据缓存（由 AgentRuntime 启动时注入）
     _model_metadata_cache: "ModelMetadataCache | None" = PrivateAttr(default=None)
+
+    # 持久化存储路径配置
+    storage: StorageConfig = Field(default_factory=StorageConfig)
 
     # 日志配置
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
@@ -686,6 +769,9 @@ class Settings(BaseSettings):
         description="是否启用 LLM 请求/响应日志"
     )
 
+    # 日志路径与轮转配置（嵌套，与上方扁平开关共存）
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
+
     # 工具调用响应显示配置
     tool_response_verbose: bool = Field(
         default=False,
@@ -705,6 +791,9 @@ class Settings(BaseSettings):
         alias="CHUNK_SENTENCE_MODE",
         description="分片时是否优先按句子分割（True=语义分片，False=强制等长截断）",
     )
+
+    # 流控嵌套配置（字节预算与分片延迟）
+    flow_control: FlowControlConfig = Field(default_factory=FlowControlConfig)
 
     def get_provider_config(self, provider_name: str | None = None) -> LLMProviderConfig:
         """获取指定提供商的配置"""

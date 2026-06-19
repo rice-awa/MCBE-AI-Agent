@@ -251,7 +251,7 @@ class ConversationManager:
         self.broker = broker
         self.settings = settings
         self.compressor = ConversationCompressor(settings)
-        self._storage_dir = Path("data/conversations")
+        self._storage_dir = settings.storage.conversations_dir
         self._storage_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(

@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from core.session import DEFAULT_CONVERSATION_ID
 from models.minecraft import (
     MinecraftMessage,
     MinecraftSubscribe,
@@ -119,7 +120,7 @@ class MinecraftProtocolHandler:
         provider: str | None = None,
         delivery: str | None = None,
         player_name: str | None = None,
-        conversation_id: str = "default",
+        conversation_id: str = DEFAULT_CONVERSATION_ID,
     ) -> ChatRequest:
         """
         创建聊天请求

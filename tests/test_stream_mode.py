@@ -491,6 +491,53 @@ def test_iter_sentence_batches_should_fallback_for_long_sentence() -> None:
     assert "".join(batches) == long_sentence
 
 
+def test_iter_sentence_batches_default_reads_from_settings(monkeypatch) -> None:
+    """未显式传入 max_chars 时，应从 Settings.flow_control.non_stream_batch_max_chars 读取默认值。"""
+    from unittest.mock import patch
+
+    fake_settings = SimpleNamespace(
+        flow_control=SimpleNamespace(non_stream_batch_max_chars=5, non_stream_send_delay=0.0)
+    )
+
+    with patch.object(core, "get_settings", return_value=fake_settings):
+        batches = list(core._iter_sentence_batches("AAAAA。BBBBB。"))
+
+    # 每句 6 字符 > max_chars=5，退化为按 5 字符切分，每句切成 2 段
+    assert len(batches) == 4
+    assert "".join(batches) == "AAAAA。BBBBB。"
+
+
+def test_send_content_event_uses_non_stream_send_delay_from_settings(monkeypatch) -> None:
+    """_send_content_event 的 add_delay 应使用 Settings.flow_control.non_stream_send_delay。"""
+    from unittest.mock import patch
+
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    fake_settings = SimpleNamespace(
+        flow_control=SimpleNamespace(non_stream_batch_max_chars=150, non_stream_send_delay=0.25)
+    )
+
+    ctx = core._HandlerContext()
+
+    async def run() -> None:
+        await core._send_content_event(ctx, "hello。", add_delay=True)
+
+    with patch.object(core, "get_settings", return_value=fake_settings), \
+         patch.object(core.asyncio, "sleep", fake_sleep):
+        asyncio.run(run())
+
+    assert slept == [0.25]
+
+
+def test_non_stream_constants_removed_from_module() -> None:
+    """旧的模块级常量应已被移除，避免遗留的硬编码来源。"""
+    assert not hasattr(core, "NON_STREAM_BATCH_MAX_CHARS")
+    assert not hasattr(core, "NON_STREAM_SEND_DELAY")
+
+
 def test_empty_text_chunks_should_not_yield_content_events(monkeypatch) -> None:
     """空文本列表不应产生内容事件"""
     _patch_agent_node_adapter(monkeypatch)
