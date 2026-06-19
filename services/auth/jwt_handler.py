@@ -79,7 +79,7 @@ class JWTHandler:
             "exp": time.time() + self.expiration,
             "iat": time.time(),
         }
-        token = jwt.encode(payload, self.secret_key, algorithm="HS256")
+        token = jwt.encode(payload, self.secret_key, algorithm=self.settings.jwt_algorithm)
         logger.debug("token_generated")
         return token
 
@@ -94,7 +94,7 @@ class JWTHandler:
             是否有效
         """
         try:
-            jwt.decode(token, self.secret_key, algorithms=["HS256"])
+            jwt.decode(token, self.secret_key, algorithms=[self.settings.jwt_algorithm])
             return True
         except jwt.ExpiredSignatureError:
             logger.debug("token_expired")

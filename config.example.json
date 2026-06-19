@@ -6,6 +6,7 @@
   "auth": {
     "jwt_secret": "${SECRET_KEY}",
     "jwt_expiration": 1800,
+    "jwt_algorithm": "HS256",
     "default_password": "${WEBSOCKET_PASSWORD}"
   },
   "providers": {

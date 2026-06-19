@@ -394,6 +394,8 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["jwt_secret"] = auth["jwt_secret"]
     if "jwt_expiration" in auth:
         result["jwt_expiration"] = auth["jwt_expiration"]
+    if "jwt_algorithm" in auth:
+        result["jwt_algorithm"] = auth["jwt_algorithm"]
     if "default_password" in auth:
         result["default_password"] = auth["default_password"]
 
@@ -648,6 +650,7 @@ class Settings(BaseSettings):
     # 认证配置
     jwt_secret: str = Field(default="change-me-in-production", alias="SECRET_KEY")
     jwt_expiration: int = 1800  # 30分钟
+    jwt_algorithm: str = "HS256"
     default_password: str = Field(default="123456", alias="WEBSOCKET_PASSWORD")
 
     # LLM 配置
