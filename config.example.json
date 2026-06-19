@@ -173,7 +173,9 @@
       "scriptevent": 0.05,
       "ai_resp": 0.15,
       "ai_resp_prelude": 0.5
-    }
+    },
+    "non_stream_batch_max_chars": 150,
+    "non_stream_send_delay": 0.1
   },
   "model_metadata": {
     "enabled": true,

@@ -272,8 +272,16 @@ chat_agent = _LegacyChatAgentProxy()  # type: ignore[assignment]
 
 
 SENTENCE_END_PATTERN = re.compile(r"[。！？\n.!?]+")
-NON_STREAM_BATCH_MAX_CHARS = 150  # 减小批次大小，避免 MC 崩溃
-NON_STREAM_SEND_DELAY = 0.1  # 非流式模式下每个包之间的延迟（秒）
+
+
+def _non_stream_batch_max_chars() -> int:
+    """非流式模式按句子分批的最大字符数（从 Settings.flow_control 读取）。"""
+    return get_settings().flow_control.non_stream_batch_max_chars
+
+
+def _non_stream_send_delay() -> float:
+    """非流式模式每个包之间的发送延迟（秒，从 Settings.flow_control 读取）。"""
+    return get_settings().flow_control.non_stream_send_delay
 
 
 def _serialize_usage(usage: Any | None) -> dict[str, Any] | None:
@@ -489,8 +497,9 @@ def _append_sent_text(sent_text: str, new_text: str) -> str:
     return f"{sent_text}{new_text}"
 
 
-def _iter_sentence_batches(text: str, max_chars: int = NON_STREAM_BATCH_MAX_CHARS) -> Iterator[str]:
+def _iter_sentence_batches(text: str, max_chars: int | None = None) -> Iterator[str]:
     """按句子完整性分批，避免单次 WebSocket 发送过大。"""
+    max_chars = max_chars if max_chars is not None else _non_stream_batch_max_chars()
     if not text:
         return
 
@@ -554,7 +563,7 @@ async def _send_content_event(
     ctx.sent_text = _append_sent_text(ctx.sent_text, content)
     ctx.sequence += 1
     if add_delay:
-        await asyncio.sleep(NON_STREAM_SEND_DELAY)
+        await asyncio.sleep(_non_stream_send_delay())
     return event
 
 

@@ -536,6 +536,10 @@ class FlowControlConfig(BaseModel):
 
     command_line_byte_budget: int = 461
     chunk_delays: FlowControlDelayConfig = Field(default_factory=FlowControlDelayConfig)
+    # 非流式模式：按句子分批的最大字符数（避免单次 WebSocket 发送过大）
+    non_stream_batch_max_chars: int = 150
+    # 非流式模式：每个包之间的发送延迟（秒，避免 MC 崩溃）
+    non_stream_send_delay: float = 0.1
 
 
 class WebSocketConfig(BaseModel):
