@@ -1,5 +1,6 @@
 """models.dev 元数据解析与缓存测试"""
 
+import json
 import sys
 from pathlib import Path
 
@@ -8,9 +9,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from config.settings import ModelMetadataConfig
 from services.agent.model_metadata import (
     ModelMetadata,
     ModelMetadataCache,
+    ModelMetadataService,
     load_cache,
     save_cache,
 )
@@ -278,3 +281,151 @@ async def test_save_then_load_roundtrip_creates_parent_dir(tmp_path: Path):
     assert metadata.name == "DeepSeek Chat"
     assert metadata.context_window == 1000000
     assert metadata.max_output_tokens == 384000
+
+
+# ---------------------------------------------------------------------------
+# Task 3: ModelMetadataService 启动刷新
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_metadata_service_initialize_disabled_skips_refresh(tmp_path, monkeypatch):
+    config = ModelMetadataConfig(
+        enabled=False,
+        refresh_on_startup=True,
+        cache_path=tmp_path / "cache.json",
+    )
+    service = ModelMetadataService(config)
+
+    async def _must_not_call():
+        raise AssertionError("_fetch_payload should not be called when disabled")
+
+    monkeypatch.setattr(service, "_fetch_payload", _must_not_call)
+    await service.initialize()
+    assert len(service.cache.models) == 0
+
+
+@pytest.mark.asyncio
+async def test_metadata_service_initialize_refresh_on_startup_false_skips_refresh(
+    tmp_path, monkeypatch
+):
+    config = ModelMetadataConfig(
+        enabled=True,
+        refresh_on_startup=False,
+        cache_path=tmp_path / "cache.json",
+    )
+    service = ModelMetadataService(config)
+
+    async def _must_not_call():
+        raise AssertionError(
+            "_fetch_payload should not be called when refresh_on_startup is False"
+        )
+
+    monkeypatch.setattr(service, "_fetch_payload", _must_not_call)
+    await service.initialize()
+    assert len(service.cache.models) == 0
+
+
+@pytest.mark.asyncio
+async def test_metadata_service_refresh_updates_in_memory_cache(tmp_path, monkeypatch):
+    config = ModelMetadataConfig(
+        enabled=True,
+        refresh_on_startup=True,
+        cache_path=tmp_path / "cache.json",
+    )
+    service = ModelMetadataService(config)
+
+    async def _fake_fetch():
+        return {
+            "openai": {
+                "models": {
+                    "gpt-4o": {
+                        "name": "GPT-4o",
+                        "limit": {"context": 128000, "output": 16384},
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr(service, "_fetch_payload", _fake_fetch)
+    await service.refresh()
+
+    assert service.cache.get_context_window("openai", "gpt-4o") == 128000
+
+
+@pytest.mark.asyncio
+async def test_metadata_service_initialize_refresh_failure_preserves_loaded_cache(
+    tmp_path, monkeypatch
+):
+    cache_path = tmp_path / "cache.json"
+    preloaded = ModelMetadataCache.from_models_dev_api(
+        {"openai": {"models": {"preserved-model": {"limit": {"context": 999}}}}}
+    )
+    await save_cache(cache_path, preloaded)
+
+    config = ModelMetadataConfig(
+        enabled=True,
+        refresh_on_startup=True,
+        cache_path=cache_path,
+    )
+    service = ModelMetadataService(config)
+
+    async def _failing_fetch():
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(service, "_fetch_payload", _failing_fetch)
+    await service.initialize()
+
+    assert service.cache.get_context_window("openai", "preserved-model") == 999
+
+
+@pytest.mark.asyncio
+async def test_metadata_service_initialize_refresh_failure_no_local_cache_no_raise(
+    tmp_path, monkeypatch
+):
+    config = ModelMetadataConfig(
+        enabled=True,
+        refresh_on_startup=True,
+        cache_path=tmp_path / "missing.json",
+    )
+    service = ModelMetadataService(config)
+
+    async def _failing_fetch():
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(service, "_fetch_payload", _failing_fetch)
+    await service.initialize()
+    assert len(service.cache.models) == 0
+
+
+@pytest.mark.asyncio
+async def test_metadata_service_refresh_writes_cache_file(tmp_path, monkeypatch):
+    cache_path = tmp_path / "subdir" / "cache.json"
+    config = ModelMetadataConfig(
+        enabled=True,
+        refresh_on_startup=True,
+        cache_path=cache_path,
+    )
+    service = ModelMetadataService(config)
+
+    async def _fake_fetch():
+        return {"openai": {"models": {"gpt-4o": {"limit": {"context": 128000}}}}}
+
+    monkeypatch.setattr(service, "_fetch_payload", _fake_fetch)
+    await service.refresh()
+
+    assert cache_path.exists()
+    data = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert "openai:gpt-4o" in data["models"]
+    assert data["models"]["openai:gpt-4o"]["context_window"] == 128000
+
+
+@pytest.mark.asyncio
+async def test_metadata_service_get_context_window_delegates_to_cache(tmp_path):
+    config = ModelMetadataConfig(cache_path=tmp_path / "cache.json")
+    service = ModelMetadataService(config)
+    service._cache = ModelMetadataCache.from_models_dev_api(
+        {"openai": {"models": {"gpt-4o": {"limit": {"context": 128000}}}}}
+    )
+    assert service.get_context_window("openai", "gpt-4o") == 128000
+    assert service.get_context_window("openai", "missing") is None

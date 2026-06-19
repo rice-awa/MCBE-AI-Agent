@@ -7,9 +7,11 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import httpx
 from pydantic import BaseModel, Field, ValidationError
 
 from config.logging import get_logger
+from config.settings import ModelMetadataConfig
 
 logger = get_logger(__name__)
 
@@ -105,3 +107,51 @@ async def save_cache(path: Path, cache: ModelMetadataCache) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(cache.model_dump(mode="json"), f, ensure_ascii=False, indent=2)
+
+
+class ModelMetadataService:
+    """启动期加载/刷新 models.dev 元数据，向运行时提供上下文窗口。"""
+
+    def __init__(self, config: ModelMetadataConfig):
+        self.config = config
+        self._cache = ModelMetadataCache()
+
+    @property
+    def cache(self) -> ModelMetadataCache:
+        return self._cache
+
+    async def initialize(self) -> None:
+        self._cache = await load_cache(self.config.cache_path)
+        if self.config.enabled and self.config.refresh_on_startup:
+            await self.refresh()
+
+    async def refresh(self) -> None:
+        try:
+            payload = await self._fetch_payload()
+            if not isinstance(payload, Mapping):
+                raise TypeError(
+                    f"expected mapping payload, got {type(payload).__name__}"
+                )
+            new_cache = ModelMetadataCache.from_models_dev_api(payload)
+            self._cache = new_cache
+            await save_cache(self.config.cache_path, new_cache)
+            logger.info(
+                "model_metadata_refresh_completed",
+                model_count=len(new_cache.models),
+            )
+        except Exception as e:
+            logger.warning("model_metadata_refresh_failed", error=str(e))
+
+    async def _fetch_payload(self) -> Mapping[str, Any]:
+        async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+            response = await client.get(
+                self.config.source_url,
+                headers={
+                    "User-Agent": "mcbe-ai-agent/2.2.0 (+https://github.com/rice-awa/mcbe_ai_agent)"
+                },
+            )
+            response.raise_for_status()
+            return response.json()
+
+    def get_context_window(self, provider: str, model: str) -> int | None:
+        return self._cache.get_context_window(provider, model)
