@@ -459,6 +459,10 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["addon"] = data["addon"]
     if "model_metadata" in data:
         result["model_metadata"] = data["model_metadata"]
+    if "logging" in data:
+        result["logging"] = data["logging"]
+    if "storage" in data:
+        result["storage"] = data["storage"]
 
     if "level" in logging_config:
         result["log_level"] = logging_config["level"]
@@ -587,6 +591,31 @@ class AddonConfig(BaseModel):
     protocol: AddonProtocolConfig = Field(default_factory=AddonProtocolConfig)
 
 
+class LoggingFilesConfig(BaseModel):
+    """日志文件名配置"""
+
+    app: str = "app.log"
+    websocket_raw: str = "websocket.log"
+    llm_raw: str = "llm.log"
+
+
+class LoggingConfig(BaseModel):
+    """日志路径与轮转配置（与 Settings 顶层扁平字段 log_level/enable_* 共存）"""
+
+    log_dir: Path = Path("logs")
+    files: LoggingFilesConfig = Field(default_factory=LoggingFilesConfig)
+    rotation_when: str = "midnight"
+    rotation_interval: int = 1
+    rotation_backup_count: int = 30
+
+
+class StorageConfig(BaseModel):
+    """持久化存储路径配置"""
+
+    conversations_dir: Path = Path("data/conversations")
+    tokens_file: Path = Path("data/tokens.json")
+
+
 class Settings(BaseSettings):
     """应用主配置"""
 
@@ -711,6 +740,9 @@ class Settings(BaseSettings):
     # 运行时附加的 models.dev 元数据缓存（由 AgentRuntime 启动时注入）
     _model_metadata_cache: "ModelMetadataCache | None" = PrivateAttr(default=None)
 
+    # 持久化存储路径配置
+    storage: StorageConfig = Field(default_factory=StorageConfig)
+
     # 日志配置
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     enable_file_logging: bool = True
@@ -733,6 +765,9 @@ class Settings(BaseSettings):
         alias="ENABLE_LLM_RAW_LOG",
         description="是否启用 LLM 请求/响应日志"
     )
+
+    # 日志路径与轮转配置（嵌套，与上方扁平开关共存）
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
     # 工具调用响应显示配置
     tool_response_verbose: bool = Field(

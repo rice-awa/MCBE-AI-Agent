@@ -170,7 +170,20 @@
     "level": "INFO",
     "enable_file_logging": true,
     "enable_ws_raw_log": false,
-    "enable_llm_raw_log": false
+    "enable_llm_raw_log": false,
+    "log_dir": "logs",
+    "files": {
+      "app": "app.log",
+      "websocket_raw": "websocket.log",
+      "llm_raw": "llm.log"
+    },
+    "rotation_when": "midnight",
+    "rotation_interval": 1,
+    "rotation_backup_count": 30
+  },
+  "storage": {
+    "conversations_dir": "data/conversations",
+    "tokens_file": "data/tokens.json"
   },
   "dev_mode": false,
   "flow_control": {
