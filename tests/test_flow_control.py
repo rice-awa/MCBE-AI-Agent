@@ -221,6 +221,29 @@ class TestChunkTellraw:
             reassembled += _tellraw_text(command_line)[len("§b"):]
         assert reassembled == text
 
+    def test_tellraw_sentence_mode_affects_production_chunks(self):
+        """生产 tellraw 分片路径应按配置优先落在句子边界。"""
+        original_mode = FlowControlMiddleware.DEFAULT_SENTENCE_MODE
+        text = "第一句。第二句！第三句？"
+        try:
+            FlowControlMiddleware.configure(sentence_mode=True)
+            semantic_payloads = FlowControlMiddleware.chunk_tellraw(text, max_length=5)
+            semantic_chunks = [
+                _tellraw_text(_command_line(payload))[len("§a"):]
+                for payload in semantic_payloads
+            ]
+            assert semantic_chunks == ["第一句。", "第二句！", "第三句？"]
+
+            FlowControlMiddleware.configure(sentence_mode=False)
+            hard_payloads = FlowControlMiddleware.chunk_tellraw(text, max_length=5)
+            hard_chunks = [
+                _tellraw_text(_command_line(payload))[len("§a"):]
+                for payload in hard_payloads
+            ]
+            assert hard_chunks == ["第一句。第", "二句！第三", "句？"]
+        finally:
+            FlowControlMiddleware.configure(sentence_mode=original_mode)
+
     def test_tellraw_wrapper_exhaustion_rejects_non_empty_text(self):
         """target/color 包装占满预算时，非空 tellraw 文本不能被空分片吞掉。"""
         target = "a" * 440
@@ -381,6 +404,31 @@ class TestChunkAiResponse:
         payloads = FlowControlMiddleware.chunk_ai_response(player, "assistant", text, max_length=3)
         assert len(payloads) >= 100
         _assert_ai_response_payloads_reassemble(payloads, text, player, "assistant")
+
+    def test_ai_response_sentence_mode_affects_production_chunks(self):
+        """生产 AI response 分片路径应按配置优先落在句子边界。"""
+        original_mode = FlowControlMiddleware.DEFAULT_SENTENCE_MODE
+        text = "第一句。第二句！第三句？"
+        try:
+            FlowControlMiddleware.configure(sentence_mode=True)
+            semantic_payloads = FlowControlMiddleware.chunk_ai_response(
+                "Steve", "assistant", text, max_length=5
+            )
+            assert [
+                _ai_response_inner(payload)["c"] for payload in semantic_payloads
+            ] == ["第一句。", "第二句！", "第三句？"]
+
+            FlowControlMiddleware.configure(sentence_mode=False)
+            hard_payloads = FlowControlMiddleware.chunk_ai_response(
+                "Steve", "assistant", text, max_length=5
+            )
+            assert [_ai_response_inner(payload)["c"] for payload in hard_payloads] == [
+                "第一句。第",
+                "二句！第三",
+                "句？",
+            ]
+        finally:
+            FlowControlMiddleware.configure(sentence_mode=original_mode)
 
 
 class TestChunkRawCommand:

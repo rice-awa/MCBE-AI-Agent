@@ -263,30 +263,14 @@ class FlowControlMiddleware:
         max_length: int,
     ) -> list[str]:
         """按最终 create_tellraw commandLine 的真实 UTF-8 字节数切分文本。"""
-        chunks: list[str] = []
-        buffer = ""
-        for ch in text:
-            tentative = buffer + ch
-            if len(tentative) <= max_length and cls._tellraw_command_fits(tentative, color, target):
-                buffer = tentative
-                continue
-            if buffer:
-                chunks.append(buffer)
-                buffer = ch
-                if len(buffer) <= max_length and cls._tellraw_command_fits(buffer, color, target):
-                    continue
-            raise ValueError(
-                "tellraw wrapper exceeds byte budget; target/color leave no room for content"
-            )
-        if buffer:
-            chunks.append(buffer)
-        return chunks if chunks else [""]
-
-    @staticmethod
-    def _tellraw_command_fits(text: str, color: str, target: str) -> bool:
-        command = MinecraftCommand.create_tellraw(text, color=color, target=target)
-        command_line = command.body.commandLine
-        return len(command_line.encode("utf-8")) <= _COMMAND_LINE_BYTE_BUDGET
+        return cls._split_by_command_fit(
+            text,
+            max_length,
+            lambda part: MinecraftCommand.create_tellraw(
+                part, color=color, target=target
+            ).body.commandLine,
+            error_message="tellraw wrapper exceeds byte budget; target/color leave no room for content",
+        )
 
     @classmethod
     def _split_by_command_fit(
@@ -294,24 +278,98 @@ class FlowControlMiddleware:
         text: str,
         max_length: int,
         command_line_for: Callable[[str], str],
+        *,
+        error_message: str = "command wrapper exceeds byte budget; no room for content",
     ) -> list[str]:
-        """Split text by probing the final commandLine UTF-8 byte length."""
+        """Split text by sentence candidates while probing final commandLine bytes."""
+        if not text:
+            return [""]
+
+        chunks: list[str] = []
+        buffer = ""
+        for part in cls._semantic_parts(text):
+            tentative = buffer + part
+            if cls._command_part_fits(tentative, max_length, command_line_for):
+                buffer = tentative
+                continue
+
+            if buffer:
+                chunks.append(buffer)
+                buffer = ""
+
+            if cls._command_part_fits(part, max_length, command_line_for):
+                buffer = part
+                continue
+
+            chunks.extend(
+                cls._split_by_command_fit_chars(
+                    part,
+                    max_length,
+                    command_line_for,
+                    error_message=error_message,
+                )
+            )
+
+        if buffer:
+            chunks.append(buffer)
+        return chunks if chunks else [""]
+
+    @classmethod
+    def _semantic_parts(cls, text: str) -> list[str]:
+        if not cls.DEFAULT_SENTENCE_MODE:
+            return list(text)
+
+        parts = _SENTENCE_DELIMITER_RE.split(text)
+        sentences: list[str] = []
+        i = 0
+        while i < len(parts):
+            segment = parts[i]
+            delimiter = (
+                parts[i + 1]
+                if i + 1 < len(parts)
+                and _SENTENCE_DELIMITER_RE.match(parts[i + 1])
+                else ""
+            )
+            combined = segment + delimiter if delimiter else segment
+            i += 2 if delimiter else 1
+            if combined:
+                sentences.append(combined)
+        return sentences if sentences else [""]
+
+    @classmethod
+    def _split_by_command_fit_chars(
+        cls,
+        text: str,
+        max_length: int,
+        command_line_for: Callable[[str], str],
+        *,
+        error_message: str,
+    ) -> list[str]:
         chunks: list[str] = []
         buffer = ""
         for ch in text:
             tentative = buffer + ch
-            if len(tentative) <= max_length and cls._command_line_fits(command_line_for(tentative)):
+            if cls._command_part_fits(tentative, max_length, command_line_for):
                 buffer = tentative
                 continue
             if buffer:
                 chunks.append(buffer)
                 buffer = ch
-                if len(buffer) <= max_length and cls._command_line_fits(command_line_for(buffer)):
+                if cls._command_part_fits(buffer, max_length, command_line_for):
                     continue
-            raise ValueError("command wrapper exceeds byte budget; no room for content")
+            raise ValueError(error_message)
         if buffer:
             chunks.append(buffer)
         return chunks if chunks else [""]
+
+    @classmethod
+    def _command_part_fits(
+        cls,
+        part: str,
+        max_length: int,
+        command_line_for: Callable[[str], str],
+    ) -> bool:
+        return len(part) <= max_length and cls._command_line_fits(command_line_for(part))
 
     @staticmethod
     def _command_line_fits(command_line: str) -> bool:
