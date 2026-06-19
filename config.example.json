@@ -163,5 +163,12 @@
   "flow_control": {
     "max_chunk_content_length": 400,
     "chunk_sentence_mode": true
+  },
+  "model_metadata": {
+    "enabled": true,
+    "source_url": "https://models.dev/api.json",
+    "refresh_on_startup": true,
+    "timeout": 10,
+    "cache_path": "data/model_metadata_cache.json"
   }
 }

@@ -353,3 +353,13 @@ def test_minecraft_protocol_uses_injected_config():
         "help=求助; ctx=关"
     )
     assert handler.create_error_message("bad").text == "ERR:bad"
+
+
+def test_model_metadata_settings_loaded_from_json():
+    settings = Settings()
+
+    assert settings.model_metadata.enabled is True
+    assert settings.model_metadata.source_url == "https://models.dev/api.json"
+    assert settings.model_metadata.refresh_on_startup is True
+    assert settings.model_metadata.timeout == 10
+    assert str(settings.model_metadata.cache_path) == "data/model_metadata_cache.json"

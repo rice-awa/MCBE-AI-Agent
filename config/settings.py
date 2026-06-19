@@ -185,6 +185,16 @@ class LLMProviderConfig(BaseModel):
     context_window: int | None = None
 
 
+class ModelMetadataConfig(BaseModel):
+    """模型元数据配置（来源 models.dev）"""
+
+    enabled: bool = True
+    source_url: str = "https://models.dev/api.json"
+    refresh_on_startup: bool = True
+    timeout: int = 10
+    cache_path: Path = Path("data/model_metadata_cache.json")
+
+
 # 常用模型的上下文窗口大小（单位：tokens）
 CONFIG_FILE = Path("config.json")
 DOTENV_FILE = Path(".env")
@@ -246,6 +256,11 @@ REQUIRED_CONFIG_PATHS = (
     "dev_mode",
     "flow_control.max_chunk_content_length",
     "flow_control.chunk_sentence_mode",
+    "model_metadata.enabled",
+    "model_metadata.source_url",
+    "model_metadata.refresh_on_startup",
+    "model_metadata.timeout",
+    "model_metadata.cache_path",
 )
 
 
@@ -435,6 +450,8 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["minecraft"] = data["minecraft"]
     if "mcp" in data:
         result["mcp"] = data["mcp"]
+    if "model_metadata" in data:
+        result["model_metadata"] = data["model_metadata"]
 
     if "level" in logging_config:
         result["log_level"] = logging_config["level"]
@@ -635,6 +652,9 @@ class Settings(BaseSettings):
 
     # MCP 配置
     mcp: MCPConfig = Field(default_factory=MCPConfig)
+
+    # 模型元数据配置
+    model_metadata: ModelMetadataConfig = Field(default_factory=ModelMetadataConfig)
 
     # 日志配置
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
