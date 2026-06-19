@@ -15,7 +15,7 @@ from pydantic_ai import (
     RunContext,
     TextPartDelta,
 )
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import ModelMessage, TextPart, ThinkingPart, ThinkingPartDelta
 from pydantic_ai.models import Model
 
 from config.logging import get_logger
@@ -453,6 +453,19 @@ def _extract_tool_events_from_messages(messages: list[ModelMessage]) -> list[dic
     return tool_events
 
 
+def _extract_reasoning_from_messages(messages: list[ModelMessage]) -> list[str]:
+    """从结果消息中提取思考内容（ThinkingPart），用于非流式模式回填 reasoning 事件。"""
+    reasoning_chunks: list[str] = []
+    for message in messages:
+        parts = getattr(message, "parts", None)
+        if not parts:
+            continue
+        for part in parts:
+            if isinstance(part, ThinkingPart) and part.content:
+                reasoning_chunks.append(part.content)
+    return reasoning_chunks
+
+
 def _extract_complete_sentences(buffer: str) -> tuple[list[str], str]:
     """从缓冲区提取完整句子，并返回剩余未完成文本。"""
     sentences: list[str] = []
@@ -542,6 +555,23 @@ async def _send_content_event(
     return event
 
 
+async def _send_reasoning_event(
+    ctx: _HandlerContext,
+    content: str,
+) -> StreamEvent:
+    """发送推理（思考）事件并更新上下文。
+
+    思考内容不进 sentence_buffer，避免与正文文本混淆。
+    """
+    event = StreamEvent(
+        event_type="reasoning",
+        content=content,
+        sequence=ctx.sequence,
+    )
+    ctx.sequence += 1
+    return event
+
+
 async def stream_response_handler(
     prompt: str,
     deps: AgentDependencies,
@@ -611,17 +641,24 @@ async def stream_response_handler(
                                     connection_id=str(deps.connection_id),
                                     current_buffer=ctx.sentence_buffer,
                                 )
-                                # 重要：PartStartEvent.part 可能包含初始文本内容！
-                                # 如果是 TextPart 且有内容，需要处理
                                 part = event.part
-                                if hasattr(part, "content") and part.content:
+                                # ThinkingPart：作为 reasoning 事件输出，不进文本缓冲区
+                                if isinstance(part, ThinkingPart) and part.content:
+                                    logger.debug(
+                                        "agent_part_start_thinking",
+                                        index=event.index,
+                                        content=part.content,
+                                        connection_id=str(deps.connection_id),
+                                    )
+                                    yield await _send_reasoning_event(ctx, part.content)
+                                # TextPart：初始内容进文本缓冲区，按完整句子发送
+                                elif isinstance(part, TextPart) and part.content:
                                     logger.debug(
                                         "agent_part_start_content",
                                         index=event.index,
                                         content=part.content,
                                         connection_id=str(deps.connection_id),
                                     )
-                                    # 将 PartStartEvent 中的初始内容添加到 buffer
                                     ctx.sentence_buffer += part.content
                                     sentences, ctx.sentence_buffer = (
                                         _extract_complete_sentences(
@@ -635,9 +672,21 @@ async def stream_response_handler(
 
                             # 处理增量事件
                             elif isinstance(event, PartDeltaEvent):
-                                if isinstance(event.delta, TextPartDelta):
-                                    # 文本增量 - 缓冲并按完整句子发送
-                                    chunk = event.delta.content_delta
+                                delta = event.delta
+                                # ThinkingPartDelta：作为 reasoning 事件输出
+                                if isinstance(delta, ThinkingPartDelta):
+                                    chunk = delta.content_delta
+                                    if chunk:
+                                        logger.debug(
+                                            "agent_thinking_delta",
+                                            chunk=chunk,
+                                            index=event.index,
+                                            connection_id=str(deps.connection_id),
+                                        )
+                                        yield await _send_reasoning_event(ctx, chunk)
+                                # TextPartDelta：文本增量缓冲并按完整句子发送
+                                elif isinstance(delta, TextPartDelta):
+                                    chunk = delta.content_delta
                                     logger.debug(
                                         "agent_text_delta",
                                         chunk=chunk,
@@ -822,6 +871,10 @@ async def non_stream_response_handler(
         ctx.all_messages = _extract_all_messages(result)
         ctx.serialized_usage = _serialize_usage(_extract_result_usage(result))
         ctx.tool_events = _extract_tool_events_from_messages(ctx.new_messages)
+
+        # 从结果消息中提取思考内容（ThinkingPart），在正文之前作为 reasoning 事件输出
+        for reasoning_chunk in _extract_reasoning_from_messages(ctx.new_messages):
+            yield await _send_reasoning_event(ctx, reasoning_chunk)
 
         # 提取完整响应文本
         full_response = _extract_result_output(result)

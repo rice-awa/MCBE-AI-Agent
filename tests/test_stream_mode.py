@@ -15,7 +15,7 @@ from pydantic_ai import (
     PartStartEvent,
     TextPartDelta,
 )
-from pydantic_ai.messages import TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import TextPart, ThinkingPart, ThinkingPartDelta, ToolCallPart, ToolReturnPart
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
@@ -50,6 +50,26 @@ def make_part_start_event(index: int, content: str = "") -> PartStartEvent:
 def make_part_delta_event(index: int, content_delta: str) -> PartDeltaEvent:
     """创建模拟 PartDeltaEvent"""
     return PartDeltaEvent(index=index, delta=make_text_part_delta(content_delta))
+
+
+def make_thinking_part(content: str = "") -> ThinkingPart:
+    """创建模拟 ThinkingPart"""
+    return ThinkingPart(content)
+
+
+def make_thinking_part_delta(content_delta: str) -> ThinkingPartDelta:
+    """创建模拟 ThinkingPartDelta"""
+    return ThinkingPartDelta(content_delta=content_delta)
+
+
+def make_thinking_part_start_event(index: int, content: str = "") -> PartStartEvent:
+    """创建模拟 ThinkingPart 的 PartStartEvent"""
+    return PartStartEvent(index=index, part=make_thinking_part(content))
+
+
+def make_thinking_part_delta_event(index: int, content_delta: str) -> PartDeltaEvent:
+    """创建模拟 ThinkingPartDelta 的 PartDeltaEvent"""
+    return PartDeltaEvent(index=index, delta=make_thinking_part_delta(content_delta))
 
 
 def make_tool_part(
@@ -604,3 +624,85 @@ def test_chat_agent_manager_explicit_agent_overrides_fallback(monkeypatch) -> No
     manager.mark_mcp_failed()
 
     assert manager.get_active_agent(explicit_agent) is explicit_agent
+
+
+# ============== 思考模式（reasoning）测试 ==============
+
+
+def test_thinking_part_start_should_yield_reasoning_not_content(monkeypatch) -> None:
+    """ThinkingPart 的 PartStartEvent 应作为 reasoning 事件，不应混入 content。"""
+    _patch_agent_node_adapter(monkeypatch)
+
+    request_node_events = [
+        [
+            make_thinking_part_start_event(0, "玩家"),
+            make_thinking_part_delta_event(0, "打了个招呼"),
+            make_part_start_event(1, "嗨"),
+            make_part_delta_event(1, "！"),
+        ]
+    ]
+
+    mock_agent = MockAgent(
+        request_node_events=request_node_events,
+        result_output="嗨！",
+    )
+    monkeypatch.setattr(core, "chat_agent", mock_agent)
+
+    events = asyncio.run(_collect_events("hi", _build_deps(True), model="fake"))
+    reasoning_events = [e for e in events if e.event_type == "reasoning" and e.content]
+    content_events = [e for e in events if e.event_type == "content" and e.content]
+
+    assert "".join(e.content for e in reasoning_events) == "玩家打了个招呼"
+    assert "".join(e.content for e in content_events) == "嗨！"
+
+
+def test_thinking_part_delta_after_text_should_not_merge_into_content(monkeypatch) -> None:
+    """思考增量在前、文本在后的场景，两者不应互相串入。"""
+    _patch_agent_node_adapter(monkeypatch)
+
+    request_node_events = [
+        [
+            make_thinking_part_start_event(0, "思考。"),
+            make_part_start_event(1, "回答。"),
+        ]
+    ]
+
+    mock_agent = MockAgent(
+        request_node_events=request_node_events,
+        result_output="回答。",
+    )
+    monkeypatch.setattr(core, "chat_agent", mock_agent)
+
+    events = asyncio.run(_collect_events("hi", _build_deps(True), model="fake"))
+    reasoning_events = [e for e in events if e.event_type == "reasoning" and e.content]
+    content_events = [e for e in events if e.event_type == "content" and e.content]
+
+    assert "".join(e.content for e in reasoning_events) == "思考。"
+    assert "".join(e.content for e in content_events) == "回答。"
+
+
+def test_non_stream_mode_should_yield_reasoning_from_thinking_parts(monkeypatch) -> None:
+    """非流式模式：应从结果消息的 ThinkingPart 提取 reasoning 并在 content 之前 yield。"""
+    _patch_agent_node_adapter(monkeypatch)
+
+    result_messages = [
+        SimpleNamespace(parts=[make_thinking_part("先想一想。"), make_text_part("最终答案。")]),
+    ]
+
+    mock_agent = MockAgent(
+        result_output="最终答案。",
+        result_messages=result_messages,
+    )
+    monkeypatch.setattr(core, "chat_agent", mock_agent)
+
+    events = asyncio.run(_collect_events("hi", _build_deps(False), model="fake"))
+    typed = [(e.event_type, e.content) for e in events if e.content]
+    reasoning = [c for t, c in typed if t == "reasoning"]
+    content = [c for t, c in typed if t == "content"]
+
+    assert reasoning == ["先想一想。"]
+    assert "".join(content) == "最终答案。"
+    # reasoning 必须在 content 之前
+    first_reasoning_idx = next(i for i, (t, _) in enumerate(typed) if t == "reasoning")
+    first_content_idx = next(i for i, (t, _) in enumerate(typed) if t == "content")
+    assert first_reasoning_idx < first_content_idx

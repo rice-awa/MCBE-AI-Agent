@@ -255,6 +255,9 @@ class AgentWorker:
         event_count = 0
         response_parts: list[str] = []
         reasoning_parts: list[str] = []
+        reasoning_started = False
+        thinking_end_sent = False
+        enable_reasoning_output = self.settings.enable_reasoning_output
         start_time = time.monotonic()
 
         from services.agent.core import _is_mcp_timeout_error
@@ -462,17 +465,63 @@ class AgentWorker:
                 # content 和 reasoning 事件需要发送到游戏
                 elif event.event_type in ("content", "reasoning"):
                     if event.content:
-                        chunk = StreamChunk(
-                            connection_id=connection_id,
-                            chunk_type=event.event_type,  # type: ignore
-                            content=event.content,
-                            sequence=sequence,
-                            delivery=request.delivery,
-                            player_name=request.player_name,
-                            target=stream_target,
+                        # 思考开始：第一个 reasoning 事件到来时发送 thinking_start 标识
+                        if (
+                            event.event_type == "reasoning"
+                            and not reasoning_started
+                            and enable_reasoning_output
+                        ):
+                            reasoning_started = True
+                            start_chunk = StreamChunk(
+                                connection_id=connection_id,
+                                chunk_type="thinking_start",
+                                content="",
+                                sequence=sequence,
+                                delivery=request.delivery,
+                                player_name=request.player_name,
+                                target=stream_target,
+                            )
+                            await self.broker.send_response(connection_id, start_chunk)
+                            sequence += 1
+
+                        # 思考结束：reasoning 之后第一个 content 事件到来时发送 thinking_end 标识
+                        if (
+                            event.event_type == "content"
+                            and reasoning_started
+                            and not thinking_end_sent
+                            and enable_reasoning_output
+                        ):
+                            thinking_end_sent = True
+                            end_chunk = StreamChunk(
+                                connection_id=connection_id,
+                                chunk_type="thinking_end",
+                                content="",
+                                sequence=sequence,
+                                delivery=request.delivery,
+                                player_name=request.player_name,
+                                target=stream_target,
+                            )
+                            await self.broker.send_response(connection_id, end_chunk)
+                            sequence += 1
+
+                        # reasoning 事件仅在启用思考输出时发送到游戏
+                        should_send = (
+                            enable_reasoning_output
+                            if event.event_type == "reasoning"
+                            else True
                         )
-                        await self.broker.send_response(connection_id, chunk)
-                        sequence += 1
+                        if should_send:
+                            chunk = StreamChunk(
+                                connection_id=connection_id,
+                                chunk_type=event.event_type,  # type: ignore
+                                content=event.content,
+                                sequence=sequence,
+                                delivery=request.delivery,
+                                player_name=request.player_name,
+                                target=stream_target,
+                            )
+                            await self.broker.send_response(connection_id, chunk)
+                            sequence += 1
                 # tool_call 事件已在上面处理并发送
                 # tool_result 事件已根据配置决定是否发送
                 # is_complete 事件不需要发送到游戏
