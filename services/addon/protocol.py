@@ -140,9 +140,10 @@ def decode_ui_chat_chunk(chunk: str) -> UiChatChunk:
         raise ValueError("Invalid UI chat chunk format")
 
     namespace, prefix, msg_id, part, content = parts
-    if namespace != "MCBEAI":
+    expected_namespace, _, expected_prefix = _protocol().ui_chat_prefix.partition("|")
+    if namespace != expected_namespace:
         raise ValueError("Invalid UI chat chunk namespace")
-    if prefix != "UI_CHAT":
+    if prefix != expected_prefix:
         raise ValueError("Invalid UI chat chunk prefix")
 
     if not msg_id:
