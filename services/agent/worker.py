@@ -63,7 +63,7 @@ class AgentWorker:
             return
 
         self._running = True
-        self._http_client = httpx.AsyncClient(timeout=60)
+        self._http_client = httpx.AsyncClient(timeout=self.settings.worker_http_timeout)
 
         logger.info("worker_started", worker_id=self.worker_id)
 
@@ -101,7 +101,7 @@ class AgentWorker:
                 try:
                     item = await asyncio.wait_for(
                         self.broker.get_request(),
-                        timeout=1.0
+                        timeout=self.settings.worker_poll_timeout
                     )
                 except asyncio.TimeoutError:
                     # 超时后继续循环，检查 _running 状态
@@ -853,7 +853,7 @@ class AgentWorker:
                 return "命令执行失败: 连接不存在"
 
             try:
-                return await asyncio.wait_for(future, timeout=10.0)
+                return await asyncio.wait_for(future, timeout=self.settings.run_command_timeout)
             except asyncio.TimeoutError:
                 return "命令执行超时: 未收到游戏侧 commandResponse"
 

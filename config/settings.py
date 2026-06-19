@@ -625,6 +625,9 @@ class Settings(BaseSettings):
     enable_reasoning_output: bool = True
     max_history_turns: int = 20
     agent_retries: int = Field(default=2, ge=0)
+    worker_http_timeout: int = Field(default=60, ge=1)
+    worker_poll_timeout: float = Field(default=1.0, gt=0)
+    run_command_timeout: float = Field(default=10.0, gt=0)
 
     # 对话压缩配置
     compression_enabled: bool = True
