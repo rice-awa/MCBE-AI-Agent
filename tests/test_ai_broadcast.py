@@ -31,6 +31,7 @@ class DummyWebSocket:
 def _server(tmp_path, monkeypatch) -> tuple[WebSocketServer, MessageBroker, ConnectionState]:
     monkeypatch.chdir(tmp_path)
     settings = Settings(default_provider="ollama", dev_mode=True, tool_response_verbose=True)
+    monkeypatch.setattr("services.websocket.flow_control.get_settings", lambda: settings)
     broker = MessageBroker()
     state = ConnectionState(websocket=DummyWebSocket())
     state.authenticated = True

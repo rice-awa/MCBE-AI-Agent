@@ -543,6 +543,21 @@ class TestChunkDelayFor:
         assert FlowControlMiddleware.chunk_delay_for("") == 0.0
 
 
+def test_chunk_delay_read_from_settings():
+    """chunk_delay_for 应从 Settings.flow_control.chunk_delays 读取配置值。"""
+    from unittest.mock import patch
+
+    with patch("services.websocket.flow_control.get_settings") as mock_settings:
+        mock_settings.return_value.flow_control.chunk_delays.model_dump.return_value = {
+            "tellraw": 0.1,
+            "scriptevent": 0.2,
+            "ai_resp": 0.3,
+            "ai_resp_prelude": 0.4,
+        }
+        assert FlowControlMiddleware.chunk_delay_for("tellraw") == 0.1
+        assert FlowControlMiddleware.chunk_delay_for("unknown") == 0.0
+
+
 class TestByteSafetyAssertion:
     """字节兜底校验：分片后 commandLine 字节数必须 ≤ 461 B。"""
 

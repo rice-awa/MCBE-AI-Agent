@@ -5,17 +5,22 @@ import re
 import uuid
 from collections.abc import Callable
 
+from config.settings import get_settings
 from models.minecraft import MinecraftCommand
 
 # 句子分隔符：中英文句号、问号、感叹号、换行
 _SENTENCE_DELIMITER_RE = re.compile(r"([。！？.!?\n])")
 
-# MCBE commandLine 实测安全字节上限
-# 数据来源: 自动递增压力测试 (200B→512B, step 1B, interval 0ms, 222 包)
-#   最大成功 commandLine: 461 B
-#   首次失败 commandLine: 462 B
-# 取 461 为硬上限；超过此值 server 会拒绝 commandRequest
-_COMMAND_LINE_BYTE_BUDGET = 461
+
+def _get_command_line_byte_budget() -> int:
+    """从配置读取 MCBE commandLine 实测安全字节上限。
+
+    数据来源: 自动递增压力测试 (200B→512B, step 1B, interval 0ms, 222 包)
+      最大成功 commandLine: 461 B
+      首次失败 commandLine: 462 B
+    取 461 为硬上限；超过此值 server 会拒绝 commandRequest
+    """
+    return get_settings().flow_control.command_line_byte_budget
 
 
 class FlowControlMiddleware:
@@ -24,15 +29,10 @@ class FlowControlMiddleware:
     DEFAULT_MAX_CONTENT_LENGTH = 400
     DEFAULT_SENTENCE_MODE = True
 
-    # 分片间延迟策略：避免命令洪泛触发 MCBE 看门狗。
-    # 数值与历史 connection.py 的硬编码保持一致，集中在此便于统一调优。
-    _CHUNK_DELAYS: dict[str, float] = {
-        "tellraw": 0.05,
-        "scriptevent": 0.05,
-        "ai_resp": 0.15,
-        # AI 响应同步前置等待：tellraw 流式发送完毕再发 scriptevent
-        "ai_resp_prelude": 0.5,
-    }
+    @classmethod
+    def _chunk_delays(cls) -> dict[str, float]:
+        """从配置读取分片间延迟策略：避免命令洪泛触发 MCBE 看门狗。"""
+        return get_settings().flow_control.chunk_delays.model_dump()
 
     @classmethod
     def chunk_delay_for(cls, kind: str) -> float:
@@ -41,7 +41,7 @@ class FlowControlMiddleware:
         kind: "tellraw" | "scriptevent" | "ai_resp" | "ai_resp_prelude"
         未知 kind 返回 0.0（不延迟），调用方自行决定是否报错。
         """
-        return cls._CHUNK_DELAYS.get(kind, 0.0)
+        return cls._chunk_delays().get(kind, 0.0)
 
     @classmethod
     def configure(
@@ -139,11 +139,12 @@ class FlowControlMiddleware:
         """
         cmd = MinecraftCommand.create_raw(command)
         payload = cmd.model_dump_json(exclude_none=True)
+        budget = _get_command_line_byte_budget()
         command_line_bytes = len(cmd.body.commandLine.encode("utf-8"))
-        if command_line_bytes > _COMMAND_LINE_BYTE_BUDGET:
+        if command_line_bytes > budget:
             raise ValueError(
                 f"raw command too long in bytes "
-                f"({command_line_bytes} > {_COMMAND_LINE_BYTE_BUDGET}); "
+                f"({command_line_bytes} > {budget}); "
                 "cannot be safely chunked"
             )
         return [payload]
@@ -373,7 +374,7 @@ class FlowControlMiddleware:
 
     @staticmethod
     def _command_line_fits(command_line: str) -> bool:
-        return len(command_line.encode("utf-8")) <= _COMMAND_LINE_BYTE_BUDGET
+        return len(command_line.encode("utf-8")) <= _get_command_line_byte_budget()
 
     @classmethod
     def _split_text(
@@ -390,7 +391,7 @@ class FlowControlMiddleware:
         sentence_mode=False 时跳过语义合并，仍受双重约束。
         """
         if byte_budget is None:
-            byte_budget = _COMMAND_LINE_BYTE_BUDGET
+            byte_budget = _get_command_line_byte_budget()
 
         if not text:
             return [""]
@@ -494,9 +495,10 @@ class FlowControlMiddleware:
             return
 
         byte_len = len(command_line.encode("utf-8"))
-        if byte_len > _COMMAND_LINE_BYTE_BUDGET:
+        budget = _get_command_line_byte_budget()
+        if byte_len > budget:
             raise ValueError(
                 f"chunked commandLine exceeds byte budget "
-                f"({byte_len} > {_COMMAND_LINE_BYTE_BUDGET}); "
+                f"({byte_len} > {budget}); "
                 "this indicates a bug in _split_text or wrapper overhead estimate"
             )

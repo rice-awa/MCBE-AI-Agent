@@ -474,6 +474,8 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["max_chunk_content_length"] = flow_control["max_chunk_content_length"]
     if "chunk_sentence_mode" in flow_control:
         result["chunk_sentence_mode"] = flow_control["chunk_sentence_mode"]
+    if "flow_control" in data:
+        result["flow_control"] = data["flow_control"]
 
     return result
 
@@ -518,6 +520,22 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "mistral": 8192,
     "codellama": 16384,
 }
+
+
+class FlowControlDelayConfig(BaseModel):
+    """流控分片间延迟配置（秒）"""
+
+    tellraw: float = 0.05
+    scriptevent: float = 0.05
+    ai_resp: float = 0.15
+    ai_resp_prelude: float = 0.5
+
+
+class FlowControlConfig(BaseModel):
+    """流控中间件配置"""
+
+    command_line_byte_budget: int = 461
+    chunk_delays: FlowControlDelayConfig = Field(default_factory=FlowControlDelayConfig)
 
 
 class WebSocketConfig(BaseModel):
@@ -707,6 +725,9 @@ class Settings(BaseSettings):
         alias="CHUNK_SENTENCE_MODE",
         description="分片时是否优先按句子分割（True=语义分片，False=强制等长截断）",
     )
+
+    # 流控嵌套配置（字节预算与分片延迟）
+    flow_control: FlowControlConfig = Field(default_factory=FlowControlConfig)
 
     def get_provider_config(self, provider_name: str | None = None) -> LLMProviderConfig:
         """获取指定提供商的配置"""
