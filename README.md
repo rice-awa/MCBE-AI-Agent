@@ -19,6 +19,8 @@
 - **动态系统提示词**: 根据玩家信息动态调整
 - **模型预热**: 启动时自动预热 LLM 模型，提高首次响应速度
 - **命令响应回传**: Agent 执行命令后自动回传 commandResponse，工具调用更流畅
+- **MCP 扩展**: 支持通过 MCP (Model Context Protocol) 接入外部工具服务器，动态扩展 Agent 能力
+- **AI 聊天广播控制**: 支持将 AI 回复从私聊切换为全服广播，或指定特定玩家广播
 
 ### 🔌 多 LLM 支持
 - **DeepSeek**: deepseek-reasoner (支持思维链)
@@ -499,6 +501,9 @@ AGENT 对话 list            # 查看当前连接内的对话
 AGENT 上下文 启用          # 启用携带当前对话历史
 AGENT 上下文 关闭          # 关闭携带历史但不清除对话
 AGENT 上下文 状态          # 查看上下文开关与当前对话状态
+AGENT 广播 状态           # 查看 AI 聊天广播策略
+AGENT 广播 全服 开启      # 开启 AI 全服广播
+AGENT 广播 玩家 <名> 开启 # 指定玩家开启广播
 切换模型 openai          # 切换到 OpenAI
 切换模型 deepseek        # 切换回 DeepSeek
 帮助                     # 显示帮助信息
@@ -604,6 +609,8 @@ nohup python cli.py serve > mcbe.log 2>&1 &
 | `logging.level` | 日志级别 | `INFO` |
 | `logging.enable_ws_raw_log` | WebSocket 原始日志开关 | `true` |
 | `logging.enable_llm_raw_log` | LLM 原始日志开关 | `true` |
+| `mcp.enabled` | MCP 功能总开关 | `false` |
+| `mcp.servers` | MCP 服务器配置（支持官方 / 简写格式） | `{}` |
 | `dev_mode` | 开发模式（跳过身份验证） | `false` |
 
 `.env` 仅用于敏感变量，例如 `SECRET_KEY`、`WEBSOCKET_PASSWORD`、`DEEPSEEK_API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`。
@@ -940,6 +947,12 @@ pip install --prefer-binary -r requirements.txt
 
 ## 更新日志
 
+### v2.4.0 (2026-06-19)
+- ✨ **AI 聊天广播控制**: 新增 `AGENT 广播` 命令，支持全服广播或指定玩家广播 AI 回复
+- 🔧 **会话隔离增强**: 引入对话失效 epoch 机制，避免对话切换期间的竞态条件
+- ⚡ **流控与发送加固**: 统一流控中间件支持 sentence mode 语义分句，WebSocket 命令投递和响应发送更加健壮
+- 🛡️ **MCP 工具热重载**: 支持运行时通过命令重载 MCP 工具集，自动跳过不健康的服务器
+
 ### v2.3.1 (2026-05-02)
 - 修复多人共享同一 `/wsserver` 连接时的玩家识别、上下文历史和 UI 响应串扰问题
 - 将对话历史、会话锁、上下文开关、模型、模板和变量升级为 `(connection_id, player_name)` 维度隔离
@@ -1015,7 +1028,7 @@ pip install --prefer-binary -r requirements.txt
 
 ---
 
-**版本**: 2.3.1
-**最后更新**: 2026-05-02
+**版本**: 2.4.0
+**最后更新**: 2026-06-19
 **架构**: 现代化异步 + PydanticAI
 **平台支持**: Windows, Linux, macOS, Termux (Android)

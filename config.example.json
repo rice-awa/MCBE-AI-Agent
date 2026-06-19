@@ -114,6 +114,12 @@
         "description": "MCP 服务器管理",
         "usage": "<list/status/reload>"
       },
+      "AGENT 广播": {
+        "type": "ai_broadcast",
+        "aliases": ["AGENT broadcast", "AI 广播", "AI broadcast"],
+        "description": "AI 聊天广播策略管理",
+        "usage": "<状态|关闭|全服 开启|关闭|玩家 <玩家名> 开启|关闭>"
+      },
       "运行命令": {
         "type": "run_command",
         "aliases": ["runcmd", "cmd"],
