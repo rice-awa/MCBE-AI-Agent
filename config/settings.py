@@ -5,11 +5,14 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 from pydantic_settings.sources import JsonConfigSettingsSource
+
+if TYPE_CHECKING:
+    from services.agent.model_metadata import ModelMetadataCache
 
 
 class MinecraftCommandConfig(BaseModel):
@@ -185,6 +188,16 @@ class LLMProviderConfig(BaseModel):
     context_window: int | None = None
 
 
+class ModelMetadataConfig(BaseModel):
+    """模型元数据配置（来源 models.dev）"""
+
+    enabled: bool = True
+    source_url: str = "https://models.dev/api.json"
+    refresh_on_startup: bool = True
+    timeout: int = 10
+    cache_path: Path = Path("data/model_metadata_cache.json")
+
+
 # 常用模型的上下文窗口大小（单位：tokens）
 CONFIG_FILE = Path("config.json")
 DOTENV_FILE = Path(".env")
@@ -246,6 +259,11 @@ REQUIRED_CONFIG_PATHS = (
     "dev_mode",
     "flow_control.max_chunk_content_length",
     "flow_control.chunk_sentence_mode",
+    "model_metadata.enabled",
+    "model_metadata.source_url",
+    "model_metadata.refresh_on_startup",
+    "model_metadata.timeout",
+    "model_metadata.cache_path",
 )
 
 
@@ -435,6 +453,8 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["minecraft"] = data["minecraft"]
     if "mcp" in data:
         result["mcp"] = data["mcp"]
+    if "model_metadata" in data:
+        result["model_metadata"] = data["model_metadata"]
 
     if "level" in logging_config:
         result["log_level"] = logging_config["level"]
@@ -636,6 +656,12 @@ class Settings(BaseSettings):
     # MCP 配置
     mcp: MCPConfig = Field(default_factory=MCPConfig)
 
+    # 模型元数据配置
+    model_metadata: ModelMetadataConfig = Field(default_factory=ModelMetadataConfig)
+
+    # 运行时附加的 models.dev 元数据缓存（由 AgentRuntime 启动时注入）
+    _model_metadata_cache: "ModelMetadataCache | None" = PrivateAttr(default=None)
+
     # 日志配置
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     enable_file_logging: bool = True
@@ -683,9 +709,13 @@ class Settings(BaseSettings):
         """获取指定提供商的配置"""
         name = provider_name or self.default_provider
 
-        # 获取模型的上下文窗口大小
-        def get_context_window(model: str) -> int | None:
-            return MODEL_CONTEXT_WINDOWS.get(model)
+        # 获取模型的上下文窗口大小：静态表优先，回退到 models.dev 元数据缓存
+        def get_context_window(provider: str, model: str) -> int | None:
+            if model in MODEL_CONTEXT_WINDOWS:
+                return MODEL_CONTEXT_WINDOWS[model]
+            if self.model_metadata.enabled and self._model_metadata_cache is not None:
+                return self._model_metadata_cache.get_context_window(provider, model)
+            return None
 
         if name == "deepseek":
             return LLMProviderConfig(
@@ -694,7 +724,7 @@ class Settings(BaseSettings):
                 base_url=self.deepseek_base_url,
                 model=self.deepseek_model,
                 enabled=self.deepseek_api_key is not None,
-                context_window=get_context_window(self.deepseek_model),
+                context_window=get_context_window("deepseek", self.deepseek_model),
             )
         elif name == "openai":
             return LLMProviderConfig(
@@ -703,7 +733,7 @@ class Settings(BaseSettings):
                 base_url=self.openai_base_url,
                 model=self.openai_model,
                 enabled=self.openai_api_key is not None,
-                context_window=get_context_window(self.openai_model),
+                context_window=get_context_window("openai", self.openai_model),
             )
         elif name == "anthropic":
             return LLMProviderConfig(
@@ -711,7 +741,7 @@ class Settings(BaseSettings):
                 api_key=self.anthropic_api_key,
                 model=self.anthropic_model,
                 enabled=self.anthropic_api_key is not None,
-                context_window=get_context_window(self.anthropic_model),
+                context_window=get_context_window("anthropic", self.anthropic_model),
             )
         elif name == "ollama":
             return LLMProviderConfig(
@@ -719,10 +749,14 @@ class Settings(BaseSettings):
                 base_url=self.ollama_base_url,
                 model=self.ollama_model,
                 enabled=True,  # Ollama 不需要 API key
-                context_window=get_context_window(self.ollama_model),
+                context_window=get_context_window("ollama", self.ollama_model),
             )
         else:
             raise ValueError(f"未知的提供商: {name}")
+
+    def attach_model_metadata_cache(self, cache: "ModelMetadataCache | None") -> None:
+        """运行时注入 models.dev 元数据缓存，供 get_provider_config 回退查询。"""
+        self._model_metadata_cache = cache
 
     def list_available_providers(self) -> list[str]:
         """列出所有可用的提供商"""

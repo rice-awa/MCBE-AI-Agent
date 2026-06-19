@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from config.settings import CONFIG_FILE, Settings, get_settings
+from config.settings import CONFIG_FILE, ModelMetadataConfig, Settings, get_settings
+from services.agent.model_metadata import ModelMetadataCache
 from services.websocket.minecraft import MinecraftProtocolHandler
 
 
@@ -353,3 +354,101 @@ def test_minecraft_protocol_uses_injected_config():
         "help=求助; ctx=关"
     )
     assert handler.create_error_message("bad").text == "ERR:bad"
+
+
+def test_model_metadata_settings_loaded_from_json(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    write_json_config(
+        tmp_path,
+        {
+            "model_metadata": {
+                "enabled": False,
+                "source_url": "https://example.test/api.json",
+                "refresh_on_startup": False,
+                "timeout": 42,
+                "cache_path": "custom/cache.json",
+            }
+        },
+    )
+
+    settings = Settings()
+
+    assert settings.model_metadata.enabled is False
+    assert settings.model_metadata.source_url == "https://example.test/api.json"
+    assert settings.model_metadata.refresh_on_startup is False
+    assert settings.model_metadata.timeout == 42
+    assert str(settings.model_metadata.cache_path) == "custom/cache.json"
+
+
+# ---------------------------------------------------------------------------
+# Task 5 / 7: get_provider_config 上下文窗口优先级与 worker 间接验证
+# ---------------------------------------------------------------------------
+
+
+def test_provider_context_window_prefers_static_table(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(openai_model="gpt-4o")
+    cache = ModelMetadataCache.from_models_dev_api(
+        {"openai": {"models": {"gpt-4o": {"limit": {"context": 999}}}}}
+    )
+    settings.attach_model_metadata_cache(cache)
+
+    assert settings.get_provider_config("openai").context_window == 128000
+
+
+def test_provider_context_window_uses_models_dev_cache_when_static_missing(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(openai_model="future-model")
+    cache = ModelMetadataCache.from_models_dev_api(
+        {"openai": {"models": {"future-model": {"limit": {"context": 123456}}}}}
+    )
+    settings.attach_model_metadata_cache(cache)
+
+    assert settings.get_provider_config("openai").context_window == 123456
+
+
+def test_provider_context_window_none_when_both_missing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(openai_model="future-model")
+    settings.attach_model_metadata_cache(ModelMetadataCache.from_models_dev_api({}))
+
+    assert settings.get_provider_config("openai").context_window is None
+
+
+def test_provider_context_window_ignores_cache_when_metadata_disabled(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(
+        openai_model="future-model",
+        model_metadata=ModelMetadataConfig(enabled=False),
+    )
+    cache = ModelMetadataCache.from_models_dev_api(
+        {"openai": {"models": {"future-model": {"limit": {"context": 123456}}}}}
+    )
+    settings.attach_model_metadata_cache(cache)
+
+    assert settings.get_provider_config("openai").context_window is None
+
+
+def test_provider_context_window_cache_applies_to_all_providers(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(
+        deepseek_model="ds-future",
+        anthropic_model="claude-future",
+        ollama_model="ollama-future",
+    )
+    cache = ModelMetadataCache.from_models_dev_api(
+        {
+            "deepseek": {"models": {"ds-future": {"limit": {"context": 111}}}},
+            "anthropic": {"models": {"claude-future": {"limit": {"context": 222}}}},
+            "ollama": {"models": {"ollama-future": {"limit": {"context": 333}}}},
+        }
+    )
+    settings.attach_model_metadata_cache(cache)
+
+    assert settings.get_provider_config("deepseek").context_window == 111
+    assert settings.get_provider_config("anthropic").context_window == 222
+    assert settings.get_provider_config("ollama").context_window == 333

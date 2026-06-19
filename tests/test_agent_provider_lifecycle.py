@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -7,6 +8,7 @@ from core.queue import MessageBroker
 from models.agent import StreamEvent
 from models.messages import ChatRequest
 from services.agent.core import ChatAgentManager
+from services.agent.model_metadata import ModelMetadataCache
 from services.agent.providers import ProviderRegistry, RuntimeAdapterRegistry
 from services.agent.runtime import AgentRuntime, get_agent_runtime, set_agent_runtime
 
@@ -400,3 +402,169 @@ def test_agent_runtime_shutdown_closes_mcp_before_adapters():
     asyncio.run(runtime.shutdown())
 
     assert calls == ["mcp_shutdown", "adapters_shutdown"]
+
+
+# ---------------------------------------------------------------------------
+# Task 4: 运行时接入模型元数据服务
+# ---------------------------------------------------------------------------
+
+
+def _metadata_namespace(tmp_path: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        enabled=False,
+        refresh_on_startup=False,
+        cache_path=tmp_path / "cache.json",
+    )
+
+
+def test_agent_runtime_initializes_model_metadata_before_warmup(tmp_path):
+    calls = []
+
+    class FakeSettings:
+        def __init__(self):
+            self.model_metadata = _metadata_namespace(tmp_path)
+
+        def attach_model_metadata_cache(self, cache):
+            calls.append("metadata_attach")
+
+    settings = FakeSettings()
+
+    class FakeRuntimeAdapters:
+        async def warmup_models(self, received_settings):
+            calls.append("warmup")
+
+    class FakeMCPManager:
+        async def initialize(self):
+            calls.append("mcp_initialize")
+            return True
+
+        def get_toolsets_for_agent(self):
+            calls.append("mcp_toolsets")
+            return ["toolset"]
+
+    class FakeChatAgentManager:
+        async def initialize(self, received_settings, mcp_toolsets):
+            calls.append("agent_initialize")
+
+    runtime = AgentRuntime(
+        runtime_adapters=FakeRuntimeAdapters(),
+        mcp_manager=FakeMCPManager(),
+        chat_agent_manager=FakeChatAgentManager(),
+    )
+
+    assert asyncio.run(runtime.initialize(settings)) is True
+    assert calls == [
+        "metadata_attach",
+        "warmup",
+        "mcp_initialize",
+        "mcp_toolsets",
+        "agent_initialize",
+    ]
+    assert runtime.get_model_metadata_service() is not None
+
+
+def test_agent_runtime_metadata_init_failure_does_not_break_init(tmp_path, monkeypatch):
+    calls = []
+
+    class FakeSettings:
+        def __init__(self):
+            self.model_metadata = _metadata_namespace(tmp_path)
+
+        def attach_model_metadata_cache(self, cache):
+            calls.append("metadata_attach")
+
+    class FailingService:
+        def __init__(self, config):
+            calls.append("service_created")
+
+        async def initialize(self):
+            raise RuntimeError("metadata boom")
+
+        @property
+        def cache(self):
+            return ModelMetadataCache()
+
+    import services.agent.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "ModelMetadataService", FailingService)
+
+    settings = FakeSettings()
+
+    class FakeRuntimeAdapters:
+        async def warmup_models(self, received_settings):
+            calls.append("warmup")
+
+    class FakeMCPManager:
+        async def initialize(self):
+            calls.append("mcp_initialize")
+            return True
+
+        def get_toolsets_for_agent(self):
+            calls.append("mcp_toolsets")
+            return ["toolset"]
+
+    class FakeChatAgentManager:
+        async def initialize(self, received_settings, mcp_toolsets):
+            calls.append("agent_initialize")
+
+    runtime = AgentRuntime(
+        runtime_adapters=FakeRuntimeAdapters(),
+        mcp_manager=FakeMCPManager(),
+        chat_agent_manager=FakeChatAgentManager(),
+    )
+
+    assert asyncio.run(runtime.initialize(settings)) is True
+    assert "metadata_attach" not in calls
+    assert runtime.get_model_metadata_service() is None
+    assert calls == [
+        "service_created",
+        "warmup",
+        "mcp_initialize",
+        "mcp_toolsets",
+        "agent_initialize",
+    ]
+
+
+def test_runtime_attaches_metadata_cache_to_settings_before_worker(tmp_path):
+    calls = []
+
+    class FakeSettings:
+        def __init__(self):
+            self.model_metadata = _metadata_namespace(tmp_path)
+            self._model_metadata_cache = None
+
+        def attach_model_metadata_cache(self, cache):
+            self._model_metadata_cache = cache
+            calls.append("metadata_attach")
+
+    settings = FakeSettings()
+
+    class FakeRuntimeAdapters:
+        async def warmup_models(self, received_settings):
+            calls.append("warmup")
+            assert received_settings._model_metadata_cache is not None
+
+    class FakeMCPManager:
+        async def initialize(self):
+            calls.append("mcp_initialize")
+            return True
+
+        def get_toolsets_for_agent(self):
+            calls.append("mcp_toolsets")
+            return ["toolset"]
+
+    class FakeChatAgentManager:
+        async def initialize(self, received_settings, mcp_toolsets):
+            calls.append("agent_initialize")
+
+    runtime = AgentRuntime(
+        runtime_adapters=FakeRuntimeAdapters(),
+        mcp_manager=FakeMCPManager(),
+        chat_agent_manager=FakeChatAgentManager(),
+    )
+
+    asyncio.run(runtime.initialize(settings))
+
+    assert settings._model_metadata_cache is not None
+    assert calls[0] == "metadata_attach"
+    assert calls.index("metadata_attach") < calls.index("warmup")
