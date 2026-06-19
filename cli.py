@@ -196,7 +196,9 @@ def info():
     for provider in settings.list_available_providers():
         config = settings.get_provider_config(provider)
         status = "✓" if config.enabled else "✗"
-        click.echo(f"  {status} {provider}: {config.model}")
+        ctx = config.context_window
+        ctx_str = str(ctx) if ctx is not None else "unknown"
+        click.echo(f"  {status} {provider}: {config.model} (context: {ctx_str})")
 
 
 @cli.command()
