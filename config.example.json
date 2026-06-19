@@ -139,7 +139,7 @@
         "usage": null
       }
     },
-    "welcome_message_template": "-----------\n成功连接 MCBE AI Agent v2.2.0\n连接 ID: {connection_id}...\n当前模型: {provider}/{model}\n上下文: {context_status}\n-----------\n使用 \"{help_command}\" 查看可用命令",
+    "welcome_message_template": "-----------\n成功连接 MCBE AI Agent v{version}\n连接 ID: {connection_id}...\n当前模型: {provider}/{model}\n上下文: {context_status}\n-----------\n使用 \"{help_command}\" 查看可用命令",
     "context_enabled_text": "启用",
     "context_disabled_text": "关闭",
     "error_prefix": "❌ 错误: ",

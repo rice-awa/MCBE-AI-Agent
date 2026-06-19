@@ -7,6 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from _version import __version__
 from pydantic import BaseModel, Field, PrivateAttr
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 from pydantic_settings.sources import JsonConfigSettingsSource
@@ -120,9 +121,9 @@ class MinecraftConfig(BaseModel):
         "help": ("显示此帮助", None),
     }
 
-    # 欢迎消息模板
+    # 欢迎消息模板（{version} 在运行时由 __version__ 填充）
     welcome_message_template: str = """-----------
-成功连接 MCBE AI Agent v2.2.0
+成功连接 MCBE AI Agent v{version}
 连接 ID: {connection_id}...
 当前模型: {provider}/{model}
 上下文: {context_status}

@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
+from _version import __version__
 from config.logging import get_logger
 from config.settings import ModelMetadataConfig
 
@@ -147,7 +148,7 @@ class ModelMetadataService:
             response = await client.get(
                 self.config.source_url,
                 headers={
-                    "User-Agent": "mcbe-ai-agent/2.2.0 (+https://github.com/rice-awa/mcbe_ai_agent)"
+                    f"User-Agent": "mcbe-ai-agent/{__version__} (+https://github.com/rice-awa/mcbe_ai_agent)"
                 },
             )
             response.raise_for_status()

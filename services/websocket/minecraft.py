@@ -13,6 +13,7 @@ from models.minecraft import (
 from models.messages import ChatRequest
 from services.websocket.connection import ConnectionState
 from services.websocket.command import CommandRegistry, ParsedCommand
+from _version import __version__
 from config.logging import get_logger
 from config.settings import MinecraftConfig
 
@@ -58,6 +59,7 @@ class MinecraftProtocolHandler:
             self.config.context_enabled_text if context_enabled else self.config.context_disabled_text
         )
         return self.config.welcome_message_template.format(
+            version=__version__,
             connection_id=connection_id[:8],
             provider=provider,
             model=model,

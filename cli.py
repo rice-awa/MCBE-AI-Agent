@@ -9,6 +9,7 @@ from typing import Any
 
 import click
 
+from _version import __version__
 from config.settings import get_settings
 from config.logging import setup_logging, get_logger
 from core.queue import MessageBroker
@@ -39,7 +40,7 @@ class Application:
         """启动应用"""
         logger.info(
             "application_starting",
-            version="2.2.0",
+            version=__version__,
             host=self.settings.host,
             port=self.settings.port,
             default_provider=self.settings.default_provider,
@@ -137,7 +138,7 @@ async def run_application() -> None:
 
 
 @click.group()
-@click.version_option(version="2.2.0", prog_name="mcbe-AI-agent")
+@click.version_option(version=__version__, prog_name="mcbe-AI-agent")
 def cli():
     """MCBE AI Agent - Minecraft Bedrock Edition AI 聊天服务器"""
     pass
