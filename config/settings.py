@@ -455,6 +455,8 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["minecraft"] = data["minecraft"]
     if "mcp" in data:
         result["mcp"] = data["mcp"]
+    if "addon" in data:
+        result["addon"] = data["addon"]
     if "model_metadata" in data:
         result["model_metadata"] = data["model_metadata"]
 
@@ -567,6 +569,22 @@ class MCPConfig(BaseModel):
 
     enabled: bool = False
     servers: dict[str, MCPServerConfig] = {}  # 服务器名称 -> 配置
+
+
+class AddonProtocolConfig(BaseModel):
+    """Addon 桥接协议标识配置"""
+
+    bridge_message_id: str = "mcbeai:bridge_request"
+    bridge_prefix: str = "MCBEAI|RESP"
+    ui_chat_prefix: str = "MCBEAI|UI_CHAT"
+    bridge_tool_player_name: str = "MCBEAI_TOOL"
+    ai_resp_message_id: str = "mcbeai:ai_resp"
+
+
+class AddonConfig(BaseModel):
+    """Addon 桥接配置"""
+
+    protocol: AddonProtocolConfig = Field(default_factory=AddonProtocolConfig)
 
 
 class Settings(BaseSettings):
@@ -683,6 +701,9 @@ class Settings(BaseSettings):
 
     # MCP 配置
     mcp: MCPConfig = Field(default_factory=MCPConfig)
+
+    # Addon 桥接配置
+    addon: AddonConfig = Field(default_factory=AddonConfig)
 
     # 模型元数据配置
     model_metadata: ModelMetadataConfig = Field(default_factory=ModelMetadataConfig)

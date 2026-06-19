@@ -157,6 +157,15 @@
     "enabled": false,
     "servers": {}
   },
+  "addon": {
+    "protocol": {
+      "bridge_message_id": "mcbeai:bridge_request",
+      "bridge_prefix": "MCBEAI|RESP",
+      "ui_chat_prefix": "MCBEAI|UI_CHAT",
+      "bridge_tool_player_name": "MCBEAI_TOOL",
+      "ai_resp_message_id": "mcbeai:ai_resp"
+    }
+  },
   "logging": {
     "level": "INFO",
     "enable_file_logging": true,
