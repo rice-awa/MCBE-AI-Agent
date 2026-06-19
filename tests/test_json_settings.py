@@ -355,11 +355,25 @@ def test_minecraft_protocol_uses_injected_config():
     assert handler.create_error_message("bad").text == "ERR:bad"
 
 
-def test_model_metadata_settings_loaded_from_json():
+def test_model_metadata_settings_loaded_from_json(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    write_json_config(
+        tmp_path,
+        {
+            "model_metadata": {
+                "enabled": False,
+                "source_url": "https://example.test/api.json",
+                "refresh_on_startup": False,
+                "timeout": 42,
+                "cache_path": "custom/cache.json",
+            }
+        },
+    )
+
     settings = Settings()
 
-    assert settings.model_metadata.enabled is True
-    assert settings.model_metadata.source_url == "https://models.dev/api.json"
-    assert settings.model_metadata.refresh_on_startup is True
-    assert settings.model_metadata.timeout == 10
-    assert str(settings.model_metadata.cache_path) == "data/model_metadata_cache.json"
+    assert settings.model_metadata.enabled is False
+    assert settings.model_metadata.source_url == "https://example.test/api.json"
+    assert settings.model_metadata.refresh_on_startup is False
+    assert settings.model_metadata.timeout == 42
+    assert str(settings.model_metadata.cache_path) == "custom/cache.json"
