@@ -45,6 +45,10 @@ def _server(tmp_path, monkeypatch) -> tuple[WebSocketServer, MessageBroker, Conn
     return WebSocketServer(broker, settings, JWTHandler(settings)), broker, state
 
 
+def _sent_command_lines(state: ConnectionState) -> list[str]:
+    return [json.loads(payload)["body"]["commandLine"] for payload in state.websocket.sent]
+
+
 def test_conversation_status_does_not_block_command_response(tmp_path, monkeypatch):
     async def _run() -> None:
         server, broker, state = _server(tmp_path, monkeypatch)
@@ -197,6 +201,92 @@ def test_send_ws_payload_preserves_broadcast_tellraw_target(tmp_path, monkeypatc
     asyncio.run(_run())
 
 
+def test_player_command_replies_are_sent_to_sender(tmp_path, monkeypatch):
+    async def _run() -> None:
+        server, _broker, state = _server(tmp_path, monkeypatch)
+
+        commands = [
+            ("login", "wrong"),
+            ("chat", ""),
+            ("context", "状态"),
+            ("conversation", "status"),
+            ("template", ""),
+            ("setting", ""),
+            ("mcp", ""),
+            ("switch_model", "missing-provider"),
+            ("help", ""),
+            ("run_command", ""),
+        ]
+        for cmd_type, content in commands:
+            before = len(state.websocket.sent)
+            await server.handle_command(state, cmd_type, content, player_name="Alice")
+            command_lines = _sent_command_lines(state)[before:]
+            assert command_lines, cmd_type
+            assert all(line.startswith("tellraw Alice ") for line in command_lines), cmd_type
+            assert not any(line.startswith("tellraw @a ") for line in command_lines), cmd_type
+            assert not any(line.startswith("tellraw Bob ") for line in command_lines), cmd_type
+
+    asyncio.run(_run())
+
+
+def test_chat_queue_full_error_is_sent_to_sender(tmp_path, monkeypatch):
+    async def _run() -> None:
+        server, broker, state = _server(tmp_path, monkeypatch)
+
+        async def _raise_queue_full(*_args, **_kwargs) -> None:
+            raise asyncio.QueueFull
+
+        monkeypatch.setattr(broker, "submit_request", _raise_queue_full)
+
+        await server.handle_command(state, "chat", "hello", player_name="Alice")
+
+        command_line = _sent_command_lines(state)[-1]
+        assert command_line.startswith("tellraw Alice ")
+        assert "服务器繁忙" in command_line
+        assert not command_line.startswith("tellraw @a ")
+        assert not command_line.startswith("tellraw Bob ")
+
+    asyncio.run(_run())
+
+
+def test_auth_error_is_sent_to_triggering_player(tmp_path, monkeypatch):
+    async def _run() -> None:
+        monkeypatch.chdir(tmp_path)
+        settings = Settings(default_provider="ollama", dev_mode=False)
+        broker = MessageBroker()
+        state = ConnectionState()
+        state.websocket = DummyWebSocket()
+        broker.register_connection(state.id)
+        server = WebSocketServer(broker, settings, JWTHandler(settings))
+
+        await server.handle_command(state, "chat", "hello", player_name="Alice")
+
+        command_line = _sent_command_lines(state)[-1]
+        assert command_line.startswith("tellraw Alice ")
+        assert "请先登录" in command_line
+        assert not command_line.startswith("tellraw @a ")
+        assert not command_line.startswith("tellraw Bob ")
+
+    asyncio.run(_run())
+
+
+def test_player_state_replies_do_not_leak_between_players(tmp_path, monkeypatch):
+    async def _run() -> None:
+        server, _broker, state = _server(tmp_path, monkeypatch)
+
+        await server.handle_command(state, "context", "关闭", player_name="Bob")
+        await server.handle_command(state, "context", "状态", player_name="Alice")
+
+        command_line = _sent_command_lines(state)[-1]
+        assert command_line.startswith("tellraw Alice ")
+        assert "上下文状态: 启用" in command_line
+        assert "上下文状态: 关闭" not in command_line
+        assert not command_line.startswith("tellraw @a ")
+        assert not command_line.startswith("tellraw Bob ")
+
+    asyncio.run(_run())
+
+
 def test_handle_run_command_reports_too_long_raw_command(tmp_path, monkeypatch):
     async def _run() -> None:
         server, _broker, state = _server(tmp_path, monkeypatch)
@@ -209,6 +299,19 @@ def test_handle_run_command_reports_too_long_raw_command(tmp_path, monkeypatch):
 
     asyncio.run(_run())
 
+
+def test_handle_run_command_reports_multibyte_raw_command_byte_limit(tmp_path, monkeypatch):
+    async def _run() -> None:
+        server, _broker, state = _server(tmp_path, monkeypatch)
+
+        await server.handle_run_command(state, "say " + "中" * 200)
+
+        assert state.websocket.sent
+        command_line = json.loads(state.websocket.sent[-1])["body"]["commandLine"]
+        assert "raw command too long in bytes" in command_line
+        assert "604 > 461" in command_line
+
+    asyncio.run(_run())
 
 def test_run_command_length_error_is_sent_to_sender(tmp_path, monkeypatch):
     async def _run() -> None:

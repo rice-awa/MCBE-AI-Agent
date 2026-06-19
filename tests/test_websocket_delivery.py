@@ -113,6 +113,41 @@ async def test_delivery_syncs_ai_response_with_chunk_metadata(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_delivery_rejects_invalid_scriptevent_message_id() -> None:
+    sender = DummySender()
+    delivery = McbeOutboundDelivery(connection_id="conn", send_payload=sender.send)
+
+    with pytest.raises(ValueError, match="invalid scriptevent message_id"):
+        await delivery.send_scriptevent("hello", "mcbeai:test; say hacked")
+
+    assert sender.payloads == []
+
+
+@pytest.mark.asyncio
+async def test_delivery_syncs_ai_response_with_escaped_metadata_budget(monkeypatch) -> None:
+    monkeypatch.setattr("services.websocket.delivery.asyncio.sleep", _no_sleep)
+    sender = DummySender()
+    delivery = McbeOutboundDelivery(connection_id="conn", send_payload=sender.send)
+    player = 'Alice "Builder" \\ 中文🌍' * 4
+    text = '引号" 反斜杠\\ 换行\n emoji🌍 中文' * 40
+
+    count = await delivery.send_ai_response(
+        AiResponseSync(player_name=player, role="assistant", text=text)
+    )
+
+    chunks: list[str] = []
+    for index, payload in enumerate(sender.payloads, start=1):
+        command_line = json.loads(payload)["body"]["commandLine"]
+        assert len(command_line.encode("utf-8")) <= 461
+        inner = json.loads(command_line[command_line.find("{"):])
+        assert inner["p"] == player
+        assert inner["i"] == index
+        assert inner["n"] == count
+        chunks.append(inner["c"])
+    assert "".join(chunks) == text
+
+
+@pytest.mark.asyncio
 async def test_delivery_rejects_too_long_raw_command() -> None:
     sender = DummySender()
     delivery = McbeOutboundDelivery(connection_id="conn", send_payload=sender.send)
@@ -128,7 +163,7 @@ async def test_delivery_rejects_raw_command_over_byte_budget() -> None:
     sender = DummySender()
     delivery = McbeOutboundDelivery(connection_id="conn", send_payload=sender.send)
 
-    with pytest.raises(ValueError, match="byte budget"):
+    with pytest.raises(ValueError, match="raw command too long in bytes"):
         await delivery.send_raw_command("say " + "中" * 200)
 
     assert sender.payloads == []

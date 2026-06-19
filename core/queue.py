@@ -359,8 +359,34 @@ class MessageBroker:
         player_name: str | None,
         conversation_id: str | None = None,
     ) -> int:
-        """获取对话桶版本，用于避免过期请求覆盖后续管理命令。"""
+        """获取对话历史 revision；普通历史写入会递增，兼容既有 API。"""
         return self.sessions.get_conversation_generation(
+            connection_id,
+            player_name,
+            conversation_id,
+        )
+
+    def get_conversation_invalidation_epoch(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        conversation_id: str | None = None,
+    ) -> int:
+        """获取对话失效 epoch；仅管理操作递增，用于 stale guard。"""
+        return self.sessions.get_conversation_invalidation_epoch(
+            connection_id,
+            player_name,
+            conversation_id,
+        )
+
+    def bump_conversation_invalidation_epoch(
+        self,
+        connection_id: UUID,
+        player_name: str | None,
+        conversation_id: str | None = None,
+    ) -> int:
+        """递增指定对话的失效 epoch。"""
+        return self.sessions.bump_conversation_invalidation_epoch(
             connection_id,
             player_name,
             conversation_id,
@@ -404,6 +430,7 @@ class MessageBroker:
         history: list[ModelMessage] | None = None,
         conversation_id: str | None = None,
         expected_generation: int | None = None,
+        expected_invalidation_epoch: int | None = None,
     ) -> bool:
         """更新 (连接, 玩家, 对话) 维度的对话历史。"""
         if history is None and isinstance(player_name, list):
@@ -415,6 +442,7 @@ class MessageBroker:
             list(history or []),
             conversation_id,
             expected_generation,
+            expected_invalidation_epoch,
         )
 
     def clear_conversation_history(

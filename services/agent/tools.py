@@ -8,8 +8,8 @@ from typing import Any, Protocol, cast
 from pydantic_ai import Agent, RunContext
 
 from config.logging import get_logger
-from models.agent import AgentDependencies
-from models.minecraft import MinecraftCommand
+from models.agent import AgentDependencies, MCColor
+from models.minecraft import MinecraftCommand, sanitize_tellraw_target
 from services.agent.harness.audit import wrap_registered_tools
 from services.agent.harness.prompting import render_schema_description_prefix
 from services.agent.tool_results import ToolResult
@@ -163,6 +163,7 @@ def register_agent_tools(
     async def send_game_message(
         ctx: RunContext[AgentDependencies],
         message: str,
+        broadcast: bool = False,
     ) -> str:
         """
         向游戏发送消息
@@ -170,6 +171,7 @@ def register_agent_tools(
         Args:
             ctx: 运行上下文
             message: 要发送的消息
+            broadcast: 是否广播给全服；默认只发送给触发玩家
 
         Returns:
             发送结果
@@ -181,7 +183,9 @@ def register_agent_tools(
         )
 
         try:
-            await ctx.deps.send_to_game(message)
+            target = "@a" if broadcast else ctx.deps.player_name
+            command = build_tellraw_command(message, MCColor.GREEN, target)
+            await ctx.deps.run_command(command)
             return _tool_success("消息已发送到游戏")
         except Exception as e:
             logger.error(
@@ -196,6 +200,7 @@ def register_agent_tools(
         ctx: RunContext[AgentDependencies],
         message: str,
         color: str = "§a",
+        broadcast: bool = False,
     ) -> str:
         """
         发送带颜色的聊天消息
@@ -204,6 +209,7 @@ def register_agent_tools(
             ctx: 运行上下文
             message: 消息内容
             color: Minecraft 颜色代码，例如 "§a"
+            broadcast: 是否广播给全服；默认只发送给触发玩家
 
         Returns:
             发送结果
@@ -216,7 +222,8 @@ def register_agent_tools(
         )
 
         try:
-            command = build_tellraw_command(message, color)
+            target = "@a" if broadcast else ctx.deps.player_name
+            command = build_tellraw_command(message, color, target)
             await ctx.deps.run_command(command)
             return _tool_success("彩色消息已发送")
         except Exception as e:
@@ -235,6 +242,7 @@ def register_agent_tools(
         fade_in: int = 10,
         stay: int = 70,
         fade_out: int = 20,
+        broadcast: bool = False,
     ) -> str:
         """
         发送标题消息
@@ -246,6 +254,7 @@ def register_agent_tools(
             fade_in: 淡入时间（ticks）
             stay: 停留时间（ticks）
             fade_out: 淡出时间（ticks）
+            broadcast: 是否广播给全服；默认只发送给触发玩家
 
         Returns:
             发送结果
@@ -257,7 +266,8 @@ def register_agent_tools(
         )
 
         try:
-            commands = build_title_commands(title, subtitle, fade_in, stay, fade_out)
+            target = "@a" if broadcast else ctx.deps.player_name
+            commands = build_title_commands(title, subtitle, fade_in, stay, fade_out, target)
             for command in commands:
                 await ctx.deps.run_command(command)
             return _tool_success("标题消息已发送")
@@ -273,6 +283,7 @@ def register_agent_tools(
     async def send_actionbar_message(
         ctx: RunContext[AgentDependencies],
         message: str,
+        broadcast: bool = False,
     ) -> str:
         """
         发送 Actionbar 消息
@@ -280,6 +291,7 @@ def register_agent_tools(
         Args:
             ctx: 运行上下文
             message: Actionbar 内容
+            broadcast: 是否广播给全服；默认只发送给触发玩家
 
         Returns:
             发送结果
@@ -291,7 +303,8 @@ def register_agent_tools(
         )
 
         try:
-            command = build_actionbar_command(message)
+            target = "@a" if broadcast else ctx.deps.player_name
+            command = build_actionbar_command(message, target)
             await ctx.deps.run_command(command)
             return _tool_success("Actionbar 消息已发送")
         except Exception as e:
@@ -655,17 +668,20 @@ def build_title_commands(
     fade_in: int,
     stay: int,
     fade_out: int,
+    target: str,
 ) -> list[str]:
-    commands = [f'title @a title "{escape_command_text(title)}"']
+    safe_target = sanitize_tellraw_target(target)
+    commands = [f'title {safe_target} title "{escape_command_text(title)}"']
     if subtitle:
-        commands.append(f'title @a subtitle "{escape_command_text(subtitle)}"')
-    commands.append(f"title @a times {fade_in} {stay} {fade_out}")
+        commands.append(f'title {safe_target} subtitle "{escape_command_text(subtitle)}"')
+    commands.append(f"title {safe_target} times {fade_in} {stay} {fade_out}")
     return commands
 
 
-def build_actionbar_command(message: str) -> str:
-    return f'title @a actionbar "{escape_command_text(message)}"'
+def build_actionbar_command(message: str, target: str) -> str:
+    safe_target = sanitize_tellraw_target(target)
+    return f'title {safe_target} actionbar "{escape_command_text(message)}"'
 
 
-def build_tellraw_command(message: str, color: str) -> str:
-    return MinecraftCommand.create_tellraw(message, color=color).body.commandLine
+def build_tellraw_command(message: str, color: str, target: str) -> str:
+    return MinecraftCommand.create_tellraw(message, color=color, target=target).body.commandLine

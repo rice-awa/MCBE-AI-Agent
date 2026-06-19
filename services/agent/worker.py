@@ -152,11 +152,8 @@ class AgentWorker:
     ) -> None:
         """处理单个请求（已持有会话锁）"""
         if conversation_generation is None:
-            conversation_generation = self.broker.get_conversation_generation(
-                connection_id,
-                request.player_name,
-                request.conversation_id,
-            )
+            conversation_generation = request.conversation_generation
+        conversation_invalidation_epoch = request.conversation_invalidation_epoch
 
         logger.info(
             "processing_chat_request",
@@ -219,6 +216,18 @@ class AgentWorker:
             get_context_info=get_context_info,
         )
 
+        stream_target = "@a" if request.broadcast_ai_chat else request.player_name
+        if request.broadcast_ai_chat:
+            await self.broker.send_response(
+                connection_id,
+                SystemNotification(
+                    connection_id=connection_id,
+                    level="info",
+                    message=f"AI正在为{request.player_name or 'Player'}思考",
+                    player_name="@a",
+                ),
+            )
+
         # 获取模型
         try:
             provider_name = request.provider or self.settings.default_provider
@@ -238,7 +247,7 @@ class AgentWorker:
                 error=str(e),
             )
             # 发送错误消息
-            await self._send_error_chunk(connection_id, request.player_name, str(e), 0)
+            await self._send_error_chunk(connection_id, request.player_name, str(e), 0, target=stream_target)
             return
 
         # 流式处理
@@ -286,6 +295,7 @@ class AgentWorker:
                         sequence=sequence,
                         delivery=request.delivery,
                         player_name=request.player_name,
+                        target=stream_target,
                         tool_name=tool_name,
                         tool_args=tool_args,
                     )
@@ -310,6 +320,7 @@ class AgentWorker:
                             sequence=sequence,
                             delivery=request.delivery,
                             player_name=request.player_name,
+                            target=stream_target,
                             tool_name=tool_name,
                             tool_result_preview=truncate_text(result_content, 80),
                         )
@@ -332,7 +343,7 @@ class AgentWorker:
                                 request.player_name,
                                 trimmed_history,
                                 request.conversation_id,
-                                expected_generation=conversation_generation,
+                                expected_invalidation_epoch=conversation_invalidation_epoch,
                             )
                             if history_updated:
                                 logger.debug(
@@ -443,6 +454,7 @@ class AgentWorker:
                         sequence=sequence,
                         delivery=request.delivery,
                         player_name=request.player_name,
+                        target=stream_target,
                     )
                     await self.broker.send_response(connection_id, chunk)
                     sequence += 1
@@ -457,6 +469,7 @@ class AgentWorker:
                             sequence=sequence,
                             delivery=request.delivery,
                             player_name=request.player_name,
+                            target=stream_target,
                         )
                         await self.broker.send_response(connection_id, chunk)
                         sequence += 1
@@ -492,6 +505,7 @@ class AgentWorker:
                 request.player_name,
                 error_detail,
                 sequence,
+                target=stream_target,
             )
 
     async def _generate_title_for_conversation(
@@ -809,6 +823,7 @@ class AgentWorker:
         player_name: str | None,
         error: str,
         sequence: int,
+        target: str | None = None,
     ) -> None:
         """发送错误消息块"""
         chunk = StreamChunk(
@@ -817,5 +832,6 @@ class AgentWorker:
             content=f"错误: {error}",
             sequence=sequence,
             player_name=player_name,
+            target=target,
         )
         await self.broker.send_response(connection_id, chunk)

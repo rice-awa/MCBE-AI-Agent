@@ -47,6 +47,57 @@ def test_unregister_should_resolve_pending_and_queued_command_futures() -> None:
     asyncio.run(_run())
 
 
+def test_unregister_should_clear_prompt_manager_state_for_all_players() -> None:
+    async def _run() -> None:
+        from services.agent.prompt import get_prompt_manager
+
+        broker = MessageBroker()
+        manager = ConnectionManager(broker)
+        prompt_manager = get_prompt_manager()
+
+        state = ConnectionState()
+        other_state = ConnectionState()
+        state.response_queue = broker.register_connection(state.id)
+        other_state.response_queue = broker.register_connection(other_state.id)
+
+        connection_id = str(state.id)
+        other_connection_id = str(other_state.id)
+
+        try:
+            prompt_manager.set_session_template(connection_id, "Alice", "concise")
+            prompt_manager.set_session_variable(connection_id, "Alice", "greeting", "hello Alice")
+            prompt_manager.set_session_template(connection_id, "Bob", "detailed")
+            prompt_manager.set_session_variable(connection_id, "Bob", "greeting", "hello Bob")
+            prompt_manager.set_session_template(other_connection_id, "Carol", "detailed")
+            prompt_manager.set_session_variable(
+                other_connection_id, "Carol", "greeting", "hello Carol"
+            )
+
+            manager._connections[state.id] = state
+            manager._connections[other_state.id] = other_state
+            manager._sender_tasks[state.id] = asyncio.create_task(asyncio.sleep(60))
+
+            await manager.unregister(state.id)
+
+            assert prompt_manager.get_session_template(connection_id, "Alice") == "default"
+            assert prompt_manager.get_session_variables(connection_id, "Alice") == {}
+            assert prompt_manager.get_session_template(connection_id, "Bob") == "default"
+            assert prompt_manager.get_session_variables(connection_id, "Bob") == {}
+            assert prompt_manager.get_session_template(other_connection_id, "Carol") == "detailed"
+            assert prompt_manager.get_session_variables(other_connection_id, "Carol") == {
+                "custom_greeting": "hello Carol"
+            }
+            assert broker.get_response_queue(state.id) is None
+            assert broker.get_response_queue(other_state.id) is not None
+        finally:
+            prompt_manager.clear_connection(connection_id)
+            prompt_manager.clear_connection(other_connection_id)
+            if manager.get_connection(other_state.id) is not None:
+                await manager.unregister(other_state.id)
+
+    asyncio.run(_run())
+
+
 class _DummyWebSocket:
     def __init__(self) -> None:
         self.closed = False

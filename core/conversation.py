@@ -719,6 +719,10 @@ class ConversationManager:
 
         messages = result if isinstance(result, list) else []
 
+        bump_epoch = getattr(self.broker, "bump_conversation_invalidation_epoch", None)
+        if bump_epoch is not None:
+            bump_epoch(connection_id, player_name, conversation_id)
+
         # 设置到 broker（按 player_name 分桶）
         self.broker.set_conversation_history(connection_id, player_name, messages, conversation_id)
 
@@ -778,7 +782,7 @@ class ConversationManager:
 
     async def delete_conversation(self, session_id: str) -> tuple[bool, str]:
         """
-        删除指定的对话
+        删除指定的已保存对话文件；不影响当前连接内的运行时对话。
 
         Args:
             session_id: 会话 ID

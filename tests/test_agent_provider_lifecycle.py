@@ -170,6 +170,32 @@ def test_chat_agent_manager_uses_fallback_after_mcp_failure(monkeypatch):
     assert active["toolsets"] is None
 
 
+def test_chat_agent_manager_refresh_mcp_toolsets_restores_primary_after_failure(monkeypatch):
+    manager = ChatAgentManager()
+    created = []
+
+    def fake_create_agent(toolsets=None):
+        agent = {"toolsets": toolsets}
+        created.append(agent)
+        return agent
+
+    monkeypatch.setattr(manager, "_create_agent", fake_create_agent)
+
+    asyncio.run(manager.initialize(Settings(default_provider="ollama", dev_mode=True), mcp_toolsets=["old-toolset"]))
+    manager.mark_mcp_failed()
+    fallback = manager.get_active_agent(connection_id="conn", mode="stream")
+
+    manager.refresh_mcp_toolsets(["new-toolset"])
+    active = manager.get_active_agent(connection_id="conn", mode="stream")
+
+    assert fallback["toolsets"] is None
+    assert manager.is_mcp_available is True
+    assert manager.mcp_toolsets == ["new-toolset"]
+    assert active is manager.get_agent()
+    assert active is not fallback
+    assert active["toolsets"] == ["new-toolset"]
+
+
 def test_runtime_adapter_registry_shutdown_closes_clients_and_clears_caches(monkeypatch):
     registry = RuntimeAdapterRegistry()
     closed = []
@@ -284,6 +310,29 @@ def test_agent_runtime_initializes_adapters_mcp_and_agent_manager():
         ("mcp_toolsets",),
         ("agent_initialize", settings, ["toolset"]),
     ]
+
+
+def test_agent_runtime_refresh_mcp_tools_passes_latest_toolsets():
+    calls = []
+    settings = SimpleNamespace()
+
+    class FakeMCPManager:
+        def get_toolsets_for_agent(self):
+            calls.append("mcp_toolsets")
+            return ["latest-toolset"]
+
+    class FakeChatAgentManager:
+        def refresh_mcp_toolsets(self, mcp_toolsets):
+            calls.append(("agent_refresh", mcp_toolsets))
+
+    runtime = AgentRuntime(
+        mcp_manager=FakeMCPManager(),
+        chat_agent_manager=FakeChatAgentManager(),
+    )
+
+    runtime.refresh_mcp_tools(settings)
+
+    assert calls == ["mcp_toolsets", ("agent_refresh", ["latest-toolset"])]
 
 
 

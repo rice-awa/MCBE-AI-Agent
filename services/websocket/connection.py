@@ -10,6 +10,7 @@ from websockets.server import WebSocketServerProtocol
 from core.queue import MessageBroker
 from models.messages import StreamChunk, SystemNotification
 from models.agent import MCColor, MCPrefix
+from services.agent.prompt import get_prompt_manager
 from services.websocket.delivery import AiResponseSync, McbeOutboundDelivery
 from config.logging import get_logger
 
@@ -45,6 +46,8 @@ class ConnectionState:
     connected_at: datetime = field(default_factory=datetime.now)
     response_queue: asyncio.Queue | None = None
     pending_command_futures: dict[str, asyncio.Future[str]] = field(default_factory=dict)
+    ai_broadcast_all: bool = False
+    ai_broadcast_players: set[str] = field(default_factory=set)
     # 按玩家隔离的会话状态
     _player_sessions: dict[str, PlayerSession] = field(default_factory=dict)
 
@@ -56,6 +59,11 @@ class ConnectionState:
             session = PlayerSession(player_name=key)
             self._player_sessions[key] = session
         return session
+
+    def should_broadcast_ai_chat(self, player_name: str | None) -> bool:
+        if self.ai_broadcast_all:
+            return True
+        return bool(player_name and player_name in self.ai_broadcast_players)
 
     def all_player_sessions(self) -> list[PlayerSession]:
         """快照式列出连接下所有玩家会话。"""
@@ -128,6 +136,9 @@ class ConnectionManager:
 
             self._fail_pending_command_futures(state)
             self._fail_queued_command_futures(state)
+
+            # 清理提示词管理器中该连接下所有玩家的模板和变量状态
+            get_prompt_manager().clear_connection(str(connection_id))
 
             # 从消息代理注销
             self.broker.unregister_connection(connection_id)
@@ -346,7 +357,7 @@ class ConnectionManager:
                 state,
                 message,
                 color,
-                player_name=chunk.player_name,
+                player_name=chunk.target or chunk.player_name,
             )
 
     async def _send_system_notification(

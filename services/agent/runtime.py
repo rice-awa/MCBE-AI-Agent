@@ -49,6 +49,12 @@ class AgentRuntime:
     async def warmup_models(self, settings: Settings) -> None:
         await self.runtime_adapters.warmup_models(settings)
 
+    def refresh_mcp_tools(self, settings: Settings) -> None:
+        """Refresh ChatAgentManager with the latest MCP toolsets after MCP reload."""
+        mcp_manager = self.get_mcp_manager(settings)
+        agent_manager = self.get_agent_manager()
+        agent_manager.refresh_mcp_toolsets(mcp_manager.get_toolsets_for_agent())
+
     async def shutdown(self) -> None:
         if self.mcp_manager is not None:
             await self.mcp_manager.shutdown()

@@ -181,6 +181,18 @@ class ChatAgentManager:
         self._initialized = False
         self._mcp_available = True
 
+    def refresh_mcp_toolsets(self, toolsets: list[Any]) -> None:
+        """用最新 MCP 工具集恢复 primary Agent。"""
+        self._mcp_toolsets = toolsets
+        self._mcp_available = True
+        self._fallback_agent = None
+        self._agent = self._create_agent(toolsets=self._mcp_toolsets if self._mcp_toolsets else None)
+        self._initialized = True
+        logger.info(
+            "chat_agent_mcp_toolsets_refreshed",
+            mcp_toolsets_count=len(self._mcp_toolsets),
+        )
+
     def mark_mcp_failed(self) -> None:
         """
         标记 MCP 为不可用状态

@@ -1,20 +1,38 @@
 """Minecraft 协议消息模型"""
 
+import json
+import re
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
 
-_TELLRAW_TARGET_SAFE_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.@[]=,!")
+_TELLRAW_TARGET_UNQUOTED_RE = re.compile(
+    r"^(?:@[a-z](?:\[[A-Za-z0-9_.,=!:-]*\])?|[A-Za-z0-9_.-]+)$"
+)
+_SCRIPT_EVENT_MESSAGE_ID_RE = re.compile(r"^[a-z0-9_.-]+:[a-z0-9_./-]+$")
 
 
 def sanitize_tellraw_target(target: str) -> str:
+    """Return a command-safe tellraw target without allowing command injection."""
     target = target.strip() or "@a"
-    if all(char in _TELLRAW_TARGET_SAFE_CHARS for char in target):
+    if any(ord(char) < 0x20 or char == "\x7f" for char in target):
+        raise ValueError("tellraw target contains control characters")
+    if _TELLRAW_TARGET_UNQUOTED_RE.fullmatch(target):
         return target
-    escaped = target.replace('\\', '\\\\').replace('"', '\\"')
+    escaped = target.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def validate_scriptevent_message_id(message_id: str) -> str:
+    """Validate a scriptevent message id before embedding it in commandLine."""
+    if not _SCRIPT_EVENT_MESSAGE_ID_RE.fullmatch(message_id):
+        raise ValueError(
+            "invalid scriptevent message_id; expected namespace:path matching "
+            "^[a-z0-9_.-]+:[a-z0-9_./-]+$"
+        )
+    return message_id
 
 
 def _sanitize_tellraw_target(target: str) -> str:
@@ -81,9 +99,13 @@ class MinecraftCommand(BaseModel):
         target: str = "@a",
     ) -> "MinecraftCommand":
         """创建 tellraw 命令"""
-        safe_message = sanitize_tellraw_text(message)
+        rawtext = json.dumps(
+            {"rawtext": [{"text": f"{color}{message}"}]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         safe_target = sanitize_tellraw_target(target)
-        command_line = f'tellraw {safe_target} {{"rawtext":[{{"text":"{color}{safe_message}"}}]}}'
+        command_line = f"tellraw {safe_target} {rawtext}"
         return cls(
             body=MinecraftCommandBody(
                 origin=MinecraftOrigin(type="say"),
@@ -94,9 +116,10 @@ class MinecraftCommand(BaseModel):
     @classmethod
     def create_scriptevent(cls, content: str, message_id: str = "server:data") -> "MinecraftCommand":
         """创建 scriptevent 命令"""
+        safe_message_id = validate_scriptevent_message_id(message_id)
         return cls(
             body=MinecraftCommandBody(
-                commandLine=f"scriptevent {message_id} {content}",
+                commandLine=f"scriptevent {safe_message_id} {content}",
             )
         )
 
