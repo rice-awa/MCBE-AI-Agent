@@ -6,6 +6,8 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
+from core.session import DEFAULT_CONVERSATION_ID
+
 
 class BaseMessage(BaseModel):
     """消息基类"""
@@ -24,7 +26,7 @@ class ChatRequest(BaseMessage):
     use_context: bool = True
     provider: str | None = None  # 可选指定 LLM 提供商
     delivery: Literal["tellraw", "scriptevent"] = "tellraw"
-    conversation_id: str = "default"
+    conversation_id: str = DEFAULT_CONVERSATION_ID
     # 历史 revision，保留兼容 API；普通聊天写回会递增。
     conversation_generation: int = 0
     # 管理操作失效 epoch；clear/switch/new/restore/switch_model 等运行时状态变更会递增。
