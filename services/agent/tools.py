@@ -403,7 +403,7 @@ def register_agent_tools(
         pretty: bool = False,
     ) -> str:
         """
-        搜索 Minecraft Wiki 内容
+        搜索 Minecraft Wiki 内容，尽量不要使用多个搜索关键词。
 
         Args:
             ctx: 运行上下文
@@ -474,7 +474,7 @@ def register_agent_tools(
         max_chars: int = 2000,
     ) -> str:
         """
-        获取 Minecraft Wiki 页面内容
+        获取 Minecraft Wiki 页面内容，优先使用wikitext格式
 
         Args:
             ctx: 运行上下文
