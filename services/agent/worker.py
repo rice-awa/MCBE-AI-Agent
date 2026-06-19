@@ -14,6 +14,7 @@ from services.agent.core import stream_chat, _extract_exception_details
 from services.agent.providers import ProviderRegistry
 from services.agent.title import generate_conversation_title
 from services.addon.service import get_addon_bridge_service
+from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
 from models.messages import ChatRequest, StreamChunk, SystemNotification
 from models.agent import (
     AgentDependencies,
@@ -206,7 +207,7 @@ class AgentWorker:
         # 构建依赖
         deps = AgentDependencies(
             connection_id=connection_id,
-            player_name=request.player_name or "Player",
+            player_name=request.player_name or DEFAULT_PLAYER_DISPLAY_NAME,
             settings=self.settings,
             http_client=self._http_client,  # type: ignore
             send_to_game=self._create_send_callback(connection_id),
@@ -223,7 +224,7 @@ class AgentWorker:
                 SystemNotification(
                     connection_id=connection_id,
                     level="info",
-                    message=f"AI正在为{request.player_name or 'Player'}思考",
+                    message=f"AI正在为{request.player_name or DEFAULT_PLAYER_DISPLAY_NAME}思考",
                     player_name="@a",
                 ),
             )
@@ -435,7 +436,7 @@ class AgentWorker:
                     if response_text:
                         await self.broker.send_response(connection_id, {
                             "type": "ai_response_sync",
-                            "player_name": request.player_name or "Player",
+                            "player_name": request.player_name or DEFAULT_PLAYER_DISPLAY_NAME,
                             "role": "assistant",
                             "text": response_text,
                         })

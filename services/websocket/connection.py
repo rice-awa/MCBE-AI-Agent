@@ -9,6 +9,7 @@ from websockets.server import WebSocketServerProtocol
 
 from core.queue import MessageBroker
 from core.session import DEFAULT_PLAYER_KEY
+from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
 from models.messages import StreamChunk, SystemNotification
 from models.agent import MCColor, MCPrefix
 from services.agent.prompt import get_prompt_manager
@@ -495,7 +496,7 @@ class ConnectionManager:
         为避免看门狗踢出，assistant 响应先等 tellraw 流式发送完毕，
         各分片之间插入延迟，避免命令洪泛。
         """
-        player_name = response.get("player_name", "Player")
+        player_name = response.get("player_name", DEFAULT_PLAYER_DISPLAY_NAME)
         role = response.get("role", "assistant")
         text = response.get("text", "")
 
