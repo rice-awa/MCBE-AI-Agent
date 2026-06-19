@@ -5,12 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from config.logging import get_logger
 from config.settings import Settings
+from services.agent.model_metadata import ModelMetadataService
 from services.agent.providers import RuntimeAdapterRegistry
 
 if TYPE_CHECKING:
     from services.agent.core import ChatAgentManager
     from services.agent.mcp import MCPManager
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -20,6 +24,7 @@ class AgentRuntime:
     runtime_adapters: Any = field(default_factory=RuntimeAdapterRegistry)
     chat_agent_manager: ChatAgentManager | None = None
     mcp_manager: MCPManager | None = None
+    model_metadata_service: ModelMetadataService | None = None
 
     def get_agent_manager(self) -> ChatAgentManager:
         if self.chat_agent_manager is None:
@@ -36,6 +41,7 @@ class AgentRuntime:
         return self.mcp_manager
 
     async def initialize(self, settings: Settings) -> bool:
+        await self.initialize_model_metadata(settings)
         await self.warmup_models(settings)
         mcp_manager = self.get_mcp_manager(settings)
         mcp_connected = await mcp_manager.initialize()
@@ -45,6 +51,25 @@ class AgentRuntime:
             mcp_toolsets=mcp_manager.get_toolsets_for_agent(),
         )
         return mcp_connected
+
+    async def initialize_model_metadata(self, settings: Settings) -> None:
+        """启动期加载 models.dev 元数据并附加到 settings，须在 warmup_models 之前完成。"""
+        try:
+            service = ModelMetadataService(settings.model_metadata)
+            await service.initialize()
+            settings.attach_model_metadata_cache(service.cache)
+            self.model_metadata_service = service
+            logger.info(
+                "model_metadata_status",
+                enabled=settings.model_metadata.enabled,
+                cached_model_count=len(service.cache.models),
+                refresh_on_startup=settings.model_metadata.refresh_on_startup,
+            )
+        except Exception as e:
+            logger.warning("model_metadata_init_failed", error=str(e))
+
+    def get_model_metadata_service(self) -> ModelMetadataService | None:
+        return self.model_metadata_service
 
     async def warmup_models(self, settings: Settings) -> None:
         await self.runtime_adapters.warmup_models(settings)
@@ -64,6 +89,7 @@ class AgentRuntime:
             if reset is not None:
                 reset()
             self.chat_agent_manager = None
+        self.model_metadata_service = None
         await self.runtime_adapters.shutdown()
 
 
