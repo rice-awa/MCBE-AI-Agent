@@ -6,16 +6,18 @@ from collections.abc import AsyncIterator, Iterator
 from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Protocol, cast
 
-from pydantic_ai import (
-    Agent,
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
+    ModelMessage,
     PartDeltaEvent,
     PartStartEvent,
-    RunContext,
+    TextPart,
     TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
 )
-from pydantic_ai.messages import ModelMessage, TextPart, ThinkingPart, ThinkingPartDelta
 from pydantic_ai.models import Model
 
 from config.logging import get_logger

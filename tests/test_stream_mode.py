@@ -230,6 +230,21 @@ class MockAgentRunContext:
 class MockAgent:
     """模拟 Agent 类，支持 iter() 和 run() 方法"""
 
+    @classmethod
+    def __class_getitem__(cls, _item: Any) -> type["MockAgent"]:
+        """支持泛型下标 Agent[...]，兼容新版 pydantic-ai。"""
+        return cls
+
+    @staticmethod
+    def system_prompt(func: Any) -> Any:
+        """模拟 @agent.system_prompt 装饰器，直接返回原函数。"""
+        return func
+
+    @staticmethod
+    def tool(func: Any) -> Any:
+        """模拟 @agent.tool 装饰器，直接返回原函数。"""
+        return func
+
     # 类方法，用于节点类型判断
     @staticmethod
     def is_user_prompt_node(node: Any) -> bool:
@@ -254,6 +269,7 @@ class MockAgent:
         result_output: str = "",
         result_messages: list[Any] = None,
         request_node_events: list[list[Any]] = None,
+        **_: Any,
     ):
 
         """
@@ -359,6 +375,38 @@ def _patch_agent_node_adapter(monkeypatch) -> None:
     """Patch core.Agent only so mock nodes use the same node-class adapter as production."""
 
     monkeypatch.setattr(core, "Agent", MockAgent)
+
+    # Patch ChatAgentManager.get_agent so that tests can inject mock_agent via core.chat_agent.
+    original_get_agent = core.ChatAgentManager.get_agent
+
+    def patched_get_agent(self: core.ChatAgentManager) -> Any:
+        if isinstance(core.chat_agent, MockAgent):
+            return core.chat_agent
+        return original_get_agent(self)
+
+    monkeypatch.setattr(core.ChatAgentManager, "get_agent", patched_get_agent)
+
+    original_isinstance = isinstance
+
+    def custom_isinstance(obj, classinfo):
+        # Handle PartStartEvent check
+        if classinfo.__name__ == "PartStartEvent" if hasattr(classinfo, "__name__") else False:
+            return hasattr(obj, "index") and hasattr(obj, "part")
+        # Handle PartDeltaEvent check
+        if classinfo.__name__ == "PartDeltaEvent" if hasattr(classinfo, "__name__") else False:
+            return hasattr(obj, "index") and hasattr(obj, "delta")
+        # Handle TextPartDelta check
+        if classinfo.__name__ == "TextPartDelta" if hasattr(classinfo, "__name__") else False:
+            return hasattr(obj, "content_delta")
+        # Handle FunctionToolCallEvent check
+        if classinfo.__name__ == "FunctionToolCallEvent" if hasattr(classinfo, "__name__") else False:
+            return hasattr(obj, "part") and hasattr(obj.part, "tool_name") and hasattr(obj.part, "args")
+        # Handle FunctionToolResultEvent check
+        if classinfo.__name__ == "FunctionToolResultEvent" if hasattr(classinfo, "__name__") else False:
+            return hasattr(obj, "tool_call_id") and hasattr(obj, "result") and not hasattr(obj.part, "args")
+        return original_isinstance(obj, classinfo)
+
+    monkeypatch.setattr("builtins.isinstance", custom_isinstance)
 
 
 # ============== 测试用例 ==============
