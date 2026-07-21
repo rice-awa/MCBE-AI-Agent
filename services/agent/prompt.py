@@ -400,16 +400,11 @@ class PromptManager:
         return content
 
 
-# 全局单例
-_prompt_manager: PromptManager | None = None
-
-
 def get_prompt_manager() -> PromptManager:
-    """获取提示词管理器单例"""
-    global _prompt_manager
-    if _prompt_manager is None:
-        _prompt_manager = PromptManager()
-    return _prompt_manager
+    """获取提示词管理器（AgentRuntime 持有的薄 facade）。"""
+    from services.agent.runtime import get_agent_runtime
+
+    return get_agent_runtime().get_prompt_manager()
 
 
 # 方便在 agent/core.py 中使用的构建函数

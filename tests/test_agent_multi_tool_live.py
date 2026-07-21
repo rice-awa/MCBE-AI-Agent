@@ -18,6 +18,8 @@ from pydantic_ai.messages import ModelMessage
 from services.agent.core import stream_chat
 from services.agent.providers import ProviderRegistry
 
+pytestmark = pytest.mark.live
+
 
 class _ToolRecorder:
     def __init__(self) -> None:
@@ -113,21 +115,32 @@ async def _run_live_multi_turn_tool_chain(model_name: str) -> tuple[list[dict], 
     return [first_meta, second_meta], recorder.commands
 
 
+def _assert_tool_events_contract(metadata: dict) -> None:
+    """Current stream completion metadata uses tool_events, not legacy keys."""
+    assert metadata.get("is_complete") is True
+    tool_events = metadata.get("tool_events") or []
+    assert isinstance(tool_events, list)
+    assert len(tool_events) >= 1
+    for event in tool_events:
+        assert isinstance(event, dict)
+        assert "tool_name" in event
+        assert "tool_call_id" in event
+        assert "args" in event
+    assert "tool_calls" not in metadata
+    assert "tool_returns" not in metadata
+
+
 def test_deepseek_chat_should_support_multi_turn_tool_chain() -> None:
     metadata_list, _commands = asyncio.run(_run_live_multi_turn_tool_chain("deepseek-chat"))
 
     assert len(metadata_list) == 2
-    assert metadata_list[0].get("is_complete") is True
-    assert metadata_list[1].get("is_complete") is True
-    assert len(metadata_list[0].get("tool_events") or []) >= 1
-    assert len(metadata_list[1].get("tool_events") or []) >= 1
+    _assert_tool_events_contract(metadata_list[0])
+    _assert_tool_events_contract(metadata_list[1])
 
 
 def test_deepseek_reasoner_should_support_multi_turn_tool_chain() -> None:
     metadata_list, _commands = asyncio.run(_run_live_multi_turn_tool_chain("deepseek-reasoner"))
 
     assert len(metadata_list) == 2
-    assert metadata_list[0].get("is_complete") is True
-    assert metadata_list[1].get("is_complete") is True
-    assert len(metadata_list[0].get("tool_events") or []) >= 1
-    assert len(metadata_list[1].get("tool_events") or []) >= 1
+    _assert_tool_events_contract(metadata_list[0])
+    _assert_tool_events_contract(metadata_list[1])

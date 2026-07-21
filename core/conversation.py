@@ -991,21 +991,11 @@ class ConversationManager:
         return "\n".join(lines)
 
 
-# 全局管理器实例
-_conversation_manager: ConversationManager | None = None
-
-
 def get_conversation_manager(
     broker,
     settings: Settings | None = None,
 ) -> ConversationManager:
-    """获取对话管理器单例"""
-    global _conversation_manager
+    """获取对话管理器（AgentRuntime 持有的薄 facade）。"""
+    from services.agent.runtime import get_agent_runtime
 
-    if _conversation_manager is None:
-        from config.settings import get_settings
-
-        settings = settings or get_settings()
-        _conversation_manager = ConversationManager(broker, settings)
-
-    return _conversation_manager
+    return get_agent_runtime().get_conversation_manager(broker, settings)

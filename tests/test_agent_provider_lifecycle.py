@@ -291,7 +291,7 @@ def test_agent_runtime_initializes_adapters_mcp_and_agent_manager():
             calls.append(("mcp_initialize",))
             return True
 
-        def get_toolsets_for_agent(self):
+        def get_healthy_toolsets(self):
             calls.append(("mcp_toolsets",))
             return ["toolset"]
 
@@ -312,6 +312,7 @@ def test_agent_runtime_initializes_adapters_mcp_and_agent_manager():
         ("mcp_toolsets",),
         ("agent_initialize", settings, ["toolset"]),
     ]
+    assert runtime.prompt_manager is not None
 
 
 def test_agent_runtime_refresh_mcp_tools_passes_latest_toolsets():
@@ -319,7 +320,7 @@ def test_agent_runtime_refresh_mcp_tools_passes_latest_toolsets():
     settings = SimpleNamespace()
 
     class FakeMCPManager:
-        def get_toolsets_for_agent(self):
+        def get_healthy_toolsets(self):
             calls.append("mcp_toolsets")
             return ["latest-toolset"]
 
@@ -354,7 +355,7 @@ def test_agent_runtime_shutdown_resets_managers_for_reinitialize():
             calls.append("mcp_initialize")
             return True
 
-        def get_toolsets_for_agent(self):
+        def get_healthy_toolsets(self):
             calls.append("mcp_toolsets")
             return ["toolset"]
 
@@ -373,14 +374,23 @@ def test_agent_runtime_shutdown_resets_managers_for_reinitialize():
         mcp_manager=FakeMCPManager(),
         chat_agent_manager=FakeChatAgentManager(),
     )
+    runtime.prompt_manager = object()  # type: ignore[assignment]
+    runtime.conversation_manager = object()  # type: ignore[assignment]
+    runtime._conversation_broker = object()
+    runtime._conversation_settings = settings  # type: ignore[assignment]
 
     assert asyncio.run(runtime.initialize(settings)) is True
     asyncio.run(runtime.shutdown())
 
     assert "mcp_shutdown" in calls
     assert "agent_reset" in calls
+    assert "adapters_shutdown" in calls
     assert runtime.mcp_manager is None
     assert runtime.chat_agent_manager is None
+    assert runtime.prompt_manager is None
+    assert runtime.conversation_manager is None
+    assert runtime._conversation_broker is None
+    assert runtime._conversation_settings is None
 
 
 def test_agent_runtime_shutdown_closes_mcp_before_adapters():
@@ -402,6 +412,105 @@ def test_agent_runtime_shutdown_closes_mcp_before_adapters():
     asyncio.run(runtime.shutdown())
 
     assert calls == ["mcp_shutdown", "adapters_shutdown"]
+
+
+def test_agent_runtime_owns_prompt_and_conversation_managers(monkeypatch):
+    from core.conversation import ConversationManager
+    from services.agent.prompt import PromptManager, get_prompt_manager
+    from core.conversation import get_conversation_manager
+
+    original = get_agent_runtime()
+    runtime = AgentRuntime()
+    broker = object()
+    settings = Settings(default_provider="ollama", dev_mode=True)
+
+    try:
+        set_agent_runtime(runtime)
+
+        prompt1 = runtime.get_prompt_manager()
+        prompt2 = get_prompt_manager()
+        assert isinstance(prompt1, PromptManager)
+        assert prompt1 is prompt2
+        assert runtime.prompt_manager is prompt1
+
+        conv1 = runtime.get_conversation_manager(broker, settings)
+        conv2 = get_conversation_manager(broker, settings)
+        assert isinstance(conv1, ConversationManager)
+        assert conv1 is conv2
+        assert runtime.conversation_manager is conv1
+        assert runtime._conversation_broker is broker
+        assert runtime._conversation_settings is settings
+
+        # New broker/settings identity must not reuse stale manager.
+        other_broker = object()
+        other_settings = Settings(default_provider="ollama", dev_mode=True)
+        conv3 = runtime.get_conversation_manager(other_broker, other_settings)
+        assert conv3 is not conv1
+        assert runtime.conversation_manager is conv3
+        assert runtime._conversation_broker is other_broker
+        assert runtime._conversation_settings is other_settings
+    finally:
+        set_agent_runtime(original)
+
+
+def test_agent_runtime_shutdown_aggregates_errors_and_continues(monkeypatch):
+    """MCP shutdown failure must not prevent agent/audit/provider cleanup."""
+    calls = []
+
+    class FakeRuntimeAdapters:
+        async def shutdown(self):
+            calls.append("providers_close")
+
+    class FailingMCPManager:
+        async def shutdown(self):
+            calls.append("mcp_shutdown")
+            raise RuntimeError("mcp boom")
+
+    class FakeChatAgentManager:
+        def reset(self):
+            calls.append("agent_reset")
+
+    class FakeMetadataService:
+        async def close(self):
+            calls.append("metadata_close")
+
+    runtime = AgentRuntime(
+        runtime_adapters=FakeRuntimeAdapters(),
+        mcp_manager=FailingMCPManager(),  # type: ignore[arg-type]
+        chat_agent_manager=FakeChatAgentManager(),  # type: ignore[arg-type]
+        model_metadata_service=FakeMetadataService(),  # type: ignore[arg-type]
+    )
+    runtime._audit_writer_started = True
+    runtime.prompt_manager = object()  # type: ignore[assignment]
+    runtime.conversation_manager = object()  # type: ignore[assignment]
+    runtime._conversation_broker = object()
+    runtime._conversation_settings = Settings(default_provider="ollama", dev_mode=True)
+
+    def fake_stop_audit_writer(timeout: float = 5.0) -> None:
+        calls.append("audit_stop")
+
+    monkeypatch.setattr(
+        "services.agent.runtime.stop_audit_writer",
+        fake_stop_audit_writer,
+    )
+
+    asyncio.run(runtime.shutdown())
+
+    assert calls == [
+        "mcp_shutdown",
+        "agent_reset",
+        "audit_stop",
+        "metadata_close",
+        "providers_close",
+    ]
+    assert runtime.mcp_manager is None
+    assert runtime.chat_agent_manager is None
+    assert runtime.model_metadata_service is None
+    assert runtime.prompt_manager is None
+    assert runtime.conversation_manager is None
+    assert runtime._audit_writer_started is False
+    assert runtime._conversation_broker is None
+    assert runtime._conversation_settings is None
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +547,7 @@ def test_agent_runtime_initializes_model_metadata_before_warmup(tmp_path):
             calls.append("mcp_initialize")
             return True
 
-        def get_toolsets_for_agent(self):
+        def get_healthy_toolsets(self):
             calls.append("mcp_toolsets")
             return ["toolset"]
 
@@ -499,7 +608,7 @@ def test_agent_runtime_metadata_init_failure_does_not_break_init(tmp_path, monke
             calls.append("mcp_initialize")
             return True
 
-        def get_toolsets_for_agent(self):
+        def get_healthy_toolsets(self):
             calls.append("mcp_toolsets")
             return ["toolset"]
 
@@ -549,7 +658,7 @@ def test_runtime_attaches_metadata_cache_to_settings_before_worker(tmp_path):
             calls.append("mcp_initialize")
             return True
 
-        def get_toolsets_for_agent(self):
+        def get_healthy_toolsets(self):
             calls.append("mcp_toolsets")
             return ["toolset"]
 
@@ -765,3 +874,38 @@ def test_llm_http_client_installs_hooks_without_aread_when_enabled(monkeypatch):
     source = inspect.getsource(R._create_llm_http_client)
     assert "response.aread" not in source
     assert "await response.aread" not in source
+
+
+def test_default_pytest_collection_excludes_live_marker():
+    """Default pytest.ini addopts exclude live tests from collection/selection."""
+    import os
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "."
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "tests/test_agent_multi_tool_live.py",
+        ],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = (result.stdout or "") + (result.stderr or "")
+    # With addopts = -m 'not live', live tests must not be selected by default.
+    assert "test_deepseek_chat_should_support_multi_turn_tool_chain" not in result.stdout
+    assert "test_deepseek_reasoner_should_support_multi_turn_tool_chain" not in result.stdout
+    assert (
+        result.returncode == 0
+        or "deselected" in output.lower()
+        or "no tests collected" in output.lower()
+    )
