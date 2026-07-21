@@ -2,11 +2,14 @@
 
 import json
 
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Protocol
-from uuid import UUID
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Protocol
+from uuid import UUID, uuid4
 
 import httpx
+
+if TYPE_CHECKING:
+    from services.agent.tool_results import CommandResult
 
 
 # Minecraft 颜色代码常量
@@ -165,11 +168,14 @@ class AgentDependencies:
     settings: Any
     http_client: httpx.AsyncClient
     send_to_game: Callable[[str], Awaitable[None]]
-    run_command: Callable[[str], Awaitable[str]]
+    run_command: Callable[[str], Awaitable["CommandResult"]]
     addon_bridge: AddonBridgeClient | None = None
     provider: str | None = None  # 当前使用的 LLM 提供商
     # 获取上下文使用信息的回调，返回 (消息数, 估计token数, 最大token数)
     get_context_info: Callable[[], ContextInfo | None] | None = None
+    # 单次 run 身份：关联模型请求、工具调用与完成事件
+    run_id: str = field(default_factory=lambda: str(uuid4()))
+    conversation_id: str | None = None
 
 
 @dataclass
@@ -178,9 +184,12 @@ class AgentResponse:
 
     content: str
     reasoning: str | None = None
-    tool_calls: list[dict[str, Any]] | None = None
+    tool_events: list[dict[str, Any]] | None = None
     token_usage: dict[str, int] | None = None
     is_complete: bool = True
+    run_id: str | None = None
+    conversation_id: str | None = None
+    player_name: str | None = None
 
 
 @dataclass

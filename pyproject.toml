@@ -14,3 +14,7 @@ warn_unused_ignores = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "live: tests that require real network/provider access",
+]
+addopts = "-m 'not live'"

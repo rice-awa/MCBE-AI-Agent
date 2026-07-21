@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Protocol, cast
 
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
@@ -19,10 +20,15 @@ from pydantic_ai.messages import (
     ThinkingPartDelta,
 )
 from pydantic_ai.models import Model
+from pydantic_ai.tools import DeferredToolRequests
+from pydantic_ai.usage import UsageLimits
 
 from config.logging import get_logger
 from config.settings import Settings, get_settings
 from models.agent import AgentDependencies, StreamEvent
+from services.agent.context import build_context_history_processor
+from services.agent.harness.execution import build_harness_capability
+from services.agent.tool_results import PLAYER_ERROR_ADVICE, ErrorKind
 from services.agent.tools import register_agent_tools
 from services.agent.prompt import build_dynamic_prompt
 
@@ -31,6 +37,132 @@ logger = get_logger(__name__)
 
 class StreamModeSettings(Protocol):
     stream_sentence_mode: bool
+    request_limit: int
+    tool_calls_limit: int
+    input_tokens_limit: int | None
+    output_tokens_limit: int | None
+    total_tokens_limit: int | None
+    run_timeout: float
+    max_tool_concurrency: int
+    context_output_reserve_tokens: int
+
+
+class RunBudgetSettings(Protocol):
+    request_limit: int
+    tool_calls_limit: int
+    input_tokens_limit: int | None
+    output_tokens_limit: int | None
+    total_tokens_limit: int | None
+    run_timeout: float
+    max_tool_concurrency: int
+    context_output_reserve_tokens: int
+
+    def get_provider_config(self, provider_name: str | None = None) -> Any:
+        ...
+
+
+def _resolve_instrumentation(settings: Any) -> Any:
+    """可配置的 PydanticAI instrumentation；默认关闭 exporter。
+
+    即使关闭，structlog 事件仍通过 deps.run_id 形成因果链。
+    开启时强制 include_content=False，禁止把完整正文写入 trace。
+    """
+    enabled = bool(getattr(settings, "pydantic_ai_instrumentation", False))
+    if not enabled:
+        return False
+    try:
+        from pydantic_ai.models.instrumented import InstrumentationSettings
+
+        return InstrumentationSettings(include_content=False, include_binary_content=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "pydantic_ai_instrumentation_unavailable",
+            error=str(exc),
+        )
+        return False
+
+
+def build_usage_limits(settings: Any, provider_name: str | None = None) -> UsageLimits:
+    """从 Settings 构建 PydanticAI UsageLimits。
+
+    ContextBuilder 负责正常历史退化；`count_tokens_before_request=True`
+    作为最终硬边界，阻止估算误差导致的超窗请求。
+    若 context_window 元数据缺失，不回退到无限预算。
+    """
+    request_limit = int(getattr(settings, "request_limit", 8) or 8)
+    tool_calls_limit = int(getattr(settings, "tool_calls_limit", 8) or 8)
+    input_tokens_limit = getattr(settings, "input_tokens_limit", None)
+    output_tokens_limit = getattr(settings, "output_tokens_limit", None)
+    total_tokens_limit = getattr(settings, "total_tokens_limit", None)
+    reserve = int(getattr(settings, "context_output_reserve_tokens", 1024) or 0)
+
+    context_window = None
+    get_provider_config = getattr(settings, "get_provider_config", None)
+    if callable(get_provider_config):
+        try:
+            provider_config = get_provider_config(provider_name)
+            context_window = getattr(provider_config, "context_window", None)
+        except Exception:
+            context_window = None
+
+    # 未显式配置 input/total 时，尝试从模型 context_window 派生
+    if input_tokens_limit is None or total_tokens_limit is None:
+        if context_window is not None and context_window > reserve:
+            derived = int(context_window) - reserve
+            if input_tokens_limit is None:
+                input_tokens_limit = derived
+            if total_tokens_limit is None:
+                total_tokens_limit = int(context_window)
+
+    # 元数据缺失且未显式配置时：使用保守硬上限，避免无限预算
+    if context_window is None:
+        if input_tokens_limit is None:
+            input_tokens_limit = max(1024, 8192 - reserve)
+        if total_tokens_limit is None:
+            total_tokens_limit = 8192
+
+    return UsageLimits(
+        request_limit=request_limit,
+        tool_calls_limit=tool_calls_limit,
+        input_tokens_limit=input_tokens_limit,
+        output_tokens_limit=output_tokens_limit,
+        total_tokens_limit=total_tokens_limit,
+        # 生产默认开启；FunctionModel/TestModel 不支持 count_tokens，测试可在 settings 关闭
+        count_tokens_before_request=bool(
+            getattr(settings, "count_tokens_before_request", True)
+        ),
+    )
+
+
+def get_run_timeout(settings: Any) -> float:
+    return float(getattr(settings, "run_timeout", 90.0) or 90.0)
+
+
+def player_facing_error(error_kind: ErrorKind, fallback: str | None = None) -> str:
+    return PLAYER_ERROR_ADVICE.get(error_kind, fallback or PLAYER_ERROR_ADVICE["INTERNAL"])
+
+
+def classify_run_exception(exc: BaseException) -> tuple[ErrorKind, str, str]:
+    """返回 (error_kind, player_message, diagnostic_summary)。"""
+    if isinstance(exc, asyncio.CancelledError):
+        return "CANCELLED", player_facing_error("CANCELLED"), "CancelledError"
+    if isinstance(exc, asyncio.TimeoutError):
+        return "TRANSIENT", player_facing_error("TRANSIENT"), "run_timeout"
+    if isinstance(exc, UsageLimitExceeded):
+        return "DENIED", "已达到本轮请求预算上限，请缩短问题或稍后再试。", str(exc)
+
+    # 懒导入避免 core ↔ context 循环依赖
+    from services.agent.context import ContextOversizedError
+
+    if isinstance(exc, ContextOversizedError):
+        msg = str(exc).strip() or "上下文超出预算，请缩短问题或清空上下文后重试。"
+        return "DENIED", msg, str(exc)
+
+    detail = _extract_exception_details(exc)
+    lower = detail.lower()
+    if "timeout" in lower or "deadline exceeded" in lower:
+        return "TRANSIENT", player_facing_error("TRANSIENT"), detail
+    return "INTERNAL", player_facing_error("INTERNAL"), detail
 
 
 TOOL_USAGE_GUIDE = """
@@ -53,17 +185,17 @@ class ChatAgentManager:
     """
 
     def __init__(self):
-        self._agent: Agent[AgentDependencies, str] | None = None
-        self._fallback_agent: Agent[AgentDependencies, str] | None = None
+        self._agent: Agent[AgentDependencies, str | DeferredToolRequests] | None = None
+        self._fallback_agent: Agent[AgentDependencies, str | DeferredToolRequests] | None = None
         self._mcp_toolsets: list[Any] = []
         self._initialized = False
         self._settings: Settings | None = None
-        self._mcp_available: bool = True  # MCP 是否可用，一旦失败后永久标记为不可用
+        self._mcp_available: bool = True  # MCP 是否可用；失败后由 MCPManager 健康状态决定后续装配
 
     def _create_agent(
         self,
         toolsets: list[Any] | None = None,
-    ) -> Agent[AgentDependencies, str]:
+    ) -> Agent[AgentDependencies, str | DeferredToolRequests]:
         """
         创建 Agent 实例
 
@@ -72,13 +204,20 @@ class ChatAgentManager:
         """
         settings = self._settings or get_settings()
         default_provider_config = settings.get_provider_config(settings.default_provider)
-        agent = Agent[AgentDependencies, str](
+        harness_cap = build_harness_capability(settings)
+        history_processor = build_context_history_processor(settings)
+        instrument = _resolve_instrumentation(settings)
+        agent: Agent[AgentDependencies, str | DeferredToolRequests] = Agent(
             f"{settings.default_provider}:{default_provider_config.model}",  # 默认模型，运行时可覆盖
             deps_type=AgentDependencies,
-            output_type=str,
+            output_type=[str, DeferredToolRequests],
             defer_model_check=True,
             retries=settings.agent_retries,
             toolsets=toolsets,
+            max_concurrency=getattr(settings, "max_tool_concurrency", 4),
+            capabilities=[harness_cap],
+            history_processors=[history_processor],
+            instrument=instrument,
         )
 
         @agent.system_prompt
@@ -134,7 +273,7 @@ class ChatAgentManager:
             mcp_toolsets_count=len(self._mcp_toolsets),
         )
 
-    def get_agent(self) -> Agent[AgentDependencies, str]:
+    def get_agent(self) -> Agent[AgentDependencies, str | DeferredToolRequests]:
         """
         获取 Agent 实例
 
@@ -146,16 +285,6 @@ class ChatAgentManager:
         if self._agent is None:
             # 懒初始化：自动加载 MCP 工具集
             if not self._initialized:
-                import inspect
-
-                # 检查是否在异步上下文中
-                try:
-                    loop = asyncio.get_running_loop()
-                    # 如果在异步上下文中，使用 ensure_future 延迟初始化
-                    # 但为简化逻辑，这里直接同步初始化（第一次调用时）
-                except RuntimeError:
-                    pass
-
                 # 执行懒初始化
                 self._settings = get_settings()
                 from services.agent.mcp import load_mcp_toolsets
@@ -217,7 +346,7 @@ class ChatAgentManager:
         """MCP 是否可用"""
         return self._mcp_available
 
-    def get_fallback_agent(self) -> Agent[AgentDependencies, str]:
+    def get_fallback_agent(self) -> Agent[AgentDependencies, str | DeferredToolRequests]:
         """获取无 MCP 工具集的降级 Agent 实例。"""
         if self._fallback_agent is None:
             logger.info("creating_fallback_agent_without_mcp")
@@ -226,13 +355,14 @@ class ChatAgentManager:
 
     def get_active_agent(
         self,
-        agent: Agent[AgentDependencies, str] | None = None,
+        agent: Agent[AgentDependencies, str | DeferredToolRequests] | None = None,
         *,
         connection_id: str | None = None,
         mode: str = "stream",
-    ) -> Agent[AgentDependencies, str]:
+    ) -> Agent[AgentDependencies, str | DeferredToolRequests]:
         if agent is not None:
             return agent
+        # 后续新请求应优先装配 MCPManager 健康 server；此处仅在全局不可用时降级。
         if not self._mcp_available:
             logger.info(
                 "mcp_already_failed_using_fallback",
@@ -254,7 +384,7 @@ def get_agent_manager() -> ChatAgentManager:
 # 通过懒加载方式获取 Agent，确保 MCP 工具被正确加载
 
 
-def _get_legacy_chat_agent() -> Agent[AgentDependencies, str]:
+def _get_legacy_chat_agent() -> Agent[AgentDependencies, str | DeferredToolRequests]:
     """获取兼容性 Agent 实例（懒加载）"""
     return get_agent_manager().get_agent()
 
@@ -278,12 +408,18 @@ SENTENCE_END_PATTERN = re.compile(r"[。！？\n.!?]+")
 
 def _non_stream_batch_max_chars() -> int:
     """非流式模式按句子分批的最大字符数（从 Settings.flow_control 读取）。"""
-    return get_settings().flow_control.non_stream_batch_max_chars
+    try:
+        return get_settings().flow_control.non_stream_batch_max_chars
+    except Exception:
+        return 150
 
 
 def _non_stream_send_delay() -> float:
     """非流式模式每个包之间的发送延迟（秒，从 Settings.flow_control 读取）。"""
-    return get_settings().flow_control.non_stream_send_delay
+    try:
+        return get_settings().flow_control.non_stream_send_delay
+    except Exception:
+        return 0.1
 
 
 def _serialize_usage(usage: Any | None) -> dict[str, Any] | None:
@@ -432,10 +568,91 @@ def _extract_result_output(result: Any) -> str:
             value = getattr(result, field_name)
             if value is None:
                 continue
+            if isinstance(value, DeferredToolRequests):
+                return ""
             if isinstance(value, str):
                 return value
             return str(value)
     return ""
+
+
+def _extract_deferred_requests(result: Any) -> DeferredToolRequests | None:
+    """若 run 输出为 DeferredToolRequests 则返回，否则 None。"""
+    output = getattr(result, "output", None)
+    if isinstance(output, DeferredToolRequests):
+        return output
+    data = getattr(result, "data", None)
+    if isinstance(data, DeferredToolRequests):
+        return data
+    return None
+
+
+def _build_approval_required_event(
+    ctx: _HandlerContext,
+    deps: AgentDependencies,
+    deferred: DeferredToolRequests,
+    result: Any,
+) -> StreamEvent:
+    """构造审批暂停事件，供 Worker 写入 PendingApprovalStore 并提示玩家。"""
+    return StreamEvent(
+        event_type="approval_required",
+        content="工具调用需要玩家审批",
+        sequence=ctx.sequence,
+        metadata={
+            "deferred_requests": deferred,
+            "all_messages": _extract_all_messages(result),
+            "new_messages": _extract_new_messages(result),
+            "tool_events": ctx.tool_events,
+            "usage": ctx.serialized_usage,
+            "run_id": deps.run_id,
+            "conversation_id": deps.conversation_id,
+            "player_name": deps.player_name,
+            "connection_id": str(deps.connection_id),
+        },
+    )
+
+
+def _mark_mcp_failure_from_exception(exc: BaseException, diagnostic: str) -> None:
+    """仅标记有证据关联的 MCP server；无证据时不盲目禁用全部。"""
+    try:
+        from services.agent.mcp import get_mcp_manager
+
+        mcp_manager = get_mcp_manager()
+    except Exception:
+        return
+
+    detail = diagnostic
+    try:
+        detail = f"{diagnostic}\n{_extract_exception_details(exc)}"
+    except Exception:
+        pass
+
+    matched = False
+    for server_name in list(mcp_manager.servers.keys()):
+        if server_name and server_name in detail:
+            mcp_manager.mark_server_failed(server_name, diagnostic)
+            matched = True
+
+    if matched:
+        # 用健康工具集刷新后续装配；不递归重放当前 run
+        try:
+            from services.agent.runtime import get_agent_runtime
+
+            runtime = get_agent_runtime()
+            settings = getattr(mcp_manager, "_settings", None)
+            if settings is not None:
+                runtime.refresh_mcp_tools(settings)
+        except Exception:
+            pass
+        return
+
+    # 无明确 server 证据时：只记录，不批量 mark 全部 server
+    logger.warning(
+        "mcp_failure_without_server_evidence",
+        error=diagnostic,
+        servers=list(mcp_manager.servers.keys()),
+        # run_id 在调用侧日志补充；此处无 deps
+    )
 
 
 def _extract_tool_events_from_messages(messages: list[ModelMessage]) -> list[dict[str, Any]]:
@@ -587,12 +804,14 @@ async def _send_reasoning_event(
 
 
 async def stream_response_handler(
-    prompt: str,
+    prompt: str | None,
     deps: AgentDependencies,
     model: Model | str | None = None,
     message_history: list[ModelMessage] | None = None,
     ctx: _HandlerContext | None = None,
-    agent: Agent[AgentDependencies, str] | None = None,
+    agent: Agent[AgentDependencies, str | DeferredToolRequests] | None = None,
+    *,
+    deferred_tool_results: Any | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """
     流式响应处理器（基于 agent.iter() 官方推荐方式）
@@ -602,15 +821,16 @@ async def stream_response_handler(
     2. 在 ModelRequestNode 中流式输出文本
     3. 在 CallToolsNode 中处理工具调用事件
     4. 工具调用由 Pydantic AI 自动执行
-    5. MCP 连接失败时自动降级到无工具集模式
+    5. MCP 故障返回结构化错误，不在当前 run 内递归重放
 
     Args:
-        prompt: 用户输入
+        prompt: 用户输入；审批恢复时可为 None（使用 message_history + deferred_tool_results）
         deps: Agent 依赖
         model: 可选的模型覆盖
         message_history: 消息历史
         ctx: 处理器上下文
         agent: 可选的 Agent 实例，不传则使用管理器中的 Agent
+        deferred_tool_results: 审批恢复时传入的 DeferredToolResults
 
     Yields:
         StreamEvent: 流式事件
@@ -626,223 +846,257 @@ async def stream_response_handler(
         mode="stream",
     )
 
+    usage_limits = build_usage_limits(deps.settings, deps.provider)
+    run_timeout = get_run_timeout(deps.settings)
+
     try:
-        # 使用 agent.iter() 进行细粒度节点控制
-        async with active_agent.iter(
-            prompt,
-            deps=deps,
-            model=model,
-            message_history=message_history,
-        ) as run:
-            async for node in run:
-                # 处理用户提示节点
-                if Agent.is_user_prompt_node(node):
-                    logger.debug(
-                        "agent_user_prompt",
-                        prompt=node.user_prompt,
-                        connection_id=str(deps.connection_id),
-                    )
+        async with asyncio.timeout(run_timeout):
+            run_kwargs: dict[str, Any] = {
+                "deps": deps,
+                "model": model,
+                "message_history": message_history,
+                "usage_limits": usage_limits,
+            }
+            if deferred_tool_results is not None:
+                run_kwargs["deferred_tool_results"] = deferred_tool_results
+            # 使用 agent.iter() 进行细粒度节点控制
+            async with active_agent.iter(
+                prompt,
+                **run_kwargs,
+            ) as run:
+                async for node in run:
+                    # 处理用户提示节点
+                    if Agent.is_user_prompt_node(node):
+                        logger.debug(
+                            "agent_user_prompt",
+                            prompt=node.user_prompt,
+                            connection_id=str(deps.connection_id),
+                            run_id=deps.run_id,
+                        )
 
-                # 处理模型请求节点 - 流式输出文本
-                elif Agent.is_model_request_node(node):
-                    async with node.stream(run.ctx) as request_stream:
-                        async for event in request_stream:
-                            # 处理部分开始事件
-                            if isinstance(event, PartStartEvent):
-                                logger.debug(
-                                    "agent_part_start",
-                                    index=event.index,
-                                    connection_id=str(deps.connection_id),
-                                    current_buffer=ctx.sentence_buffer,
-                                )
-                                part = event.part
-                                # ThinkingPart：作为 reasoning 事件输出，不进文本缓冲区
-                                if isinstance(part, ThinkingPart) and part.content:
+                    # 处理模型请求节点 - 流式输出文本
+                    elif Agent.is_model_request_node(node):
+                        async with node.stream(run.ctx) as request_stream:
+                            async for event in request_stream:
+                                # 处理部分开始事件
+                                if isinstance(event, PartStartEvent):
                                     logger.debug(
-                                        "agent_part_start_thinking",
+                                        "agent_part_start",
                                         index=event.index,
-                                        content=part.content,
                                         connection_id=str(deps.connection_id),
+                                        current_buffer=ctx.sentence_buffer,
                                     )
-                                    yield await _send_reasoning_event(ctx, part.content)
-                                # TextPart：初始内容进文本缓冲区，按完整句子发送
-                                elif isinstance(part, TextPart) and part.content:
-                                    logger.debug(
-                                        "agent_part_start_content",
-                                        index=event.index,
-                                        content=part.content,
-                                        connection_id=str(deps.connection_id),
-                                    )
-                                    ctx.sentence_buffer += part.content
-                                    sentences, ctx.sentence_buffer = (
-                                        _extract_complete_sentences(
-                                            ctx.sentence_buffer
-                                        )
-                                    )
-                                    for sentence in sentences:
-                                        yield await _send_content_event(
-                                            ctx, sentence
-                                        )
-
-                            # 处理增量事件
-                            elif isinstance(event, PartDeltaEvent):
-                                delta = event.delta
-                                # ThinkingPartDelta：作为 reasoning 事件输出
-                                if isinstance(delta, ThinkingPartDelta):
-                                    chunk = delta.content_delta
-                                    if chunk:
+                                    part = event.part
+                                    # ThinkingPart：作为 reasoning 事件输出，不进文本缓冲区
+                                    if isinstance(part, ThinkingPart) and part.content:
                                         logger.debug(
-                                            "agent_thinking_delta",
-                                            chunk=chunk,
+                                            "agent_part_start_thinking",
                                             index=event.index,
+                                            content=part.content,
                                             connection_id=str(deps.connection_id),
                                         )
-                                        yield await _send_reasoning_event(ctx, chunk)
-                                # TextPartDelta：文本增量缓冲并按完整句子发送
-                                elif isinstance(delta, TextPartDelta):
-                                    chunk = delta.content_delta
-                                    logger.debug(
-                                        "agent_text_delta",
-                                        chunk=chunk,
-                                        index=event.index,
-                                        connection_id=str(deps.connection_id),
-                                        buffer_before=ctx.sentence_buffer,
-                                    )
-                                    if chunk:
-                                        ctx.sentence_buffer += chunk
+                                        yield await _send_reasoning_event(ctx, part.content)
+                                    # TextPart：初始内容进文本缓冲区，按完整句子发送
+                                    elif isinstance(part, TextPart) and part.content:
+                                        logger.debug(
+                                            "agent_part_start_content",
+                                            index=event.index,
+                                            content=part.content,
+                                            connection_id=str(deps.connection_id),
+                                        )
+                                        ctx.sentence_buffer += part.content
                                         sentences, ctx.sentence_buffer = (
                                             _extract_complete_sentences(
                                                 ctx.sentence_buffer
                                             )
-                                        )
-                                        logger.debug(
-                                            "agent_sentences_extracted",
-                                            sentences=sentences,
-                                            buffer_after=ctx.sentence_buffer,
-                                            connection_id=str(deps.connection_id),
                                         )
                                         for sentence in sentences:
                                             yield await _send_content_event(
                                                 ctx, sentence
                                             )
 
-                # 处理工具调用节点 - 工具由框架自动执行
-                elif Agent.is_call_tools_node(node):
-                    async with node.stream(run.ctx) as handle_stream:
-                        async for event in handle_stream:
-                            # 工具调用事件
-                            if isinstance(event, FunctionToolCallEvent):
-                                tool_info = {
-                                    "tool_name": event.part.tool_name,
-                                    "tool_call_id": event.part.tool_call_id,
-                                    "args": event.part.args,
-                                }
-                                ctx.tool_events.append(tool_info)
-                                ctx.tool_call_names[event.part.tool_call_id] = event.part.tool_name
-                                logger.info(
-                                    "agent_tool_call",
-                                    tool=event.part.tool_name,
-                                    args=event.part.args,
-                                    tool_call_id=event.part.tool_call_id,
-                                    connection_id=str(deps.connection_id),
-                                )
-                                # 发送工具调用事件
-                                yield StreamEvent(
-                                    event_type="tool_call",
-                                    content=event.part.tool_name,
-                                    sequence=ctx.sequence,
-                                    metadata={
+                                # 处理增量事件
+                                elif isinstance(event, PartDeltaEvent):
+                                    delta = event.delta
+                                    # ThinkingPartDelta：作为 reasoning 事件输出
+                                    if isinstance(delta, ThinkingPartDelta):
+                                        chunk = delta.content_delta
+                                        if chunk:
+                                            logger.debug(
+                                                "agent_thinking_delta",
+                                                chunk=chunk,
+                                                index=event.index,
+                                                connection_id=str(deps.connection_id),
+                                            )
+                                            yield await _send_reasoning_event(ctx, chunk)
+                                    # TextPartDelta：文本增量缓冲并按完整句子发送
+                                    elif isinstance(delta, TextPartDelta):
+                                        chunk = delta.content_delta
+                                        logger.debug(
+                                            "agent_text_delta",
+                                            chunk=chunk,
+                                            index=event.index,
+                                            connection_id=str(deps.connection_id),
+                                            buffer_before=ctx.sentence_buffer,
+                                        )
+                                        if chunk:
+                                            ctx.sentence_buffer += chunk
+                                            sentences, ctx.sentence_buffer = (
+                                                _extract_complete_sentences(
+                                                    ctx.sentence_buffer
+                                                )
+                                            )
+                                            logger.debug(
+                                                "agent_sentences_extracted",
+                                                sentences=sentences,
+                                                buffer_after=ctx.sentence_buffer,
+                                                connection_id=str(deps.connection_id),
+                                            )
+                                            for sentence in sentences:
+                                                yield await _send_content_event(
+                                                    ctx, sentence
+                                                )
+
+                    # 处理工具调用节点 - 工具由框架自动执行
+                    elif Agent.is_call_tools_node(node):
+                        async with node.stream(run.ctx) as handle_stream:
+                            async for event in handle_stream:
+                                # 工具调用事件
+                                if isinstance(event, FunctionToolCallEvent):
+                                    tool_info = {
                                         "tool_name": event.part.tool_name,
                                         "tool_call_id": event.part.tool_call_id,
                                         "args": event.part.args,
-                                    },
-                                )
-                                ctx.sequence += 1
+                                    }
+                                    ctx.tool_events.append(tool_info)
+                                    ctx.tool_call_names[event.part.tool_call_id] = event.part.tool_name
+                                    logger.info(
+                                        "agent_tool_call",
+                                        tool=event.part.tool_name,
+                                        args=event.part.args,
+                                        tool_call_id=event.part.tool_call_id,
+                                        connection_id=str(deps.connection_id),
+                                        run_id=deps.run_id,
+                                        player_name=deps.player_name,
+                                    )
+                                    # 发送工具调用事件
+                                    yield StreamEvent(
+                                        event_type="tool_call",
+                                        content=event.part.tool_name,
+                                        sequence=ctx.sequence,
+                                        metadata={
+                                            "tool_name": event.part.tool_name,
+                                            "tool_call_id": event.part.tool_call_id,
+                                            "args": event.part.args,
+                                            "run_id": deps.run_id,
+                                            "player_name": deps.player_name,
+                                        },
+                                    )
+                                    ctx.sequence += 1
 
-                            # 工具返回事件
-                            elif isinstance(event, FunctionToolResultEvent):
-                                result_content = str(event.result.content)
-                                ctx.tool_results[event.tool_call_id] = result_content
-                                logger.info(
-                                    "agent_tool_result",
-                                    tool_call_id=event.tool_call_id,
-                                    tool_name=ctx.tool_call_names.get(event.tool_call_id),
-                                    result=result_content,
-                                    result_length=len(result_content),
-                                    connection_id=str(deps.connection_id),
-                                )
-                                # 发送工具返回事件
-                                yield StreamEvent(
-                                    event_type="tool_result",
-                                    content=result_content,
-                                    sequence=ctx.sequence,
-                                    metadata={
-                                        "tool_call_id": event.tool_call_id,
-                                        "tool_name": ctx.tool_call_names.get(event.tool_call_id),
-                                    },
-                                )
-                                ctx.sequence += 1
+                                # 工具返回事件
+                                elif isinstance(event, FunctionToolResultEvent):
+                                    result_content = str(event.result.content)
+                                    ctx.tool_results[event.tool_call_id] = result_content
+                                    logger.info(
+                                        "agent_tool_result",
+                                        tool_call_id=event.tool_call_id,
+                                        tool_name=ctx.tool_call_names.get(event.tool_call_id),
+                                        result_preview=result_content[:100],
+                                        result_length=len(result_content),
+                                        connection_id=str(deps.connection_id),
+                                        run_id=deps.run_id,
+                                        player_name=deps.player_name,
+                                    )
+                                    # 发送工具返回事件
+                                    yield StreamEvent(
+                                        event_type="tool_result",
+                                        content=result_content,
+                                        sequence=ctx.sequence,
+                                        metadata={
+                                            "tool_call_id": event.tool_call_id,
+                                            "tool_name": ctx.tool_call_names.get(event.tool_call_id),
+                                            "run_id": deps.run_id,
+                                            "player_name": deps.player_name,
+                                        },
+                                    )
+                                    ctx.sequence += 1
 
-                # 处理结束节点
-                elif Agent.is_end_node(node):
-                    # 仅在整个执行结束时再冲刷尾部 buffer，避免跨节点半句提前下发
-                    if ctx.sentence_buffer.strip():
-                        yield await _send_content_event(ctx, ctx.sentence_buffer)
-                        ctx.sentence_buffer = ""
+                    # 处理结束节点
+                    elif Agent.is_end_node(node):
+                        # 仅在整个执行结束时再冲刷尾部 buffer，避免跨节点半句提前下发
+                        if ctx.sentence_buffer.strip():
+                            yield await _send_content_event(ctx, ctx.sentence_buffer)
+                            ctx.sentence_buffer = ""
 
-                    # 从最终结果中提取信息
-                    if run.result is not None:
-                        ctx.all_messages = _extract_all_messages(run.result)
-                        ctx.new_messages = _extract_new_messages(run.result)
-                        ctx.serialized_usage = _serialize_usage(
-                            _extract_result_usage(run.result)
+                        # 从最终结果中提取信息
+                        if run.result is not None:
+                            ctx.all_messages = _extract_all_messages(run.result)
+                            ctx.new_messages = _extract_new_messages(run.result)
+                            ctx.serialized_usage = _serialize_usage(
+                                _extract_result_usage(run.result)
+                            )
+                            deferred = _extract_deferred_requests(run.result)
+                            if deferred is not None:
+                                yield _build_approval_required_event(
+                                    ctx, deps, deferred, run.result
+                                )
+                                return
+                        logger.debug(
+                            "agent_run_complete",
+                            connection_id=str(deps.connection_id),
+                            run_id=deps.run_id,
+                            tool_events_count=len(ctx.tool_events),
                         )
-                    logger.debug(
-                        "agent_run_complete",
-                        connection_id=str(deps.connection_id),
-                        tool_events_count=len(ctx.tool_events),
-                    )
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        error_detail = _extract_exception_details(e)
+        error_kind, player_msg, diagnostic = classify_run_exception(e)
 
-        # 检查是否是 MCP 连接超时错误
+        # MCP 故障：只标记有证据关联的 server，不在本 run 内递归重放
         if _is_mcp_timeout_error(e):
             logger.warning(
-                "mcp_connection_timeout_fallback",
-                error=error_detail,
+                "mcp_connection_timeout_no_replay",
+                error=diagnostic,
                 connection_id=str(deps.connection_id),
+                run_id=deps.run_id,
             )
-            # 标记 MCP 为不可用，后续请求将直接使用降级 Agent
-            agent_manager.mark_mcp_failed()
-            # 降级到无 MCP 工具集的模式
-            fallback_agent = agent_manager.get_fallback_agent()
-            async for event in stream_response_handler(
-                prompt, deps, model, message_history, ctx, fallback_agent
-            ):
-                yield event
-            return
+            _mark_mcp_failure_from_exception(e, diagnostic)
+            error_kind = "TRANSIENT"
+            player_msg = player_facing_error("TRANSIENT")
 
         logger.error(
             "stream_response_handler_error",
-            error=error_detail,
+            error=diagnostic,
+            error_kind=error_kind,
             connection_id=str(deps.connection_id),
+            run_id=deps.run_id,
             exc_info=True,  # 保留完整堆栈
         )
         yield StreamEvent(
             event_type="error",
-            content=f"流式响应处理错误: {error_detail}",
+            content=player_msg,
             sequence=ctx.sequence,
+            metadata={
+                "error_kind": error_kind,
+                "diagnostic_summary": diagnostic,
+                "run_id": deps.run_id,
+                "conversation_id": deps.conversation_id,
+                "player_name": deps.player_name,
+            },
         )
 
 
 async def non_stream_response_handler(
-    prompt: str,
+    prompt: str | None,
     deps: AgentDependencies,
     model: Model | str | None = None,
     message_history: list[ModelMessage] | None = None,
     ctx: _HandlerContext | None = None,
-    agent: Agent[AgentDependencies, str] | None = None,
+    agent: Agent[AgentDependencies, str | DeferredToolRequests] | None = None,
+    *,
+    deferred_tool_results: Any | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """
     非流式响应处理器
@@ -853,12 +1107,13 @@ async def non_stream_response_handler(
     3. 逐一发送完整句子（带延迟以避免 MC 崩溃）
 
     Args:
-        prompt: 用户输入
+        prompt: 用户输入；审批恢复时可为 None
         deps: Agent 依赖
         model: 可选的模型覆盖
         message_history: 消息历史
         ctx: 处理器上下文
         agent: 可选的 Agent 实例，不传则使用管理器中的 Agent
+        deferred_tool_results: 审批恢复时传入的 DeferredToolResults
 
     Yields:
         StreamEvent: 流式事件
@@ -874,19 +1129,34 @@ async def non_stream_response_handler(
         mode="non_stream",
     )
 
+    usage_limits = build_usage_limits(deps.settings, deps.provider)
+    run_timeout = get_run_timeout(deps.settings)
+
     try:
-        result = await active_agent.run(
-            prompt,
-            deps=deps,
-            model=model,
-            message_history=message_history,
-        )
+        async with asyncio.timeout(run_timeout):
+            run_kwargs: dict[str, Any] = {
+                "deps": deps,
+                "model": model,
+                "message_history": message_history,
+                "usage_limits": usage_limits,
+            }
+            if deferred_tool_results is not None:
+                run_kwargs["deferred_tool_results"] = deferred_tool_results
+            result = await active_agent.run(
+                prompt,
+                **run_kwargs,
+            )
 
         # 提取处理结果
         ctx.new_messages = _extract_new_messages(result)
         ctx.all_messages = _extract_all_messages(result)
         ctx.serialized_usage = _serialize_usage(_extract_result_usage(result))
         ctx.tool_events = _extract_tool_events_from_messages(ctx.new_messages)
+
+        deferred = _extract_deferred_requests(result)
+        if deferred is not None:
+            yield _build_approval_required_event(ctx, deps, deferred, result)
+            return
 
         # 从结果消息中提取思考内容（ThinkingPart），在正文之前作为 reasoning 事件输出
         for reasoning_chunk in _extract_reasoning_from_messages(ctx.new_messages):
@@ -902,45 +1172,52 @@ async def non_stream_response_handler(
         for chunk in _iter_sentence_batches(full_response):
             yield await _send_content_event(ctx, chunk, add_delay=True)
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        error_detail = _extract_exception_details(e)
+        error_kind, player_msg, diagnostic = classify_run_exception(e)
 
-        # 检查是否是 MCP 连接超时错误
         if _is_mcp_timeout_error(e):
             logger.warning(
-                "mcp_connection_timeout_fallback_non_stream",
-                error=error_detail,
+                "mcp_connection_timeout_no_replay_non_stream",
+                error=diagnostic,
                 connection_id=str(deps.connection_id),
+                run_id=deps.run_id,
             )
-            # 标记 MCP 为不可用，后续请求将直接使用降级 Agent
-            agent_manager.mark_mcp_failed()
-            # 降级到无 MCP 工具集的模式
-            fallback_agent = agent_manager.get_fallback_agent()
-            async for event in non_stream_response_handler(
-                prompt, deps, model, message_history, ctx, fallback_agent
-            ):
-                yield event
-            return
+            _mark_mcp_failure_from_exception(e, diagnostic)
+            error_kind = "TRANSIENT"
+            player_msg = player_facing_error("TRANSIENT")
 
         logger.error(
             "non_stream_response_handler_error",
-            error=error_detail,
+            error=diagnostic,
+            error_kind=error_kind,
             connection_id=str(deps.connection_id),
+            run_id=deps.run_id,
             exc_info=True,
         )
         yield StreamEvent(
             event_type="error",
-            content=f"非流式响应处理错误: {error_detail}",
+            content=player_msg,
             sequence=ctx.sequence,
+            metadata={
+                "error_kind": error_kind,
+                "diagnostic_summary": diagnostic,
+                "run_id": deps.run_id,
+                "conversation_id": deps.conversation_id,
+                "player_name": deps.player_name,
+            },
         )
 
 
 async def stream_chat(
-    prompt: str,
+    prompt: str | None,
     deps: AgentDependencies,
     model: Model | str | None = None,
     message_history: list[ModelMessage] | None = None,
-    agent: Agent[AgentDependencies, str] | None = None,
+    agent: Agent[AgentDependencies, str | DeferredToolRequests] | None = None,
+    *,
+    deferred_tool_results: Any | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """
     流式聊天处理主调度函数
@@ -949,11 +1226,12 @@ async def stream_chat(
     工具调用由 Pydantic AI 框架自动处理，无需手动回退。
 
     Args:
-        prompt: 用户输入
+        prompt: 用户输入；审批恢复时可为 None
         deps: Agent 依赖
         model: 可选的模型覆盖
         message_history: 消息历史
         agent: 可选的 Agent 实例，不传则使用管理器中的 Agent
+        deferred_tool_results: 审批恢复时传入的 DeferredToolResults
 
     Yields:
         StreamEvent: 流式事件
@@ -966,18 +1244,36 @@ async def stream_chat(
         if use_stream_mode:
             # 流式模式处理
             async for event in stream_response_handler(
-                prompt, deps, model, message_history, ctx, agent
+                prompt,
+                deps,
+                model,
+                message_history,
+                ctx,
+                agent,
+                deferred_tool_results=deferred_tool_results,
             ):
                 if event.event_type == "error":
+                    yield event
+                    return
+                if event.event_type == "approval_required":
                     yield event
                     return
                 yield event
         else:
             # 非流式模式处理
             async for event in non_stream_response_handler(
-                prompt, deps, model, message_history, ctx, agent
+                prompt,
+                deps,
+                model,
+                message_history,
+                ctx,
+                agent,
+                deferred_tool_results=deferred_tool_results,
             ):
                 if event.event_type == "error":
+                    yield event
+                    return
+                if event.event_type == "approval_required":
                     yield event
                     return
                 yield event
@@ -985,6 +1281,9 @@ async def stream_chat(
         logger.debug(
             "chat_complete",
             connection_id=str(deps.connection_id),
+            run_id=deps.run_id,
+            player_name=deps.player_name,
+            conversation_id=deps.conversation_id,
             tool_events_count=len(ctx.tool_events),
         )
 
@@ -998,19 +1297,33 @@ async def stream_chat(
                 "usage": ctx.serialized_usage,
                 "all_messages": ctx.all_messages,
                 "tool_events": ctx.tool_events,
+                "run_id": deps.run_id,
+                "conversation_id": deps.conversation_id,
+                "player_name": deps.player_name,
             },
         )
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        error_detail = _extract_exception_details(e)
+        error_kind, player_msg, diagnostic = classify_run_exception(e)
         logger.error(
             "stream_chat_error",
-            error=error_detail,
+            error=diagnostic,
+            error_kind=error_kind,
             connection_id=str(deps.connection_id),
+            run_id=deps.run_id,
             exc_info=True,
         )
         yield StreamEvent(
             event_type="error",
-            content=f"聊天处理错误: {error_detail}",
+            content=player_msg,
             sequence=ctx.sequence,
+            metadata={
+                "error_kind": error_kind,
+                "diagnostic_summary": diagnostic,
+                "run_id": deps.run_id,
+                "conversation_id": deps.conversation_id,
+                "player_name": deps.player_name,
+            },
         )

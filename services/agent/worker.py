@@ -4,15 +4,20 @@ import asyncio
 import copy
 import dataclasses
 import time
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ThinkingPart
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDenied
 
 from core.queue import MessageBroker
-from services.agent.core import stream_chat, _extract_exception_details
+from services.agent.core import stream_chat, _extract_exception_details, player_facing_error, classify_run_exception
+from services.agent.harness.approvals import PendingApproval
+from services.agent.harness.execution import summarize_args_for_player
 from services.agent.providers import ProviderRegistry
+from services.agent.runtime import get_agent_runtime
 from services.agent.title import generate_conversation_title
+from services.agent.tool_results import CommandResult
 from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
 from models.messages import ChatRequest, StreamChunk, SystemNotification
 from models.agent import (
@@ -97,6 +102,7 @@ class AgentWorker:
     async def _run(self) -> None:
         """Worker 主循环"""
         while self._running:
+            item = None
             try:
                 # 从队列获取请求（带超时，避免无限期阻塞）
                 try:
@@ -111,12 +117,10 @@ class AgentWorker:
                 # 处理请求
                 await self._process_request(item)
 
-                # 标记任务完成
-                self.broker.request_done()
-
             except asyncio.CancelledError:
                 logger.info("worker_cancelled", worker_id=self.worker_id)
-                break
+                # 若已取出 item 但尚未 request_done，在 finally 中补齐
+                raise
             except Exception as e:
                 logger.error(
                     "worker_error",
@@ -125,6 +129,17 @@ class AgentWorker:
                     exc_info=True,
                 )
                 # 继续运行，不因单个错误而停止
+            finally:
+                # 正常、异常、取消路径均完成 queue task，避免悬挂
+                if item is not None:
+                    try:
+                        self.broker.request_done()
+                    except Exception as done_error:
+                        logger.error(
+                            "worker_request_done_failed",
+                            worker_id=self.worker_id,
+                            error=str(done_error),
+                        )
 
     async def _process_request(self, item: any) -> None:
         """
@@ -157,17 +172,32 @@ class AgentWorker:
             conversation_generation = request.conversation_generation
         conversation_invalidation_epoch = request.conversation_invalidation_epoch
 
+        # 确保 run 有稳定身份
+        run_id = request.run_id or str(uuid4())
+        if not request.run_id:
+            request.run_id = run_id
+
         logger.info(
             "processing_chat_request",
             worker_id=self.worker_id,
             connection_id=str(connection_id),
             player=request.player_name,
             conversation_id=request.conversation_id,
+            run_id=run_id,
             content_length=len(request.content),
         )
 
         message_history: list[ModelMessage] | None = None
-        if request.use_context:
+        deferred_tool_results: DeferredToolResults | None = None
+        resume_prompt: str | None = request.content
+
+        if request.resume_approval_id and request.deferred_tool_results is not None:
+            # 审批恢复：使用原 messages，不把批准文本作为新 prompt
+            resume_prompt = None
+            raw_history = request.resume_message_history or []
+            message_history = list(raw_history)
+            deferred_tool_results = self._coerce_deferred_tool_results(request.deferred_tool_results)
+        elif request.use_context:
             raw_history = self.broker.get_conversation_history(
                 connection_id, request.player_name, request.conversation_id
             )
@@ -178,6 +208,7 @@ class AgentWorker:
                 connection_id=str(connection_id),
                 player=request.player_name,
                 conversation_id=request.conversation_id,
+                run_id=run_id,
                 history_message_count=len(message_history),
                 cleared_reasoning_content_count=cleared_count,
             )
@@ -192,8 +223,9 @@ class AgentWorker:
                 connection_id, request.player_name, request.conversation_id
             )
             message_count = len(history) if history else 0
-            # 简单估算：平均每条消息 100 tokens
-            estimated_tokens = message_count * 100
+            from services.agent.context import estimate_history_tokens
+
+            estimated_tokens = estimate_history_tokens(history) if history else 0
             # 获取模型最大上下文
             provider_name = request.provider or self.settings.default_provider
             provider_config = self.settings.get_provider_config(provider_name)
@@ -216,6 +248,8 @@ class AgentWorker:
             addon_bridge=self._create_addon_bridge_client(connection_id),
             provider=request.provider or self.settings.default_provider,
             get_context_info=get_context_info,
+            run_id=run_id,
+            conversation_id=request.conversation_id,
         )
 
         stream_target = "@a" if request.broadcast_ai_chat else request.player_name
@@ -230,9 +264,48 @@ class AgentWorker:
                 ),
             )
 
+        # 模型请求前：token 预算优先压缩（审批恢复路径不压缩）
+        provider_name = request.provider or self.settings.default_provider
+        if request.use_context and not (
+            request.resume_approval_id and request.deferred_tool_results is not None
+        ):
+            from core.conversation import get_conversation_manager
+
+            conv_manager = get_conversation_manager(self.broker, self.settings)
+            compressed, compress_msg = await conv_manager.check_and_compress(
+                connection_id,
+                request.player_name,
+                force=False,
+                conversation_id=request.conversation_id,
+                provider_name=provider_name,
+            )
+            if compressed:
+                # 压缩后重新加载历史，确保本轮请求使用裁剪后的上下文
+                raw_history = self.broker.get_conversation_history(
+                    connection_id, request.player_name, request.conversation_id
+                )
+                message_history, cleared_count = self._strip_reasoning_content(raw_history)
+                await self.broker.send_response(
+                    connection_id,
+                    SystemNotification(
+                        connection_id=connection_id,
+                        level="info",
+                        message=f"对话历史已自动压缩，{compress_msg}",
+                        player_name=request.player_name,
+                    ),
+                )
+                logger.debug(
+                    "pre_request_compression_triggered",
+                    worker_id=self.worker_id,
+                    connection_id=str(connection_id),
+                    player=request.player_name,
+                    message=compress_msg,
+                    history_message_count=len(message_history),
+                    cleared_reasoning_content_count=cleared_count,
+                )
+
         # 获取模型
         try:
-            provider_name = request.provider or self.settings.default_provider
             provider_config = self.settings.get_provider_config(provider_name)
             model = ProviderRegistry.get_model(provider_config)
 
@@ -240,6 +313,7 @@ class AgentWorker:
                 "using_provider",
                 provider=provider_name,
                 model=provider_config.model,
+                run_id=run_id,
             )
 
         except Exception as e:
@@ -247,9 +321,18 @@ class AgentWorker:
                 "provider_error",
                 provider=provider_name,
                 error=str(e),
+                run_id=run_id,
             )
-            # 发送错误消息
-            await self._send_error_chunk(connection_id, request.player_name, str(e), 0, target=stream_target)
+            # 玩家只收到稳定错误类别
+            await self._send_error_chunk(
+                connection_id,
+                request.player_name,
+                player_facing_error("INTERNAL"),
+                0,
+                target=stream_target,
+                error_kind="INTERNAL",
+                run_id=run_id,
+            )
             return
 
         # 流式处理
@@ -270,10 +353,11 @@ class AgentWorker:
 
         try:
             async for event in stream_chat(
-                request.content,
+                resume_prompt,
                 deps,
                 model,
                 message_history=message_history,
+                deferred_tool_results=deferred_tool_results,
             ):
                 event_count += 1
                 if event.event_type == "content" and event.content:
@@ -346,6 +430,16 @@ class AgentWorker:
                         )
                         await self.broker.send_response(connection_id, result_chunk)
                         sequence += 1
+
+                elif event.event_type == "approval_required":
+                    await self._handle_approval_required(
+                        request=request,
+                        connection_id=connection_id,
+                        event=event,
+                        sequence=sequence,
+                        stream_target=stream_target,
+                    )
+                    return
 
                 if event.metadata and event.metadata.get("is_complete"):
                     all_messages = event.metadata.get("all_messages")
@@ -427,6 +521,7 @@ class AgentWorker:
                                     connection_id=str(connection_id),
                                     player=request.player_name,
                                     conversation_id=request.conversation_id,
+                                    run_id=run_id,
                                 )
 
                     response_text = "".join(response_parts)
@@ -437,15 +532,15 @@ class AgentWorker:
                         worker_id=self.worker_id,
                         connection_id=str(connection_id),
                         player=request.player_name,
-                        response=response_text,
+                        conversation_id=request.conversation_id,
+                        run_id=run_id,
                         response_length=len(response_text),
                         reasoning_length=len(reasoning_text),
                         chunk_count=event_count,
                         duration_ms=duration_ms,
                         usage=event.metadata.get("usage"),
-                        tool_calls=event.metadata.get("tool_calls"),
-                        tool_returns=event.metadata.get("tool_returns"),
-                        tool_fallback_used=event.metadata.get("tool_fallback_used"),
+                        tool_events=event.metadata.get("tool_events"),
+                        tool_events_count=len(event.metadata.get("tool_events") or []),
                     )
 
                     # AI 响应同步到 Addon UI 历史记录
@@ -458,15 +553,23 @@ class AgentWorker:
                         })
                 elif event.event_type == "error":
                     response_text = "".join(response_parts)
+                    error_kind = (
+                        event.metadata.get("error_kind") if event.metadata else None
+                    ) or "INTERNAL"
                     logger.error(
                         "chat_response_error",
                         worker_id=self.worker_id,
                         connection_id=str(connection_id),
-                        error=event.content,
-                        response=response_text,
+                        run_id=run_id,
+                        error_kind=error_kind,
+                        diagnostic_summary=(
+                            event.metadata.get("diagnostic_summary")
+                            if event.metadata
+                            else None
+                        ),
                         response_length=len(response_text),
                     )
-                    # 错误事件需要发送到游戏
+                    # 错误事件需要发送到游戏（玩家只看稳定类别文案）
                     chunk = StreamChunk(
                         connection_id=connection_id,
                         chunk_type=event.event_type,  # type: ignore
@@ -544,7 +647,7 @@ class AgentWorker:
                 # is_complete 事件不需要发送到游戏
 
         except Exception as e:
-            error_detail = _extract_exception_details(e)
+            error_kind, player_msg, diagnostic = classify_run_exception(e)
 
             # 检查是否是 MCP 超时错误，如果是则更新 MCP 服务器状态
             if _is_mcp_timeout_error(e):
@@ -552,26 +655,42 @@ class AgentWorker:
                     "mcp_timeout_detected_in_worker",
                     worker_id=self.worker_id,
                     connection_id=str(connection_id),
-                    error=error_detail,
+                    run_id=run_id,
+                    error=diagnostic,
                 )
-                # 标记所有 MCP 服务器为失败（因为我们不知道具体是哪个）
-                for server_name in mcp_manager.servers.keys():
-                    mcp_manager.mark_server_failed(server_name, f"连接超时: {error_detail}")
-                # 注意：core.py 中的降级机制会自动重试，这里不需要额外处理
+                # 仅标记有证据关联的 server；无证据时不批量禁用
+                if mcp_manager is not None:
+                    detail = diagnostic
+                    matched = False
+                    for server_name in list(mcp_manager.servers.keys()):
+                        if server_name and server_name in detail:
+                            mcp_manager.mark_server_failed(
+                                server_name, f"连接超时: {diagnostic}"
+                            )
+                            matched = True
+                    if matched:
+                        from services.agent.runtime import get_agent_runtime
+
+                        get_agent_runtime().refresh_mcp_tools(self.settings)
+                # 不在当前 run 内递归重放
 
             logger.error(
                 "stream_processing_error",
                 worker_id=self.worker_id,
                 connection_id=str(connection_id),
-                error=error_detail,
+                run_id=run_id,
+                error_kind=error_kind,
+                error=diagnostic,
                 exc_info=True,
             )
             await self._send_error_chunk(
                 connection_id,
                 request.player_name,
-                error_detail,
+                player_msg,
                 sequence,
                 target=stream_target,
+                error_kind=error_kind,
+                run_id=run_id,
             )
 
     async def _generate_title_for_conversation(
@@ -850,9 +969,9 @@ class AgentWorker:
         return send_to_game
 
     def _create_command_callback(self, connection_id: UUID):
-        """创建执行命令的回调"""
+        """创建执行命令的回调，返回结构化 CommandResult。"""
 
-        async def run_command(command: str) -> str:
+        async def run_command(command: str) -> CommandResult:
             # 发送到响应队列，由 WebSocket Handler 处理并等待命令结果
             loop = asyncio.get_running_loop()
             future: asyncio.Future[str] = loop.create_future()
@@ -866,12 +985,30 @@ class AgentWorker:
             )
 
             if not sent:
-                return "命令执行失败: 连接不存在"
+                return CommandResult.connection_unavailable(
+                    "连接不存在",
+                    diagnostic_summary="broker.send_response returned False",
+                )
 
             try:
-                return await asyncio.wait_for(future, timeout=self.settings.run_command_timeout)
+                raw = await asyncio.wait_for(future, timeout=self.settings.run_command_timeout)
             except asyncio.TimeoutError:
-                return "命令执行超时: 未收到游戏侧 commandResponse"
+                return CommandResult.timeout_unknown(
+                    "命令执行超时: 未收到游戏侧 commandResponse",
+                    diagnostic_summary="asyncio.TimeoutError waiting for commandResponse",
+                )
+            except asyncio.CancelledError:
+                raise
+
+            text = str(raw) if raw is not None else ""
+            if text.startswith("命令执行失败: 连接") or text.startswith("命令执行失败: WebSocket"):
+                return CommandResult.connection_unavailable(
+                    text,
+                    diagnostic_summary=text,
+                )
+            if text.startswith("命令执行失败"):
+                return CommandResult.failed(text, diagnostic_summary=text)
+            return CommandResult.ok(text or "命令执行成功")
 
         return run_command
 
@@ -881,12 +1018,25 @@ class AgentWorker:
         Returns ``None`` when no ``AddonBridgeService`` was injected (unit tests
         or hosts without addon tooling). Runtime ``cli.py serve`` always injects
         the shared service from ``HostGatewayServer``.
+
+        Addon 层仍消费字符串结果；从 CommandResult 映射。
         """
         if self._addon is None:
             return None
+
+        async def send_command_for_addon(command: str) -> str:
+            result = await self._create_command_callback(connection_id)(command)
+            if result.is_success:
+                return result.output
+            if result.status == "connection_unavailable":
+                return f"命令执行失败: {result.output}"
+            if result.status == "timeout_unknown":
+                return f"命令执行超时: {result.output}"
+            return f"命令执行失败: {result.output}"
+
         return self._addon.create_client(
             connection_id=connection_id,
-            send_command=self._create_command_callback(connection_id),
+            send_command=send_command_for_addon,
         )
 
     async def _send_error_chunk(
@@ -896,14 +1046,173 @@ class AgentWorker:
         error: str,
         sequence: int,
         target: str | None = None,
+        *,
+        error_kind: str | None = None,
+        run_id: str | None = None,
     ) -> None:
-        """发送错误消息块"""
+        """发送错误消息块（玩家可见文案，不含堆栈）。"""
         chunk = StreamChunk(
             connection_id=connection_id,
             chunk_type="error",
-            content=f"错误: {error}",
+            content=error if error.startswith("错误") else f"错误: {error}",
             sequence=sequence,
             player_name=player_name,
             target=target,
         )
         await self.broker.send_response(connection_id, chunk)
+
+    def _coerce_deferred_tool_results(self, payload: dict | DeferredToolResults) -> DeferredToolResults:
+        if isinstance(payload, DeferredToolResults):
+            return payload
+        results = DeferredToolResults()
+        approvals = payload.get("approvals") if isinstance(payload, dict) else None
+        calls = payload.get("calls") if isinstance(payload, dict) else None
+        metadata = payload.get("metadata") if isinstance(payload, dict) else None
+        if isinstance(approvals, dict):
+            for tool_call_id, value in approvals.items():
+                if value is True:
+                    results.approvals[tool_call_id] = True
+                elif value is False:
+                    results.approvals[tool_call_id] = False
+                elif isinstance(value, dict) and value.get("kind") == "tool-denied":
+                    results.approvals[tool_call_id] = ToolDenied(
+                        message=str(value.get("message") or "已拒绝")
+                    )
+                else:
+                    results.approvals[tool_call_id] = value
+        if isinstance(calls, dict):
+            results.calls.update(calls)
+        if isinstance(metadata, dict):
+            results.metadata.update(metadata)
+        return results
+
+    async def _handle_approval_required(
+        self,
+        *,
+        request: ChatRequest,
+        connection_id: UUID,
+        event,
+        sequence: int,
+        stream_target: str | None,
+    ) -> None:
+        """把 DeferredToolRequests 落盘到 PendingApprovalStore，并提示玩家审批。"""
+        import time as _time
+
+        metadata = event.metadata or {}
+        deferred = metadata.get("deferred_requests")
+        if not isinstance(deferred, DeferredToolRequests):
+            await self._send_error_chunk(
+                connection_id,
+                request.player_name,
+                "内部错误：缺少待审批工具调用",
+                sequence,
+                target=stream_target,
+                error_kind="INTERNAL",
+                run_id=request.run_id,
+            )
+            return
+
+        messages = metadata.get("all_messages") or []
+        store = get_agent_runtime().get_pending_approval_store(self.settings)
+        ttl = float(getattr(self.settings, "approval_ttl", 120.0) or 120.0)
+        now = _time.time()
+        player_name = request.player_name or DEFAULT_PLAYER_DISPLAY_NAME
+        approval_ids: list[str] = []
+
+        pending_calls = list(deferred.approvals) + list(deferred.calls)
+        if not pending_calls:
+            await self._send_error_chunk(
+                connection_id,
+                request.player_name,
+                "没有需要审批的工具调用",
+                sequence,
+                target=stream_target,
+                error_kind="INTERNAL",
+                run_id=request.run_id,
+            )
+            return
+
+        # 同一 DeferredToolRequests 作为一批：须全部决策后才 resume
+        batch_id = store.generate_batch_id()
+        preassigned_ids = [store.generate_approval_id() for _ in pending_calls]
+        sibling_ids = list(preassigned_ids)
+
+        for approval_id, call in zip(preassigned_ids, pending_calls):
+            meta = deferred.metadata.get(call.tool_call_id, {}) if deferred.metadata else {}
+            normalized_args = meta.get("normalized_args")
+            if not isinstance(normalized_args, dict):
+                args = call.args if isinstance(call.args, dict) else {}
+                normalized_args = args
+            args_hash = str(meta.get("args_hash") or "")
+            args_summary = str(
+                meta.get("args_summary")
+                or summarize_args_for_player(call.tool_name, normalized_args)
+            )
+            policy_version = str(meta.get("policy_version") or getattr(self.settings, "tool_policy_version", "unknown"))
+            pending = PendingApproval(
+                approval_id=approval_id,
+                connection_id=str(connection_id),
+                player_name=player_name,
+                conversation_id=request.conversation_id,
+                run_id=request.run_id or str(metadata.get("run_id") or ""),
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                normalized_args=normalized_args,
+                args_summary=args_summary,
+                args_hash=args_hash,
+                policy_version=policy_version,
+                messages=list(messages),
+                requests=deferred,
+                provider=request.provider,
+                delivery=request.delivery,
+                use_context=request.use_context,
+                broadcast_ai_chat=request.broadcast_ai_chat,
+                created_at=now,
+                expires_at=now + ttl,
+                batch_id=batch_id,
+                sibling_approval_ids=sibling_ids,
+                metadata={
+                    "risk": meta.get("risk"),
+                    "reason": meta.get("reason"),
+                },
+            )
+            store.put(pending)
+            approval_ids.append(approval_id)
+
+            batch_hint = ""
+            if len(sibling_ids) > 1:
+                batch_hint = (
+                    f"\n批次: {batch_id}（共 {len(sibling_ids)} 项，"
+                    f"需全部决策后才会继续执行）"
+                )
+            prompt = (
+                f"工具审批请求 [{approval_id}]\n"
+                f"工具: {call.tool_name}\n"
+                f"参数: {args_summary}\n"
+                f"原因: {meta.get('reason') or '需要确认'}"
+                f"{batch_hint}\n"
+                f"请执行: AGENT 工具审批 {approval_id} 允许|拒绝"
+            )
+            chunk = StreamChunk(
+                connection_id=connection_id,
+                chunk_type="approval_required",
+                content=prompt,
+                sequence=sequence,
+                delivery=request.delivery,
+                player_name=request.player_name,
+                target=stream_target or request.player_name,
+                tool_name=call.tool_name,
+            )
+            await self.broker.send_response(connection_id, chunk)
+            sequence += 1
+
+        logger.info(
+            "tool_approval_pending",
+            worker_id=self.worker_id,
+            connection_id=str(connection_id),
+            player=player_name,
+            conversation_id=request.conversation_id,
+            approval_ids=approval_ids,
+            batch_id=batch_id,
+            run_id=request.run_id,
+        )

@@ -467,3 +467,198 @@ class TestMCPManagerAsyncOperations:
         assert result is False
 
         await manager.shutdown()
+
+
+class TestMCPFailureInvariants:
+    """MCP 故障不变量：局部失败不拖垮健康 server；不整轮重放。"""
+
+    def test_one_server_failure_does_not_remove_healthy(self):
+        from services.agent.mcp import MCPManager, MCPConnectionStatus, MCPServerInfo
+
+        manager = MCPManager(Settings())
+        healthy = object()
+        failed = object()
+        manager._servers["good"] = MCPServerInfo(
+            name="good",
+            config=MCPServerConfig(command="echo"),
+            toolset=healthy,
+            status=MCPConnectionStatus.ACTIVE,
+        )
+        manager._servers["bad"] = MCPServerInfo(
+            name="bad",
+            config=MCPServerConfig(command="echo"),
+            toolset=failed,
+            status=MCPConnectionStatus.ACTIVE,
+        )
+
+        manager.mark_server_failed("bad", "timeout")
+        toolsets = manager.get_healthy_toolsets()
+
+        assert manager._servers["bad"].status == MCPConnectionStatus.ERROR
+        assert manager._servers["good"].status == MCPConnectionStatus.ACTIVE
+        assert healthy in toolsets
+        assert failed not in toolsets
+
+    def test_get_toolsets_for_agent_uses_healthy_only(self):
+        from services.agent.mcp import MCPManager, MCPConnectionStatus, MCPServerInfo
+
+        manager = MCPManager(Settings())
+        a = object()
+        b = object()
+        manager._servers["a"] = MCPServerInfo(
+            name="a",
+            config=MCPServerConfig(command="echo"),
+            toolset=a,
+            status=MCPConnectionStatus.PENDING,
+        )
+        manager._servers["b"] = MCPServerInfo(
+            name="b",
+            config=MCPServerConfig(command="echo"),
+            toolset=b,
+            status=MCPConnectionStatus.ERROR,
+            last_error="boom",
+        )
+        assert manager.get_toolsets_for_agent() == [a]
+
+
+    @pytest.mark.asyncio
+    async def test_mcp_timeout_does_not_replay_whole_run(self, monkeypatch):
+        """行为测试：本地工具已执行后 MCP timeout 返回结构化错误，且不重跑整轮。
+
+        用 non_stream + FunctionModel：先执行本地工具，再在下一轮 model 请求抛
+        含 mcp/timeout 的 TimeoutError，触发 no-replay TRANSIENT 路径。
+        """
+        from types import SimpleNamespace
+        from uuid import uuid4
+
+        from pydantic_ai import Agent, RunContext
+        from pydantic_ai.messages import ModelResponse, ToolCallPart
+        from pydantic_ai.models.function import FunctionModel
+        from pydantic_ai.models.test import TestModel
+        from pydantic_ai.tools import DeferredToolRequests
+
+        from models.agent import AgentDependencies
+        from services.agent.core import non_stream_response_handler
+        from services.agent.harness.execution import HarnessCapability, PolicyEngine
+        from services.agent.tool_results import ToolResult
+
+        class _Settings:
+            runtime_harness_enabled = True
+            runtime_harness_audit_enabled = False
+            runtime_harness_audit_path = "logs/unused.jsonl"
+            runtime_harness_audit_max_records = 100
+            hard_deny_tools: list[str] = []
+            hard_deny_command_roots: list[str] = []
+            max_batch_commands = 10
+            mcp_tool_allowlist: list[str] = []
+            tool_policy_version = "2026-07-21.1"
+            approval_ttl = 120.0
+            stream_sentence_mode = False
+            request_limit = 8
+            tool_calls_limit = 8
+            input_tokens_limit = None
+            output_tokens_limit = None
+            total_tokens_limit = None
+            run_timeout = 30.0
+            max_tool_concurrency = 4
+            context_output_reserve_tokens = 1024
+            count_tokens_before_request = False
+
+            def get_provider_config(self, provider_name: str | None = None):
+                return SimpleNamespace(context_window=None)
+
+        local_calls = {"count": 0}
+        handler_invocations = {"count": 0}
+
+        policy = PolicyEngine.from_settings(_Settings())
+        agent: Agent[AgentDependencies, str | DeferredToolRequests] = Agent(
+            "test",
+            deps_type=AgentDependencies,
+            output_type=[str, DeferredToolRequests],
+            capabilities=[HarnessCapability(policy=policy)],
+        )
+
+        @agent.tool
+        async def list_available_providers(ctx: RunContext[AgentDependencies]) -> str:
+            local_calls["count"] += 1
+            return ToolResult.ok("providers: deepseek")
+
+        step = {"n": 0}
+
+        def model_fn(messages, info):
+            step["n"] += 1
+            if step["n"] == 1:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name="list_available_providers",
+                            args={},
+                            tool_call_id="tc-local-1",
+                        )
+                    ]
+                )
+            # 本地工具已执行后，模拟 MCP 连接/调用超时（不递归重放）
+            raise TimeoutError("mcp server demo-mcp timeout: deadline exceeded")
+
+        async def _noop_send(msg: str) -> None:
+            return None
+
+        async def _noop_cmd(cmd: str):
+            from services.agent.tool_results import CommandResult
+
+            return CommandResult.ok("ok")
+
+        deps = AgentDependencies(
+            connection_id=uuid4(),
+            player_name="Steve",
+            settings=_Settings(),
+            http_client=SimpleNamespace(),
+            send_to_game=_noop_send,
+            run_command=_noop_cmd,
+            provider="test",
+            run_id="run-mcp-timeout",
+            conversation_id="conv-mcp",
+        )
+
+        from services.agent import core as core_mod
+
+        class _FakeManager:
+            def get_active_agent(self, agent_arg=None, **kwargs):
+                return agent_arg or agent
+
+        monkeypatch.setattr(core_mod, "get_agent_manager", lambda: _FakeManager())
+
+        events = []
+        handler_invocations["count"] += 1
+        async for event in non_stream_response_handler(
+            "call tools",
+            deps,
+            model=FunctionModel(model_fn),
+            agent=agent,
+        ):
+            events.append(event)
+
+        error_events = [e for e in events if e.event_type == "error"]
+        assert error_events, f"expected structured error, got {[e.event_type for e in events]}"
+        err = error_events[0]
+        assert (err.metadata or {}).get("error_kind") == "TRANSIENT"
+        assert (err.metadata or {}).get("run_id") == "run-mcp-timeout"
+
+        # 本地工具已执行（最多一次）；不得因 timeout 再起一轮导致二次执行
+        assert local_calls["count"] == 1
+        assert handler_invocations["count"] == 1
+
+        # 再跑一次独立请求可以再次执行本地工具（证明只影响当前 run，不递归重放）
+        local_before = local_calls["count"]
+        events2 = []
+        handler_invocations["count"] += 1
+        async for event in non_stream_response_handler(
+            "list only",
+            deps,
+            model=TestModel(call_tools=["list_available_providers"]),
+            agent=agent,
+        ):
+            events2.append(event)
+        assert local_calls["count"] == local_before + 1
+        assert handler_invocations["count"] == 2
+        assert not any(e.event_type == "error" for e in events2)

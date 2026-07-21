@@ -87,6 +87,12 @@ class MinecraftConfig(BaseModel):
             "description": "控制多人 AI 聊天广播",
             "usage": "<状态/关闭/全服 开启|关闭/玩家 <玩家名> 开启|关闭>"
         },
+        "AGENT 工具审批": {
+            "type": "tool_approval",
+            "aliases": ["AGENT tool-approval", "AI 工具审批", "AI tool-approval"],
+            "description": "审批高风险工具调用",
+            "usage": "<approval_id> <允许|拒绝>",
+        },
         "运行命令": {
             "type": "run_command",
             "aliases": ["runcmd", "cmd"],
@@ -115,6 +121,7 @@ class MinecraftConfig(BaseModel):
         "context": ("管理上下文开关", "<启用/关闭/状态>"),
         "mcp": ("MCP 服务器管理", "<list/status/reload>"),
         "ai_broadcast": ("控制多人 AI 聊天广播", "<状态/关闭/全服 开启|关闭/玩家 <玩家名> 开启|关闭>"),
+        "tool_approval": ("审批高风险工具调用", "<approval_id> <允许|拒绝>"),
         "switch_model": ("切换 LLM", "<provider>"),
         "save": ("保存当前对话历史", None),
         "run_command": ("执行游戏命令", "<命令>"),
@@ -229,12 +236,28 @@ REQUIRED_CONFIG_PATHS = (
     "agent.mcwiki_base_url",
     "agent.dedup_external_messages",
     "agent.tool_response_verbose",
+    "agent.request_limit",
+    "agent.tool_calls_limit",
+    "agent.input_tokens_limit",
+    "agent.output_tokens_limit",
+    "agent.total_tokens_limit",
+    "agent.run_timeout",
+    "agent.max_tool_concurrency",
+    "agent.context_output_reserve_tokens",
+    "agent.count_tokens_before_request",
     "agent.runtime_harness.enabled",
     "agent.runtime_harness.prompt_enabled",
     "agent.runtime_harness.schema_enabled",
     "agent.runtime_harness.audit_enabled",
     "agent.runtime_harness.audit_path",
     "agent.runtime_harness.audit_max_records",
+    "agent.runtime_harness.approval_ttl",
+    "agent.runtime_harness.max_batch_commands",
+    "agent.runtime_harness.hard_deny_tools",
+    "agent.runtime_harness.hard_deny_command_roots",
+    "agent.runtime_harness.mcp_tool_allowlist",
+    "agent.runtime_harness.tool_policy_version",
+    "agent.pydantic_ai_instrumentation",
     "queue.max_size",
     "queue.llm_worker_count",
     "websocket.ping_interval",
@@ -445,6 +468,20 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["runtime_harness_audit_path"] = runtime_harness["audit_path"]
     if "audit_max_records" in runtime_harness:
         result["runtime_harness_audit_max_records"] = runtime_harness["audit_max_records"]
+    if "approval_ttl" in runtime_harness:
+        result["approval_ttl"] = runtime_harness["approval_ttl"]
+    if "max_batch_commands" in runtime_harness:
+        result["max_batch_commands"] = runtime_harness["max_batch_commands"]
+    if "hard_deny_tools" in runtime_harness:
+        result["hard_deny_tools"] = runtime_harness["hard_deny_tools"]
+    if "hard_deny_command_roots" in runtime_harness:
+        result["hard_deny_command_roots"] = runtime_harness["hard_deny_command_roots"]
+    if "mcp_tool_allowlist" in runtime_harness:
+        result["mcp_tool_allowlist"] = runtime_harness["mcp_tool_allowlist"]
+    if "tool_policy_version" in runtime_harness:
+        result["tool_policy_version"] = runtime_harness["tool_policy_version"]
+    if "pydantic_ai_instrumentation" in agent:
+        result["pydantic_ai_instrumentation"] = agent["pydantic_ai_instrumentation"]
 
     if "max_size" in queue:
         result["queue_max_size"] = queue["max_size"]
@@ -749,6 +786,20 @@ class Settings(BaseSettings):
         description="是否排除sender为外部且事件为PlayerMessage的重复消息"
     )
 
+    # 每轮 run 预算（UsageLimits + wall-clock）
+    request_limit: int = Field(default=8, ge=1)
+    tool_calls_limit: int = Field(default=8, ge=1)
+    # None = 未显式配置；运行时可由模型 context window 派生
+    input_tokens_limit: int | None = Field(default=None, ge=1)
+    output_tokens_limit: int | None = Field(default=None, ge=1)
+    total_tokens_limit: int | None = Field(default=None, ge=1)
+    run_timeout: float = Field(default=90.0, gt=0)
+    max_tool_concurrency: int = Field(default=4, ge=1)
+    context_output_reserve_tokens: int = Field(default=1024, ge=0)
+    # 请求前 token 硬边界（UsageLimits.count_tokens_before_request）；
+    # FunctionModel/TestModel 不支持 count_tokens，相关离线测试可关闭。
+    count_tokens_before_request: bool = True
+
     # 运行时 Harness 配置
     runtime_harness_enabled: bool = True
     runtime_harness_prompt_enabled: bool = True
@@ -756,6 +807,19 @@ class Settings(BaseSettings):
     runtime_harness_audit_enabled: bool = True
     runtime_harness_audit_path: str = "logs/runtime_harness_tools.jsonl"
     runtime_harness_audit_max_records: int = Field(default=5000, gt=0)
+    # 工具策略 / 审批
+    approval_ttl: float = Field(default=120.0, gt=0)
+    max_batch_commands: int = Field(default=10, ge=1)
+    hard_deny_tools: list[str] = Field(default_factory=list)
+    hard_deny_command_roots: list[str] = Field(
+        default_factory=lambda: ["op", "deop", "stop", "whitelist", "permission", "wsserver"]
+    )
+    mcp_tool_allowlist: list[str] = Field(default_factory=list)
+    tool_policy_version: str = "2026-07-21.1"
+    # PydanticAI 原生 OpenTelemetry instrumentation 开关；默认关闭 exporter，
+    # 关闭时仍依赖 structlog 的 run_id 因果链。开启时 include_content=False，
+    # 避免把完整 prompt/completion 写入 trace。
+    pydantic_ai_instrumentation: bool = False
 
     # 队列配置
     queue_max_size: int = 100
@@ -793,14 +857,14 @@ class Settings(BaseSettings):
         description="开发模式 - 跳过身份验证，仅用于本地开发调试"
     )
 
-    # 原始日志开关配置
+    # 原始日志开关配置（默认关闭，避免缓冲流式 body / 泄露完整内容）
     enable_ws_raw_log: bool = Field(
-        default=True,
+        default=False,
         alias="ENABLE_WS_RAW_LOG",
         description="是否启用 WebSocket 原始请求/响应日志"
     )
     enable_llm_raw_log: bool = Field(
-        default=True,
+        default=False,
         alias="ENABLE_LLM_RAW_LOG",
         description="是否启用 LLM 请求/响应日志"
     )

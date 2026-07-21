@@ -16,7 +16,6 @@ REGISTERED_AGENT_TOOL_NAMES = {
     "send_title_message",
     "send_actionbar_message",
     "send_script_event",
-    "fetch_url_text",
     "mcwiki_search",
     "mcwiki_get_page",
     "list_available_providers",

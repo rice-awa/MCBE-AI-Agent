@@ -236,16 +236,18 @@ class MCPManager:
                         server=server_name,
                         mode="sse",
                         url=config.url,
+                        timeout=config.timeout,
                     )
-                    return MCPServerSSE(config.url)
+                    return MCPServerSSE(config.url, timeout=config.timeout)
                 else:
                     logger.info(
                         "mcp_toolset_created",
                         server=server_name,
                         mode="streamable-http",
                         url=config.url,
+                        timeout=config.timeout,
                     )
-                    return MCPServerStreamableHTTP(config.url)
+                    return MCPServerStreamableHTTP(config.url, timeout=config.timeout)
 
             # Stdio 模式（通过命令配置）
             if config.command:
@@ -357,15 +359,12 @@ class MCPManager:
         """
         获取用于 Agent 的工具集列表
 
-        如果没有有效的工具集，返回空列表（优雅降级）
+        默认仅装配 PENDING / ACTIVE 的健康 server。
 
         Returns:
             MCP 工具集列表
         """
-        toolsets = self.toolsets
-        if not toolsets:
-            logger.debug("mcp_no_active_toolsets")
-        return toolsets
+        return self.get_healthy_toolsets()
 
     def get_healthy_toolsets(self) -> list[Any]:
         """

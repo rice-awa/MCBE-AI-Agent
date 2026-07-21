@@ -134,6 +134,24 @@ class HostConnectionHook(NoOpHook):
                 connection_id=str(state.id),
                 error=str(exc),
             )
+        try:
+            from services.agent.runtime import get_agent_runtime
+
+            cleared = get_agent_runtime().pending_approvals.clear_connection(
+                str(state.id)
+            )
+            if cleared:
+                logger.info(
+                    "pending_approvals_cleared_on_disconnect",
+                    connection_id=str(state.id),
+                    cleared=cleared,
+                )
+        except Exception as exc:
+            logger.warning(
+                "pending_approvals_clear_failed",
+                connection_id=str(state.id),
+                error=str(exc),
+            )
         logger.info("client_disconnected", connection_id=str(state.id))
 
     async def on_player_message(

@@ -1,7 +1,6 @@
 """LLM Provider 注册表"""
 
 import hashlib
-import json
 from typing import Any
 
 import httpx
@@ -11,6 +10,7 @@ from pydantic_ai.providers.deepseek import DeepSeekProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from config.logging import get_logger
+from config.redaction import format_body_for_log, redact_exception, sanitize_headers, sanitize_url
 from config.settings import LLMProviderConfig, Settings
 from core.exceptions import ProviderNotConfiguredError, ProviderNotFoundError
 
@@ -21,7 +21,7 @@ llm_raw_logger = get_logger("llm.raw")
 class RuntimeAdapterRegistry:
     """Owns LLM model adapters and their HTTP client lifecycle."""
 
-    _raw_body_max_chars = 20_000
+    _raw_body_max_chars = 2_000
 
     def __init__(self) -> None:
         self._model_cache: dict[str, Model] = {}
@@ -84,9 +84,25 @@ class RuntimeAdapterRegistry:
                 details={"reason": "缺少 API Key"},
             )
 
-        logger.info("creating_deepseek_model", model=config.model)
+        logger.info(
+            "creating_deepseek_model",
+            model=config.model,
+            base_url=config.base_url,
+        )
 
         http_client = self._get_or_create_http_client(config, "deepseek")
+        base_url = config.base_url or "https://api.deepseek.com"
+
+        # DeepSeekProvider 固定 base_url 属性；自定义 base_url 走 OpenAIProvider。
+        if config.base_url and config.base_url.rstrip("/") != "https://api.deepseek.com":
+            return OpenAIChatModel(
+                config.model,
+                provider=OpenAIProvider(
+                    api_key=config.api_key,
+                    base_url=base_url,
+                    http_client=http_client,
+                ),
+            )
 
         return OpenAIChatModel(
             config.model,
@@ -126,11 +142,23 @@ class RuntimeAdapterRegistry:
                 details={"reason": "缺少 API Key"},
             )
 
-        logger.info("creating_anthropic_model", model=config.model)
+        logger.info(
+            "creating_anthropic_model",
+            model=config.model,
+            timeout=config.timeout,
+        )
 
         from pydantic_ai.models.anthropic import AnthropicModel
+        from pydantic_ai.providers.anthropic import AnthropicProvider
 
-        return AnthropicModel(config.model, api_key=config.api_key)
+        http_client = self._get_or_create_http_client(config, "anthropic")
+        return AnthropicModel(
+            config.model,
+            provider=AnthropicProvider(
+                api_key=config.api_key,
+                http_client=http_client,
+            ),
+        )
 
     def _create_ollama_model(self, config: LLMProviderConfig) -> Model:
         """创建 Ollama 模型"""
@@ -138,13 +166,19 @@ class RuntimeAdapterRegistry:
             "creating_ollama_model",
             model=config.model,
             base_url=config.base_url,
+            timeout=config.timeout,
         )
 
         from pydantic_ai.models.ollama import OllamaModel
+        from pydantic_ai.providers.ollama import OllamaProvider
 
+        http_client = self._get_or_create_http_client(config, "ollama")
         return OllamaModel(
             config.model,
-            base_url=config.base_url or "http://localhost:11434",
+            provider=OllamaProvider(
+                base_url=config.base_url or "http://localhost:11434",
+                http_client=http_client,
+            ),
         )
 
     @staticmethod
@@ -272,8 +306,18 @@ class RuntimeAdapterRegistry:
         self,
         config: LLMProviderConfig,
         provider_name: str,
+        *,
+        enable_llm_raw_log: bool | None = None,
     ) -> httpx.AsyncClient:
-        """创建带 LLM 原始请求/响应日志的 HTTP 客户端。"""
+        """创建 LLM HTTP 客户端；raw hook 仅在显式开启时安装，且不缓冲流式 body。"""
+        raw_enabled = (
+            enable_llm_raw_log
+            if enable_llm_raw_log is not None
+            else self._is_llm_raw_log_enabled()
+        )
+
+        if not raw_enabled:
+            return httpx.AsyncClient(timeout=config.timeout)
 
         async def on_request(request: httpx.Request) -> None:
             llm_raw_logger.info(
@@ -281,25 +325,33 @@ class RuntimeAdapterRegistry:
                 provider=provider_name,
                 model=config.model,
                 method=request.method,
-                url=str(request.url),
-                headers=self._sanitize_headers(dict(request.headers)),
-                body=self._format_raw_body(request.content),
+                url=sanitize_url(request.url),
+                headers=sanitize_headers(dict(request.headers)),
+                body=format_body_for_log(
+                    request.content,
+                    max_length=self._raw_body_max_chars,
+                ),
             )
 
         async def on_response(response: httpx.Response) -> None:
+            # 不得强制读取响应体：会消费/缓冲流式 body。
+            # 仅在 body 已被读取时记录；否则写占位符。
             try:
-                await response.aread()
-                body = self._format_raw_body(response.content)
+                raw = getattr(response, "_content", False)
+                if raw is False or raw is None:
+                    body = "<stream-or-unread-body-not-buffered>"
+                else:
+                    body = format_body_for_log(raw, max_length=self._raw_body_max_chars)
             except Exception as e:
-                body = f"<response_read_error: {str(e)}>"
+                body = f"<response_read_error: {redact_exception(e)}>"
 
             llm_raw_logger.info(
                 "llm_raw_response",
                 provider=provider_name,
                 model=config.model,
                 status_code=response.status_code,
-                url=str(response.request.url),
-                headers=self._sanitize_headers(dict(response.headers)),
+                url=sanitize_url(response.request.url),
+                headers=sanitize_headers(dict(response.headers)),
                 body=body,
             )
 
@@ -308,43 +360,22 @@ class RuntimeAdapterRegistry:
             event_hooks={"request": [on_request], "response": [on_response]},
         )
 
-    def _format_raw_body(self, content: bytes | str | None) -> str | None:
-        if content is None:
-            return None
-
-        if isinstance(content, bytes):
-            text = content.decode("utf-8", errors="replace")
-        else:
-            text = str(content)
-
-        text = text.strip()
-        if not text:
-            return None
-
+    @staticmethod
+    def _is_llm_raw_log_enabled() -> bool:
         try:
-            parsed = json.loads(text)
-            text = json.dumps(parsed, ensure_ascii=False)
+            from config.settings import get_settings
+
+            return bool(get_settings().enable_llm_raw_log)
         except Exception:
-            pass
+            return False
 
-        if len(text) > self._raw_body_max_chars:
-            return (
-                text[: self._raw_body_max_chars]
-                + f"...<truncated:{len(text) - self._raw_body_max_chars}>"
-            )
-
-        return text
+    def _format_raw_body(self, content: bytes | str | None) -> str | None:
+        """兼容旧调用；统一走 shared redaction helper。"""
+        return format_body_for_log(content, max_length=self._raw_body_max_chars)
 
     @staticmethod
     def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
-        sensitive_keys = {"authorization", "api-key", "x-api-key"}
-        sanitized: dict[str, str] = {}
-        for key, value in headers.items():
-            if key.lower() in sensitive_keys:
-                sanitized[key] = "***"
-            else:
-                sanitized[key] = value
-        return sanitized
+        return sanitize_headers(headers)
 
 
 class ProviderRegistry:

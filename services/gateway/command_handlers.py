@@ -164,6 +164,9 @@ class CommandHandlers:
             "ai_broadcast": lambda: self.handle_ai_broadcast(
                 state, content, player_name=player_name
             ),
+            "tool_approval": lambda: self.handle_tool_approval(
+                state, content, player_name=player_name
+            ),
             "switch_model": lambda: self.handle_switch_model(
                 state, content, player_name=player_name
             ),
@@ -596,7 +599,7 @@ class CommandHandlers:
                 else self.protocol.create_error_message(result)
             )
         if action in ("已保存", "saved"):
-            conversations = await conv_manager.list_conversations()
+            conversations = await conv_manager.list_conversations(player_name=actor)
             list_text = conv_manager.format_conversation_list(conversations)
             return self.protocol.create_info_message(list_text)
         if action in ("删除", "delete"):
@@ -604,7 +607,9 @@ class CommandHandlers:
                 return self.protocol.create_error_message(
                     "请指定要删除的保存会话 ID\n用法: AGENT 对话 delete <保存ID>"
                 )
-            success, result = await conv_manager.delete_conversation(arg)
+            success, result = await conv_manager.delete_conversation(
+                arg, player_name=actor
+            )
             return (
                 self.protocol.create_success_message(result)
                 if success
@@ -833,6 +838,125 @@ class CommandHandlers:
         self, state: ConnectionState, player_name: str | None = None
     ) -> None:
         await self.handle_conversation(state, "save", player_name=player_name)
+
+    async def handle_tool_approval(
+        self,
+        state: ConnectionState,
+        content: str,
+        player_name: str | None = None,
+    ) -> None:
+        """处理 `AGENT 工具审批 <approval_id> <允许|拒绝>`。
+
+        同一 DeferredToolRequests 批内每条命令只记录一项决策；待 batch 全部决策后，
+        用完整 DeferredToolResults 恢复 run，避免 partial results。
+        """
+        from services.agent.runtime import get_agent_runtime
+
+        parts = content.strip().split()
+        if len(parts) < 2:
+            msg = self.protocol.create_error_message(
+                "用法: AGENT 工具审批 <approval_id> <允许|拒绝>"
+            )
+            await self._send_player_reply(
+                state, msg, source="tool_approval", player_name=player_name
+            )
+            return
+
+        approval_id = parts[0]
+        decision_raw = parts[1].lower()
+        if decision_raw in ("允许", "allow", "approve", "yes", "y", "true", "1"):
+            approved = True
+        elif decision_raw in ("拒绝", "deny", "reject", "no", "n", "false", "0"):
+            approved = False
+        else:
+            msg = self.protocol.create_error_message("第二参数必须是 允许 或 拒绝")
+            await self._send_player_reply(
+                state, msg, source="tool_approval", player_name=player_name
+            )
+            return
+
+        host = self._require_host(state)
+        owner = player_name or state._player_name or DEFAULT_PLAYER_DISPLAY_NAME
+        conversation_id = self.broker.get_active_conversation_id(state.id, owner)
+        store = get_agent_runtime().get_pending_approval_store(self.settings)
+
+        pending, reject_reason, completed_batch = store.record_decision(
+            connection_id=str(state.id),
+            player_name=owner,
+            conversation_id=conversation_id,
+            approval_id=approval_id,
+            approved=approved,
+        )
+        if pending is None:
+            msg = self.protocol.create_error_message(reject_reason or "审批不可用")
+            await self._send_player_reply(
+                state, msg, source="tool_approval", player_name=player_name
+            )
+            return
+
+        if not approved:
+            msg = self.protocol.create_info_message(
+                f"已拒绝工具调用 [{approval_id}] {pending.tool_name}"
+            )
+        else:
+            msg = self.protocol.create_success_message(
+                f"已批准工具调用 [{approval_id}] {pending.tool_name}"
+            )
+        await self._send_player_reply(
+            state, msg, source="tool_approval", player_name=player_name
+        )
+
+        if completed_batch is None:
+            wait_msg = self.protocol.create_info_message(
+                f"已记录 [{approval_id}] 的决策；同批还有待审批项，"
+                f"全部决策后才会继续执行（batch={pending.batch_id}）"
+            )
+            await self._send_player_reply(
+                state, wait_msg, source="tool_approval", player_name=player_name
+            )
+            return
+
+        approvals_payload: dict[str, Any] = {}
+        for item in completed_batch:
+            if item.decision is True:
+                approvals_payload[item.tool_call_id] = True
+            else:
+                approvals_payload[item.tool_call_id] = {
+                    "kind": "tool-denied",
+                    "message": f"玩家拒绝了工具调用 {item.tool_name}",
+                }
+
+        resume_msg = self.protocol.create_success_message(
+            f"批次 {pending.batch_id} 决策完成（{len(completed_batch)} 项），继续执行..."
+        )
+        await self._send_player_reply(
+            state, resume_msg, source="tool_approval", player_name=player_name
+        )
+
+        generation = self.broker.get_conversation_generation(
+            state.id, owner, conversation_id
+        )
+        invalidation_epoch = self.broker.get_conversation_invalidation_epoch(
+            state.id, owner, conversation_id
+        )
+        session = host.get_player_session(owner)
+        chat_req = ChatRequest(
+            connection_id=state.id,
+            content="",
+            player_name=owner,
+            use_context=pending.use_context,
+            provider=pending.provider or session.current_provider,
+            delivery=pending.delivery,  # type: ignore[arg-type]
+            conversation_id=conversation_id,
+            conversation_generation=generation,
+            conversation_invalidation_epoch=invalidation_epoch,
+            broadcast_ai_chat=pending.broadcast_ai_chat,
+            run_id=pending.run_id,
+            resume_approval_id=pending.batch_id,
+            deferred_tool_results={"approvals": approvals_payload},
+            resume_message_history=pending.messages,
+        )
+        await self.broker.submit_request(state.id, chat_req, priority=0)
 
     async def handle_run_command(
         self,

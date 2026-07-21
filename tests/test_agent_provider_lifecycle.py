@@ -291,7 +291,7 @@ def test_agent_runtime_initializes_adapters_mcp_and_agent_manager():
             calls.append(("mcp_initialize",))
             return True
 
-        def get_toolsets_for_agent(self):
+        def get_healthy_toolsets(self):
             calls.append(("mcp_toolsets",))
             return ["toolset"]
 
@@ -312,6 +312,7 @@ def test_agent_runtime_initializes_adapters_mcp_and_agent_manager():
         ("mcp_toolsets",),
         ("agent_initialize", settings, ["toolset"]),
     ]
+    assert runtime.prompt_manager is not None
 
 
 def test_agent_runtime_refresh_mcp_tools_passes_latest_toolsets():
@@ -319,7 +320,7 @@ def test_agent_runtime_refresh_mcp_tools_passes_latest_toolsets():
     settings = SimpleNamespace()
 
     class FakeMCPManager:
-        def get_toolsets_for_agent(self):
+        def get_healthy_toolsets(self):
             calls.append("mcp_toolsets")
             return ["latest-toolset"]
 
@@ -354,7 +355,7 @@ def test_agent_runtime_shutdown_resets_managers_for_reinitialize():
             calls.append("mcp_initialize")
             return True
 
-        def get_toolsets_for_agent(self):
+        def get_healthy_toolsets(self):
             calls.append("mcp_toolsets")
             return ["toolset"]
 
@@ -373,14 +374,23 @@ def test_agent_runtime_shutdown_resets_managers_for_reinitialize():
         mcp_manager=FakeMCPManager(),
         chat_agent_manager=FakeChatAgentManager(),
     )
+    runtime.prompt_manager = object()  # type: ignore[assignment]
+    runtime.conversation_manager = object()  # type: ignore[assignment]
+    runtime._conversation_broker = object()
+    runtime._conversation_settings = settings  # type: ignore[assignment]
 
     assert asyncio.run(runtime.initialize(settings)) is True
     asyncio.run(runtime.shutdown())
 
     assert "mcp_shutdown" in calls
     assert "agent_reset" in calls
+    assert "adapters_shutdown" in calls
     assert runtime.mcp_manager is None
     assert runtime.chat_agent_manager is None
+    assert runtime.prompt_manager is None
+    assert runtime.conversation_manager is None
+    assert runtime._conversation_broker is None
+    assert runtime._conversation_settings is None
 
 
 def test_agent_runtime_shutdown_closes_mcp_before_adapters():
@@ -402,6 +412,105 @@ def test_agent_runtime_shutdown_closes_mcp_before_adapters():
     asyncio.run(runtime.shutdown())
 
     assert calls == ["mcp_shutdown", "adapters_shutdown"]
+
+
+def test_agent_runtime_owns_prompt_and_conversation_managers(monkeypatch):
+    from core.conversation import ConversationManager
+    from services.agent.prompt import PromptManager, get_prompt_manager
+    from core.conversation import get_conversation_manager
+
+    original = get_agent_runtime()
+    runtime = AgentRuntime()
+    broker = object()
+    settings = Settings(default_provider="ollama", dev_mode=True)
+
+    try:
+        set_agent_runtime(runtime)
+
+        prompt1 = runtime.get_prompt_manager()
+        prompt2 = get_prompt_manager()
+        assert isinstance(prompt1, PromptManager)
+        assert prompt1 is prompt2
+        assert runtime.prompt_manager is prompt1
+
+        conv1 = runtime.get_conversation_manager(broker, settings)
+        conv2 = get_conversation_manager(broker, settings)
+        assert isinstance(conv1, ConversationManager)
+        assert conv1 is conv2
+        assert runtime.conversation_manager is conv1
+        assert runtime._conversation_broker is broker
+        assert runtime._conversation_settings is settings
+
+        # New broker/settings identity must not reuse stale manager.
+        other_broker = object()
+        other_settings = Settings(default_provider="ollama", dev_mode=True)
+        conv3 = runtime.get_conversation_manager(other_broker, other_settings)
+        assert conv3 is not conv1
+        assert runtime.conversation_manager is conv3
+        assert runtime._conversation_broker is other_broker
+        assert runtime._conversation_settings is other_settings
+    finally:
+        set_agent_runtime(original)
+
+
+def test_agent_runtime_shutdown_aggregates_errors_and_continues(monkeypatch):
+    """MCP shutdown failure must not prevent agent/audit/provider cleanup."""
+    calls = []
+
+    class FakeRuntimeAdapters:
+        async def shutdown(self):
+            calls.append("providers_close")
+
+    class FailingMCPManager:
+        async def shutdown(self):
+            calls.append("mcp_shutdown")
+            raise RuntimeError("mcp boom")
+
+    class FakeChatAgentManager:
+        def reset(self):
+            calls.append("agent_reset")
+
+    class FakeMetadataService:
+        async def close(self):
+            calls.append("metadata_close")
+
+    runtime = AgentRuntime(
+        runtime_adapters=FakeRuntimeAdapters(),
+        mcp_manager=FailingMCPManager(),  # type: ignore[arg-type]
+        chat_agent_manager=FakeChatAgentManager(),  # type: ignore[arg-type]
+        model_metadata_service=FakeMetadataService(),  # type: ignore[arg-type]
+    )
+    runtime._audit_writer_started = True
+    runtime.prompt_manager = object()  # type: ignore[assignment]
+    runtime.conversation_manager = object()  # type: ignore[assignment]
+    runtime._conversation_broker = object()
+    runtime._conversation_settings = Settings(default_provider="ollama", dev_mode=True)
+
+    def fake_stop_audit_writer(timeout: float = 5.0) -> None:
+        calls.append("audit_stop")
+
+    monkeypatch.setattr(
+        "services.agent.runtime.stop_audit_writer",
+        fake_stop_audit_writer,
+    )
+
+    asyncio.run(runtime.shutdown())
+
+    assert calls == [
+        "mcp_shutdown",
+        "agent_reset",
+        "audit_stop",
+        "metadata_close",
+        "providers_close",
+    ]
+    assert runtime.mcp_manager is None
+    assert runtime.chat_agent_manager is None
+    assert runtime.model_metadata_service is None
+    assert runtime.prompt_manager is None
+    assert runtime.conversation_manager is None
+    assert runtime._audit_writer_started is False
+    assert runtime._conversation_broker is None
+    assert runtime._conversation_settings is None
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +547,7 @@ def test_agent_runtime_initializes_model_metadata_before_warmup(tmp_path):
             calls.append("mcp_initialize")
             return True
 
-        def get_toolsets_for_agent(self):
+        def get_healthy_toolsets(self):
             calls.append("mcp_toolsets")
             return ["toolset"]
 
@@ -499,7 +608,7 @@ def test_agent_runtime_metadata_init_failure_does_not_break_init(tmp_path, monke
             calls.append("mcp_initialize")
             return True
 
-        def get_toolsets_for_agent(self):
+        def get_healthy_toolsets(self):
             calls.append("mcp_toolsets")
             return ["toolset"]
 
@@ -549,7 +658,7 @@ def test_runtime_attaches_metadata_cache_to_settings_before_worker(tmp_path):
             calls.append("mcp_initialize")
             return True
 
-        def get_toolsets_for_agent(self):
+        def get_healthy_toolsets(self):
             calls.append("mcp_toolsets")
             return ["toolset"]
 
@@ -568,3 +677,235 @@ def test_runtime_attaches_metadata_cache_to_settings_before_worker(tmp_path):
     assert settings._model_metadata_cache is not None
     assert calls[0] == "metadata_attach"
     assert calls.index("metadata_attach") < calls.index("warmup")
+
+
+# ---------------------------------------------------------------------------
+# Task1: Provider 配置参数确实传入（无真实网络）
+# ---------------------------------------------------------------------------
+
+
+def test_deepseek_custom_base_url_uses_openai_provider(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    captured = {}
+
+    class FakeOpenAIChatModel:
+        def __init__(self, model, provider=None):
+            captured["model"] = model
+            captured["provider"] = provider
+
+    class FakeOpenAIProvider:
+        def __init__(self, **kwargs):
+            captured["openai_provider_kwargs"] = kwargs
+
+    class FakeDeepSeekProvider:
+        def __init__(self, **kwargs):
+            captured["deepseek_provider_kwargs"] = kwargs
+
+    monkeypatch.setattr("services.agent.providers.OpenAIChatModel", FakeOpenAIChatModel)
+    monkeypatch.setattr("services.agent.providers.OpenAIProvider", FakeOpenAIProvider)
+    monkeypatch.setattr("services.agent.providers.DeepSeekProvider", FakeDeepSeekProvider)
+    monkeypatch.setattr(
+        registry,
+        "_get_or_create_http_client",
+        lambda config, name: "http-client",
+    )
+
+    registry._create_deepseek_model(
+        provider_config(base_url="https://custom.deepseek.test/v1", api_key="k")
+    )
+
+    assert captured["model"] == "deepseek-chat"
+    assert "openai_provider_kwargs" in captured
+    assert captured["openai_provider_kwargs"]["base_url"] == "https://custom.deepseek.test/v1"
+    assert captured["openai_provider_kwargs"]["http_client"] == "http-client"
+    assert "deepseek_provider_kwargs" not in captured
+
+
+def test_deepseek_default_base_url_uses_deepseek_provider(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    captured = {}
+
+    class FakeOpenAIChatModel:
+        def __init__(self, model, provider=None):
+            captured["provider"] = provider
+
+    class FakeDeepSeekProvider:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("services.agent.providers.OpenAIChatModel", FakeOpenAIChatModel)
+    monkeypatch.setattr("services.agent.providers.DeepSeekProvider", FakeDeepSeekProvider)
+    monkeypatch.setattr(
+        registry,
+        "_get_or_create_http_client",
+        lambda config, name: "http-client",
+    )
+
+    registry._create_deepseek_model(provider_config(base_url="https://api.deepseek.com", api_key="k"))
+
+    assert captured["kwargs"]["api_key"] == "k"
+    assert captured["kwargs"]["http_client"] == "http-client"
+
+
+def test_anthropic_model_receives_timeout_via_http_client(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    captured = {}
+
+    class FakeAnthropicModel:
+        def __init__(self, model, provider=None):
+            captured["model"] = model
+            captured["provider"] = provider
+
+    class FakeAnthropicProvider:
+        def __init__(self, **kwargs):
+            captured["provider_kwargs"] = kwargs
+
+    import services.agent.providers as providers_mod
+
+    # 延迟 import 路径在函数内部；patch 目标模块
+    import pydantic_ai.models.anthropic as anthropic_models
+    import pydantic_ai.providers.anthropic as anthropic_providers
+
+    monkeypatch.setattr(anthropic_models, "AnthropicModel", FakeAnthropicModel)
+    monkeypatch.setattr(anthropic_providers, "AnthropicProvider", FakeAnthropicProvider)
+
+    def fake_http(config, name):
+        captured["http_timeout"] = config.timeout
+        captured["provider_name"] = name
+        return "anthropic-http"
+
+    monkeypatch.setattr(registry, "_get_or_create_http_client", fake_http)
+
+    registry._create_anthropic_model(
+        provider_config(name="anthropic", model="claude-test", api_key="k", timeout=33)
+    )
+
+    assert captured["model"] == "claude-test"
+    assert captured["http_timeout"] == 33
+    assert captured["provider_name"] == "anthropic"
+    assert captured["provider_kwargs"]["http_client"] == "anthropic-http"
+
+
+def test_ollama_model_receives_base_url_and_timeout(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    captured = {}
+
+    class FakeOllamaModel:
+        def __init__(self, model, provider=None):
+            captured["model"] = model
+            captured["provider"] = provider
+
+    class FakeOllamaProvider:
+        def __init__(self, **kwargs):
+            captured["provider_kwargs"] = kwargs
+
+    import pydantic_ai.models.ollama as ollama_models
+    import pydantic_ai.providers.ollama as ollama_providers
+
+    monkeypatch.setattr(ollama_models, "OllamaModel", FakeOllamaModel)
+    monkeypatch.setattr(ollama_providers, "OllamaProvider", FakeOllamaProvider)
+
+    def fake_http(config, name):
+        captured["http_timeout"] = config.timeout
+        return "ollama-http"
+
+    monkeypatch.setattr(registry, "_get_or_create_http_client", fake_http)
+
+    registry._create_ollama_model(
+        provider_config(
+            name="ollama",
+            model="llama3",
+            api_key=None,
+            base_url="http://ollama.local:11434",
+            timeout=17,
+        )
+    )
+
+    assert captured["model"] == "llama3"
+    assert captured["http_timeout"] == 17
+    assert captured["provider_kwargs"]["base_url"] == "http://ollama.local:11434"
+    assert captured["provider_kwargs"]["http_client"] == "ollama-http"
+
+
+def test_llm_http_client_skips_raw_hooks_when_disabled(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    monkeypatch.setattr(
+        RuntimeAdapterRegistry,
+        "_is_llm_raw_log_enabled",
+        staticmethod(lambda: False),
+    )
+
+    created = {}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    monkeypatch.setattr("services.agent.providers.httpx.AsyncClient", FakeAsyncClient)
+
+    client = registry._create_llm_http_client(provider_config(timeout=12), "deepseek")
+    assert isinstance(client, FakeAsyncClient)
+    assert created["timeout"] == 12
+    assert "event_hooks" not in created
+
+
+def test_llm_http_client_installs_hooks_without_aread_when_enabled(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    monkeypatch.setattr(
+        RuntimeAdapterRegistry,
+        "_is_llm_raw_log_enabled",
+        staticmethod(lambda: True),
+    )
+
+    created = {}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    monkeypatch.setattr("services.agent.providers.httpx.AsyncClient", FakeAsyncClient)
+
+    registry._create_llm_http_client(provider_config(timeout=9), "openai")
+    assert "event_hooks" in created
+    # 确保源码不再强制 aread
+    import inspect
+    from services.agent.providers import RuntimeAdapterRegistry as R
+
+    source = inspect.getsource(R._create_llm_http_client)
+    assert "response.aread" not in source
+    assert "await response.aread" not in source
+
+
+def test_default_pytest_collection_excludes_live_marker():
+    """Default pytest.ini addopts exclude live tests from collection/selection."""
+    import os
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "."
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "tests/test_agent_multi_tool_live.py",
+        ],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = (result.stdout or "") + (result.stderr or "")
+    # With addopts = -m 'not live', live tests must not be selected by default.
+    assert "test_deepseek_chat_should_support_multi_turn_tool_chain" not in result.stdout
+    assert "test_deepseek_reasoner_should_support_multi_turn_tool_chain" not in result.stdout
+    assert (
+        result.returncode == 0
+        or "deselected" in output.lower()
+        or "no tests collected" in output.lower()
+    )

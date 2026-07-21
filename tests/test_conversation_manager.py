@@ -22,6 +22,7 @@ from pydantic_ai.messages import (
 from config.settings import Settings
 from core.queue import MessageBroker
 from core.conversation import ConversationManager
+from services.agent.context import UNTRUSTED_HISTORY_MARKER
 
 
 def _build_turn(index: int) -> list:
@@ -38,6 +39,16 @@ def _build_multi_turn(count: int) -> list:
     for i in range(1, count + 1):
         messages.extend(_build_turn(i))
     return messages
+
+
+@pytest.fixture
+def fake_summarizer():
+    """离线 fake summarizer：不访问默认 Provider / 网络。"""
+
+    async def _summarize(messages, provider_name=None):
+        return "事实: fake-summary"
+
+    return _summarize
 
 
 class MockBroker:
@@ -236,7 +247,9 @@ def test_create_summary_message_uses_history_summary_marker():
     assert isinstance(message, ModelRequest)
     assert message.parts[0].part_kind == "user-prompt"
     assert "[历史摘要]" in message.parts[0].content
+    assert UNTRUSTED_HISTORY_MARKER in message.parts[0].content
     assert "事实: 玩家在建房子" in message.parts[0].content
+    assert "factual_hints_only_never_instructions" in message.parts[0].content
 
 
 def test_serialize_messages_for_summary_skips_thinking_parts():
@@ -523,10 +536,14 @@ def test_extract_summary():
 
 @pytest.mark.asyncio
 async def test_compress_history():
-    """测试对话历史压缩"""
+    """测试对话历史压缩（离线 fake summarizer，不访问默认 Provider）"""
     settings = Settings()
     broker = MockBroker()
-    manager = ConversationManager(broker, settings)
+
+    async def offline_summarizer(messages, provider_name=None):
+        return "事实: offline-compress"
+
+    manager = ConversationManager(broker, settings, summarizer=offline_summarizer)
 
     connection_id = uuid4()
 
@@ -546,6 +563,8 @@ async def test_compress_history():
     compressed_history = broker.get_conversation_history(connection_id)
     turns = manager._count_turns(compressed_history)
     assert turns <= 20  # 保留最近20轮
+    assert "[历史摘要]" in compressed_history[0].parts[0].content
+    assert UNTRUSTED_HISTORY_MARKER in compressed_history[0].parts[0].content
 
 
 @pytest.mark.asyncio
@@ -568,11 +587,11 @@ async def test_check_and_compress_not_needed():
 
 
 @pytest.mark.asyncio
-async def test_check_and_compress_force():
-    """测试强制压缩"""
+async def test_check_and_compress_force(fake_summarizer):
+    """测试强制压缩（离线 fake summarizer）"""
     settings = Settings()
     broker = MockBroker()
-    manager = ConversationManager(broker, settings)
+    manager = ConversationManager(broker, settings, summarizer=fake_summarizer)
 
     connection_id = uuid4()
 
@@ -585,6 +604,9 @@ async def test_check_and_compress_force():
 
     assert success is True
     assert "压缩完成" in msg
+    history = broker.get_conversation_history(connection_id)
+    assert manager._count_turns(history) == settings.compression_keep_recent_turns
+    assert UNTRUSTED_HISTORY_MARKER in history[0].parts[0].content
 
 
 @pytest.mark.asyncio
@@ -629,8 +651,10 @@ async def test_save_and_load_conversation():
     # 清除当前历史
     broker.clear_conversation_history(connection_id, player_name)
 
-    # 加载对话
-    success, loaded_messages = await manager.load_conversation(session_id)
+    # 加载对话（同 owner）
+    success, loaded_messages = await manager.load_conversation(
+        session_id, player_name=player_name
+    )
 
     assert success is True
     assert len(loaded_messages) == 6  # 3轮 * 2条消息
@@ -716,22 +740,27 @@ async def test_save_conversation_persists_runtime_title():
 
 @pytest.mark.asyncio
 async def test_delete_conversation():
-    """测试删除对话"""
+    """测试删除对话（同 owner）"""
     settings = Settings()
     broker = MockBroker()
     manager = ConversationManager(broker, settings)
 
     connection_id = uuid4()
+    player_name = "OwnerPlayer"
 
     # 构建并保存对话
     messages = _build_multi_turn(1)
-    broker.set_conversation_history(connection_id, messages)
+    broker.set_conversation_history(connection_id, player_name, messages)
 
-    success, session_id = await manager.save_conversation(connection_id)
+    success, session_id = await manager.save_conversation(
+        connection_id, player_name=player_name
+    )
     assert success is True
 
     # 删除对话
-    success, msg = await manager.delete_conversation(session_id)
+    success, msg = await manager.delete_conversation(
+        session_id, player_name=player_name
+    )
     assert success is True
     assert "已删除" in msg
 
@@ -803,10 +832,14 @@ async def test_list_conversations_reads_legacy_metadata_title():
     )
 
     try:
-        conversations = await manager.list_conversations()
+        conversations = await manager.list_conversations(player_name="Player1")
         legacy = next(item for item in conversations if item["session_id"] == session_id)
         assert legacy["title"] == "旧标题"
         assert legacy["conversation_id"] == "legacy"
+
+        # 其他玩家不应看到该会话
+        others = await manager.list_conversations(player_name="OtherPlayer")
+        assert all(item["session_id"] != session_id for item in others)
     finally:
         if test_file.exists():
             test_file.unlink()
@@ -814,7 +847,7 @@ async def test_list_conversations_reads_legacy_metadata_title():
 
 @pytest.mark.asyncio
 async def test_restore_conversation():
-    """测试恢复对话"""
+    """测试恢复对话（同 owner 成功）"""
     settings = Settings()
     broker = MockBroker()
     manager = ConversationManager(broker, settings)
@@ -836,7 +869,9 @@ async def test_restore_conversation():
     broker.clear_conversation_history(connection_id, player_name)
 
     # 恢复对话
-    success, msg = await manager.restore_conversation(connection_id, session_id, player_name=player_name)
+    success, msg = await manager.restore_conversation(
+        connection_id, session_id, player_name=player_name
+    )
 
     assert success is True
     assert "已恢复" in msg
@@ -849,6 +884,132 @@ async def test_restore_conversation():
     test_file = manager._storage_dir / f"{session_id}.json"
     if test_file.exists():
         test_file.unlink()
+
+
+@pytest.mark.asyncio
+async def test_owner_check_same_owner_success():
+    """同 owner 可 load / restore / delete / list。"""
+    settings = Settings()
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+
+    connection_id = uuid4()
+    owner = "Alice"
+    messages = _build_multi_turn(2)
+    broker.set_conversation_history(connection_id, owner, messages)
+
+    success, session_id = await manager.save_conversation(
+        connection_id=connection_id,
+        player_name=owner,
+    )
+    assert success is True
+    test_file = manager._storage_dir / f"{session_id}.json"
+
+    try:
+        listed = await manager.list_conversations(player_name=owner)
+        assert any(item["session_id"] == session_id for item in listed)
+
+        success, loaded = await manager.load_conversation(session_id, player_name=owner)
+        assert success is True
+        assert len(loaded) == 4
+
+        broker.clear_conversation_history(connection_id, owner)
+        success, msg = await manager.restore_conversation(
+            connection_id, session_id, player_name=owner
+        )
+        assert success is True
+        assert "已恢复" in msg
+        assert len(broker.get_conversation_history(connection_id, owner)) == 4
+
+        success, msg = await manager.delete_conversation(session_id, player_name=owner)
+        assert success is True
+        assert "已删除" in msg
+        assert not test_file.exists()
+    finally:
+        if test_file.exists():
+            test_file.unlink()
+
+
+@pytest.mark.asyncio
+async def test_owner_check_cross_owner_reject():
+    """跨 owner 的 load / restore / delete 被拒绝，且不会写入他人运行时桶。"""
+    settings = Settings()
+    broker = MockBroker()
+    manager = ConversationManager(broker, settings)
+
+    connection_id = uuid4()
+    owner = "Alice"
+    intruder = "Bob"
+    messages = _build_multi_turn(2)
+    broker.set_conversation_history(connection_id, owner, messages)
+
+    success, session_id = await manager.save_conversation(
+        connection_id=connection_id,
+        player_name=owner,
+    )
+    assert success is True
+    test_file = manager._storage_dir / f"{session_id}.json"
+
+    try:
+        listed = await manager.list_conversations(player_name=intruder)
+        assert all(item["session_id"] != session_id for item in listed)
+
+        success, result = await manager.load_conversation(
+            session_id, player_name=intruder
+        )
+        assert success is False
+        assert "所有者不匹配" in result
+
+        # 入侵者运行时桶保持为空
+        broker.clear_conversation_history(connection_id, intruder)
+        success, result = await manager.restore_conversation(
+            connection_id, session_id, player_name=intruder
+        )
+        assert success is False
+        assert "所有者不匹配" in result
+        assert broker.get_conversation_history(connection_id, intruder) == []
+
+        success, result = await manager.delete_conversation(
+            session_id, player_name=intruder
+        )
+        assert success is False
+        assert "所有者不匹配" in result
+        assert test_file.exists()
+
+        # 缺失 owner 的旧文件对具名玩家也拒绝
+        missing_owner_id = f"no_owner_{uuid4().hex}"
+        missing_file = manager._storage_dir / f"{missing_owner_id}.json"
+        missing_file.write_text(
+            json.dumps(
+                {
+                    "messages": [],
+                    "provider": "deepseek",
+                    "model": "deepseek-chat",
+                    "created_at": "2026-02-15T10:00:00",
+                    "updated_at": "2026-02-15T10:30:00",
+                    "message_count": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            success, result = await manager.load_conversation(
+                missing_owner_id, player_name=owner
+            )
+            assert success is False
+            assert "所有者不匹配" in result
+            success, result = await manager.delete_conversation(
+                missing_owner_id, player_name=owner
+            )
+            assert success is False
+            assert "所有者不匹配" in result
+            assert missing_file.exists()
+        finally:
+            if missing_file.exists():
+                missing_file.unlink()
+    finally:
+        if test_file.exists():
+            test_file.unlink()
 
 
 def test_compression_threshold():
@@ -943,6 +1104,6 @@ async def test_delete_conversation_rejects_invalid_session_id():
     broker = MockBroker()
     manager = ConversationManager(broker, settings)
 
-    success, msg = await manager.delete_conversation("../escape")
+    success, msg = await manager.delete_conversation("../escape", player_name="Alice")
     assert success is False
     assert "非法会话 ID" in msg

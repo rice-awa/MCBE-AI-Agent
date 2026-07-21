@@ -15,7 +15,8 @@ sys.path.append(str(ROOT))
 
 from config.settings import Settings
 from models.agent import AgentDependencies
-from services.agent.tools import register_agent_tools
+from services.agent.tools import iter_registered_tools, register_agent_tools
+from services.agent.tool_results import CommandResult
 
 
 class _FakeAddonBridge:
@@ -31,8 +32,8 @@ async def _noop_send(_: str) -> None:
     return None
 
 
-async def _noop_command(_: str) -> str:
-    return "命令执行成功"
+async def _noop_command(_: str) -> CommandResult:
+    return CommandResult.ok("命令执行成功")
 
 
 def _build_tool_context(fake_addon: _FakeAddonBridge) -> SimpleNamespace:
@@ -55,7 +56,7 @@ async def test_agent_tool_get_player_snapshot_uses_addon_bridge() -> None:
     agent = Agent("test", deps_type=AgentDependencies, output_type=str)
     register_agent_tools(agent)
 
-    tool = agent._function_toolset.tools["get_player_snapshot"]
+    tool = iter_registered_tools(agent)["get_player_snapshot"]
     ctx = _build_tool_context(fake_addon)
     try:
         result = await tool.function(ctx, target="Steve")
@@ -72,7 +73,7 @@ async def test_agent_tool_find_entities_uses_addon_bridge_payload() -> None:
     agent = Agent("test", deps_type=AgentDependencies, output_type=str)
     register_agent_tools(agent)
 
-    tool = agent._function_toolset.tools["find_entities"]
+    tool = iter_registered_tools(agent)["find_entities"]
     ctx = _build_tool_context(fake_addon)
     try:
         result = await tool.function(ctx, entity_type="minecraft:cow", radius=16, target="@s")

@@ -18,7 +18,7 @@
 - 第一版审批状态只要求在单进程内可靠恢复，不实现跨进程 checkpoint。审批、历史和工具执行状态分开保存。
 - 通用 `fetch_url_text` 暂时从 MCBE Chat Agent 工具中移除，只保留受控的 MCWiki 工具。未来确有通用网页访问需求时，再以域名 allowlist 独立设计，不在本轮实现通用 SSRF 代理。
 - 日志默认只记录标识、状态、耗时、token 和脱敏摘要；完整玩家内容、工具结果与 LLM body 默认关闭。
-- 不新增重复的 WebSocket 分片实现。审批提示和恢复结果继续走现有消息事件与 `services/websocket/flow_control.py`。
+- 不新增重复的 WebSocket 分片实现。审批提示和恢复结果继续走现有消息事件与 gateway / SDK 出站流控（`McbeOutboundDelivery` / `BrokerResponseBridge`）。
 
 首版配置采用以下保守默认值，避免实现阶段再次决定行为：`request_limit=8`、`tool_calls_limit=8`、`run_timeout=90s`、`max_tool_concurrency=4`、`context_output_reserve_tokens=1024`、`approval_ttl=120s`、`max_batch_commands=10`。模型输入/总 token 上限默认从模型元数据的 context window 扣除输出预留后派生；元数据缺失时拒绝超长上下文，不回退到无限预算。硬 deny 的命令根首批包含 `op`、`deop`、`stop`、`whitelist`、`permission` 和 `wsserver`，并允许管理员在 `config.json` 中追加但不能清空内置 deny 集合。
 
@@ -82,12 +82,13 @@
 - 修改：`services/agent/runtime.py`
 - 修改：`services/agent/worker.py`
 - 修改：`models/messages.py`
-- 修改：`services/websocket/server.py`
+- 修改：`services/gateway/command_handlers.py`（审批命令；原 websocket/server 路径已迁至 gateway）
+- 修改：`services/gateway/hook.py`（断连清理 pending approvals）
 - 修改：`config/settings.py`
 - 修改：`config.example.json`
 - 新增：`tests/test_runtime_harness_execution.py`
 - 修改：`tests/test_mcp.py`
-- 修改：`tests/test_websocket_command.py`
+- 新增：`tests/test_tool_approval_command.py`
 
 ### 实现
 
