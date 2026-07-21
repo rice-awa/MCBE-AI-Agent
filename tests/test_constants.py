@@ -1,14 +1,19 @@
 from core.session import DEFAULT_CONVERSATION_ID, DEFAULT_PLAYER_KEY
 from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
 from services.agent.prompt import PromptManager
-from services.websocket.connection import ConnectionState
+from services.gateway.session_store import HostConnectionSession, HostSessionStore
 
 
 def test_default_player_key_single_source():
     """所有模块应引用同一匿名玩家键。"""
     assert DEFAULT_PLAYER_KEY == "__anonymous__"
     assert PromptManager.DEFAULT_PLAYER_KEY == DEFAULT_PLAYER_KEY
-    assert ConnectionState.get_player_session.__defaults__ is None  # 不使用默认值覆盖
+    # Host player sessions require an explicit player_name (no identity default).
+    from uuid import uuid4
+    store = HostSessionStore()
+    host = store.create(uuid4())
+    session = host.get_player_session("Steve")
+    assert session.player_name == "Steve"
 
 
 def test_default_conversation_id_single_source():

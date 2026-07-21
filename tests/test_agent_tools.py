@@ -305,7 +305,7 @@ async def test_send_script_event_rejects_invalid_message_id() -> None:
 
 
 def test_create_scriptevent_rejects_uppercase_message_id() -> None:
-    for message_id in ("Server:Data", "MCBEAI:AI_RESP"):
+    for message_id in ("Server:Data", "MCBEWS:TEXT_RESP"):
         with pytest.raises(ValueError):
             MinecraftCommand.create_scriptevent("payload", message_id)
 

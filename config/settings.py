@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from _version import __version__
-from pydantic import BaseModel, Field, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 from pydantic_settings.sources import JsonConfigSettingsSource
 
@@ -531,12 +531,48 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 
 
 class FlowControlDelayConfig(BaseModel):
-    """流控分片间延迟配置（秒）"""
+    """流控分片间延迟配置（秒）
+
+    Canonical keys: tellraw / scriptevent / text_resp / text_resp_prelude.
+    Legacy ai_resp / ai_resp_prelude remain readable (and dumpable) for one
+    migration cycle so old config.json and host delivery paths keep working.
+    """
+
+    model_config = {"extra": "ignore"}
 
     tellraw: float = 0.05
     scriptevent: float = 0.05
-    ai_resp: float = 0.15
-    ai_resp_prelude: float = 0.5
+    text_resp: float = 0.15
+    text_resp_prelude: float = 0.5
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_ai_resp_keys(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        migrated = dict(data)
+        if "text_resp" not in migrated and "ai_resp" in migrated:
+            migrated["text_resp"] = migrated["ai_resp"]
+        if "text_resp_prelude" not in migrated and "ai_resp_prelude" in migrated:
+            migrated["text_resp_prelude"] = migrated["ai_resp_prelude"]
+        return migrated
+
+    @property
+    def ai_resp(self) -> float:
+        """Legacy alias for text_resp (host delivery still uses ai_resp keys)."""
+        return self.text_resp
+
+    @property
+    def ai_resp_prelude(self) -> float:
+        """Legacy alias for text_resp_prelude."""
+        return self.text_resp_prelude
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        data = super().model_dump(*args, **kwargs)
+        # Keep legacy keys for FlowControlMiddleware.chunk_delay_for("ai_resp*").
+        data["ai_resp"] = data.get("text_resp", self.text_resp)
+        data["ai_resp_prelude"] = data.get("text_resp_prelude", self.text_resp_prelude)
+        return data
 
 
 class FlowControlConfig(BaseModel):
@@ -578,13 +614,13 @@ class MCPConfig(BaseModel):
 
 
 class AddonProtocolConfig(BaseModel):
-    """Addon 桥接协议标识配置"""
+    """Addon 桥接协议标识配置（线协议镜像；运行时以 SDK McbewsV1Profile 为准）。"""
 
-    bridge_message_id: str = "mcbeai:bridge_request"
-    bridge_prefix: str = "MCBEAI|RESP"
-    ui_chat_prefix: str = "MCBEAI|UI_CHAT"
-    bridge_tool_player_name: str = "MCBEAI_TOOL"
-    ai_resp_message_id: str = "mcbeai:ai_resp"
+    bridge_message_id: str = "mcbews:bridge_req"
+    bridge_prefix: str = "MCBEWS|BRIDGE"
+    ui_chat_prefix: str = "MCBEWS|UI_CHAT"
+    bridge_tool_player_name: str = "MCBEWS_BRIDGE"
+    ai_resp_message_id: str = "mcbews:text_resp"
 
 
 class AddonConfig(BaseModel):

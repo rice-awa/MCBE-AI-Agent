@@ -160,11 +160,11 @@
   },
   "addon": {
     "protocol": {
-      "bridge_message_id": "mcbeai:bridge_request",
-      "bridge_prefix": "MCBEAI|RESP",
-      "ui_chat_prefix": "MCBEAI|UI_CHAT",
-      "bridge_tool_player_name": "MCBEAI_TOOL",
-      "ai_resp_message_id": "mcbeai:ai_resp"
+      "bridge_message_id": "mcbews:bridge_req",
+      "bridge_prefix": "MCBEWS|BRIDGE",
+      "ui_chat_prefix": "MCBEWS|UI_CHAT",
+      "bridge_tool_player_name": "MCBEWS_BRIDGE",
+      "ai_resp_message_id": "mcbews:text_resp"
     }
   },
   "logging": {
@@ -194,8 +194,8 @@
     "chunk_delays": {
       "tellraw": 0.05,
       "scriptevent": 0.05,
-      "ai_resp": 0.15,
-      "ai_resp_prelude": 0.5
+      "text_resp": 0.15,
+      "text_resp_prelude": 0.5
     },
     "non_stream_batch_max_chars": 150,
     "non_stream_send_delay": 0.1

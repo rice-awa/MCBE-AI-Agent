@@ -5,7 +5,7 @@ import pytest
 
 from config.settings import CONFIG_FILE, ModelMetadataConfig, Settings, get_settings
 from services.agent.model_metadata import ModelMetadataCache
-from services.websocket.minecraft import MinecraftProtocolHandler
+from services.gateway.settings_map import build_protocol_handler
 
 
 def write_json_config(tmp_path, data):
@@ -304,7 +304,7 @@ def test_minecraft_commands_merge_defaults_with_user_config(tmp_path, monkeypatc
     )
 
     settings = Settings()
-    handler = MinecraftProtocolHandler(settings.minecraft)
+    handler = build_protocol_handler(settings)
 
     assert "AGENT 对话" in settings.minecraft.commands
     assert handler.parse_command("AGENT 对话 list") == ("conversation", "list")
@@ -346,13 +346,14 @@ def test_minecraft_protocol_uses_injected_config():
             "success_color": "green",
         }
     )
-    handler = MinecraftProtocolHandler(settings.minecraft)
+    handler = build_protocol_handler(settings)
 
     assert handler.parse_command("ask hello") == ("chat", "hello")
     assert "问 <内容> - 自定义聊天" in handler.get_help_text()
-    assert handler.create_welcome_message("abcdef123456", "model", "provider", False) == (
-        "help=求助; ctx=关"
-    )
+    # Welcome banner formatting stays host-side (hook fills all template keys).
+    assert handler.surface.welcome_message_template == "help={help_command}; ctx={context_status}"
+    assert settings.minecraft.context_disabled_text == "关"
+    assert handler.command_registry.get_command_prefix("help") == "求助"
     assert handler.create_error_message("bad").text == "ERR:bad"
 
 

@@ -1,7 +1,7 @@
 import { system, world } from "@minecraft/server";
 import type { Player } from "@minecraft/server";
 
-import { AI_RESP_MESSAGE_ID } from "./constants";
+import { TEXT_RESP_MESSAGE_ID } from "./constants";
 import { appendHistoryItem, createHistoryId } from "../ui/history";
 import type { HistoryItem, HistoryRole } from "../ui/history";
 import type { AgentUiState } from "../ui/state";
@@ -40,7 +40,7 @@ export function clearActiveUiState(playerId: string): void {
 }
 
 /**
- * 注册 scriptEventReceive 订阅，监听 mcbeai:ai_resp 分片。
+ * 注册 scriptEventReceive 订阅，监听 mcbews:text_resp 分片。
  */
 export function registerResponseSyncHandler(): void {
   if (isRegistered) {
@@ -49,7 +49,7 @@ export function registerResponseSyncHandler(): void {
   isRegistered = true;
 
   system.afterEvents.scriptEventReceive.subscribe((event) => {
-    if (event.id !== AI_RESP_MESSAGE_ID) {
+    if (event.id !== TEXT_RESP_MESSAGE_ID) {
       return;
     }
 

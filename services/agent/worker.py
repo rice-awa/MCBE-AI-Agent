@@ -13,7 +13,6 @@ from core.queue import MessageBroker
 from services.agent.core import stream_chat, _extract_exception_details
 from services.agent.providers import ProviderRegistry
 from services.agent.title import generate_conversation_title
-from services.addon.service import get_addon_bridge_service
 from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
 from models.messages import ChatRequest, StreamChunk, SystemNotification
 from models.agent import (
@@ -46,10 +45,12 @@ class AgentWorker:
         broker: MessageBroker,
         settings: Settings,
         worker_id: int = 0,
+        addon: "AddonBridgeService | None" = None,
     ):
         self.broker = broker
         self.settings = settings
         self.worker_id = worker_id
+        self._addon = addon
         self._running = False
         self._http_client: httpx.AsyncClient | None = None
         self._task: asyncio.Task | None = None
@@ -280,7 +281,7 @@ class AgentWorker:
                 elif event.event_type == "reasoning" and event.content:
                     reasoning_parts.append(event.content)
 
-                # 处理工具调用事件 - 发送到游戏显示
+                # 处理工具调用事件 - 游戏内显示截断消息；完整参数记入日志
                 elif event.event_type == "tool_call":
                     tool_name = event.metadata.get("tool_name", "unknown") if event.metadata else "unknown"
                     tool_args = event.metadata.get("args") if event.metadata else None
@@ -292,6 +293,14 @@ class AgentWorker:
                         except json.JSONDecodeError:
                             tool_args = {"raw": tool_args}
                     tool_msg = format_tool_call_message(tool_name, tool_args)
+                    logger.info(
+                        "worker_tool_call_display",
+                        tool=tool_name,
+                        args=tool_args,
+                        display=tool_msg,
+                        connection_id=str(connection_id),
+                        player_name=request.player_name,
+                    )
                     tool_chunk = StreamChunk(
                         connection_id=connection_id,
                         chunk_type="tool_call",
@@ -306,16 +315,23 @@ class AgentWorker:
                     await self.broker.send_response(connection_id, tool_chunk)
                     sequence += 1
 
-                # 处理工具返回事件 - 根据配置决定是否发送到游戏显示
+                # 处理工具返回事件 - 游戏内按配置显示截断结果；完整结果记入日志
                 elif event.event_type == "tool_result":
+                    tool_name = event.metadata.get("tool_name") if event.metadata else None
+                    result_content = event.content
+                    logger.info(
+                        "worker_tool_result_display",
+                        tool=tool_name,
+                        result=result_content,
+                        result_length=len(result_content or ""),
+                        connection_id=str(connection_id),
+                        player_name=request.player_name,
+                    )
                     # 只有在 tool_response_verbose 为 True 时才显示工具返回结果
                     if self.settings.tool_response_verbose:
-                        tool_name = event.metadata.get("tool_name") if event.metadata else None
-                        result_content = event.content
                         tool_result_msg = format_tool_result_message(
                             tool_name or "tool",
                             result_content,
-                            max_length=80,
                         )
                         result_chunk = StreamChunk(
                             connection_id=connection_id,
@@ -860,9 +876,15 @@ class AgentWorker:
         return run_command
 
     def _create_addon_bridge_client(self, connection_id: UUID):
-        """创建 addon 桥接客户端。"""
-        service = get_addon_bridge_service()
-        return service.create_client(
+        """创建 addon 桥接客户端。
+
+        Returns ``None`` when no ``AddonBridgeService`` was injected (unit tests
+        or hosts without addon tooling). Runtime ``cli.py serve`` always injects
+        the shared service from ``HostGatewayServer``.
+        """
+        if self._addon is None:
+            return None
+        return self._addon.create_client(
             connection_id=connection_id,
             send_command=self._create_command_callback(connection_id),
         )

@@ -9,15 +9,15 @@ describe("bridge chunking", () => {
 
     expect(chunks).toHaveLength(3);
     expect(chunks).toEqual([
-      "MCBEAI|RESP|req-2|1/3|{\"ok\":tr",
-      "MCBEAI|RESP|req-2|2/3|ue,\"valu",
-      "MCBEAI|RESP|req-2|3/3|e\":1}",
+      "MCBEWS|BRIDGE|req-2|1/3|{\"ok\":tr",
+      "MCBEWS|BRIDGE|req-2|2/3|ue,\"valu",
+      "MCBEWS|BRIDGE|req-2|3/3|e\":1}",
     ]);
   });
 
   it("formats error responses consistently", () => {
     const chunk = formatResponseChunk("req-3", 1, 1, "{\"ok\":false}");
-    expect(chunk).toBe("MCBEAI|RESP|req-3|1/1|{\"ok\":false}");
+    expect(chunk).toBe("MCBEWS|BRIDGE|req-3|1/1|{\"ok\":false}");
   });
 
   it("rejects non-positive max chunk content length", () => {
