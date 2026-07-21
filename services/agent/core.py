@@ -130,6 +130,13 @@ def classify_run_exception(exc: BaseException) -> tuple[ErrorKind, str, str]:
     if isinstance(exc, UsageLimitExceeded):
         return "DENIED", "已达到本轮请求预算上限，请缩短问题或稍后再试。", str(exc)
 
+    # 懒导入避免 core ↔ context 循环依赖
+    from services.agent.context import ContextOversizedError
+
+    if isinstance(exc, ContextOversizedError):
+        msg = str(exc).strip() or "上下文超出预算，请缩短问题或清空上下文后重试。"
+        return "DENIED", msg, str(exc)
+
     detail = _extract_exception_details(exc)
     lower = detail.lower()
     if "timeout" in lower or "deadline exceeded" in lower:

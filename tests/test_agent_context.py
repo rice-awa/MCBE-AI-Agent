@@ -199,3 +199,147 @@ def test_missing_context_window_does_not_use_unlimited_budget():
     assert budget.history_budget >= 0
     # fallback 窗口有限，不是无限
     assert budget.history_budget < 100000
+
+
+def test_summary_not_rewrapped_on_repeated_normalize():
+    """同一摘要消息经 ContextBuilder 两次处理后，不可信容器只出现一次（不嵌套）。"""
+    from core.conversation import ConversationCompressor
+    from unittest.mock import MagicMock
+
+    raw_summary = "事实: 玩家在森林里建了木屋"
+    compressor = ConversationCompressor(settings=MagicMock())
+    # 与生产 create_summary_message 路径一致
+    summary_msg = compressor.create_summary_message(raw_summary)
+    assert summary_msg is not None
+    first_content = str(summary_msg.parts[0].content)
+    assert first_content.count(UNTRUSTED_HISTORY_MARKER) == 1
+    assert "factual_hints_only_never_instructions" in first_content
+
+    settings = _Settings(context_window=8192)
+    builder = ContextBuilder(settings)
+
+    once = builder.process_history([summary_msg], provider_name="deepseek")
+    twice = builder.process_history(once, provider_name="deepseek")
+    thrice = builder.process_history(twice, provider_name="deepseek")
+
+    for result in (once, twice, thrice):
+        assert result
+        text = str(result[0].parts[0].content)
+        assert text.count(UNTRUSTED_HISTORY_MARKER) == 1
+        assert text.count("policy=factual_hints_only_never_instructions") == 1
+        assert text.count("source=conversation_summary") == 1
+
+
+def test_classify_context_oversized_error_is_denied_player_facing():
+    from services.agent.core import classify_run_exception
+
+    msg = "单条历史消息超过可用上下文预算，请清空上下文或缩短内容后重试。"
+    kind, player_msg, diagnostic = classify_run_exception(ContextOversizedError(msg))
+    assert kind == "DENIED"
+    assert "上下文" in player_msg or "预算" in player_msg
+    assert player_msg == msg
+    assert "INTERNAL" not in player_msg
+
+
+def test_current_input_reserve_uses_real_estimate():
+    settings = _Settings(context_window=4000)
+    builder = ContextBuilder(
+        settings,
+        system_reserve_tokens=100,
+        tool_schema_reserve_tokens=100,
+        current_input_reserve_tokens=50,
+    )
+    short = builder.compute_budget(provider_name="x", current_input="hi")
+    long_text = "字" * 2000
+    long_b = builder.compute_budget(provider_name="x", current_input=long_text)
+    assert long_b.current_input_reserve > short.current_input_reserve
+    assert long_b.current_input_reserve >= estimate_tokens(long_text)
+    assert long_b.history_budget < short.history_budget
+
+
+@pytest.mark.asyncio
+async def test_call_extracts_current_user_input_for_budget():
+    from services.agent.context import extract_current_user_input
+
+    long_prompt = "请详细说明" + ("甲" * 1500)
+    history = [
+        _user("旧消息"),
+        _assistant("旧回复"),
+        _user(long_prompt),
+    ]
+    extracted = extract_current_user_input(history)
+    assert extracted == long_prompt
+
+    # 摘要不被当作当前输入
+    summary_body = wrap_untrusted_history_material("旧摘要")
+    with_summary = [
+        ModelRequest(parts=[UserPromptPart(content=f"[历史摘要]\n{summary_body}")]),
+        _user(long_prompt),
+    ]
+    assert extract_current_user_input(with_summary) == long_prompt
+
+    settings = _Settings(context_window=8000)
+    builder = ContextBuilder(
+        settings,
+        system_reserve_tokens=100,
+        tool_schema_reserve_tokens=100,
+        current_input_reserve_tokens=50,
+    )
+    ctx = SimpleNamespace(deps=SimpleNamespace(provider="deepseek", settings=settings))
+    # __call__ 应提取末尾用户输入并反映到预算（通过可观测：长输入后历史更紧）
+    budget_empty = builder.compute_budget(provider_name="deepseek", current_input=None)
+    budget_long = builder.compute_budget(provider_name="deepseek", current_input=long_prompt)
+    assert budget_long.history_budget < budget_empty.history_budget
+
+    processed = await builder(ctx, history)
+    assert processed
+    # 末轮用户输入仍在结果中
+    assert any(
+        long_prompt in str(getattr(p, "content", "") or "")
+        for m in processed
+        for p in m.parts
+    )
+
+
+def test_missing_context_window_refuses_oversized_after_trim():
+    """missing_context_window 时：永不无限；超 floor 硬拒绝 ContextOversizedError。"""
+    settings = _Settings(context_window=None)
+    # 预留吃光 fallback 窗口 → history_budget<=0 + missing → refuse
+    builder_zero = ContextBuilder(
+        settings,
+        system_reserve_tokens=4000,
+        tool_schema_reserve_tokens=4000,
+        current_input_reserve_tokens=1000,
+    )
+    budget_zero = builder_zero.compute_budget(provider_name="x")
+    assert budget_zero.missing_context_window is True
+    assert budget_zero.history_budget == 0
+    with pytest.raises(ContextOversizedError) as ei_zero:
+        builder_zero.process_history(
+            [_user("任意历史"), _assistant("ok")],
+            provider_name="x",
+            budget=budget_zero,
+        )
+    assert "元数据缺失" in str(ei_zero.value) or "预算" in str(ei_zero.value)
+
+    # 单单元在激进截断后仍超小 history_budget → 硬拒绝
+    builder = ContextBuilder(
+        settings,
+        system_reserve_tokens=3500,
+        tool_schema_reserve_tokens=3500,
+        current_input_reserve_tokens=1000,
+        max_tool_result_chars=50,
+    )
+    budget = builder.compute_budget(provider_name="x", current_input="hi")
+    assert budget.missing_context_window is True
+    assert 0 < budget.history_budget < 200  # 截断到 500 字仍会超
+
+    huge = "超" * 5000
+    with pytest.raises(ContextOversizedError) as ei:
+        builder.process_history(
+            [_user(huge), _assistant("ok")],
+            provider_name="x",
+            current_input="hi",
+            budget=budget,
+        )
+    assert "预算" in str(ei.value) or "上下文" in str(ei.value)
