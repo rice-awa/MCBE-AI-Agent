@@ -287,6 +287,9 @@ class MockAgent:
         self._request_node_events = request_node_events
         self.run_called = False
         self.run_call_count = 0
+        self.iter_called = False
+        self.last_usage_limits = None
+        self.last_kwargs: dict[str, Any] = {}
 
     def iter(
         self,
@@ -294,8 +297,13 @@ class MockAgent:
         deps: Any = None,
         model: Any = None,
         message_history: list[Any] = None,
+        usage_limits: Any = None,
+        **kwargs: Any,
     ) -> MockAgentRunContext:
         """模拟 iter() 方法"""
+        self.iter_called = True
+        self.last_usage_limits = usage_limits
+        self.last_kwargs = kwargs
         # 构建节点序列
         nodes = []
 
@@ -332,10 +340,14 @@ class MockAgent:
         deps: Any = None,
         model: Any = None,
         message_history: list[Any] = None,
+        usage_limits: Any = None,
+        **kwargs: Any,
     ) -> SimpleNamespace:
         """模拟 run() 方法（用于非流式模式）"""
         self.run_called = True
         self.run_call_count += 1
+        self.last_usage_limits = usage_limits
+        self.last_kwargs = kwargs
         return SimpleNamespace(
             output=self._result_output,
             usage=lambda: {"total_tokens": 100},
@@ -364,10 +376,22 @@ def _build_deps(stream_sentence_mode: bool) -> AgentDependencies:
     return AgentDependencies(
         connection_id=uuid4(),
         player_name="Tester",
-        settings=SimpleNamespace(stream_sentence_mode=stream_sentence_mode),  # type: ignore[arg-type]
+        settings=SimpleNamespace(
+            stream_sentence_mode=stream_sentence_mode,
+            request_limit=8,
+            tool_calls_limit=8,
+            input_tokens_limit=None,
+            output_tokens_limit=None,
+            total_tokens_limit=None,
+            run_timeout=90.0,
+            max_tool_concurrency=4,
+            context_output_reserve_tokens=1024,
+        ),  # type: ignore[arg-type]
         http_client=None,  # type: ignore[arg-type]
         send_to_game=_noop,
         run_command=_noop,
+        run_id="test-run-id",
+        conversation_id="test-conv",
     )
 
 
@@ -501,6 +525,14 @@ def test_tool_call_should_be_recorded_in_tool_events(monkeypatch) -> None:
     tool_events_list = events[-1].metadata.get("tool_events", [])
     assert len(tool_events_list) == 1
     assert tool_events_list[0]["tool_name"] == "run_minecraft_command"
+    assert events[-1].metadata.get("run_id") == "test-run-id"
+    assert events[-1].metadata.get("player_name") == "Tester"
+    assert events[-1].metadata.get("conversation_id") == "test-conv"
+    assert "tool_calls" not in events[-1].metadata
+    assert "tool_returns" not in events[-1].metadata
+    assert mock_agent.last_usage_limits is not None
+    assert mock_agent.last_usage_limits.request_limit == 8
+    assert mock_agent.last_usage_limits.tool_calls_limit == 8
 
 
 def test_tool_chain_no_longer_needs_manual_fallback(monkeypatch) -> None:
@@ -603,7 +635,7 @@ def test_empty_text_chunks_should_not_yield_content_events(monkeypatch) -> None:
 
 
 def test_non_stream_mode_uses_run_method(monkeypatch) -> None:
-    """非流式模式应使用 run() 方法"""
+    """非流式模式应使用 run() 方法，并传入 UsageLimits。"""
     _patch_agent_node_adapter(monkeypatch)
 
     mock_agent = MockAgent(result_output="这是一个测试响应。")
@@ -613,8 +645,14 @@ def test_non_stream_mode_uses_run_method(monkeypatch) -> None:
 
     # 非流式模式调用 run()
     assert mock_agent.run_called is True
+    assert mock_agent.last_usage_limits is not None
+    assert mock_agent.last_usage_limits.request_limit == 8
     assert events[-1].metadata is not None
     assert events[-1].metadata.get("is_complete") is True
+    assert events[-1].metadata.get("run_id") == "test-run-id"
+    assert "tool_events" in events[-1].metadata
+    assert "tool_calls" not in events[-1].metadata
+    assert "tool_returns" not in events[-1].metadata
 
 
 def test_multiple_tool_calls_should_all_be_recorded(monkeypatch) -> None:
@@ -685,6 +723,9 @@ def test_non_stream_mode_should_populate_tool_events_from_messages(monkeypatch) 
     assert len(tool_events_list) == 1
     assert tool_events_list[0]["tool_name"] == "run_minecraft_command"
     assert tool_events_list[0]["args"] == {"command": "time set day"}
+    assert events[-1].metadata.get("run_id") == "test-run-id"
+    assert "tool_calls" not in events[-1].metadata
+    assert "tool_returns" not in events[-1].metadata
 
 
 def test_chat_agent_manager_caches_fallback_agent_after_mcp_failure(monkeypatch) -> None:

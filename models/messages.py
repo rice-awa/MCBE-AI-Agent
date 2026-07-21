@@ -27,6 +27,8 @@ class ChatRequest(BaseMessage):
     provider: str | None = None  # 可选指定 LLM 提供商
     delivery: Literal["tellraw", "scriptevent"] = "tellraw"
     conversation_id: str = DEFAULT_CONVERSATION_ID
+    # 单次 run 身份，由入队侧或 Worker 生成；贯穿工具/完成事件。
+    run_id: str | None = None
     # 历史 revision，保留兼容 API；普通聊天写回会递增。
     conversation_generation: int = 0
     # 管理操作失效 epoch；clear/switch/new/restore/switch_model 等运行时状态变更会递增。

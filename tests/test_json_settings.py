@@ -72,6 +72,52 @@ def test_runtime_harness_settings_loaded_from_json(tmp_path, monkeypatch):
     assert settings.runtime_harness_audit_max_records == 12
 
 
+def test_agent_run_budget_settings_loaded_from_json(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    write_json_config(
+        tmp_path,
+        {
+            "agent": {
+                "request_limit": 3,
+                "tool_calls_limit": 4,
+                "input_tokens_limit": 1000,
+                "output_tokens_limit": 200,
+                "total_tokens_limit": 1200,
+                "run_timeout": 45.5,
+                "max_tool_concurrency": 2,
+                "context_output_reserve_tokens": 256,
+            }
+        },
+    )
+
+    settings = Settings()
+
+    assert settings.request_limit == 3
+    assert settings.tool_calls_limit == 4
+    assert settings.input_tokens_limit == 1000
+    assert settings.output_tokens_limit == 200
+    assert settings.total_tokens_limit == 1200
+    assert settings.run_timeout == 45.5
+    assert settings.max_tool_concurrency == 2
+    assert settings.context_output_reserve_tokens == 256
+
+
+def test_agent_run_budget_defaults_when_absent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    write_json_config(tmp_path, {"agent": {"system_prompt": "x"}})
+
+    settings = Settings()
+
+    assert settings.request_limit == 8
+    assert settings.tool_calls_limit == 8
+    assert settings.input_tokens_limit is None
+    assert settings.output_tokens_limit is None
+    assert settings.total_tokens_limit is None
+    assert settings.run_timeout == 90.0
+    assert settings.max_tool_concurrency == 4
+    assert settings.context_output_reserve_tokens == 1024
+
+
 def test_agent_compression_settings_are_optional_in_runtime_config(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("SECRET_KEY", "test-secret")

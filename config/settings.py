@@ -229,6 +229,14 @@ REQUIRED_CONFIG_PATHS = (
     "agent.mcwiki_base_url",
     "agent.dedup_external_messages",
     "agent.tool_response_verbose",
+    "agent.request_limit",
+    "agent.tool_calls_limit",
+    "agent.input_tokens_limit",
+    "agent.output_tokens_limit",
+    "agent.total_tokens_limit",
+    "agent.run_timeout",
+    "agent.max_tool_concurrency",
+    "agent.context_output_reserve_tokens",
     "agent.runtime_harness.enabled",
     "agent.runtime_harness.prompt_enabled",
     "agent.runtime_harness.schema_enabled",
@@ -713,6 +721,17 @@ class Settings(BaseSettings):
         description="是否排除sender为外部且事件为PlayerMessage的重复消息"
     )
 
+    # 每轮 run 预算（UsageLimits + wall-clock）
+    request_limit: int = Field(default=8, ge=1)
+    tool_calls_limit: int = Field(default=8, ge=1)
+    # None = 未显式配置；运行时可由模型 context window 派生
+    input_tokens_limit: int | None = Field(default=None, ge=1)
+    output_tokens_limit: int | None = Field(default=None, ge=1)
+    total_tokens_limit: int | None = Field(default=None, ge=1)
+    run_timeout: float = Field(default=90.0, gt=0)
+    max_tool_concurrency: int = Field(default=4, ge=1)
+    context_output_reserve_tokens: int = Field(default=1024, ge=0)
+
     # 运行时 Harness 配置
     runtime_harness_enabled: bool = True
     runtime_harness_prompt_enabled: bool = True
@@ -757,14 +776,14 @@ class Settings(BaseSettings):
         description="开发模式 - 跳过身份验证，仅用于本地开发调试"
     )
 
-    # 原始日志开关配置
+    # 原始日志开关配置（默认关闭，避免缓冲流式 body / 泄露完整内容）
     enable_ws_raw_log: bool = Field(
-        default=True,
+        default=False,
         alias="ENABLE_WS_RAW_LOG",
         description="是否启用 WebSocket 原始请求/响应日志"
     )
     enable_llm_raw_log: bool = Field(
-        default=True,
+        default=False,
         alias="ENABLE_LLM_RAW_LOG",
         description="是否启用 LLM 请求/响应日志"
     )

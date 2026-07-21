@@ -236,16 +236,18 @@ class MCPManager:
                         server=server_name,
                         mode="sse",
                         url=config.url,
+                        timeout=config.timeout,
                     )
-                    return MCPServerSSE(config.url)
+                    return MCPServerSSE(config.url, timeout=config.timeout)
                 else:
                     logger.info(
                         "mcp_toolset_created",
                         server=server_name,
                         mode="streamable-http",
                         url=config.url,
+                        timeout=config.timeout,
                     )
-                    return MCPServerStreamableHTTP(config.url)
+                    return MCPServerStreamableHTTP(config.url, timeout=config.timeout)
 
             # Stdio 模式（通过命令配置）
             if config.command:

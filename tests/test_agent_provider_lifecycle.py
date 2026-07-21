@@ -568,3 +568,200 @@ def test_runtime_attaches_metadata_cache_to_settings_before_worker(tmp_path):
     assert settings._model_metadata_cache is not None
     assert calls[0] == "metadata_attach"
     assert calls.index("metadata_attach") < calls.index("warmup")
+
+
+# ---------------------------------------------------------------------------
+# Task1: Provider 配置参数确实传入（无真实网络）
+# ---------------------------------------------------------------------------
+
+
+def test_deepseek_custom_base_url_uses_openai_provider(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    captured = {}
+
+    class FakeOpenAIChatModel:
+        def __init__(self, model, provider=None):
+            captured["model"] = model
+            captured["provider"] = provider
+
+    class FakeOpenAIProvider:
+        def __init__(self, **kwargs):
+            captured["openai_provider_kwargs"] = kwargs
+
+    class FakeDeepSeekProvider:
+        def __init__(self, **kwargs):
+            captured["deepseek_provider_kwargs"] = kwargs
+
+    monkeypatch.setattr("services.agent.providers.OpenAIChatModel", FakeOpenAIChatModel)
+    monkeypatch.setattr("services.agent.providers.OpenAIProvider", FakeOpenAIProvider)
+    monkeypatch.setattr("services.agent.providers.DeepSeekProvider", FakeDeepSeekProvider)
+    monkeypatch.setattr(
+        registry,
+        "_get_or_create_http_client",
+        lambda config, name: "http-client",
+    )
+
+    registry._create_deepseek_model(
+        provider_config(base_url="https://custom.deepseek.test/v1", api_key="k")
+    )
+
+    assert captured["model"] == "deepseek-chat"
+    assert "openai_provider_kwargs" in captured
+    assert captured["openai_provider_kwargs"]["base_url"] == "https://custom.deepseek.test/v1"
+    assert captured["openai_provider_kwargs"]["http_client"] == "http-client"
+    assert "deepseek_provider_kwargs" not in captured
+
+
+def test_deepseek_default_base_url_uses_deepseek_provider(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    captured = {}
+
+    class FakeOpenAIChatModel:
+        def __init__(self, model, provider=None):
+            captured["provider"] = provider
+
+    class FakeDeepSeekProvider:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("services.agent.providers.OpenAIChatModel", FakeOpenAIChatModel)
+    monkeypatch.setattr("services.agent.providers.DeepSeekProvider", FakeDeepSeekProvider)
+    monkeypatch.setattr(
+        registry,
+        "_get_or_create_http_client",
+        lambda config, name: "http-client",
+    )
+
+    registry._create_deepseek_model(provider_config(base_url="https://api.deepseek.com", api_key="k"))
+
+    assert captured["kwargs"]["api_key"] == "k"
+    assert captured["kwargs"]["http_client"] == "http-client"
+
+
+def test_anthropic_model_receives_timeout_via_http_client(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    captured = {}
+
+    class FakeAnthropicModel:
+        def __init__(self, model, provider=None):
+            captured["model"] = model
+            captured["provider"] = provider
+
+    class FakeAnthropicProvider:
+        def __init__(self, **kwargs):
+            captured["provider_kwargs"] = kwargs
+
+    import services.agent.providers as providers_mod
+
+    # 延迟 import 路径在函数内部；patch 目标模块
+    import pydantic_ai.models.anthropic as anthropic_models
+    import pydantic_ai.providers.anthropic as anthropic_providers
+
+    monkeypatch.setattr(anthropic_models, "AnthropicModel", FakeAnthropicModel)
+    monkeypatch.setattr(anthropic_providers, "AnthropicProvider", FakeAnthropicProvider)
+
+    def fake_http(config, name):
+        captured["http_timeout"] = config.timeout
+        captured["provider_name"] = name
+        return "anthropic-http"
+
+    monkeypatch.setattr(registry, "_get_or_create_http_client", fake_http)
+
+    registry._create_anthropic_model(
+        provider_config(name="anthropic", model="claude-test", api_key="k", timeout=33)
+    )
+
+    assert captured["model"] == "claude-test"
+    assert captured["http_timeout"] == 33
+    assert captured["provider_name"] == "anthropic"
+    assert captured["provider_kwargs"]["http_client"] == "anthropic-http"
+
+
+def test_ollama_model_receives_base_url_and_timeout(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    captured = {}
+
+    class FakeOllamaModel:
+        def __init__(self, model, provider=None):
+            captured["model"] = model
+            captured["provider"] = provider
+
+    class FakeOllamaProvider:
+        def __init__(self, **kwargs):
+            captured["provider_kwargs"] = kwargs
+
+    import pydantic_ai.models.ollama as ollama_models
+    import pydantic_ai.providers.ollama as ollama_providers
+
+    monkeypatch.setattr(ollama_models, "OllamaModel", FakeOllamaModel)
+    monkeypatch.setattr(ollama_providers, "OllamaProvider", FakeOllamaProvider)
+
+    def fake_http(config, name):
+        captured["http_timeout"] = config.timeout
+        return "ollama-http"
+
+    monkeypatch.setattr(registry, "_get_or_create_http_client", fake_http)
+
+    registry._create_ollama_model(
+        provider_config(
+            name="ollama",
+            model="llama3",
+            api_key=None,
+            base_url="http://ollama.local:11434",
+            timeout=17,
+        )
+    )
+
+    assert captured["model"] == "llama3"
+    assert captured["http_timeout"] == 17
+    assert captured["provider_kwargs"]["base_url"] == "http://ollama.local:11434"
+    assert captured["provider_kwargs"]["http_client"] == "ollama-http"
+
+
+def test_llm_http_client_skips_raw_hooks_when_disabled(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    monkeypatch.setattr(
+        RuntimeAdapterRegistry,
+        "_is_llm_raw_log_enabled",
+        staticmethod(lambda: False),
+    )
+
+    created = {}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    monkeypatch.setattr("services.agent.providers.httpx.AsyncClient", FakeAsyncClient)
+
+    client = registry._create_llm_http_client(provider_config(timeout=12), "deepseek")
+    assert isinstance(client, FakeAsyncClient)
+    assert created["timeout"] == 12
+    assert "event_hooks" not in created
+
+
+def test_llm_http_client_installs_hooks_without_aread_when_enabled(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    monkeypatch.setattr(
+        RuntimeAdapterRegistry,
+        "_is_llm_raw_log_enabled",
+        staticmethod(lambda: True),
+    )
+
+    created = {}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    monkeypatch.setattr("services.agent.providers.httpx.AsyncClient", FakeAsyncClient)
+
+    registry._create_llm_http_client(provider_config(timeout=9), "openai")
+    assert "event_hooks" in created
+    # 确保源码不再强制 aread
+    import inspect
+    from services.agent.providers import RuntimeAdapterRegistry as R
+
+    source = inspect.getsource(R._create_llm_http_client)
+    assert "response.aread" not in source
+    assert "await response.aread" not in source

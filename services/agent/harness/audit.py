@@ -116,13 +116,18 @@ def summarize_result(
             "success": "failure",
             "result_preview": None,
             "failure_reason": str(exception),
+            "error_kind": "INTERNAL",
+            "external_state_unknown": "false",
         }
 
     if isinstance(result, ToolResult):
         return {
             "success": result.status,
             "result_preview": None,
-            "failure_reason": result.failure_reason if not result.success else None,
+            "failure_reason": result.failure_reason if not result.is_success else None,
+            "error_kind": result.error_kind,
+            "external_state_unknown": "true" if result.external_state_unknown else "false",
+            "diagnostic_summary": result.diagnostic_summary if not result.is_success else None,
         }
 
     text = str(result) if result is not None else ""
@@ -131,6 +136,8 @@ def summarize_result(
         "success": "failure" if failure_reason else "success",
         "result_preview": None,
         "failure_reason": failure_reason,
+        "error_kind": "PERMANENT" if failure_reason else None,
+        "external_state_unknown": "false",
     }
 
 
@@ -194,7 +201,12 @@ def wrap_tool_function(tool_name: str, function: ToolFunction, settings: AuditSe
             _write_record(settings, tool_name, parameters, ctx, "failure", duration_ms, exception=exc)
             raise
         duration_ms = _duration_ms(start)
-        _write_record(settings, tool_name, parameters, ctx, "success", duration_ms, result=result)
+        audit_status = (
+            "failure"
+            if isinstance(result, ToolResult) and not result.is_success
+            else "success"
+        )
+        _write_record(settings, tool_name, parameters, ctx, audit_status, duration_ms, result=result)
         return result
 
     def _audit_sync(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
@@ -209,7 +221,12 @@ def wrap_tool_function(tool_name: str, function: ToolFunction, settings: AuditSe
             _write_record(settings, tool_name, parameters, ctx, "failure", duration_ms, exception=exc)
             raise
         duration_ms = _duration_ms(start)
-        _write_record(settings, tool_name, parameters, ctx, "success", duration_ms, result=result)
+        audit_status = (
+            "failure"
+            if isinstance(result, ToolResult) and not result.is_success
+            else "success"
+        )
+        _write_record(settings, tool_name, parameters, ctx, audit_status, duration_ms, result=result)
         return result
 
     if is_async:

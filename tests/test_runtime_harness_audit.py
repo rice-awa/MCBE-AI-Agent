@@ -187,21 +187,21 @@ def test_summarize_result_uses_structured_tool_result_status() -> None:
     summary = summarize_result(result=result)
 
     assert str(result) == "命令执行失败: denied"
-    assert summary == {
-        "success": "failure",
-        "result_preview": None,
-        "failure_reason": "命令执行失败: denied",
-    }
+    assert summary["success"] == "failure"
+    assert summary["result_preview"] is None
+    assert summary["failure_reason"] == "命令执行失败: denied"
+    assert summary["error_kind"] == "PERMANENT"
+    assert summary["external_state_unknown"] == "false"
 
 
 def test_summarize_result_uses_structured_tool_result_success() -> None:
     summary = summarize_result(result=ToolResult.success("命令执行失败: literal output"))
 
-    assert summary == {
-        "success": "success",
-        "result_preview": None,
-        "failure_reason": None,
-    }
+    assert summary["success"] == "success"
+    assert summary["result_preview"] is None
+    assert summary["failure_reason"] is None
+    assert summary["error_kind"] is None
+    assert summary["external_state_unknown"] == "false"
 
 
 @pytest.mark.asyncio

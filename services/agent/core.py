@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Protocol, cast
 
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
@@ -19,10 +20,12 @@ from pydantic_ai.messages import (
     ThinkingPartDelta,
 )
 from pydantic_ai.models import Model
+from pydantic_ai.usage import UsageLimits
 
 from config.logging import get_logger
 from config.settings import Settings, get_settings
 from models.agent import AgentDependencies, StreamEvent
+from services.agent.tool_results import PLAYER_ERROR_ADVICE, ErrorKind
 from services.agent.tools import register_agent_tools
 from services.agent.prompt import build_dynamic_prompt
 
@@ -31,6 +34,87 @@ logger = get_logger(__name__)
 
 class StreamModeSettings(Protocol):
     stream_sentence_mode: bool
+    request_limit: int
+    tool_calls_limit: int
+    input_tokens_limit: int | None
+    output_tokens_limit: int | None
+    total_tokens_limit: int | None
+    run_timeout: float
+    max_tool_concurrency: int
+    context_output_reserve_tokens: int
+
+
+class RunBudgetSettings(Protocol):
+    request_limit: int
+    tool_calls_limit: int
+    input_tokens_limit: int | None
+    output_tokens_limit: int | None
+    total_tokens_limit: int | None
+    run_timeout: float
+    max_tool_concurrency: int
+    context_output_reserve_tokens: int
+
+    def get_provider_config(self, provider_name: str | None = None) -> Any:
+        ...
+
+
+def build_usage_limits(settings: Any, provider_name: str | None = None) -> UsageLimits:
+    """从 Settings 构建 PydanticAI UsageLimits。"""
+    request_limit = int(getattr(settings, "request_limit", 8) or 8)
+    tool_calls_limit = int(getattr(settings, "tool_calls_limit", 8) or 8)
+    input_tokens_limit = getattr(settings, "input_tokens_limit", None)
+    output_tokens_limit = getattr(settings, "output_tokens_limit", None)
+    total_tokens_limit = getattr(settings, "total_tokens_limit", None)
+    reserve = int(getattr(settings, "context_output_reserve_tokens", 1024) or 0)
+
+    # 未显式配置 input/total 时，尝试从模型 context_window 派生
+    if input_tokens_limit is None or total_tokens_limit is None:
+        context_window = None
+        get_provider_config = getattr(settings, "get_provider_config", None)
+        if callable(get_provider_config):
+            try:
+                provider_config = get_provider_config(provider_name)
+                context_window = getattr(provider_config, "context_window", None)
+            except Exception:
+                context_window = None
+        if context_window is not None and context_window > reserve:
+            derived = int(context_window) - reserve
+            if input_tokens_limit is None:
+                input_tokens_limit = derived
+            if total_tokens_limit is None:
+                total_tokens_limit = int(context_window)
+
+    return UsageLimits(
+        request_limit=request_limit,
+        tool_calls_limit=tool_calls_limit,
+        input_tokens_limit=input_tokens_limit,
+        output_tokens_limit=output_tokens_limit,
+        total_tokens_limit=total_tokens_limit,
+    )
+
+
+def get_run_timeout(settings: Any) -> float:
+    return float(getattr(settings, "run_timeout", 90.0) or 90.0)
+
+
+def player_facing_error(error_kind: ErrorKind, fallback: str | None = None) -> str:
+    return PLAYER_ERROR_ADVICE.get(error_kind, fallback or PLAYER_ERROR_ADVICE["INTERNAL"])
+
+
+def classify_run_exception(exc: BaseException) -> tuple[ErrorKind, str, str]:
+    """返回 (error_kind, player_message, diagnostic_summary)。"""
+    if isinstance(exc, asyncio.CancelledError):
+        return "CANCELLED", player_facing_error("CANCELLED"), "CancelledError"
+    if isinstance(exc, asyncio.TimeoutError):
+        return "TRANSIENT", player_facing_error("TRANSIENT"), "run_timeout"
+    if isinstance(exc, UsageLimitExceeded):
+        return "DENIED", "已达到本轮请求预算上限，请缩短问题或稍后再试。", str(exc)
+
+    detail = _extract_exception_details(exc)
+    lower = detail.lower()
+    if "timeout" in lower or "deadline exceeded" in lower:
+        return "TRANSIENT", player_facing_error("TRANSIENT"), detail
+    return "INTERNAL", player_facing_error("INTERNAL"), detail
 
 
 TOOL_USAGE_GUIDE = """
@@ -79,6 +163,7 @@ class ChatAgentManager:
             defer_model_check=True,
             retries=settings.agent_retries,
             toolsets=toolsets,
+            max_concurrency=getattr(settings, "max_tool_concurrency", 4),
         )
 
         @agent.system_prompt
@@ -278,12 +363,18 @@ SENTENCE_END_PATTERN = re.compile(r"[。！？\n.!?]+")
 
 def _non_stream_batch_max_chars() -> int:
     """非流式模式按句子分批的最大字符数（从 Settings.flow_control 读取）。"""
-    return get_settings().flow_control.non_stream_batch_max_chars
+    try:
+        return get_settings().flow_control.non_stream_batch_max_chars
+    except Exception:
+        return 150
 
 
 def _non_stream_send_delay() -> float:
     """非流式模式每个包之间的发送延迟（秒，从 Settings.flow_control 读取）。"""
-    return get_settings().flow_control.non_stream_send_delay
+    try:
+        return get_settings().flow_control.non_stream_send_delay
+    except Exception:
+        return 0.1
 
 
 def _serialize_usage(usage: Any | None) -> dict[str, Any] | None:
@@ -626,190 +717,207 @@ async def stream_response_handler(
         mode="stream",
     )
 
+    usage_limits = build_usage_limits(deps.settings, deps.provider)
+    run_timeout = get_run_timeout(deps.settings)
+
     try:
-        # 使用 agent.iter() 进行细粒度节点控制
-        async with active_agent.iter(
-            prompt,
-            deps=deps,
-            model=model,
-            message_history=message_history,
-        ) as run:
-            async for node in run:
-                # 处理用户提示节点
-                if Agent.is_user_prompt_node(node):
-                    logger.debug(
-                        "agent_user_prompt",
-                        prompt=node.user_prompt,
-                        connection_id=str(deps.connection_id),
-                    )
+        async with asyncio.timeout(run_timeout):
+            # 使用 agent.iter() 进行细粒度节点控制
+            async with active_agent.iter(
+                prompt,
+                deps=deps,
+                model=model,
+                message_history=message_history,
+                usage_limits=usage_limits,
+            ) as run:
+                async for node in run:
+                    # 处理用户提示节点
+                    if Agent.is_user_prompt_node(node):
+                        logger.debug(
+                            "agent_user_prompt",
+                            prompt=node.user_prompt,
+                            connection_id=str(deps.connection_id),
+                            run_id=deps.run_id,
+                        )
 
-                # 处理模型请求节点 - 流式输出文本
-                elif Agent.is_model_request_node(node):
-                    async with node.stream(run.ctx) as request_stream:
-                        async for event in request_stream:
-                            # 处理部分开始事件
-                            if isinstance(event, PartStartEvent):
-                                logger.debug(
-                                    "agent_part_start",
-                                    index=event.index,
-                                    connection_id=str(deps.connection_id),
-                                    current_buffer=ctx.sentence_buffer,
-                                )
-                                part = event.part
-                                # ThinkingPart：作为 reasoning 事件输出，不进文本缓冲区
-                                if isinstance(part, ThinkingPart) and part.content:
+                    # 处理模型请求节点 - 流式输出文本
+                    elif Agent.is_model_request_node(node):
+                        async with node.stream(run.ctx) as request_stream:
+                            async for event in request_stream:
+                                # 处理部分开始事件
+                                if isinstance(event, PartStartEvent):
                                     logger.debug(
-                                        "agent_part_start_thinking",
+                                        "agent_part_start",
                                         index=event.index,
-                                        content=part.content,
                                         connection_id=str(deps.connection_id),
+                                        current_buffer=ctx.sentence_buffer,
                                     )
-                                    yield await _send_reasoning_event(ctx, part.content)
-                                # TextPart：初始内容进文本缓冲区，按完整句子发送
-                                elif isinstance(part, TextPart) and part.content:
-                                    logger.debug(
-                                        "agent_part_start_content",
-                                        index=event.index,
-                                        content=part.content,
-                                        connection_id=str(deps.connection_id),
-                                    )
-                                    ctx.sentence_buffer += part.content
-                                    sentences, ctx.sentence_buffer = (
-                                        _extract_complete_sentences(
-                                            ctx.sentence_buffer
-                                        )
-                                    )
-                                    for sentence in sentences:
-                                        yield await _send_content_event(
-                                            ctx, sentence
-                                        )
-
-                            # 处理增量事件
-                            elif isinstance(event, PartDeltaEvent):
-                                delta = event.delta
-                                # ThinkingPartDelta：作为 reasoning 事件输出
-                                if isinstance(delta, ThinkingPartDelta):
-                                    chunk = delta.content_delta
-                                    if chunk:
+                                    part = event.part
+                                    # ThinkingPart：作为 reasoning 事件输出，不进文本缓冲区
+                                    if isinstance(part, ThinkingPart) and part.content:
                                         logger.debug(
-                                            "agent_thinking_delta",
-                                            chunk=chunk,
+                                            "agent_part_start_thinking",
                                             index=event.index,
+                                            content=part.content,
                                             connection_id=str(deps.connection_id),
                                         )
-                                        yield await _send_reasoning_event(ctx, chunk)
-                                # TextPartDelta：文本增量缓冲并按完整句子发送
-                                elif isinstance(delta, TextPartDelta):
-                                    chunk = delta.content_delta
-                                    logger.debug(
-                                        "agent_text_delta",
-                                        chunk=chunk,
-                                        index=event.index,
-                                        connection_id=str(deps.connection_id),
-                                        buffer_before=ctx.sentence_buffer,
-                                    )
-                                    if chunk:
-                                        ctx.sentence_buffer += chunk
+                                        yield await _send_reasoning_event(ctx, part.content)
+                                    # TextPart：初始内容进文本缓冲区，按完整句子发送
+                                    elif isinstance(part, TextPart) and part.content:
+                                        logger.debug(
+                                            "agent_part_start_content",
+                                            index=event.index,
+                                            content=part.content,
+                                            connection_id=str(deps.connection_id),
+                                        )
+                                        ctx.sentence_buffer += part.content
                                         sentences, ctx.sentence_buffer = (
                                             _extract_complete_sentences(
                                                 ctx.sentence_buffer
                                             )
-                                        )
-                                        logger.debug(
-                                            "agent_sentences_extracted",
-                                            sentences=sentences,
-                                            buffer_after=ctx.sentence_buffer,
-                                            connection_id=str(deps.connection_id),
                                         )
                                         for sentence in sentences:
                                             yield await _send_content_event(
                                                 ctx, sentence
                                             )
 
-                # 处理工具调用节点 - 工具由框架自动执行
-                elif Agent.is_call_tools_node(node):
-                    async with node.stream(run.ctx) as handle_stream:
-                        async for event in handle_stream:
-                            # 工具调用事件
-                            if isinstance(event, FunctionToolCallEvent):
-                                tool_info = {
-                                    "tool_name": event.part.tool_name,
-                                    "tool_call_id": event.part.tool_call_id,
-                                    "args": event.part.args,
-                                }
-                                ctx.tool_events.append(tool_info)
-                                ctx.tool_call_names[event.part.tool_call_id] = event.part.tool_name
-                                logger.info(
-                                    "agent_tool_call",
-                                    tool=event.part.tool_name,
-                                    args=event.part.args,
-                                    tool_call_id=event.part.tool_call_id,
-                                    connection_id=str(deps.connection_id),
-                                )
-                                # 发送工具调用事件
-                                yield StreamEvent(
-                                    event_type="tool_call",
-                                    content=event.part.tool_name,
-                                    sequence=ctx.sequence,
-                                    metadata={
+                                # 处理增量事件
+                                elif isinstance(event, PartDeltaEvent):
+                                    delta = event.delta
+                                    # ThinkingPartDelta：作为 reasoning 事件输出
+                                    if isinstance(delta, ThinkingPartDelta):
+                                        chunk = delta.content_delta
+                                        if chunk:
+                                            logger.debug(
+                                                "agent_thinking_delta",
+                                                chunk=chunk,
+                                                index=event.index,
+                                                connection_id=str(deps.connection_id),
+                                            )
+                                            yield await _send_reasoning_event(ctx, chunk)
+                                    # TextPartDelta：文本增量缓冲并按完整句子发送
+                                    elif isinstance(delta, TextPartDelta):
+                                        chunk = delta.content_delta
+                                        logger.debug(
+                                            "agent_text_delta",
+                                            chunk=chunk,
+                                            index=event.index,
+                                            connection_id=str(deps.connection_id),
+                                            buffer_before=ctx.sentence_buffer,
+                                        )
+                                        if chunk:
+                                            ctx.sentence_buffer += chunk
+                                            sentences, ctx.sentence_buffer = (
+                                                _extract_complete_sentences(
+                                                    ctx.sentence_buffer
+                                                )
+                                            )
+                                            logger.debug(
+                                                "agent_sentences_extracted",
+                                                sentences=sentences,
+                                                buffer_after=ctx.sentence_buffer,
+                                                connection_id=str(deps.connection_id),
+                                            )
+                                            for sentence in sentences:
+                                                yield await _send_content_event(
+                                                    ctx, sentence
+                                                )
+
+                    # 处理工具调用节点 - 工具由框架自动执行
+                    elif Agent.is_call_tools_node(node):
+                        async with node.stream(run.ctx) as handle_stream:
+                            async for event in handle_stream:
+                                # 工具调用事件
+                                if isinstance(event, FunctionToolCallEvent):
+                                    tool_info = {
                                         "tool_name": event.part.tool_name,
                                         "tool_call_id": event.part.tool_call_id,
                                         "args": event.part.args,
-                                    },
-                                )
-                                ctx.sequence += 1
+                                    }
+                                    ctx.tool_events.append(tool_info)
+                                    ctx.tool_call_names[event.part.tool_call_id] = event.part.tool_name
+                                    logger.info(
+                                        "agent_tool_call",
+                                        tool=event.part.tool_name,
+                                        args=event.part.args,
+                                        tool_call_id=event.part.tool_call_id,
+                                        connection_id=str(deps.connection_id),
+                                        run_id=deps.run_id,
+                                        player_name=deps.player_name,
+                                    )
+                                    # 发送工具调用事件
+                                    yield StreamEvent(
+                                        event_type="tool_call",
+                                        content=event.part.tool_name,
+                                        sequence=ctx.sequence,
+                                        metadata={
+                                            "tool_name": event.part.tool_name,
+                                            "tool_call_id": event.part.tool_call_id,
+                                            "args": event.part.args,
+                                            "run_id": deps.run_id,
+                                            "player_name": deps.player_name,
+                                        },
+                                    )
+                                    ctx.sequence += 1
 
-                            # 工具返回事件
-                            elif isinstance(event, FunctionToolResultEvent):
-                                result_content = str(event.result.content)
-                                ctx.tool_results[event.tool_call_id] = result_content
-                                logger.info(
-                                    "agent_tool_result",
-                                    tool_call_id=event.tool_call_id,
-                                    result_preview=result_content[:100],
-                                    connection_id=str(deps.connection_id),
-                                )
-                                # 发送工具返回事件
-                                yield StreamEvent(
-                                    event_type="tool_result",
-                                    content=result_content,
-                                    sequence=ctx.sequence,
-                                    metadata={
-                                        "tool_call_id": event.tool_call_id,
-                                        "tool_name": ctx.tool_call_names.get(event.tool_call_id),
-                                    },
-                                )
-                                ctx.sequence += 1
+                                # 工具返回事件
+                                elif isinstance(event, FunctionToolResultEvent):
+                                    result_content = str(event.result.content)
+                                    ctx.tool_results[event.tool_call_id] = result_content
+                                    logger.info(
+                                        "agent_tool_result",
+                                        tool_call_id=event.tool_call_id,
+                                        result_preview=result_content[:100],
+                                        connection_id=str(deps.connection_id),
+                                        run_id=deps.run_id,
+                                    )
+                                    # 发送工具返回事件
+                                    yield StreamEvent(
+                                        event_type="tool_result",
+                                        content=result_content,
+                                        sequence=ctx.sequence,
+                                        metadata={
+                                            "tool_call_id": event.tool_call_id,
+                                            "tool_name": ctx.tool_call_names.get(event.tool_call_id),
+                                            "run_id": deps.run_id,
+                                            "player_name": deps.player_name,
+                                        },
+                                    )
+                                    ctx.sequence += 1
 
-                # 处理结束节点
-                elif Agent.is_end_node(node):
-                    # 仅在整个执行结束时再冲刷尾部 buffer，避免跨节点半句提前下发
-                    if ctx.sentence_buffer.strip():
-                        yield await _send_content_event(ctx, ctx.sentence_buffer)
-                        ctx.sentence_buffer = ""
+                    # 处理结束节点
+                    elif Agent.is_end_node(node):
+                        # 仅在整个执行结束时再冲刷尾部 buffer，避免跨节点半句提前下发
+                        if ctx.sentence_buffer.strip():
+                            yield await _send_content_event(ctx, ctx.sentence_buffer)
+                            ctx.sentence_buffer = ""
 
-                    # 从最终结果中提取信息
-                    if run.result is not None:
-                        ctx.all_messages = _extract_all_messages(run.result)
-                        ctx.new_messages = _extract_new_messages(run.result)
-                        ctx.serialized_usage = _serialize_usage(
-                            _extract_result_usage(run.result)
+                        # 从最终结果中提取信息
+                        if run.result is not None:
+                            ctx.all_messages = _extract_all_messages(run.result)
+                            ctx.new_messages = _extract_new_messages(run.result)
+                            ctx.serialized_usage = _serialize_usage(
+                                _extract_result_usage(run.result)
+                            )
+                        logger.debug(
+                            "agent_run_complete",
+                            connection_id=str(deps.connection_id),
+                            run_id=deps.run_id,
+                            tool_events_count=len(ctx.tool_events),
                         )
-                    logger.debug(
-                        "agent_run_complete",
-                        connection_id=str(deps.connection_id),
-                        tool_events_count=len(ctx.tool_events),
-                    )
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        error_detail = _extract_exception_details(e)
+        error_kind, player_msg, diagnostic = classify_run_exception(e)
 
         # 检查是否是 MCP 连接超时错误
         if _is_mcp_timeout_error(e):
             logger.warning(
                 "mcp_connection_timeout_fallback",
-                error=error_detail,
+                error=diagnostic,
                 connection_id=str(deps.connection_id),
+                run_id=deps.run_id,
             )
             # 标记 MCP 为不可用，后续请求将直接使用降级 Agent
             agent_manager.mark_mcp_failed()
@@ -823,14 +931,23 @@ async def stream_response_handler(
 
         logger.error(
             "stream_response_handler_error",
-            error=error_detail,
+            error=diagnostic,
+            error_kind=error_kind,
             connection_id=str(deps.connection_id),
+            run_id=deps.run_id,
             exc_info=True,  # 保留完整堆栈
         )
         yield StreamEvent(
             event_type="error",
-            content=f"流式响应处理错误: {error_detail}",
+            content=player_msg,
             sequence=ctx.sequence,
+            metadata={
+                "error_kind": error_kind,
+                "diagnostic_summary": diagnostic,
+                "run_id": deps.run_id,
+                "conversation_id": deps.conversation_id,
+                "player_name": deps.player_name,
+            },
         )
 
 
@@ -872,13 +989,18 @@ async def non_stream_response_handler(
         mode="non_stream",
     )
 
+    usage_limits = build_usage_limits(deps.settings, deps.provider)
+    run_timeout = get_run_timeout(deps.settings)
+
     try:
-        result = await active_agent.run(
-            prompt,
-            deps=deps,
-            model=model,
-            message_history=message_history,
-        )
+        async with asyncio.timeout(run_timeout):
+            result = await active_agent.run(
+                prompt,
+                deps=deps,
+                model=model,
+                message_history=message_history,
+                usage_limits=usage_limits,
+            )
 
         # 提取处理结果
         ctx.new_messages = _extract_new_messages(result)
@@ -900,15 +1022,18 @@ async def non_stream_response_handler(
         for chunk in _iter_sentence_batches(full_response):
             yield await _send_content_event(ctx, chunk, add_delay=True)
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        error_detail = _extract_exception_details(e)
+        error_kind, player_msg, diagnostic = classify_run_exception(e)
 
         # 检查是否是 MCP 连接超时错误
         if _is_mcp_timeout_error(e):
             logger.warning(
                 "mcp_connection_timeout_fallback_non_stream",
-                error=error_detail,
+                error=diagnostic,
                 connection_id=str(deps.connection_id),
+                run_id=deps.run_id,
             )
             # 标记 MCP 为不可用，后续请求将直接使用降级 Agent
             agent_manager.mark_mcp_failed()
@@ -922,14 +1047,23 @@ async def non_stream_response_handler(
 
         logger.error(
             "non_stream_response_handler_error",
-            error=error_detail,
+            error=diagnostic,
+            error_kind=error_kind,
             connection_id=str(deps.connection_id),
+            run_id=deps.run_id,
             exc_info=True,
         )
         yield StreamEvent(
             event_type="error",
-            content=f"非流式响应处理错误: {error_detail}",
+            content=player_msg,
             sequence=ctx.sequence,
+            metadata={
+                "error_kind": error_kind,
+                "diagnostic_summary": diagnostic,
+                "run_id": deps.run_id,
+                "conversation_id": deps.conversation_id,
+                "player_name": deps.player_name,
+            },
         )
 
 
@@ -983,6 +1117,9 @@ async def stream_chat(
         logger.debug(
             "chat_complete",
             connection_id=str(deps.connection_id),
+            run_id=deps.run_id,
+            player_name=deps.player_name,
+            conversation_id=deps.conversation_id,
             tool_events_count=len(ctx.tool_events),
         )
 
@@ -996,19 +1133,33 @@ async def stream_chat(
                 "usage": ctx.serialized_usage,
                 "all_messages": ctx.all_messages,
                 "tool_events": ctx.tool_events,
+                "run_id": deps.run_id,
+                "conversation_id": deps.conversation_id,
+                "player_name": deps.player_name,
             },
         )
 
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        error_detail = _extract_exception_details(e)
+        error_kind, player_msg, diagnostic = classify_run_exception(e)
         logger.error(
             "stream_chat_error",
-            error=error_detail,
+            error=diagnostic,
+            error_kind=error_kind,
             connection_id=str(deps.connection_id),
+            run_id=deps.run_id,
             exc_info=True,
         )
         yield StreamEvent(
             event_type="error",
-            content=f"聊天处理错误: {error_detail}",
+            content=player_msg,
             sequence=ctx.sequence,
+            metadata={
+                "error_kind": error_kind,
+                "diagnostic_summary": diagnostic,
+                "run_id": deps.run_id,
+                "conversation_id": deps.conversation_id,
+                "player_name": deps.player_name,
+            },
         )

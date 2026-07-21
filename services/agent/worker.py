@@ -4,15 +4,16 @@ import asyncio
 import copy
 import dataclasses
 import time
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ThinkingPart
 
 from core.queue import MessageBroker
-from services.agent.core import stream_chat, _extract_exception_details
+from services.agent.core import stream_chat, _extract_exception_details, player_facing_error, classify_run_exception
 from services.agent.providers import ProviderRegistry
 from services.agent.title import generate_conversation_title
+from services.agent.tool_results import CommandResult
 from services.addon.service import get_addon_bridge_service
 from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
 from models.messages import ChatRequest, StreamChunk, SystemNotification
@@ -96,6 +97,7 @@ class AgentWorker:
     async def _run(self) -> None:
         """Worker 主循环"""
         while self._running:
+            item = None
             try:
                 # 从队列获取请求（带超时，避免无限期阻塞）
                 try:
@@ -110,12 +112,10 @@ class AgentWorker:
                 # 处理请求
                 await self._process_request(item)
 
-                # 标记任务完成
-                self.broker.request_done()
-
             except asyncio.CancelledError:
                 logger.info("worker_cancelled", worker_id=self.worker_id)
-                break
+                # 若已取出 item 但尚未 request_done，在 finally 中补齐
+                raise
             except Exception as e:
                 logger.error(
                     "worker_error",
@@ -124,6 +124,17 @@ class AgentWorker:
                     exc_info=True,
                 )
                 # 继续运行，不因单个错误而停止
+            finally:
+                # 正常、异常、取消路径均完成 queue task，避免悬挂
+                if item is not None:
+                    try:
+                        self.broker.request_done()
+                    except Exception as done_error:
+                        logger.error(
+                            "worker_request_done_failed",
+                            worker_id=self.worker_id,
+                            error=str(done_error),
+                        )
 
     async def _process_request(self, item: any) -> None:
         """
@@ -156,12 +167,18 @@ class AgentWorker:
             conversation_generation = request.conversation_generation
         conversation_invalidation_epoch = request.conversation_invalidation_epoch
 
+        # 确保 run 有稳定身份
+        run_id = request.run_id or str(uuid4())
+        if not request.run_id:
+            request.run_id = run_id
+
         logger.info(
             "processing_chat_request",
             worker_id=self.worker_id,
             connection_id=str(connection_id),
             player=request.player_name,
             conversation_id=request.conversation_id,
+            run_id=run_id,
             content_length=len(request.content),
         )
 
@@ -215,6 +232,8 @@ class AgentWorker:
             addon_bridge=self._create_addon_bridge_client(connection_id),
             provider=request.provider or self.settings.default_provider,
             get_context_info=get_context_info,
+            run_id=run_id,
+            conversation_id=request.conversation_id,
         )
 
         stream_target = "@a" if request.broadcast_ai_chat else request.player_name
@@ -246,9 +265,18 @@ class AgentWorker:
                 "provider_error",
                 provider=provider_name,
                 error=str(e),
+                run_id=run_id,
             )
-            # 发送错误消息
-            await self._send_error_chunk(connection_id, request.player_name, str(e), 0, target=stream_target)
+            # 玩家只收到稳定错误类别
+            await self._send_error_chunk(
+                connection_id,
+                request.player_name,
+                player_facing_error("INTERNAL"),
+                0,
+                target=stream_target,
+                error_kind="INTERNAL",
+                run_id=run_id,
+            )
             return
 
         # 流式处理
@@ -421,15 +449,15 @@ class AgentWorker:
                         worker_id=self.worker_id,
                         connection_id=str(connection_id),
                         player=request.player_name,
-                        response=response_text,
+                        conversation_id=request.conversation_id,
+                        run_id=run_id,
                         response_length=len(response_text),
                         reasoning_length=len(reasoning_text),
                         chunk_count=event_count,
                         duration_ms=duration_ms,
                         usage=event.metadata.get("usage"),
-                        tool_calls=event.metadata.get("tool_calls"),
-                        tool_returns=event.metadata.get("tool_returns"),
-                        tool_fallback_used=event.metadata.get("tool_fallback_used"),
+                        tool_events=event.metadata.get("tool_events"),
+                        tool_events_count=len(event.metadata.get("tool_events") or []),
                     )
 
                     # AI 响应同步到 Addon UI 历史记录
@@ -442,15 +470,23 @@ class AgentWorker:
                         })
                 elif event.event_type == "error":
                     response_text = "".join(response_parts)
+                    error_kind = (
+                        event.metadata.get("error_kind") if event.metadata else None
+                    ) or "INTERNAL"
                     logger.error(
                         "chat_response_error",
                         worker_id=self.worker_id,
                         connection_id=str(connection_id),
-                        error=event.content,
-                        response=response_text,
+                        run_id=run_id,
+                        error_kind=error_kind,
+                        diagnostic_summary=(
+                            event.metadata.get("diagnostic_summary")
+                            if event.metadata
+                            else None
+                        ),
                         response_length=len(response_text),
                     )
-                    # 错误事件需要发送到游戏
+                    # 错误事件需要发送到游戏（玩家只看稳定类别文案）
                     chunk = StreamChunk(
                         connection_id=connection_id,
                         chunk_type=event.event_type,  # type: ignore
@@ -528,7 +564,7 @@ class AgentWorker:
                 # is_complete 事件不需要发送到游戏
 
         except Exception as e:
-            error_detail = _extract_exception_details(e)
+            error_kind, player_msg, diagnostic = classify_run_exception(e)
 
             # 检查是否是 MCP 超时错误，如果是则更新 MCP 服务器状态
             if _is_mcp_timeout_error(e):
@@ -536,26 +572,32 @@ class AgentWorker:
                     "mcp_timeout_detected_in_worker",
                     worker_id=self.worker_id,
                     connection_id=str(connection_id),
-                    error=error_detail,
+                    run_id=run_id,
+                    error=diagnostic,
                 )
                 # 标记所有 MCP 服务器为失败（因为我们不知道具体是哪个）
-                for server_name in mcp_manager.servers.keys():
-                    mcp_manager.mark_server_failed(server_name, f"连接超时: {error_detail}")
+                if mcp_manager is not None:
+                    for server_name in mcp_manager.servers.keys():
+                        mcp_manager.mark_server_failed(server_name, f"连接超时: {diagnostic}")
                 # 注意：core.py 中的降级机制会自动重试，这里不需要额外处理
 
             logger.error(
                 "stream_processing_error",
                 worker_id=self.worker_id,
                 connection_id=str(connection_id),
-                error=error_detail,
+                run_id=run_id,
+                error_kind=error_kind,
+                error=diagnostic,
                 exc_info=True,
             )
             await self._send_error_chunk(
                 connection_id,
                 request.player_name,
-                error_detail,
+                player_msg,
                 sequence,
                 target=stream_target,
+                error_kind=error_kind,
+                run_id=run_id,
             )
 
     async def _generate_title_for_conversation(
@@ -834,9 +876,9 @@ class AgentWorker:
         return send_to_game
 
     def _create_command_callback(self, connection_id: UUID):
-        """创建执行命令的回调"""
+        """创建执行命令的回调，返回结构化 CommandResult。"""
 
-        async def run_command(command: str) -> str:
+        async def run_command(command: str) -> CommandResult:
             # 发送到响应队列，由 WebSocket Handler 处理并等待命令结果
             loop = asyncio.get_running_loop()
             future: asyncio.Future[str] = loop.create_future()
@@ -850,21 +892,51 @@ class AgentWorker:
             )
 
             if not sent:
-                return "命令执行失败: 连接不存在"
+                return CommandResult.connection_unavailable(
+                    "连接不存在",
+                    diagnostic_summary="broker.send_response returned False",
+                )
 
             try:
-                return await asyncio.wait_for(future, timeout=self.settings.run_command_timeout)
+                raw = await asyncio.wait_for(future, timeout=self.settings.run_command_timeout)
             except asyncio.TimeoutError:
-                return "命令执行超时: 未收到游戏侧 commandResponse"
+                return CommandResult.timeout_unknown(
+                    "命令执行超时: 未收到游戏侧 commandResponse",
+                    diagnostic_summary="asyncio.TimeoutError waiting for commandResponse",
+                )
+            except asyncio.CancelledError:
+                raise
+
+            text = str(raw) if raw is not None else ""
+            if text.startswith("命令执行失败: 连接") or text.startswith("命令执行失败: WebSocket"):
+                return CommandResult.connection_unavailable(
+                    text,
+                    diagnostic_summary=text,
+                )
+            if text.startswith("命令执行失败"):
+                return CommandResult.failed(text, diagnostic_summary=text)
+            return CommandResult.ok(text or "命令执行成功")
 
         return run_command
 
     def _create_addon_bridge_client(self, connection_id: UUID):
         """创建 addon 桥接客户端。"""
         service = get_addon_bridge_service()
+
+        async def send_command_for_addon(command: str) -> str:
+            """Addon 层仍消费字符串；从 CommandResult 映射。"""
+            result = await self._create_command_callback(connection_id)(command)
+            if result.is_success:
+                return result.output
+            if result.status == "connection_unavailable":
+                return f"命令执行失败: {result.output}"
+            if result.status == "timeout_unknown":
+                return f"命令执行超时: {result.output}"
+            return f"命令执行失败: {result.output}"
+
         return service.create_client(
             connection_id=connection_id,
-            send_command=self._create_command_callback(connection_id),
+            send_command=send_command_for_addon,
         )
 
     async def _send_error_chunk(
@@ -874,12 +946,15 @@ class AgentWorker:
         error: str,
         sequence: int,
         target: str | None = None,
+        *,
+        error_kind: str | None = None,
+        run_id: str | None = None,
     ) -> None:
-        """发送错误消息块"""
+        """发送错误消息块（玩家可见文案，不含堆栈）。"""
         chunk = StreamChunk(
             connection_id=connection_id,
             chunk_type="error",
-            content=f"错误: {error}",
+            content=error if error.startswith("错误") else f"错误: {error}",
             sequence=sequence,
             player_name=player_name,
             target=target,

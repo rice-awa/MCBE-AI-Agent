@@ -24,8 +24,11 @@ class _ToolRecorder:
         self.commands: list[str] = []
         self.game_messages: list[str] = []
 
-    async def run_command(self, command: str) -> None:
+    async def run_command(self, command: str):
+        from services.agent.tool_results import CommandResult
+
         self.commands.append(command)
+        return CommandResult.ok("ok")
 
     async def send_to_game(self, message: str) -> None:
         self.game_messages.append(message)
@@ -116,11 +119,8 @@ def test_deepseek_chat_should_support_multi_turn_tool_chain() -> None:
     assert len(metadata_list) == 2
     assert metadata_list[0].get("is_complete") is True
     assert metadata_list[1].get("is_complete") is True
-    assert metadata_list[0].get("tool_calls", 0) >= 1
-    assert metadata_list[0].get("tool_returns", 0) >= 1
-    assert metadata_list[1].get("tool_calls", 0) >= 1
-    assert metadata_list[1].get("tool_returns", 0) >= 1
-
+    assert len(metadata_list[0].get("tool_events") or []) >= 1
+    assert len(metadata_list[1].get("tool_events") or []) >= 1
 
 
 def test_deepseek_reasoner_should_support_multi_turn_tool_chain() -> None:
@@ -129,8 +129,5 @@ def test_deepseek_reasoner_should_support_multi_turn_tool_chain() -> None:
     assert len(metadata_list) == 2
     assert metadata_list[0].get("is_complete") is True
     assert metadata_list[1].get("is_complete") is True
-    assert metadata_list[0].get("tool_calls", 0) >= 1
-    assert metadata_list[0].get("tool_returns", 0) >= 1
-    assert metadata_list[1].get("tool_calls", 0) >= 1
-    assert metadata_list[1].get("tool_returns", 0) >= 1
-
+    assert len(metadata_list[0].get("tool_events") or []) >= 1
+    assert len(metadata_list[1].get("tool_events") or []) >= 1
