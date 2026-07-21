@@ -570,19 +570,20 @@ def register_agent_tools(
     async def mcwiki_get_page(
         ctx: RunContext[AgentDependencies],
         page_name: str,
-        format: str = "markdown",
+        format: str = "wikitext",
         use_cache: bool = True,
         include_metadata: bool = True,
         pretty: bool = False,
         max_chars: int = 2000,
     ) -> str:
         """
-        获取 Minecraft Wiki 页面内容，优先使用wikitext格式
+        获取 Minecraft Wiki 页面内容。默认使用 wikitext（稳定、信息完整）；
+        仅在调用方显式指定时才使用 html/markdown/both。
 
         Args:
             ctx: 运行上下文
             page_name: 页面名称
-            format: 输出格式（html/markdown/both/wikitext）
+            format: 输出格式，默认 wikitext；可选 html/markdown/both（需显式声明）
             use_cache: 是否使用缓存
             include_metadata: 是否包含元数据
             pretty: 是否格式化 JSON
@@ -595,6 +596,7 @@ def register_agent_tools(
             "agent_tool_call",
             tool="mcwiki_get_page",
             page_name=page_name,
+            format=format,
             connection_id=str(ctx.deps.connection_id),
             run_id=ctx.deps.run_id,
         )
@@ -602,8 +604,12 @@ def register_agent_tools(
         tool_settings = cast(AgentToolSettings, ctx.deps.settings)
         base_url = tool_settings.mcwiki_base_url
         url = build_page_url(base_url, page_name)
+        # 未识别的 format 回退到 wikitext，避免默认/脏值走到易崩的 HTML 解析路径
+        requested_format = (format or "wikitext").strip().lower()
+        if requested_format not in {"wikitext", "html", "markdown", "both"}:
+            requested_format = "wikitext"
         params = {
-            "format": format,
+            "format": requested_format,
             "useCache": "true" if use_cache else "false",
             "includeMetadata": "true" if include_metadata else "false",
         }
@@ -636,19 +642,24 @@ def register_agent_tools(
             )
 
         page = payload.get("data", {}).get("page", {})
-        title = page.get("title", page_name)
+        title = page.get("title") or page.get("pageName") or page_name
         url_item = page.get("url", "")
         content = page.get("content", {})
         text_content = ""
 
-        if format == "wikitext":
+        if requested_format == "wikitext":
             text_content = content.get("wikitext", "")
-        elif format == "html":
+        elif requested_format == "html":
             text_content = content.get("html", "")
-        elif format == "markdown":
+        elif requested_format == "markdown":
             text_content = content.get("markdown", "")
         else:
-            text_content = content.get("markdown") or content.get("html") or ""
+            text_content = (
+                content.get("markdown")
+                or content.get("html")
+                or content.get("wikitext")
+                or ""
+            )
 
         if not text_content:
             return _tool_failure(

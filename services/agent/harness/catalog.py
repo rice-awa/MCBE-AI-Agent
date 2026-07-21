@@ -164,7 +164,7 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         ToolRisk.LOW,
         "玩家要求获取明确 Minecraft Wiki 页面内容时使用。",
         "不要用于模糊搜索、网页抓取或世界状态查询。",
-        "page_name 为明确页面名；format 使用 html/markdown/both/wikitext；max_chars 控制长度。",
+        "page_name 为明确页面名；format 默认 wikitext（优先，无需声明）；html/markdown/both 仅在显式需要时传入；max_chars 控制长度。",
         preview=ParameterPreviewPolicy(include=("page_name", "format", "max_chars")),
         may_have_external_side_effects=False,
     ),
