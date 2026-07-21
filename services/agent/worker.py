@@ -13,7 +13,6 @@ from core.queue import MessageBroker
 from services.agent.core import stream_chat, _extract_exception_details
 from services.agent.providers import ProviderRegistry
 from services.agent.title import generate_conversation_title
-from services.addon.service import get_addon_bridge_service
 from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
 from models.messages import ChatRequest, StreamChunk, SystemNotification
 from models.agent import (
@@ -46,10 +45,12 @@ class AgentWorker:
         broker: MessageBroker,
         settings: Settings,
         worker_id: int = 0,
+        addon: "AddonBridgeService | None" = None,
     ):
         self.broker = broker
         self.settings = settings
         self.worker_id = worker_id
+        self._addon = addon
         self._running = False
         self._http_client: httpx.AsyncClient | None = None
         self._task: asyncio.Task | None = None
@@ -861,8 +862,9 @@ class AgentWorker:
 
     def _create_addon_bridge_client(self, connection_id: UUID):
         """创建 addon 桥接客户端。"""
-        service = get_addon_bridge_service()
-        return service.create_client(
+        if self._addon is None:
+            raise RuntimeError("AddonBridgeService not configured")
+        return self._addon.create_client(
             connection_id=connection_id,
             send_command=self._create_command_callback(connection_id),
         )

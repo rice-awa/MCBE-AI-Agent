@@ -15,7 +15,7 @@ from config.logging import setup_logging, get_logger
 from core.queue import MessageBroker
 from services.agent.worker import AgentWorker
 from services.agent.runtime import get_agent_runtime
-from services.websocket.server import WebSocketServer
+from services.gateway.server import HostGatewayServer
 from services.auth.jwt_handler import JWTHandler
 
 logger = get_logger(__name__)
@@ -28,7 +28,7 @@ class Application:
         self.settings = get_settings()
         self.broker = MessageBroker(max_size=self.settings.queue_max_size)
         self.jwt_handler = JWTHandler(self.settings)
-        self.ws_server = WebSocketServer(
+        self.ws_server = HostGatewayServer(
             self.broker,
             self.settings,
             self.jwt_handler,
@@ -48,13 +48,6 @@ class Application:
             dev_mode=self.settings.dev_mode,
         )
 
-        # 注入流控中间件运行时配置
-        from services.websocket.flow_control import FlowControlMiddleware
-        FlowControlMiddleware.configure(
-            max_content_length=self.settings.max_chunk_content_length,
-            sentence_mode=self.settings.chunk_sentence_mode,
-        )
-
         agent_runtime = get_agent_runtime()
         mcp_connected = await agent_runtime.initialize(self.settings)
         mcp_status = agent_runtime.get_mcp_manager(self.settings).get_status_summary()
@@ -67,13 +60,18 @@ class Application:
             mcp_toolsets_count=len(agent_runtime.get_agent_manager().mcp_toolsets),
         )
 
-        # 启动 Agent Workers
+        # 启动 Agent Workers（共享 HostGatewayServer 的 AddonBridgeService）
         for i in range(self.settings.llm_worker_count):
-            worker = AgentWorker(self.broker, self.settings, worker_id=i)
+            worker = AgentWorker(
+                self.broker,
+                self.settings,
+                worker_id=i,
+                addon=self.ws_server.addon,
+            )
             await worker.start()
             self.workers.append(worker)
 
-        # 启动 WebSocket 服务器
+        # 启动 SDK 网关服务器
         await self.ws_server.start()
 
         logger.info("application_started")
