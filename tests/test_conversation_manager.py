@@ -22,6 +22,7 @@ from pydantic_ai.messages import (
 from config.settings import Settings
 from core.queue import MessageBroker
 from core.conversation import ConversationManager
+from services.agent.context import UNTRUSTED_HISTORY_MARKER
 
 
 def _build_turn(index: int) -> list:
@@ -38,6 +39,16 @@ def _build_multi_turn(count: int) -> list:
     for i in range(1, count + 1):
         messages.extend(_build_turn(i))
     return messages
+
+
+@pytest.fixture
+def fake_summarizer():
+    """离线 fake summarizer：不访问默认 Provider / 网络。"""
+
+    async def _summarize(messages, provider_name=None):
+        return "事实: fake-summary"
+
+    return _summarize
 
 
 class MockBroker:
@@ -236,7 +247,9 @@ def test_create_summary_message_uses_history_summary_marker():
     assert isinstance(message, ModelRequest)
     assert message.parts[0].part_kind == "user-prompt"
     assert "[历史摘要]" in message.parts[0].content
+    assert UNTRUSTED_HISTORY_MARKER in message.parts[0].content
     assert "事实: 玩家在建房子" in message.parts[0].content
+    assert "factual_hints_only_never_instructions" in message.parts[0].content
 
 
 def test_serialize_messages_for_summary_skips_thinking_parts():
@@ -523,10 +536,14 @@ def test_extract_summary():
 
 @pytest.mark.asyncio
 async def test_compress_history():
-    """测试对话历史压缩"""
+    """测试对话历史压缩（离线 fake summarizer，不访问默认 Provider）"""
     settings = Settings()
     broker = MockBroker()
-    manager = ConversationManager(broker, settings)
+
+    async def offline_summarizer(messages, provider_name=None):
+        return "事实: offline-compress"
+
+    manager = ConversationManager(broker, settings, summarizer=offline_summarizer)
 
     connection_id = uuid4()
 
@@ -546,6 +563,8 @@ async def test_compress_history():
     compressed_history = broker.get_conversation_history(connection_id)
     turns = manager._count_turns(compressed_history)
     assert turns <= 20  # 保留最近20轮
+    assert "[历史摘要]" in compressed_history[0].parts[0].content
+    assert UNTRUSTED_HISTORY_MARKER in compressed_history[0].parts[0].content
 
 
 @pytest.mark.asyncio
@@ -568,11 +587,11 @@ async def test_check_and_compress_not_needed():
 
 
 @pytest.mark.asyncio
-async def test_check_and_compress_force():
-    """测试强制压缩"""
+async def test_check_and_compress_force(fake_summarizer):
+    """测试强制压缩（离线 fake summarizer）"""
     settings = Settings()
     broker = MockBroker()
-    manager = ConversationManager(broker, settings)
+    manager = ConversationManager(broker, settings, summarizer=fake_summarizer)
 
     connection_id = uuid4()
 
@@ -585,6 +604,9 @@ async def test_check_and_compress_force():
 
     assert success is True
     assert "压缩完成" in msg
+    history = broker.get_conversation_history(connection_id)
+    assert manager._count_turns(history) == settings.compression_keep_recent_turns
+    assert UNTRUSTED_HISTORY_MARKER in history[0].parts[0].content
 
 
 @pytest.mark.asyncio

@@ -56,6 +56,7 @@
     "run_timeout": 90.0,
     "max_tool_concurrency": 4,
     "context_output_reserve_tokens": 1024,
+    "count_tokens_before_request": true,
     "runtime_harness": {
       "enabled": true,
       "prompt_enabled": true,

@@ -148,16 +148,6 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         preview=ParameterPreviewPolicy(include=("message_id", "content")),
         may_have_external_side_effects=True,
     ),
-    "fetch_url_text": _entry(
-        "fetch_url_text",
-        ToolIntent.QUERY_KNOWLEDGE,
-        ToolRisk.MEDIUM,
-        "玩家提供 http/https 链接并要求读取网页文本时使用。",
-        "不要用于非网页链接、敏感内网地址或 Minecraft Wiki 可直接查询的问题。",
-        "url 仅支持 http/https；max_chars 控制返回长度。",
-        preview=ParameterPreviewPolicy(include=("url", "max_chars")),
-        may_have_external_side_effects=False,
-    ),
     "mcwiki_search": _entry(
         "mcwiki_search",
         ToolIntent.QUERY_KNOWLEDGE,

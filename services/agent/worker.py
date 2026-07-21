@@ -221,8 +221,9 @@ class AgentWorker:
                 connection_id, request.player_name, request.conversation_id
             )
             message_count = len(history) if history else 0
-            # 简单估算：平均每条消息 100 tokens
-            estimated_tokens = message_count * 100
+            from services.agent.context import estimate_history_tokens
+
+            estimated_tokens = estimate_history_tokens(history) if history else 0
             # 获取模型最大上下文
             provider_name = request.provider or self.settings.default_provider
             provider_config = self.settings.get_provider_config(provider_name)
@@ -261,9 +262,48 @@ class AgentWorker:
                 ),
             )
 
+        # 模型请求前：token 预算优先压缩（审批恢复路径不压缩）
+        provider_name = request.provider or self.settings.default_provider
+        if request.use_context and not (
+            request.resume_approval_id and request.deferred_tool_results is not None
+        ):
+            from core.conversation import get_conversation_manager
+
+            conv_manager = get_conversation_manager(self.broker, self.settings)
+            compressed, compress_msg = await conv_manager.check_and_compress(
+                connection_id,
+                request.player_name,
+                force=False,
+                conversation_id=request.conversation_id,
+                provider_name=provider_name,
+            )
+            if compressed:
+                # 压缩后重新加载历史，确保本轮请求使用裁剪后的上下文
+                raw_history = self.broker.get_conversation_history(
+                    connection_id, request.player_name, request.conversation_id
+                )
+                message_history, cleared_count = self._strip_reasoning_content(raw_history)
+                await self.broker.send_response(
+                    connection_id,
+                    SystemNotification(
+                        connection_id=connection_id,
+                        level="info",
+                        message=f"对话历史已自动压缩，{compress_msg}",
+                        player_name=request.player_name,
+                    ),
+                )
+                logger.debug(
+                    "pre_request_compression_triggered",
+                    worker_id=self.worker_id,
+                    connection_id=str(connection_id),
+                    player=request.player_name,
+                    message=compress_msg,
+                    history_message_count=len(message_history),
+                    cleared_reasoning_content_count=cleared_count,
+                )
+
         # 获取模型
         try:
-            provider_name = request.provider or self.settings.default_provider
             provider_config = self.settings.get_provider_config(provider_name)
             model = ProviderRegistry.get_model(provider_config)
 

@@ -562,6 +562,7 @@ class TestMCPFailureInvariants:
             run_timeout = 30.0
             max_tool_concurrency = 4
             context_output_reserve_tokens = 1024
+            count_tokens_before_request = False
 
             def get_provider_config(self, provider_name: str | None = None):
                 return SimpleNamespace(context_window=None)

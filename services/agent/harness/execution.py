@@ -54,7 +54,7 @@ _TOOL_TARGET_DEFAULTS: dict[str, str] = {
 }
 
 # 无 target/broadcast 概念的 MEDIUM 工具中，可安全自动允许的极小集合（当前为空）。
-# 未列入的（如 send_script_event、fetch_url_text）默认要求审批。
+# 未列入的（如 send_script_event）默认要求审批。
 _MEDIUM_SAFE_AUTO_ALLOW_NO_TARGET: frozenset[str] = frozenset()
 
 PolicyAction = Literal["allow", "deny", "require_approval"]
@@ -395,7 +395,7 @@ class PolicyEngine:
             # broadcast 已在上方处理 True；省略或 false 视为当前玩家
             return True
 
-        # 无 target 概念的其它 MEDIUM 工具（send_script_event、fetch_url_text 等）
+        # 无 target 概念的其它 MEDIUM 工具（send_script_event 等）
         if tool_name in _MEDIUM_SAFE_AUTO_ALLOW_NO_TARGET:
             return True
         return False

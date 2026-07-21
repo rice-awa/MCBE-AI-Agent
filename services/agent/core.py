@@ -26,6 +26,7 @@ from pydantic_ai.usage import UsageLimits
 from config.logging import get_logger
 from config.settings import Settings, get_settings
 from models.agent import AgentDependencies, StreamEvent
+from services.agent.context import build_context_history_processor
 from services.agent.harness.execution import build_harness_capability
 from services.agent.tool_results import PLAYER_ERROR_ADVICE, ErrorKind
 from services.agent.tools import register_agent_tools
@@ -61,7 +62,12 @@ class RunBudgetSettings(Protocol):
 
 
 def build_usage_limits(settings: Any, provider_name: str | None = None) -> UsageLimits:
-    """从 Settings 构建 PydanticAI UsageLimits。"""
+    """从 Settings 构建 PydanticAI UsageLimits。
+
+    ContextBuilder 负责正常历史退化；`count_tokens_before_request=True`
+    作为最终硬边界，阻止估算误差导致的超窗请求。
+    若 context_window 元数据缺失，不回退到无限预算。
+    """
     request_limit = int(getattr(settings, "request_limit", 8) or 8)
     tool_calls_limit = int(getattr(settings, "tool_calls_limit", 8) or 8)
     input_tokens_limit = getattr(settings, "input_tokens_limit", None)
@@ -69,16 +75,17 @@ def build_usage_limits(settings: Any, provider_name: str | None = None) -> Usage
     total_tokens_limit = getattr(settings, "total_tokens_limit", None)
     reserve = int(getattr(settings, "context_output_reserve_tokens", 1024) or 0)
 
+    context_window = None
+    get_provider_config = getattr(settings, "get_provider_config", None)
+    if callable(get_provider_config):
+        try:
+            provider_config = get_provider_config(provider_name)
+            context_window = getattr(provider_config, "context_window", None)
+        except Exception:
+            context_window = None
+
     # 未显式配置 input/total 时，尝试从模型 context_window 派生
     if input_tokens_limit is None or total_tokens_limit is None:
-        context_window = None
-        get_provider_config = getattr(settings, "get_provider_config", None)
-        if callable(get_provider_config):
-            try:
-                provider_config = get_provider_config(provider_name)
-                context_window = getattr(provider_config, "context_window", None)
-            except Exception:
-                context_window = None
         if context_window is not None and context_window > reserve:
             derived = int(context_window) - reserve
             if input_tokens_limit is None:
@@ -86,12 +93,23 @@ def build_usage_limits(settings: Any, provider_name: str | None = None) -> Usage
             if total_tokens_limit is None:
                 total_tokens_limit = int(context_window)
 
+    # 元数据缺失且未显式配置时：使用保守硬上限，避免无限预算
+    if context_window is None:
+        if input_tokens_limit is None:
+            input_tokens_limit = max(1024, 8192 - reserve)
+        if total_tokens_limit is None:
+            total_tokens_limit = 8192
+
     return UsageLimits(
         request_limit=request_limit,
         tool_calls_limit=tool_calls_limit,
         input_tokens_limit=input_tokens_limit,
         output_tokens_limit=output_tokens_limit,
         total_tokens_limit=total_tokens_limit,
+        # 生产默认开启；FunctionModel/TestModel 不支持 count_tokens，测试可在 settings 关闭
+        count_tokens_before_request=bool(
+            getattr(settings, "count_tokens_before_request", True)
+        ),
     )
 
 
@@ -159,6 +177,7 @@ class ChatAgentManager:
         settings = self._settings or get_settings()
         default_provider_config = settings.get_provider_config(settings.default_provider)
         harness_cap = build_harness_capability(settings)
+        history_processor = build_context_history_processor(settings)
         agent: Agent[AgentDependencies, str | DeferredToolRequests] = Agent(
             f"{settings.default_provider}:{default_provider_config.model}",  # 默认模型，运行时可覆盖
             deps_type=AgentDependencies,
@@ -168,6 +187,7 @@ class ChatAgentManager:
             toolsets=toolsets,
             max_concurrency=getattr(settings, "max_tool_concurrency", 4),
             capabilities=[harness_cap],
+            history_processors=[history_processor],
         )
 
         @agent.system_prompt

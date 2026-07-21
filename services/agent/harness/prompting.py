@@ -6,7 +6,7 @@ _INTENT_GUIDANCE: dict[ToolIntent, str] = {
     ToolIntent.CHANGE_WORLD: "玩家明确要求执行命令、修改世界或改变实体状态时使用。",
     ToolIntent.NOTIFY_DISPLAY: "玩家要求在游戏中展示消息、标题、actionbar 或脚本事件时使用。",
     ToolIntent.QUERY_WORLD: "玩家要求查询当前玩家、背包、实体或世界状态时使用。",
-    ToolIntent.QUERY_KNOWLEDGE: "玩家要求查询 Wiki、网页或 Minecraft 知识资料时使用。",
+    ToolIntent.QUERY_KNOWLEDGE: "玩家要求查询 Minecraft Wiki 或受控知识资料时使用。",
     ToolIntent.SYSTEM_INFO: "玩家询问可用 provider 等系统状态时使用。",
 }
 

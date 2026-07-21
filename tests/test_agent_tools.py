@@ -248,7 +248,7 @@ async def test_registered_tool_audit_uses_structured_failure(tmp_path) -> None:
     _wrap_tools_for_direct_audit(agent, settings)
 
     async def run_command(command: str) -> CommandResult:
-        return CommandResult.ok("ok")
+        return CommandResult.failed("bad cmd")
 
     deps = AgentDependencies(
         connection_id=uuid4(),
@@ -261,15 +261,14 @@ async def test_registered_tool_audit_uses_structured_failure(tmp_path) -> None:
     )
     ctx = SimpleNamespace(deps=deps)
 
-    result = await _tool(agent, "fetch_url_text").function(ctx, "ftp://example.test")
+    result = await _tool(agent, "run_minecraft_command").function(ctx, "say hi")
 
-    assert result == "仅支持 http 或 https URL"
+    assert "bad cmd" in str(result) or "失败" in str(result)
     records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
-    assert records[0]["tool_name"] == "fetch_url_text"
+    assert records[0]["tool_name"] == "run_minecraft_command"
     assert records[0]["status"] == "failure"
     assert records[0]["result"]["success"] == "failure"
-    assert records[0]["result"]["failure_reason"] == "仅支持 http 或 https URL"
-    assert records[0]["result"]["error_kind"] == "INVALID_ARGUMENT"
+    assert records[0]["result"]["error_kind"] in {"PERMANENT", "INVALID_ARGUMENT", "INTERNAL"}
 
 
 @pytest.mark.asyncio

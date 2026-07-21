@@ -386,6 +386,7 @@ def _build_deps(stream_sentence_mode: bool) -> AgentDependencies:
             run_timeout=90.0,
             max_tool_concurrency=4,
             context_output_reserve_tokens=1024,
+            count_tokens_before_request=False,
         ),  # type: ignore[arg-type]
         http_client=None,  # type: ignore[arg-type]
         send_to_game=_noop,

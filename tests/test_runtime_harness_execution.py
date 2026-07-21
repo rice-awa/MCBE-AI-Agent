@@ -193,13 +193,6 @@ def test_medium_no_target_tools_require_approval() -> None:
     )
     assert decision.action == PolicyDecisionKind.REQUIRE_APPROVAL
 
-    fetch = engine.decide(
-        "fetch_url_text",
-        {"url": "https://example.com"},
-        player_name="Steve",
-    )
-    assert fetch.action == PolicyDecisionKind.REQUIRE_APPROVAL
-
 
 @pytest.mark.asyncio
 async def test_low_risk_auto_executes_in_real_tool_chain() -> None:

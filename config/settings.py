@@ -244,6 +244,7 @@ REQUIRED_CONFIG_PATHS = (
     "agent.run_timeout",
     "agent.max_tool_concurrency",
     "agent.context_output_reserve_tokens",
+    "agent.count_tokens_before_request",
     "agent.runtime_harness.enabled",
     "agent.runtime_harness.prompt_enabled",
     "agent.runtime_harness.schema_enabled",
@@ -756,6 +757,9 @@ class Settings(BaseSettings):
     run_timeout: float = Field(default=90.0, gt=0)
     max_tool_concurrency: int = Field(default=4, ge=1)
     context_output_reserve_tokens: int = Field(default=1024, ge=0)
+    # 请求前 token 硬边界（UsageLimits.count_tokens_before_request）；
+    # FunctionModel/TestModel 不支持 count_tokens，相关离线测试可关闭。
+    count_tokens_before_request: bool = True
 
     # 运行时 Harness 配置
     runtime_harness_enabled: bool = True

@@ -488,57 +488,6 @@ def register_agent_tools(
             )
 
     @chat_agent.tool
-    async def fetch_url_text(
-        ctx: RunContext[AgentDependencies],
-        url: str,
-        max_chars: int = 2000,
-    ) -> str:
-        """
-        拉取网页文本内容（仅支持 http/https）
-
-        Args:
-            ctx: 运行上下文
-            url: 请求地址
-            max_chars: 最大返回字符数
-
-        Returns:
-            文本内容
-        """
-        logger.info(
-            "agent_tool_call",
-            tool="fetch_url_text",
-            url=url,
-            connection_id=str(ctx.deps.connection_id),
-            run_id=ctx.deps.run_id,
-        )
-
-        if not url.startswith(("http://", "https://")):
-            return _tool_failure(
-                "仅支持 http 或 https URL",
-                error_kind="INVALID_ARGUMENT",
-            )
-
-        try:
-            response = await ctx.deps.http_client.get(url)
-            response.raise_for_status()
-            text = response.text.strip()
-            if len(text) > max_chars:
-                return _tool_success(text[:max_chars] + "...")
-            return _tool_success(text)
-        except Exception as e:
-            logger.error(
-                "agent_tool_error",
-                tool="fetch_url_text",
-                error=str(e),
-            )
-            return _tool_failure(
-                f"请求失败: {str(e)}",
-                error_kind="TRANSIENT",
-                retryable=True,
-                diagnostic_summary=str(e),
-            )
-
-    @chat_agent.tool
     async def mcwiki_search(
         ctx: RunContext[AgentDependencies],
         query: str,
