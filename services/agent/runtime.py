@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from config.logging import get_logger
 from config.settings import Settings
+from services.agent.harness.approvals import PendingApprovalStore
 from services.agent.model_metadata import ModelMetadataService
 from services.agent.providers import RuntimeAdapterRegistry
 
@@ -25,6 +26,7 @@ class AgentRuntime:
     chat_agent_manager: ChatAgentManager | None = None
     mcp_manager: MCPManager | None = None
     model_metadata_service: ModelMetadataService | None = None
+    pending_approvals: PendingApprovalStore = field(default_factory=PendingApprovalStore)
 
     def get_agent_manager(self) -> ChatAgentManager:
         if self.chat_agent_manager is None:
@@ -40,6 +42,13 @@ class AgentRuntime:
             self.mcp_manager = MCPManager(settings)
         return self.mcp_manager
 
+    def get_pending_approval_store(self, settings: Settings | None = None) -> PendingApprovalStore:
+        ttl = float(getattr(settings, "approval_ttl", 120.0) or 120.0) if settings is not None else 120.0
+        # 惰性对齐 TTL（不丢已有条目）
+        if abs(self.pending_approvals._default_ttl - ttl) > 1e-6:  # noqa: SLF001
+            self.pending_approvals._default_ttl = ttl  # noqa: SLF001
+        return self.pending_approvals
+
     async def initialize(self, settings: Settings) -> bool:
         await self.initialize_model_metadata(settings)
         await self.warmup_models(settings)
@@ -48,8 +57,9 @@ class AgentRuntime:
         agent_manager = self.get_agent_manager()
         await agent_manager.initialize(
             settings,
-            mcp_toolsets=mcp_manager.get_toolsets_for_agent(),
+            mcp_toolsets=mcp_manager.get_healthy_toolsets(),
         )
+        self.get_pending_approval_store(settings)
         return mcp_connected
 
     async def initialize_model_metadata(self, settings: Settings) -> None:
@@ -75,10 +85,10 @@ class AgentRuntime:
         await self.runtime_adapters.warmup_models(settings)
 
     def refresh_mcp_tools(self, settings: Settings) -> None:
-        """Refresh ChatAgentManager with the latest MCP toolsets after MCP reload."""
+        """Refresh ChatAgentManager with the latest healthy MCP toolsets after MCP reload."""
         mcp_manager = self.get_mcp_manager(settings)
         agent_manager = self.get_agent_manager()
-        agent_manager.refresh_mcp_toolsets(mcp_manager.get_toolsets_for_agent())
+        agent_manager.refresh_mcp_toolsets(mcp_manager.get_healthy_toolsets())
 
     async def shutdown(self) -> None:
         if self.mcp_manager is not None:
@@ -90,6 +100,7 @@ class AgentRuntime:
                 reset()
             self.chat_agent_manager = None
         self.model_metadata_service = None
+        self.pending_approvals.clear()
         await self.runtime_adapters.shutdown()
 
 

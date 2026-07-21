@@ -467,3 +467,71 @@ class TestMCPManagerAsyncOperations:
         assert result is False
 
         await manager.shutdown()
+
+
+class TestMCPFailureInvariants:
+    """MCP 故障不变量：局部失败不拖垮健康 server；不整轮重放。"""
+
+    def test_one_server_failure_does_not_remove_healthy(self):
+        from services.agent.mcp import MCPManager, MCPConnectionStatus, MCPServerInfo
+
+        manager = MCPManager(Settings())
+        healthy = object()
+        failed = object()
+        manager._servers["good"] = MCPServerInfo(
+            name="good",
+            config=MCPServerConfig(command="echo"),
+            toolset=healthy,
+            status=MCPConnectionStatus.ACTIVE,
+        )
+        manager._servers["bad"] = MCPServerInfo(
+            name="bad",
+            config=MCPServerConfig(command="echo"),
+            toolset=failed,
+            status=MCPConnectionStatus.ACTIVE,
+        )
+
+        manager.mark_server_failed("bad", "timeout")
+        toolsets = manager.get_healthy_toolsets()
+
+        assert manager._servers["bad"].status == MCPConnectionStatus.ERROR
+        assert manager._servers["good"].status == MCPConnectionStatus.ACTIVE
+        assert healthy in toolsets
+        assert failed not in toolsets
+
+    def test_get_toolsets_for_agent_uses_healthy_only(self):
+        from services.agent.mcp import MCPManager, MCPConnectionStatus, MCPServerInfo
+
+        manager = MCPManager(Settings())
+        a = object()
+        b = object()
+        manager._servers["a"] = MCPServerInfo(
+            name="a",
+            config=MCPServerConfig(command="echo"),
+            toolset=a,
+            status=MCPConnectionStatus.PENDING,
+        )
+        manager._servers["b"] = MCPServerInfo(
+            name="b",
+            config=MCPServerConfig(command="echo"),
+            toolset=b,
+            status=MCPConnectionStatus.ERROR,
+            last_error="boom",
+        )
+        assert manager.get_toolsets_for_agent() == [a]
+
+
+    def test_mcp_timeout_does_not_replay_whole_run(self, monkeypatch):
+        """本地工具已执行后 MCP timeout 不得从头重放整轮。"""
+        from pathlib import Path
+        from services.agent import core as core_mod
+
+        source = Path(core_mod.__file__).read_text(encoding="utf-8")
+        assert "mcp_connection_timeout_fallback" not in source
+        assert "mcp_connection_timeout_no_replay" in source
+        # 旧路径：timeout 后 mark_mcp_failed + 递归 handler；不得再出现
+        assert "agent_manager.mark_mcp_failed()" not in source
+        assert "get_fallback_agent()" not in source or "creating_fallback_agent_without_mcp" in source
+        assert "fallback_agent = agent_manager.get_fallback_agent()" not in source
+        assert "async for event in stream_response_handler(\n                prompt, deps, model, message_history, ctx, fallback_agent" not in source
+        assert "async for event in non_stream_response_handler(\n                prompt, deps, model, message_history, ctx, fallback_agent" not in source

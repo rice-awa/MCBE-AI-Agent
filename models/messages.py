@@ -34,6 +34,10 @@ class ChatRequest(BaseMessage):
     # 管理操作失效 epoch；clear/switch/new/restore/switch_model 等运行时状态变更会递增。
     conversation_invalidation_epoch: int = 0
     broadcast_ai_chat: bool = False
+    # 审批恢复：不把批准文本作为新 prompt，而是用原 messages + deferred results 恢复。
+    resume_approval_id: str | None = None
+    deferred_tool_results: dict | None = None
+    resume_message_history: list | None = None
 
 
 class ChatResponse(BaseMessage):
@@ -53,7 +57,8 @@ class StreamChunk(BaseMessage):
     chunk_type: Literal[
         "reasoning", "content", "error",
         "thinking_start", "thinking_end",
-        "tool_call", "tool_result"
+        "tool_call", "tool_result",
+        "approval_required",
     ]
     content: str
     sequence: int
@@ -88,7 +93,17 @@ class CommandRequest(BaseMessage):
     """命令请求"""
 
     type: Literal["command"] = "command"
-    command_type: Literal["login", "save", "context", "conversation", "run_command", "switch_model", "help", "ai_broadcast"]
+    command_type: Literal[
+        "login",
+        "save",
+        "context",
+        "conversation",
+        "run_command",
+        "switch_model",
+        "help",
+        "ai_broadcast",
+        "tool_approval",
+    ]
     content: str | None = None
 
 

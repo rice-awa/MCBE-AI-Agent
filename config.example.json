@@ -62,7 +62,13 @@
       "schema_enabled": true,
       "audit_enabled": true,
       "audit_path": "logs/runtime_harness_tools.jsonl",
-      "audit_max_records": 5000
+      "audit_max_records": 5000,
+      "approval_ttl": 120.0,
+      "max_batch_commands": 10,
+      "hard_deny_tools": [],
+      "hard_deny_command_roots": ["op", "deop", "stop", "whitelist", "permission", "wsserver"],
+      "mcp_tool_allowlist": [],
+      "tool_policy_version": "2026-07-21.1"
     }
   },
   "queue": {
@@ -132,6 +138,12 @@
         "aliases": ["AGENT broadcast", "AI 广播", "AI broadcast"],
         "description": "AI 聊天广播策略管理",
         "usage": "<状态|关闭|全服 开启|关闭|玩家 <玩家名> 开启|关闭>"
+      },
+      "AGENT 工具审批": {
+        "type": "tool_approval",
+        "aliases": ["AGENT tool-approval", "AI 工具审批", "AI tool-approval"],
+        "description": "审批高风险工具调用",
+        "usage": "<approval_id> <允许|拒绝>"
       },
       "运行命令": {
         "type": "run_command",

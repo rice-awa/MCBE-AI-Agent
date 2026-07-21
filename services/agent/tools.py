@@ -837,6 +837,9 @@ def register_agent_tools(
 
     if _runtime_harness_schema_enabled(settings):
         _enhance_registered_tool_descriptions(chat_agent)
+    # 策略/幂等/审批统一由 harness.execution.HarnessToolset 入口处理。
+    # 保留轻量 audit wrap 以兼容直接 function 调用的审计测试；
+    # 生产路径的 WrapperToolset 也会写审计，双写时记录字段一致。
     toolset = get_agent_tools_container(chat_agent)
     if toolset is not None:
         wrap_registered_tools(toolset, settings)

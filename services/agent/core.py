@@ -20,11 +20,13 @@ from pydantic_ai.messages import (
     ThinkingPartDelta,
 )
 from pydantic_ai.models import Model
+from pydantic_ai.tools import DeferredToolRequests
 from pydantic_ai.usage import UsageLimits
 
 from config.logging import get_logger
 from config.settings import Settings, get_settings
 from models.agent import AgentDependencies, StreamEvent
+from services.agent.harness.execution import build_harness_capability
 from services.agent.tool_results import PLAYER_ERROR_ADVICE, ErrorKind
 from services.agent.tools import register_agent_tools
 from services.agent.prompt import build_dynamic_prompt
@@ -137,17 +139,17 @@ class ChatAgentManager:
     """
 
     def __init__(self):
-        self._agent: Agent[AgentDependencies, str] | None = None
-        self._fallback_agent: Agent[AgentDependencies, str] | None = None
+        self._agent: Agent[AgentDependencies, str | DeferredToolRequests] | None = None
+        self._fallback_agent: Agent[AgentDependencies, str | DeferredToolRequests] | None = None
         self._mcp_toolsets: list[Any] = []
         self._initialized = False
         self._settings: Settings | None = None
-        self._mcp_available: bool = True  # MCP 是否可用，一旦失败后永久标记为不可用
+        self._mcp_available: bool = True  # MCP 是否可用；失败后由 MCPManager 健康状态决定后续装配
 
     def _create_agent(
         self,
         toolsets: list[Any] | None = None,
-    ) -> Agent[AgentDependencies, str]:
+    ) -> Agent[AgentDependencies, str | DeferredToolRequests]:
         """
         创建 Agent 实例
 
@@ -156,14 +158,16 @@ class ChatAgentManager:
         """
         settings = self._settings or get_settings()
         default_provider_config = settings.get_provider_config(settings.default_provider)
-        agent = Agent[AgentDependencies, str](
+        harness_cap = build_harness_capability(settings)
+        agent: Agent[AgentDependencies, str | DeferredToolRequests] = Agent(
             f"{settings.default_provider}:{default_provider_config.model}",  # 默认模型，运行时可覆盖
             deps_type=AgentDependencies,
-            output_type=str,
+            output_type=[str, DeferredToolRequests],
             defer_model_check=True,
             retries=settings.agent_retries,
             toolsets=toolsets,
             max_concurrency=getattr(settings, "max_tool_concurrency", 4),
+            capabilities=[harness_cap],
         )
 
         @agent.system_prompt
@@ -219,7 +223,7 @@ class ChatAgentManager:
             mcp_toolsets_count=len(self._mcp_toolsets),
         )
 
-    def get_agent(self) -> Agent[AgentDependencies, str]:
+    def get_agent(self) -> Agent[AgentDependencies, str | DeferredToolRequests]:
         """
         获取 Agent 实例
 
@@ -231,16 +235,6 @@ class ChatAgentManager:
         if self._agent is None:
             # 懒初始化：自动加载 MCP 工具集
             if not self._initialized:
-                import inspect
-
-                # 检查是否在异步上下文中
-                try:
-                    loop = asyncio.get_running_loop()
-                    # 如果在异步上下文中，使用 ensure_future 延迟初始化
-                    # 但为简化逻辑，这里直接同步初始化（第一次调用时）
-                except RuntimeError:
-                    pass
-
                 # 执行懒初始化
                 self._settings = get_settings()
                 from services.agent.mcp import load_mcp_toolsets
@@ -302,7 +296,7 @@ class ChatAgentManager:
         """MCP 是否可用"""
         return self._mcp_available
 
-    def get_fallback_agent(self) -> Agent[AgentDependencies, str]:
+    def get_fallback_agent(self) -> Agent[AgentDependencies, str | DeferredToolRequests]:
         """获取无 MCP 工具集的降级 Agent 实例。"""
         if self._fallback_agent is None:
             logger.info("creating_fallback_agent_without_mcp")
@@ -311,13 +305,14 @@ class ChatAgentManager:
 
     def get_active_agent(
         self,
-        agent: Agent[AgentDependencies, str] | None = None,
+        agent: Agent[AgentDependencies, str | DeferredToolRequests] | None = None,
         *,
         connection_id: str | None = None,
         mode: str = "stream",
-    ) -> Agent[AgentDependencies, str]:
+    ) -> Agent[AgentDependencies, str | DeferredToolRequests]:
         if agent is not None:
             return agent
+        # 后续新请求应优先装配 MCPManager 健康 server；此处仅在全局不可用时降级。
         if not self._mcp_available:
             logger.info(
                 "mcp_already_failed_using_fallback",
@@ -339,7 +334,7 @@ def get_agent_manager() -> ChatAgentManager:
 # 通过懒加载方式获取 Agent，确保 MCP 工具被正确加载
 
 
-def _get_legacy_chat_agent() -> Agent[AgentDependencies, str]:
+def _get_legacy_chat_agent() -> Agent[AgentDependencies, str | DeferredToolRequests]:
     """获取兼容性 Agent 实例（懒加载）"""
     return get_agent_manager().get_agent()
 
@@ -523,10 +518,90 @@ def _extract_result_output(result: Any) -> str:
             value = getattr(result, field_name)
             if value is None:
                 continue
+            if isinstance(value, DeferredToolRequests):
+                return ""
             if isinstance(value, str):
                 return value
             return str(value)
     return ""
+
+
+def _extract_deferred_requests(result: Any) -> DeferredToolRequests | None:
+    """若 run 输出为 DeferredToolRequests 则返回，否则 None。"""
+    output = getattr(result, "output", None)
+    if isinstance(output, DeferredToolRequests):
+        return output
+    data = getattr(result, "data", None)
+    if isinstance(data, DeferredToolRequests):
+        return data
+    return None
+
+
+def _build_approval_required_event(
+    ctx: _HandlerContext,
+    deps: AgentDependencies,
+    deferred: DeferredToolRequests,
+    result: Any,
+) -> StreamEvent:
+    """构造审批暂停事件，供 Worker 写入 PendingApprovalStore 并提示玩家。"""
+    return StreamEvent(
+        event_type="approval_required",
+        content="工具调用需要玩家审批",
+        sequence=ctx.sequence,
+        metadata={
+            "deferred_requests": deferred,
+            "all_messages": _extract_all_messages(result),
+            "new_messages": _extract_new_messages(result),
+            "tool_events": ctx.tool_events,
+            "usage": ctx.serialized_usage,
+            "run_id": deps.run_id,
+            "conversation_id": deps.conversation_id,
+            "player_name": deps.player_name,
+            "connection_id": str(deps.connection_id),
+        },
+    )
+
+
+def _mark_mcp_failure_from_exception(exc: BaseException, diagnostic: str) -> None:
+    """仅标记有证据关联的 MCP server；无证据时不盲目禁用全部。"""
+    try:
+        from services.agent.mcp import get_mcp_manager
+
+        mcp_manager = get_mcp_manager()
+    except Exception:
+        return
+
+    detail = diagnostic
+    try:
+        detail = f"{diagnostic}\n{_extract_exception_details(exc)}"
+    except Exception:
+        pass
+
+    matched = False
+    for server_name in list(mcp_manager.servers.keys()):
+        if server_name and server_name in detail:
+            mcp_manager.mark_server_failed(server_name, diagnostic)
+            matched = True
+
+    if matched:
+        # 用健康工具集刷新后续装配；不递归重放当前 run
+        try:
+            from services.agent.runtime import get_agent_runtime
+
+            runtime = get_agent_runtime()
+            settings = getattr(mcp_manager, "_settings", None)
+            if settings is not None:
+                runtime.refresh_mcp_tools(settings)
+        except Exception:
+            pass
+        return
+
+    # 无明确 server 证据时：只记录，不批量 mark 全部 server
+    logger.warning(
+        "mcp_failure_without_server_evidence",
+        error=diagnostic,
+        servers=list(mcp_manager.servers.keys()),
+    )
 
 
 def _extract_tool_events_from_messages(messages: list[ModelMessage]) -> list[dict[str, Any]]:
@@ -678,12 +753,14 @@ async def _send_reasoning_event(
 
 
 async def stream_response_handler(
-    prompt: str,
+    prompt: str | None,
     deps: AgentDependencies,
     model: Model | str | None = None,
     message_history: list[ModelMessage] | None = None,
     ctx: _HandlerContext | None = None,
-    agent: Agent[AgentDependencies, str] | None = None,
+    agent: Agent[AgentDependencies, str | DeferredToolRequests] | None = None,
+    *,
+    deferred_tool_results: Any | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """
     流式响应处理器（基于 agent.iter() 官方推荐方式）
@@ -693,15 +770,16 @@ async def stream_response_handler(
     2. 在 ModelRequestNode 中流式输出文本
     3. 在 CallToolsNode 中处理工具调用事件
     4. 工具调用由 Pydantic AI 自动执行
-    5. MCP 连接失败时自动降级到无工具集模式
+    5. MCP 故障返回结构化错误，不在当前 run 内递归重放
 
     Args:
-        prompt: 用户输入
+        prompt: 用户输入；审批恢复时可为 None（使用 message_history + deferred_tool_results）
         deps: Agent 依赖
         model: 可选的模型覆盖
         message_history: 消息历史
         ctx: 处理器上下文
         agent: 可选的 Agent 实例，不传则使用管理器中的 Agent
+        deferred_tool_results: 审批恢复时传入的 DeferredToolResults
 
     Yields:
         StreamEvent: 流式事件
@@ -722,13 +800,18 @@ async def stream_response_handler(
 
     try:
         async with asyncio.timeout(run_timeout):
+            run_kwargs: dict[str, Any] = {
+                "deps": deps,
+                "model": model,
+                "message_history": message_history,
+                "usage_limits": usage_limits,
+            }
+            if deferred_tool_results is not None:
+                run_kwargs["deferred_tool_results"] = deferred_tool_results
             # 使用 agent.iter() 进行细粒度节点控制
             async with active_agent.iter(
                 prompt,
-                deps=deps,
-                model=model,
-                message_history=message_history,
-                usage_limits=usage_limits,
+                **run_kwargs,
             ) as run:
                 async for node in run:
                     # 处理用户提示节点
@@ -899,6 +982,12 @@ async def stream_response_handler(
                             ctx.serialized_usage = _serialize_usage(
                                 _extract_result_usage(run.result)
                             )
+                            deferred = _extract_deferred_requests(run.result)
+                            if deferred is not None:
+                                yield _build_approval_required_event(
+                                    ctx, deps, deferred, run.result
+                                )
+                                return
                         logger.debug(
                             "agent_run_complete",
                             connection_id=str(deps.connection_id),
@@ -911,23 +1000,17 @@ async def stream_response_handler(
     except Exception as e:
         error_kind, player_msg, diagnostic = classify_run_exception(e)
 
-        # 检查是否是 MCP 连接超时错误
+        # MCP 故障：只标记有证据关联的 server，不在本 run 内递归重放
         if _is_mcp_timeout_error(e):
             logger.warning(
-                "mcp_connection_timeout_fallback",
+                "mcp_connection_timeout_no_replay",
                 error=diagnostic,
                 connection_id=str(deps.connection_id),
                 run_id=deps.run_id,
             )
-            # 标记 MCP 为不可用，后续请求将直接使用降级 Agent
-            agent_manager.mark_mcp_failed()
-            # 降级到无 MCP 工具集的模式
-            fallback_agent = agent_manager.get_fallback_agent()
-            async for event in stream_response_handler(
-                prompt, deps, model, message_history, ctx, fallback_agent
-            ):
-                yield event
-            return
+            _mark_mcp_failure_from_exception(e, diagnostic)
+            error_kind = "TRANSIENT"
+            player_msg = player_facing_error("TRANSIENT")
 
         logger.error(
             "stream_response_handler_error",
@@ -952,12 +1035,14 @@ async def stream_response_handler(
 
 
 async def non_stream_response_handler(
-    prompt: str,
+    prompt: str | None,
     deps: AgentDependencies,
     model: Model | str | None = None,
     message_history: list[ModelMessage] | None = None,
     ctx: _HandlerContext | None = None,
-    agent: Agent[AgentDependencies, str] | None = None,
+    agent: Agent[AgentDependencies, str | DeferredToolRequests] | None = None,
+    *,
+    deferred_tool_results: Any | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """
     非流式响应处理器
@@ -968,12 +1053,13 @@ async def non_stream_response_handler(
     3. 逐一发送完整句子（带延迟以避免 MC 崩溃）
 
     Args:
-        prompt: 用户输入
+        prompt: 用户输入；审批恢复时可为 None
         deps: Agent 依赖
         model: 可选的模型覆盖
         message_history: 消息历史
         ctx: 处理器上下文
         agent: 可选的 Agent 实例，不传则使用管理器中的 Agent
+        deferred_tool_results: 审批恢复时传入的 DeferredToolResults
 
     Yields:
         StreamEvent: 流式事件
@@ -994,12 +1080,17 @@ async def non_stream_response_handler(
 
     try:
         async with asyncio.timeout(run_timeout):
+            run_kwargs: dict[str, Any] = {
+                "deps": deps,
+                "model": model,
+                "message_history": message_history,
+                "usage_limits": usage_limits,
+            }
+            if deferred_tool_results is not None:
+                run_kwargs["deferred_tool_results"] = deferred_tool_results
             result = await active_agent.run(
                 prompt,
-                deps=deps,
-                model=model,
-                message_history=message_history,
-                usage_limits=usage_limits,
+                **run_kwargs,
             )
 
         # 提取处理结果
@@ -1007,6 +1098,11 @@ async def non_stream_response_handler(
         ctx.all_messages = _extract_all_messages(result)
         ctx.serialized_usage = _serialize_usage(_extract_result_usage(result))
         ctx.tool_events = _extract_tool_events_from_messages(ctx.new_messages)
+
+        deferred = _extract_deferred_requests(result)
+        if deferred is not None:
+            yield _build_approval_required_event(ctx, deps, deferred, result)
+            return
 
         # 从结果消息中提取思考内容（ThinkingPart），在正文之前作为 reasoning 事件输出
         for reasoning_chunk in _extract_reasoning_from_messages(ctx.new_messages):
@@ -1027,23 +1123,16 @@ async def non_stream_response_handler(
     except Exception as e:
         error_kind, player_msg, diagnostic = classify_run_exception(e)
 
-        # 检查是否是 MCP 连接超时错误
         if _is_mcp_timeout_error(e):
             logger.warning(
-                "mcp_connection_timeout_fallback_non_stream",
+                "mcp_connection_timeout_no_replay_non_stream",
                 error=diagnostic,
                 connection_id=str(deps.connection_id),
                 run_id=deps.run_id,
             )
-            # 标记 MCP 为不可用，后续请求将直接使用降级 Agent
-            agent_manager.mark_mcp_failed()
-            # 降级到无 MCP 工具集的模式
-            fallback_agent = agent_manager.get_fallback_agent()
-            async for event in non_stream_response_handler(
-                prompt, deps, model, message_history, ctx, fallback_agent
-            ):
-                yield event
-            return
+            _mark_mcp_failure_from_exception(e, diagnostic)
+            error_kind = "TRANSIENT"
+            player_msg = player_facing_error("TRANSIENT")
 
         logger.error(
             "non_stream_response_handler_error",
@@ -1068,11 +1157,13 @@ async def non_stream_response_handler(
 
 
 async def stream_chat(
-    prompt: str,
+    prompt: str | None,
     deps: AgentDependencies,
     model: Model | str | None = None,
     message_history: list[ModelMessage] | None = None,
-    agent: Agent[AgentDependencies, str] | None = None,
+    agent: Agent[AgentDependencies, str | DeferredToolRequests] | None = None,
+    *,
+    deferred_tool_results: Any | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """
     流式聊天处理主调度函数
@@ -1081,11 +1172,12 @@ async def stream_chat(
     工具调用由 Pydantic AI 框架自动处理，无需手动回退。
 
     Args:
-        prompt: 用户输入
+        prompt: 用户输入；审批恢复时可为 None
         deps: Agent 依赖
         model: 可选的模型覆盖
         message_history: 消息历史
         agent: 可选的 Agent 实例，不传则使用管理器中的 Agent
+        deferred_tool_results: 审批恢复时传入的 DeferredToolResults
 
     Yields:
         StreamEvent: 流式事件
@@ -1098,18 +1190,36 @@ async def stream_chat(
         if use_stream_mode:
             # 流式模式处理
             async for event in stream_response_handler(
-                prompt, deps, model, message_history, ctx, agent
+                prompt,
+                deps,
+                model,
+                message_history,
+                ctx,
+                agent,
+                deferred_tool_results=deferred_tool_results,
             ):
                 if event.event_type == "error":
+                    yield event
+                    return
+                if event.event_type == "approval_required":
                     yield event
                     return
                 yield event
         else:
             # 非流式模式处理
             async for event in non_stream_response_handler(
-                prompt, deps, model, message_history, ctx, agent
+                prompt,
+                deps,
+                model,
+                message_history,
+                ctx,
+                agent,
+                deferred_tool_results=deferred_tool_results,
             ):
                 if event.event_type == "error":
+                    yield event
+                    return
+                if event.event_type == "approval_required":
                     yield event
                     return
                 yield event

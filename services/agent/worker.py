@@ -8,10 +8,14 @@ from uuid import UUID, uuid4
 
 import httpx
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ThinkingPart
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDenied
 
 from core.queue import MessageBroker
 from services.agent.core import stream_chat, _extract_exception_details, player_facing_error, classify_run_exception
+from services.agent.harness.approvals import PendingApproval
+from services.agent.harness.execution import summarize_args_for_player
 from services.agent.providers import ProviderRegistry
+from services.agent.runtime import get_agent_runtime
 from services.agent.title import generate_conversation_title
 from services.agent.tool_results import CommandResult
 from services.addon.service import get_addon_bridge_service
@@ -183,7 +187,16 @@ class AgentWorker:
         )
 
         message_history: list[ModelMessage] | None = None
-        if request.use_context:
+        deferred_tool_results: DeferredToolResults | None = None
+        resume_prompt: str | None = request.content
+
+        if request.resume_approval_id and request.deferred_tool_results is not None:
+            # 审批恢复：使用原 messages，不把批准文本作为新 prompt
+            resume_prompt = None
+            raw_history = request.resume_message_history or []
+            message_history = list(raw_history)
+            deferred_tool_results = self._coerce_deferred_tool_results(request.deferred_tool_results)
+        elif request.use_context:
             raw_history = self.broker.get_conversation_history(
                 connection_id, request.player_name, request.conversation_id
             )
@@ -297,10 +310,11 @@ class AgentWorker:
 
         try:
             async for event in stream_chat(
-                request.content,
+                resume_prompt,
                 deps,
                 model,
                 message_history=message_history,
+                deferred_tool_results=deferred_tool_results,
             ):
                 event_count += 1
                 if event.event_type == "content" and event.content:
@@ -358,6 +372,16 @@ class AgentWorker:
                         )
                         await self.broker.send_response(connection_id, result_chunk)
                         sequence += 1
+
+                elif event.event_type == "approval_required":
+                    await self._handle_approval_required(
+                        request=request,
+                        connection_id=connection_id,
+                        event=event,
+                        sequence=sequence,
+                        stream_target=stream_target,
+                    )
+                    return
 
                 if event.metadata and event.metadata.get("is_complete"):
                     all_messages = event.metadata.get("all_messages")
@@ -575,11 +599,21 @@ class AgentWorker:
                     run_id=run_id,
                     error=diagnostic,
                 )
-                # 标记所有 MCP 服务器为失败（因为我们不知道具体是哪个）
+                # 仅标记有证据关联的 server；无证据时不批量禁用
                 if mcp_manager is not None:
-                    for server_name in mcp_manager.servers.keys():
-                        mcp_manager.mark_server_failed(server_name, f"连接超时: {diagnostic}")
-                # 注意：core.py 中的降级机制会自动重试，这里不需要额外处理
+                    detail = diagnostic
+                    matched = False
+                    for server_name in list(mcp_manager.servers.keys()):
+                        if server_name and server_name in detail:
+                            mcp_manager.mark_server_failed(
+                                server_name, f"连接超时: {diagnostic}"
+                            )
+                            matched = True
+                    if matched:
+                        from services.agent.runtime import get_agent_runtime
+
+                        get_agent_runtime().refresh_mcp_tools(self.settings)
+                # 不在当前 run 内递归重放
 
             logger.error(
                 "stream_processing_error",
@@ -960,3 +994,145 @@ class AgentWorker:
             target=target,
         )
         await self.broker.send_response(connection_id, chunk)
+
+    def _coerce_deferred_tool_results(self, payload: dict | DeferredToolResults) -> DeferredToolResults:
+        if isinstance(payload, DeferredToolResults):
+            return payload
+        results = DeferredToolResults()
+        approvals = payload.get("approvals") if isinstance(payload, dict) else None
+        calls = payload.get("calls") if isinstance(payload, dict) else None
+        metadata = payload.get("metadata") if isinstance(payload, dict) else None
+        if isinstance(approvals, dict):
+            for tool_call_id, value in approvals.items():
+                if value is True:
+                    results.approvals[tool_call_id] = True
+                elif value is False:
+                    results.approvals[tool_call_id] = False
+                elif isinstance(value, dict) and value.get("kind") == "tool-denied":
+                    results.approvals[tool_call_id] = ToolDenied(
+                        message=str(value.get("message") or "已拒绝")
+                    )
+                else:
+                    results.approvals[tool_call_id] = value
+        if isinstance(calls, dict):
+            results.calls.update(calls)
+        if isinstance(metadata, dict):
+            results.metadata.update(metadata)
+        return results
+
+    async def _handle_approval_required(
+        self,
+        *,
+        request: ChatRequest,
+        connection_id: UUID,
+        event,
+        sequence: int,
+        stream_target: str | None,
+    ) -> None:
+        """把 DeferredToolRequests 落盘到 PendingApprovalStore，并提示玩家审批。"""
+        import time as _time
+
+        metadata = event.metadata or {}
+        deferred = metadata.get("deferred_requests")
+        if not isinstance(deferred, DeferredToolRequests):
+            await self._send_error_chunk(
+                connection_id,
+                request.player_name,
+                "内部错误：缺少待审批工具调用",
+                sequence,
+                target=stream_target,
+                error_kind="INTERNAL",
+                run_id=request.run_id,
+            )
+            return
+
+        messages = metadata.get("all_messages") or []
+        store = get_agent_runtime().get_pending_approval_store(self.settings)
+        ttl = float(getattr(self.settings, "approval_ttl", 120.0) or 120.0)
+        now = _time.time()
+        player_name = request.player_name or DEFAULT_PLAYER_DISPLAY_NAME
+        approval_ids: list[str] = []
+
+        pending_calls = list(deferred.approvals) + list(deferred.calls)
+        if not pending_calls:
+            await self._send_error_chunk(
+                connection_id,
+                request.player_name,
+                "没有需要审批的工具调用",
+                sequence,
+                target=stream_target,
+                error_kind="INTERNAL",
+                run_id=request.run_id,
+            )
+            return
+
+        for call in pending_calls:
+            approval_id = store.generate_approval_id()
+            meta = deferred.metadata.get(call.tool_call_id, {}) if deferred.metadata else {}
+            normalized_args = meta.get("normalized_args")
+            if not isinstance(normalized_args, dict):
+                args = call.args if isinstance(call.args, dict) else {}
+                normalized_args = args
+            args_hash = str(meta.get("args_hash") or "")
+            args_summary = str(
+                meta.get("args_summary")
+                or summarize_args_for_player(call.tool_name, normalized_args)
+            )
+            policy_version = str(meta.get("policy_version") or getattr(self.settings, "tool_policy_version", "unknown"))
+            pending = PendingApproval(
+                approval_id=approval_id,
+                connection_id=str(connection_id),
+                player_name=player_name,
+                conversation_id=request.conversation_id,
+                run_id=request.run_id or str(metadata.get("run_id") or ""),
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                normalized_args=normalized_args,
+                args_summary=args_summary,
+                args_hash=args_hash,
+                policy_version=policy_version,
+                messages=list(messages),
+                requests=deferred,
+                provider=request.provider,
+                delivery=request.delivery,
+                use_context=request.use_context,
+                broadcast_ai_chat=request.broadcast_ai_chat,
+                created_at=now,
+                expires_at=now + ttl,
+                metadata={
+                    "risk": meta.get("risk"),
+                    "reason": meta.get("reason"),
+                },
+            )
+            store.put(pending)
+            approval_ids.append(approval_id)
+
+            prompt = (
+                f"工具审批请求 [{approval_id}]\n"
+                f"工具: {call.tool_name}\n"
+                f"参数: {args_summary}\n"
+                f"原因: {meta.get('reason') or '需要确认'}\n"
+                f"请执行: AGENT 工具审批 {approval_id} 允许|拒绝"
+            )
+            chunk = StreamChunk(
+                connection_id=connection_id,
+                chunk_type="approval_required",
+                content=prompt,
+                sequence=sequence,
+                delivery=request.delivery,
+                player_name=request.player_name,
+                target=stream_target or request.player_name,
+                tool_name=call.tool_name,
+            )
+            await self.broker.send_response(connection_id, chunk)
+            sequence += 1
+
+        logger.info(
+            "tool_approval_pending",
+            worker_id=self.worker_id,
+            connection_id=str(connection_id),
+            player=player_name,
+            conversation_id=request.conversation_id,
+            approval_ids=approval_ids,
+            run_id=request.run_id,
+        )

@@ -1,8 +1,11 @@
 """运行时 Harness 工具目录真相源。"""
 
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, Field
+
+POLICY_VERSION = "2026-07-21.1"
 
 
 class ToolIntent(StrEnum):
@@ -20,6 +23,9 @@ class ToolRisk(StrEnum):
     DANGEROUS = "危险"
 
 
+ToolSource = Literal["builtin", "mcp"]
+
+
 class ParameterPreviewPolicy(BaseModel):
     include: tuple[str, ...] = ()
     sensitive: tuple[str, ...] = ()
@@ -34,142 +40,192 @@ class ToolCatalogEntry(BaseModel):
     when_not_to_use: str
     parameter_constraints: str
     preview: ParameterPreviewPolicy = Field(default_factory=ParameterPreviewPolicy)
+    source: ToolSource = "builtin"
+    mcp_server: str | None = None
+    schema_hash: str | None = None
+    policy_version: str = POLICY_VERSION
+    may_have_external_side_effects: bool = False
+
+
+def _entry(
+    name: str,
+    intent: ToolIntent,
+    risk: ToolRisk,
+    when_to_use: str,
+    when_not_to_use: str,
+    parameter_constraints: str,
+    *,
+    preview: ParameterPreviewPolicy | None = None,
+    may_have_external_side_effects: bool = False,
+    source: ToolSource = "builtin",
+    mcp_server: str | None = None,
+    schema_hash: str | None = None,
+) -> ToolCatalogEntry:
+    return ToolCatalogEntry(
+        name=name,
+        intent=intent,
+        risk=risk,
+        when_to_use=when_to_use,
+        when_not_to_use=when_not_to_use,
+        parameter_constraints=parameter_constraints,
+        preview=preview or ParameterPreviewPolicy(),
+        source=source,
+        mcp_server=mcp_server,
+        schema_hash=schema_hash,
+        policy_version=POLICY_VERSION,
+        may_have_external_side_effects=may_have_external_side_effects,
+    )
 
 
 _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
-    "run_minecraft_command": ToolCatalogEntry(
-        name="run_minecraft_command",
-        intent=ToolIntent.CHANGE_WORLD,
-        risk=ToolRisk.HIGH,
-        when_to_use="玩家明确要求执行单条 Minecraft 命令或进行一次确定的世界修改时使用。",
-        when_not_to_use="不要用于闲聊、知识问答、不确定命令或需要多步确认的批量操作。",
-        parameter_constraints="command 不带前导斜杠；只传单条命令。",
+    "run_minecraft_command": _entry(
+        "run_minecraft_command",
+        ToolIntent.CHANGE_WORLD,
+        ToolRisk.HIGH,
+        "玩家明确要求执行单条 Minecraft 命令或进行一次确定的世界修改时使用。",
+        "不要用于闲聊、知识问答、不确定命令或需要多步确认的批量操作。",
+        "command 不带前导斜杠；只传单条命令。",
         preview=ParameterPreviewPolicy(include=("command",)),
+        may_have_external_side_effects=True,
     ),
-    "run_minecraft_commands": ToolCatalogEntry(
-        name="run_minecraft_commands",
-        intent=ToolIntent.CHANGE_WORLD,
-        risk=ToolRisk.DANGEROUS,
-        when_to_use="玩家明确要求连续执行多条命令，且每条命令都具体可见时使用。",
-        when_not_to_use="不要用于试探性操作、未知副作用命令或可以用单条命令完成的任务。",
-        parameter_constraints="commands 中每项不带前导斜杠；保持顺序；避免包含空命令。",
+    "run_minecraft_commands": _entry(
+        "run_minecraft_commands",
+        ToolIntent.CHANGE_WORLD,
+        ToolRisk.DANGEROUS,
+        "玩家明确要求连续执行多条命令，且每条命令都具体可见时使用。",
+        "不要用于试探性操作、未知副作用命令或可以用单条命令完成的任务。",
+        "commands 中每项不带前导斜杠；保持顺序；避免包含空命令。",
         preview=ParameterPreviewPolicy(include=("commands",)),
+        may_have_external_side_effects=True,
     ),
-    "send_game_message": ToolCatalogEntry(
-        name="send_game_message",
-        intent=ToolIntent.NOTIFY_DISPLAY,
-        risk=ToolRisk.LOW,
-        when_to_use="玩家要求向游戏内聊天发送普通文本消息时使用；默认只发送给触发玩家。",
-        when_not_to_use="不要用于执行命令、查询状态或需要颜色/标题样式的展示；除非玩家明确要求全服广播，否则不要设置 broadcast=true。",
-        parameter_constraints="message 为要展示的纯文本内容；broadcast 默认 false，仅 true 时发送给全服 @a。",
+    "send_game_message": _entry(
+        "send_game_message",
+        ToolIntent.NOTIFY_DISPLAY,
+        ToolRisk.LOW,
+        "玩家要求向游戏内聊天发送普通文本消息时使用；默认只发送给触发玩家。",
+        "不要用于执行命令、查询状态或需要颜色/标题样式的展示；除非玩家明确要求全服广播，否则不要设置 broadcast=true。",
+        "message 为要展示的纯文本内容；broadcast 默认 false，仅 true 时发送给全服 @a。",
         preview=ParameterPreviewPolicy(include=("message", "broadcast")),
+        may_have_external_side_effects=True,
     ),
-    "send_colored_message": ToolCatalogEntry(
-        name="send_colored_message",
-        intent=ToolIntent.NOTIFY_DISPLAY,
-        risk=ToolRisk.MEDIUM,
-        when_to_use="玩家要求在聊天中发送带 Minecraft 颜色代码的消息时使用；默认只发送给触发玩家。",
-        when_not_to_use="不要用于普通回复、标题展示或执行任意 tellraw 命令；除非玩家明确要求全服广播，否则不要设置 broadcast=true。",
-        parameter_constraints="message 为文本；color 使用 Minecraft 颜色代码，例如 §a；broadcast 默认 false，仅 true 时发送给全服 @a。",
+    "send_colored_message": _entry(
+        "send_colored_message",
+        ToolIntent.NOTIFY_DISPLAY,
+        ToolRisk.MEDIUM,
+        "玩家要求在聊天中发送带 Minecraft 颜色代码的消息时使用；默认只发送给触发玩家。",
+        "不要用于普通回复、标题展示或执行任意 tellraw 命令；除非玩家明确要求全服广播，否则不要设置 broadcast=true。",
+        "message 为文本；color 使用 Minecraft 颜色代码，例如 §a；broadcast 默认 false，仅 true 时发送给全服 @a。",
         preview=ParameterPreviewPolicy(include=("message", "color", "broadcast")),
+        may_have_external_side_effects=True,
     ),
-    "send_title_message": ToolCatalogEntry(
-        name="send_title_message",
-        intent=ToolIntent.NOTIFY_DISPLAY,
-        risk=ToolRisk.MEDIUM,
-        when_to_use="玩家要求在屏幕中央显示标题或副标题时使用；默认只发送给触发玩家。",
-        when_not_to_use="不要用于普通聊天消息、actionbar 或世界修改；除非玩家明确要求全服广播，否则不要设置 broadcast=true。",
-        parameter_constraints="title 必填；subtitle 可选；fade_in/stay/fade_out 为 tick 数；broadcast 默认 false，仅 true 时发送给全服 @a。",
+    "send_title_message": _entry(
+        "send_title_message",
+        ToolIntent.NOTIFY_DISPLAY,
+        ToolRisk.MEDIUM,
+        "玩家要求在屏幕中央显示标题或副标题时使用；默认只发送给触发玩家。",
+        "不要用于普通聊天消息、actionbar 或世界修改；除非玩家明确要求全服广播，否则不要设置 broadcast=true。",
+        "title 必填；subtitle 可选；fade_in/stay/fade_out 为 tick 数；broadcast 默认 false，仅 true 时发送给全服 @a。",
         preview=ParameterPreviewPolicy(include=("title", "subtitle", "broadcast")),
+        may_have_external_side_effects=True,
     ),
-    "send_actionbar_message": ToolCatalogEntry(
-        name="send_actionbar_message",
-        intent=ToolIntent.NOTIFY_DISPLAY,
-        risk=ToolRisk.LOW,
-        when_to_use="玩家要求在 actionbar 显示短提示时使用；默认只发送给触发玩家。",
-        when_not_to_use="不要用于长文本、聊天消息、标题或命令执行；除非玩家明确要求全服广播，否则不要设置 broadcast=true。",
-        parameter_constraints="message 应保持简短，适合 actionbar 展示；broadcast 默认 false，仅 true 时发送给全服 @a。",
+    "send_actionbar_message": _entry(
+        "send_actionbar_message",
+        ToolIntent.NOTIFY_DISPLAY,
+        ToolRisk.LOW,
+        "玩家要求在 actionbar 显示短提示时使用；默认只发送给触发玩家。",
+        "不要用于长文本、聊天消息、标题或命令执行；除非玩家明确要求全服广播，否则不要设置 broadcast=true。",
+        "message 应保持简短，适合 actionbar 展示；broadcast 默认 false，仅 true 时发送给全服 @a。",
         preview=ParameterPreviewPolicy(include=("message", "broadcast")),
+        may_have_external_side_effects=True,
     ),
-    "send_script_event": ToolCatalogEntry(
-        name="send_script_event",
-        intent=ToolIntent.NOTIFY_DISPLAY,
-        risk=ToolRisk.MEDIUM,
-        when_to_use="玩家要求向 Addon 或脚本通道发送指定 scriptevent 内容时使用。",
-        when_not_to_use="不要用于普通聊天展示、未知 message_id 或世界命令执行。",
-        parameter_constraints="message_id 使用命名空间格式；content 为事件载荷文本。",
+    "send_script_event": _entry(
+        "send_script_event",
+        ToolIntent.NOTIFY_DISPLAY,
+        ToolRisk.MEDIUM,
+        "玩家要求向 Addon 或脚本通道发送指定 scriptevent 内容时使用。",
+        "不要用于普通聊天展示、未知 message_id 或世界命令执行。",
+        "message_id 使用命名空间格式；content 为事件载荷文本。",
         preview=ParameterPreviewPolicy(include=("message_id", "content")),
+        may_have_external_side_effects=True,
     ),
-    "fetch_url_text": ToolCatalogEntry(
-        name="fetch_url_text",
-        intent=ToolIntent.QUERY_KNOWLEDGE,
-        risk=ToolRisk.MEDIUM,
-        when_to_use="玩家提供 http/https 链接并要求读取网页文本时使用。",
-        when_not_to_use="不要用于非网页链接、敏感内网地址或 Minecraft Wiki 可直接查询的问题。",
-        parameter_constraints="url 仅支持 http/https；max_chars 控制返回长度。",
+    "fetch_url_text": _entry(
+        "fetch_url_text",
+        ToolIntent.QUERY_KNOWLEDGE,
+        ToolRisk.MEDIUM,
+        "玩家提供 http/https 链接并要求读取网页文本时使用。",
+        "不要用于非网页链接、敏感内网地址或 Minecraft Wiki 可直接查询的问题。",
+        "url 仅支持 http/https；max_chars 控制返回长度。",
         preview=ParameterPreviewPolicy(include=("url", "max_chars")),
+        may_have_external_side_effects=False,
     ),
-    "mcwiki_search": ToolCatalogEntry(
-        name="mcwiki_search",
-        intent=ToolIntent.QUERY_KNOWLEDGE,
-        risk=ToolRisk.LOW,
-        when_to_use="玩家询问 Minecraft 条目但不确定具体页面名时使用。",
-        when_not_to_use="不要用于已知页面正文读取或非 Minecraft Wiki 内容。",
-        parameter_constraints="query 为搜索词；limit 建议较小；namespaces 仅在玩家指定范围时使用。",
+    "mcwiki_search": _entry(
+        "mcwiki_search",
+        ToolIntent.QUERY_KNOWLEDGE,
+        ToolRisk.LOW,
+        "玩家询问 Minecraft 条目但不确定具体页面名时使用。",
+        "不要用于已知页面正文读取或非 Minecraft Wiki 内容。",
+        "query 为搜索词；limit 建议较小；namespaces 仅在玩家指定范围时使用。",
         preview=ParameterPreviewPolicy(include=("query", "limit", "namespaces")),
+        may_have_external_side_effects=False,
     ),
-    "mcwiki_get_page": ToolCatalogEntry(
-        name="mcwiki_get_page",
-        intent=ToolIntent.QUERY_KNOWLEDGE,
-        risk=ToolRisk.LOW,
-        when_to_use="玩家要求获取明确 Minecraft Wiki 页面内容时使用。",
-        when_not_to_use="不要用于模糊搜索、网页抓取或世界状态查询。",
-        parameter_constraints="page_name 为明确页面名；format 使用 html/markdown/both/wikitext；max_chars 控制长度。",
+    "mcwiki_get_page": _entry(
+        "mcwiki_get_page",
+        ToolIntent.QUERY_KNOWLEDGE,
+        ToolRisk.LOW,
+        "玩家要求获取明确 Minecraft Wiki 页面内容时使用。",
+        "不要用于模糊搜索、网页抓取或世界状态查询。",
+        "page_name 为明确页面名；format 使用 html/markdown/both/wikitext；max_chars 控制长度。",
         preview=ParameterPreviewPolicy(include=("page_name", "format", "max_chars")),
+        may_have_external_side_effects=False,
     ),
-    "list_available_providers": ToolCatalogEntry(
-        name="list_available_providers",
-        intent=ToolIntent.SYSTEM_INFO,
-        risk=ToolRisk.LOW,
-        when_to_use="玩家询问当前可用 LLM provider 或模型来源时使用。",
-        when_not_to_use="不要用于切换 provider、测试连接或回答 Minecraft 知识问题。",
-        parameter_constraints="无参数。",
+    "list_available_providers": _entry(
+        "list_available_providers",
+        ToolIntent.SYSTEM_INFO,
+        ToolRisk.LOW,
+        "玩家询问当前可用 LLM provider 或模型来源时使用。",
+        "不要用于切换 provider、测试连接或回答 Minecraft 知识问题。",
+        "无参数。",
+        may_have_external_side_effects=False,
     ),
-    "get_player_snapshot": ToolCatalogEntry(
-        name="get_player_snapshot",
-        intent=ToolIntent.QUERY_WORLD,
-        risk=ToolRisk.LOW,
-        when_to_use="玩家要求查询玩家位置、状态或在线玩家快照时使用。",
-        when_not_to_use="不要用于修改玩家状态、背包查询或执行命令。",
-        parameter_constraints="target 使用 Minecraft 选择器或玩家名；默认 @a。",
+    "get_player_snapshot": _entry(
+        "get_player_snapshot",
+        ToolIntent.QUERY_WORLD,
+        ToolRisk.LOW,
+        "玩家要求查询玩家位置、状态或在线玩家快照时使用。",
+        "不要用于修改玩家状态、背包查询或执行命令。",
+        "target 使用 Minecraft 选择器或玩家名；默认 @a。",
         preview=ParameterPreviewPolicy(include=("target",)),
+        may_have_external_side_effects=False,
     ),
-    "get_inventory_snapshot": ToolCatalogEntry(
-        name="get_inventory_snapshot",
-        intent=ToolIntent.QUERY_WORLD,
-        risk=ToolRisk.MEDIUM,
-        when_to_use="玩家要求查看玩家背包或物品快照时使用。",
-        when_not_to_use="不要用于发放、移除或修改物品。",
-        parameter_constraints="target 使用 Minecraft 选择器或玩家名；默认 @a。",
+    "get_inventory_snapshot": _entry(
+        "get_inventory_snapshot",
+        ToolIntent.QUERY_WORLD,
+        ToolRisk.MEDIUM,
+        "玩家要求查看玩家背包或物品快照时使用。",
+        "不要用于发放、移除或修改物品。",
+        "target 使用 Minecraft 选择器或玩家名；默认 @a。",
         preview=ParameterPreviewPolicy(include=("target",)),
+        may_have_external_side_effects=False,
     ),
-    "find_entities": ToolCatalogEntry(
-        name="find_entities",
-        intent=ToolIntent.QUERY_WORLD,
-        risk=ToolRisk.MEDIUM,
-        when_to_use="玩家要求查询附近实体、指定类型实体或实体数量时使用。",
-        when_not_to_use="不要用于召唤、杀死、传送或修改实体。",
-        parameter_constraints="entity_type 必填；radius 为查询半径；target 为查询中心选择器。",
+    "find_entities": _entry(
+        "find_entities",
+        ToolIntent.QUERY_WORLD,
+        ToolRisk.MEDIUM,
+        "玩家要求查询附近实体、指定类型实体或实体数量时使用。",
+        "不要用于召唤、杀死、传送或修改实体。",
+        "entity_type 必填；radius 为查询半径；target 为查询中心选择器。",
         preview=ParameterPreviewPolicy(include=("entity_type", "radius", "target")),
+        may_have_external_side_effects=False,
     ),
-    "run_world_command": ToolCatalogEntry(
-        name="run_world_command",
-        intent=ToolIntent.CHANGE_WORLD,
-        risk=ToolRisk.HIGH,
-        when_to_use="需要通过 Addon 桥接受控执行世界命令，且普通命令工具不可用时使用。",
-        when_not_to_use="不要作为 run_minecraft_command 的默认替代，也不要用于查询或展示消息。",
-        parameter_constraints="command 不带前导斜杠；只传单条世界命令。",
+    "run_world_command": _entry(
+        "run_world_command",
+        ToolIntent.CHANGE_WORLD,
+        ToolRisk.HIGH,
+        "需要通过 Addon 桥接受控执行世界命令，且普通命令工具不可用时使用。",
+        "不要作为 run_minecraft_command 的默认替代，也不要用于查询或展示消息。",
+        "command 不带前导斜杠；只传单条世界命令。",
         preview=ParameterPreviewPolicy(include=("command",)),
+        may_have_external_side_effects=True,
     ),
 }
 

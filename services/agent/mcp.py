@@ -359,15 +359,12 @@ class MCPManager:
         """
         获取用于 Agent 的工具集列表
 
-        如果没有有效的工具集，返回空列表（优雅降级）
+        默认仅装配 PENDING / ACTIVE 的健康 server。
 
         Returns:
             MCP 工具集列表
         """
-        toolsets = self.toolsets
-        if not toolsets:
-            logger.debug("mcp_no_active_toolsets")
-        return toolsets
+        return self.get_healthy_toolsets()
 
     def get_healthy_toolsets(self) -> list[Any]:
         """

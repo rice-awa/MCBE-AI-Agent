@@ -17,6 +17,7 @@ from services.websocket.delivery import McbeOutboundDelivery
 from services.websocket.minecraft import MinecraftProtocolHandler, TellrawMessage
 from services.auth.jwt_handler import JWTHandler
 from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
+from models.messages import ChatRequest
 from config.settings import Settings
 from config.logging import get_logger
 
@@ -382,6 +383,7 @@ class WebSocketServer:
             "setting": lambda: self.handle_setting(state, content, player_name=player_name),
             "mcp": lambda: self.handle_mcp(state, content, player_name=player_name),
             "ai_broadcast": lambda: self.handle_ai_broadcast(state, content, player_name=player_name),
+            "tool_approval": lambda: self.handle_tool_approval(state, content, player_name=player_name),
             "switch_model": lambda: self.handle_switch_model(state, content, player_name=player_name),
             "help": lambda: self.handle_help(state, player_name=player_name),
             "save": lambda: self.handle_save(state, player_name=player_name),
@@ -915,6 +917,109 @@ class WebSocketServer:
         help_text = self.protocol_handler.get_help_text()
         msg = self.protocol_handler.create_info_message(help_text)
         await self._send_player_reply(state, msg, source="help", player_name=player_name)
+
+    async def handle_tool_approval(
+        self,
+        state: Any,
+        content: str,
+        player_name: str | None = None,
+    ) -> None:
+        """处理 `AGENT 工具审批 <approval_id> <允许|拒绝>`。"""
+        from pydantic_ai.tools import DeferredToolResults, ToolDenied
+
+        from services.agent.runtime import get_agent_runtime
+
+        parts = content.strip().split()
+        if len(parts) < 2:
+            msg = self.protocol_handler.create_error_message(
+                "用法: AGENT 工具审批 <approval_id> <允许|拒绝>"
+            )
+            await self._send_player_reply(state, msg, source="tool_approval", player_name=player_name)
+            return
+
+        approval_id = parts[0]
+        decision_raw = parts[1].lower()
+        if decision_raw in ("允许", "allow", "approve", "yes", "y", "true", "1"):
+            approved = True
+        elif decision_raw in ("拒绝", "deny", "reject", "no", "n", "false", "0"):
+            approved = False
+        else:
+            msg = self.protocol_handler.create_error_message(
+                "第二参数必须是 允许 或 拒绝"
+            )
+            await self._send_player_reply(state, msg, source="tool_approval", player_name=player_name)
+            return
+
+        owner = player_name or state.player_name or DEFAULT_PLAYER_DISPLAY_NAME
+        conversation_id = self.broker.get_active_conversation_id(state.id, owner)
+        store = get_agent_runtime().get_pending_approval_store(self.settings)
+
+        pending, reject_reason = store.get_for_owner(
+            connection_id=str(state.id),
+            player_name=owner,
+            conversation_id=conversation_id,
+            approval_id=approval_id,
+        )
+        if pending is None:
+            msg = self.protocol_handler.create_error_message(reject_reason or "审批不可用")
+            await self._send_player_reply(state, msg, source="tool_approval", player_name=player_name)
+            return
+
+        # 取出后不可复用
+        store.pop(str(state.id), owner, conversation_id, approval_id)
+
+        if not approved:
+            msg = self.protocol_handler.create_info_message(
+                f"已拒绝工具调用 [{approval_id}] {pending.tool_name}"
+            )
+            await self._send_player_reply(state, msg, source="tool_approval", player_name=player_name)
+            # 拒绝也恢复同一调用链，把 ToolDenied 回灌给模型（不执行工具）
+            results = DeferredToolResults()
+            results.approvals[pending.tool_call_id] = ToolDenied(
+                message=f"玩家拒绝了工具调用 {pending.tool_name}"
+            )
+        else:
+            msg = self.protocol_handler.create_success_message(
+                f"已批准工具调用 [{approval_id}] {pending.tool_name}，继续执行..."
+            )
+            await self._send_player_reply(state, msg, source="tool_approval", player_name=player_name)
+            results = DeferredToolResults()
+            results.approvals[pending.tool_call_id] = True
+
+        generation = self.broker.get_conversation_generation(
+            state.id, owner, conversation_id
+        )
+        invalidation_epoch = self.broker.get_conversation_invalidation_epoch(
+            state.id, owner, conversation_id
+        )
+        chat_req = ChatRequest(
+            connection_id=state.id,
+            content="",  # 不把批准文本作为新 prompt
+            player_name=owner,
+            use_context=pending.use_context,
+            provider=pending.provider or state.get_player_session(owner).current_provider,
+            delivery=pending.delivery,  # type: ignore[arg-type]
+            conversation_id=conversation_id,
+            conversation_generation=generation,
+            conversation_invalidation_epoch=invalidation_epoch,
+            broadcast_ai_chat=pending.broadcast_ai_chat,
+            run_id=pending.run_id,
+            resume_approval_id=approval_id,
+            deferred_tool_results={
+                "approvals": {
+                    pending.tool_call_id: (
+                        True
+                        if approved
+                        else {
+                            "kind": "tool-denied",
+                            "message": f"玩家拒绝了工具调用 {pending.tool_name}",
+                        }
+                    )
+                }
+            },
+            resume_message_history=pending.messages,
+        )
+        await self.broker.submit_request(state.id, chat_req, priority=0)
 
     async def handle_save(self, state: Any, player_name: str | None = None) -> None:
         """兼容旧保存命令：保存当前活动对话。"""
