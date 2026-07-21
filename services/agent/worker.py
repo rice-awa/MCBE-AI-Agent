@@ -1066,8 +1066,12 @@ class AgentWorker:
             )
             return
 
-        for call in pending_calls:
-            approval_id = store.generate_approval_id()
+        # 同一 DeferredToolRequests 作为一批：须全部决策后才 resume
+        batch_id = store.generate_batch_id()
+        preassigned_ids = [store.generate_approval_id() for _ in pending_calls]
+        sibling_ids = list(preassigned_ids)
+
+        for approval_id, call in zip(preassigned_ids, pending_calls):
             meta = deferred.metadata.get(call.tool_call_id, {}) if deferred.metadata else {}
             normalized_args = meta.get("normalized_args")
             if not isinstance(normalized_args, dict):
@@ -1099,6 +1103,8 @@ class AgentWorker:
                 broadcast_ai_chat=request.broadcast_ai_chat,
                 created_at=now,
                 expires_at=now + ttl,
+                batch_id=batch_id,
+                sibling_approval_ids=sibling_ids,
                 metadata={
                     "risk": meta.get("risk"),
                     "reason": meta.get("reason"),
@@ -1107,11 +1113,18 @@ class AgentWorker:
             store.put(pending)
             approval_ids.append(approval_id)
 
+            batch_hint = ""
+            if len(sibling_ids) > 1:
+                batch_hint = (
+                    f"\n批次: {batch_id}（共 {len(sibling_ids)} 项，"
+                    f"需全部决策后才会继续执行）"
+                )
             prompt = (
                 f"工具审批请求 [{approval_id}]\n"
                 f"工具: {call.tool_name}\n"
                 f"参数: {args_summary}\n"
-                f"原因: {meta.get('reason') or '需要确认'}\n"
+                f"原因: {meta.get('reason') or '需要确认'}"
+                f"{batch_hint}\n"
                 f"请执行: AGENT 工具审批 {approval_id} 允许|拒绝"
             )
             chunk = StreamChunk(
@@ -1134,5 +1147,6 @@ class AgentWorker:
             player=player_name,
             conversation_id=request.conversation_id,
             approval_ids=approval_ids,
+            batch_id=batch_id,
             run_id=request.run_id,
         )

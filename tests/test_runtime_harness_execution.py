@@ -322,3 +322,130 @@ def test_pending_approval_store_owner_and_expiry() -> None:
     )
     assert expired is None
     assert reason3 is not None
+
+
+@pytest.mark.asyncio
+async def test_multi_deferred_approvals_require_full_results_then_execute_only_approved() -> None:
+    """两工具 defer 时 partial resume 会 UserError；齐套决策后只执行被批准的工具。
+
+    使用 FunctionModel 保证两个 deferred call 有独立 tool_call_id
+   （TestModel 会对同名工具复用同一 id，无法表达 partial-vs-full）。
+    """
+    import time
+
+    from pydantic_ai.exceptions import UserError
+    from pydantic_ai.models.function import FunctionModel
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+
+    counter: dict[str, int] = {}
+    agent = _build_agent(counter)
+    deps = _Deps(settings=_Settings(), run_id="run-multi")
+
+    step = {"n": 0}
+
+    def model_fn(messages, info):
+        step["n"] += 1
+        if step["n"] == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="run_minecraft_command",
+                        args={"command": "a"},
+                        tool_call_id="tc-a",
+                    ),
+                    ToolCallPart(
+                        tool_name="run_minecraft_command",
+                        args={"command": "b"},
+                        tool_call_id="tc-b",
+                    ),
+                ]
+            )
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    first = await agent.run(
+        "run two commands",
+        deps=deps,
+        model=FunctionModel(model_fn),
+    )
+    assert isinstance(first.output, DeferredToolRequests)
+    assert len(first.output.approvals) == 2
+    calls = list(first.output.approvals)
+    call_ids = {c.tool_call_id for c in calls}
+    assert call_ids == {"tc-a", "tc-b"}
+    messages = first.all_messages()
+
+    # partial：只回一项 → 必须失败
+    partial = DeferredToolResults(approvals={"tc-a": True})
+    with pytest.raises(UserError, match="all deferred tool calls"):
+        await agent.run(
+            message_history=messages,
+            deferred_tool_results=partial,
+            deps=deps,
+            model=FunctionModel(model_fn),
+        )
+    assert counter.get("run_minecraft_command", 0) == 0
+
+    # 模拟 store 批次决策：一允许一拒绝，齐套后 resume
+    store = PendingApprovalStore(default_ttl_seconds=120.0)
+    batch_id = store.generate_batch_id()
+    ap_ids = [store.generate_approval_id(), store.generate_approval_id()]
+    now = time.time()
+    for ap_id, call in zip(ap_ids, calls):
+        args = call.args if isinstance(call.args, dict) else {"command": "x"}
+        store.put(
+            PendingApproval(
+                approval_id=ap_id,
+                connection_id="c1",
+                player_name="Steve",
+                conversation_id="conv",
+                run_id=deps.run_id,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                normalized_args=args,
+                args_summary=str(args),
+                args_hash="h",
+                policy_version="v",
+                messages=messages,
+                requests=first.output,
+                provider="test",
+                delivery="tellraw",
+                use_context=True,
+                broadcast_ai_chat=False,
+                created_at=now,
+                expires_at=now + 120,
+                batch_id=batch_id,
+                sibling_approval_ids=list(ap_ids),
+            )
+        )
+
+    p1, r1, batch1 = store.record_decision(
+        connection_id="c1",
+        player_name="Steve",
+        conversation_id="conv",
+        approval_id=ap_ids[0],
+        approved=True,
+    )
+    assert p1 is not None and r1 is None and batch1 is None
+    assert len(store) == 2
+
+    p2, r2, batch2 = store.record_decision(
+        connection_id="c1",
+        player_name="Steve",
+        conversation_id="conv",
+        approval_id=ap_ids[1],
+        approved=False,
+    )
+    assert p2 is not None and r2 is None and batch2 is not None
+    assert len(batch2) == 2
+    assert len(store) == 0
+
+    full = DeferredToolResults(approvals={"tc-a": True, "tc-b": False})
+    second = await agent.run(
+        message_history=messages,
+        deferred_tool_results=full,
+        deps=deps,
+        model=FunctionModel(model_fn),
+    )
+    # 只执行被批准的那一次
+    assert counter.get("run_minecraft_command") == 1
+    assert not isinstance(second.output, DeferredToolRequests)

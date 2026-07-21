@@ -924,9 +924,11 @@ class WebSocketServer:
         content: str,
         player_name: str | None = None,
     ) -> None:
-        """处理 `AGENT 工具审批 <approval_id> <允许|拒绝>`。"""
-        from pydantic_ai.tools import DeferredToolResults, ToolDenied
+        """处理 `AGENT 工具审批 <approval_id> <允许|拒绝>`。
 
+        UX (approach C)：同一 DeferredToolRequests 批内，每条命令只记录一项决策；
+        待 batch 全部决策后，用完整 DeferredToolResults 恢复 run，避免 partial results。
+        """
         from services.agent.runtime import get_agent_runtime
 
         parts = content.strip().split()
@@ -954,37 +956,52 @@ class WebSocketServer:
         conversation_id = self.broker.get_active_conversation_id(state.id, owner)
         store = get_agent_runtime().get_pending_approval_store(self.settings)
 
-        pending, reject_reason = store.get_for_owner(
+        pending, reject_reason, completed_batch = store.record_decision(
             connection_id=str(state.id),
             player_name=owner,
             conversation_id=conversation_id,
             approval_id=approval_id,
+            approved=approved,
         )
         if pending is None:
             msg = self.protocol_handler.create_error_message(reject_reason or "审批不可用")
             await self._send_player_reply(state, msg, source="tool_approval", player_name=player_name)
             return
 
-        # 取出后不可复用
-        store.pop(str(state.id), owner, conversation_id, approval_id)
-
         if not approved:
             msg = self.protocol_handler.create_info_message(
                 f"已拒绝工具调用 [{approval_id}] {pending.tool_name}"
             )
-            await self._send_player_reply(state, msg, source="tool_approval", player_name=player_name)
-            # 拒绝也恢复同一调用链，把 ToolDenied 回灌给模型（不执行工具）
-            results = DeferredToolResults()
-            results.approvals[pending.tool_call_id] = ToolDenied(
-                message=f"玩家拒绝了工具调用 {pending.tool_name}"
-            )
         else:
             msg = self.protocol_handler.create_success_message(
-                f"已批准工具调用 [{approval_id}] {pending.tool_name}，继续执行..."
+                f"已批准工具调用 [{approval_id}] {pending.tool_name}"
             )
-            await self._send_player_reply(state, msg, source="tool_approval", player_name=player_name)
-            results = DeferredToolResults()
-            results.approvals[pending.tool_call_id] = True
+        await self._send_player_reply(state, msg, source="tool_approval", player_name=player_name)
+
+        if completed_batch is None:
+            # 仍有同批未决策项：只确认记录，不 resume
+            wait_msg = self.protocol_handler.create_info_message(
+                f"已记录 [{approval_id}] 的决策；同批还有待审批项，"
+                f"全部决策后才会继续执行（batch={pending.batch_id}）"
+            )
+            await self._send_player_reply(state, wait_msg, source="tool_approval", player_name=player_name)
+            return
+
+        # batch 齐套：构造完整 DeferredToolResults 并恢复同一调用链
+        approvals_payload: dict[str, Any] = {}
+        for item in completed_batch:
+            if item.decision is True:
+                approvals_payload[item.tool_call_id] = True
+            else:
+                approvals_payload[item.tool_call_id] = {
+                    "kind": "tool-denied",
+                    "message": f"玩家拒绝了工具调用 {item.tool_name}",
+                }
+
+        resume_msg = self.protocol_handler.create_success_message(
+            f"批次 {pending.batch_id} 决策完成（{len(completed_batch)} 项），继续执行..."
+        )
+        await self._send_player_reply(state, resume_msg, source="tool_approval", player_name=player_name)
 
         generation = self.broker.get_conversation_generation(
             state.id, owner, conversation_id
@@ -1004,19 +1021,8 @@ class WebSocketServer:
             conversation_invalidation_epoch=invalidation_epoch,
             broadcast_ai_chat=pending.broadcast_ai_chat,
             run_id=pending.run_id,
-            resume_approval_id=approval_id,
-            deferred_tool_results={
-                "approvals": {
-                    pending.tool_call_id: (
-                        True
-                        if approved
-                        else {
-                            "kind": "tool-denied",
-                            "message": f"玩家拒绝了工具调用 {pending.tool_name}",
-                        }
-                    )
-                }
-            },
+            resume_approval_id=pending.batch_id,
+            deferred_tool_results={"approvals": approvals_payload},
             resume_message_history=pending.messages,
         )
         await self.broker.submit_request(state.id, chat_req, priority=0)

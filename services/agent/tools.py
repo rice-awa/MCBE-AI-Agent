@@ -11,7 +11,6 @@ from pydantic_ai.toolsets import FunctionToolset
 from config.logging import get_logger
 from models.agent import AgentDependencies, MCColor
 from models.minecraft import MinecraftCommand, sanitize_tellraw_target
-from services.agent.harness.audit import wrap_registered_tools
 from services.agent.harness.prompting import render_schema_description_prefix
 from services.agent.tool_results import CommandResult, ToolResult
 from services.agent.mcwiki import (
@@ -837,12 +836,8 @@ def register_agent_tools(
 
     if _runtime_harness_schema_enabled(settings):
         _enhance_registered_tool_descriptions(chat_agent)
-    # 策略/幂等/审批统一由 harness.execution.HarnessToolset 入口处理。
-    # 保留轻量 audit wrap 以兼容直接 function 调用的审计测试；
-    # 生产路径的 WrapperToolset 也会写审计，双写时记录字段一致。
-    toolset = get_agent_tools_container(chat_agent)
-    if toolset is not None:
-        wrap_registered_tools(toolset, settings)
+    # 策略/幂等/审批/审计统一由 harness.execution.HarnessToolset 入口处理。
+    # 禁止在生产路径修改已注册函数对象（不调用 wrap_registered_tools）。
     _stringify_tool_results(chat_agent)
 
 

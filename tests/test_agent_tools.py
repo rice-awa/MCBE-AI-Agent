@@ -22,9 +22,56 @@ from services.agent.tools import (
     build_tellraw_command,
     build_title_commands,
     escape_command_text,
+    get_agent_tools_container,
     iter_registered_tools,
     register_agent_tools,
 )
+
+
+def _unwrap_registered_tool_function(function):
+    """剥掉测试/stringify 外壳，拿到带原始签名的工具函数。"""
+    current = function
+    for _ in range(4):
+        if getattr(current, "_tool_result_stringified", False):
+            original = (getattr(current, "__kwdefaults__", None) or {}).get("_function")
+            if original is not None:
+                current = original
+                continue
+        wrapped = getattr(current, "__wrapped__", None)
+        if wrapped is not None:
+            current = wrapped
+            continue
+        break
+    return current
+
+
+def _wrap_tools_for_direct_audit(agent: Agent, settings: Settings) -> None:
+    """测试专用：直接 function 调用时挂 audit；先解 stringify 再 wrap，最后再 stringify。
+
+    生产路径只走 HarnessToolset，不调用本 helper。
+    """
+    from services.agent.harness.audit import wrap_tool_function
+
+    toolset = get_agent_tools_container(agent)
+    assert toolset is not None
+    for tool_name, tool in getattr(toolset, "tools", {}).items():
+        function = getattr(tool, "function", None)
+        if function is None or getattr(function, "_runtime_harness_audited", False):
+            continue
+        original = _unwrap_registered_tool_function(function)
+        audited = wrap_tool_function(tool_name, original, settings)
+        setattr(audited, "_runtime_harness_audited", True)
+
+        async def stringified(*args, _audited=audited, **kwargs):
+            result = await _audited(*args, **kwargs)
+            return str(result)
+
+        setattr(stringified, "_tool_result_stringified", True)
+        setattr(stringified, "_runtime_harness_audited", True)
+        tool.function = stringified
+        function_schema = getattr(tool, "function_schema", None)
+        if function_schema is not None and hasattr(function_schema, "function"):
+            function_schema.function = stringified
 
 
 def _tool(agent: Agent, name: str):
@@ -163,6 +210,8 @@ async def test_registered_tool_function_writes_audit_jsonl(tmp_path) -> None:
     settings = Settings(runtime_harness_audit_path=str(audit_path))
     agent = Agent("test", deps_type=AgentDependencies, output_type=str)
     register_agent_tools(agent, settings=settings)
+    # 生产 register 不再 wrap；测试直接 function 调用时显式挂 audit
+    _wrap_tools_for_direct_audit(agent, settings)
 
     async def run_command(command: str) -> CommandResult:
         return CommandResult.ok("ok")
@@ -196,6 +245,7 @@ async def test_registered_tool_audit_uses_structured_failure(tmp_path) -> None:
     settings = Settings(runtime_harness_audit_path=str(audit_path))
     agent = Agent("test", deps_type=AgentDependencies, output_type=str)
     register_agent_tools(agent, settings=settings)
+    _wrap_tools_for_direct_audit(agent, settings)
 
     async def run_command(command: str) -> CommandResult:
         return CommandResult.ok("ok")
@@ -254,6 +304,7 @@ async def test_run_command_tool_structured_status_shared_by_model_and_audit(
     settings = Settings(runtime_harness_audit_path=str(audit_path))
     agent = Agent("test", deps_type=AgentDependencies, output_type=str)
     register_agent_tools(agent, settings=settings)
+    _wrap_tools_for_direct_audit(agent, settings)
 
     async def run_command(command: str) -> CommandResult:
         return command_result
@@ -291,6 +342,16 @@ async def test_run_command_tool_structured_status_shared_by_model_and_audit(
         )
     else:
         assert records[0]["status"] == "success"
+
+
+def test_register_agent_tools_does_not_mutate_tool_functions() -> None:
+    """生产 register 不得修改已注册函数对象（政策入口仅 WrapperToolset）。"""
+    settings = Settings(runtime_harness_audit_enabled=True)
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent, settings=settings)
+    for name, tool in iter_registered_tools(agent).items():
+        fn = tool.function
+        assert not getattr(fn, "_runtime_harness_audited", False), name
 
 
 @pytest.mark.asyncio
