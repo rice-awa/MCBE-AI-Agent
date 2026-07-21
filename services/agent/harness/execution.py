@@ -43,6 +43,20 @@ DEFAULT_MAX_BATCH_COMMANDS = 10
 DEFAULT_IDEMPOTENCY_TTL_SECONDS = 600.0
 DEFAULT_IDEMPOTENCY_MAX_ENTRIES = 2048
 
+# 省略 target 时的已知工具默认目标（与 tools.py 签名默认值对齐）。
+# 仅当默认明确是「当前玩家」时才可自动允许 MEDIUM；@a / 多目标默认必须审批。
+# - "@s" / "self": 默认仅当前玩家
+# - "@a" / "multi": 默认全服/多目标（不可视为 current player）
+_TOOL_TARGET_DEFAULTS: dict[str, str] = {
+    "find_entities": "@s",
+    "get_inventory_snapshot": "@a",
+    "get_player_snapshot": "@a",
+}
+
+# 无 target/broadcast 概念的 MEDIUM 工具中，可安全自动允许的极小集合（当前为空）。
+# 未列入的（如 send_script_event、fetch_url_text）默认要求审批。
+_MEDIUM_SAFE_AUTO_ALLOW_NO_TARGET: frozenset[str] = frozenset()
+
 PolicyAction = Literal["allow", "deny", "require_approval"]
 
 
@@ -343,20 +357,54 @@ class PolicyEngine:
         args: dict[str, Any],
         player_name: str | None,
     ) -> bool:
+        """判断 MEDIUM 工具是否仅作用于当前玩家（可自动允许）。
+
+        规则（保守）：
+        - broadcast=true → 非当前玩家
+        - 显式 target 按选择器/玩家名判断
+        - **省略 target 时绝不默认视为当前玩家**；仅当工具有已知安全默认
+          （@s / self）或 send_* 通过 broadcast=false 默认当前玩家时才允许
+        - 无 target/broadcast 概念的工具默认 False，除非在极小安全白名单中
+        """
         if args.get("broadcast") is True:
             return False
 
-        target = args.get("target")
-        if target is None:
-            # 默认发送给触发玩家的展示工具
-            if tool_name.startswith("send_") or tool_name in {
-                "get_player_snapshot",
-                "get_inventory_snapshot",
-                "find_entities",
-            }:
+        has_target_key = "target" in args
+        target = args.get("target") if has_target_key else None
+
+        # 显式传入 target（含空字符串）
+        if has_target_key and target is not None:
+            return self._target_selector_is_current_player(target, player_name)
+
+        # target 键存在但值为 None：与省略同等对待（未知）
+        # 省略 target：按工具已知默认值推断，未知则 require approval
+        if tool_name in _TOOL_TARGET_DEFAULTS:
+            default = _TOOL_TARGET_DEFAULTS[tool_name]
+            if default in {"@s", "self"}:
                 return True
+            # 默认 @a / multi 等 → 非当前玩家
+            return self._target_selector_is_current_player(default, player_name)
+
+        # send_* 展示类（有 broadcast、无 target）：默认只发给触发玩家
+        if tool_name in {
+            "send_game_message",
+            "send_colored_message",
+            "send_title_message",
+            "send_actionbar_message",
+        }:
+            # broadcast 已在上方处理 True；省略或 false 视为当前玩家
             return True
 
+        # 无 target 概念的其它 MEDIUM 工具（send_script_event、fetch_url_text 等）
+        if tool_name in _MEDIUM_SAFE_AUTO_ALLOW_NO_TARGET:
+            return True
+        return False
+
+    @staticmethod
+    def _target_selector_is_current_player(
+        target: Any,
+        player_name: str | None,
+    ) -> bool:
         if not isinstance(target, str):
             return False
         target_text = target.strip()

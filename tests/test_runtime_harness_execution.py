@@ -112,6 +112,95 @@ def test_policy_high_risk_requires_approval() -> None:
     assert approved.action == PolicyDecisionKind.ALLOW
 
 
+def test_medium_inventory_missing_target_requires_approval() -> None:
+    """省略 target 时工具默认 @a，不得当作当前玩家自动允许。"""
+    engine = PolicyEngine.from_settings(_Settings())
+
+    omitted = engine.decide("get_inventory_snapshot", {}, player_name="Steve")
+    assert omitted.action == PolicyDecisionKind.REQUIRE_APPROVAL
+
+    explicit_all = engine.decide(
+        "get_inventory_snapshot",
+        {"target": "@a"},
+        player_name="Steve",
+    )
+    assert explicit_all.action == PolicyDecisionKind.REQUIRE_APPROVAL
+
+    self_target = engine.decide(
+        "get_inventory_snapshot",
+        {"target": "@s"},
+        player_name="Steve",
+    )
+    assert self_target.action == PolicyDecisionKind.ALLOW
+
+    named = engine.decide(
+        "get_inventory_snapshot",
+        {"target": "Steve"},
+        player_name="Steve",
+    )
+    assert named.action == PolicyDecisionKind.ALLOW
+
+    other = engine.decide(
+        "get_inventory_snapshot",
+        {"target": "Alex"},
+        player_name="Steve",
+    )
+    assert other.action == PolicyDecisionKind.REQUIRE_APPROVAL
+
+
+def test_medium_find_entities_omitted_target_allows_self_default() -> None:
+    """find_entities 默认 target=@s，省略时可自动允许。"""
+    engine = PolicyEngine.from_settings(_Settings())
+    decision = engine.decide(
+        "find_entities",
+        {"entity_type": "zombie"},
+        player_name="Steve",
+    )
+    assert decision.action == PolicyDecisionKind.ALLOW
+
+    multi = engine.decide(
+        "find_entities",
+        {"entity_type": "zombie", "target": "@a"},
+        player_name="Steve",
+    )
+    assert multi.action == PolicyDecisionKind.REQUIRE_APPROVAL
+
+
+def test_medium_send_colored_current_player_allows_broadcast_requires() -> None:
+    engine = PolicyEngine.from_settings(_Settings())
+    auto = engine.decide(
+        "send_colored_message",
+        {"message": "hi", "color": "§a"},
+        player_name="Steve",
+    )
+    assert auto.action == PolicyDecisionKind.ALLOW
+
+    broadcast = engine.decide(
+        "send_colored_message",
+        {"message": "hi", "color": "§a", "broadcast": True},
+        player_name="Steve",
+    )
+    assert broadcast.action == PolicyDecisionKind.REQUIRE_APPROVAL
+
+
+def test_medium_no_target_tools_require_approval() -> None:
+    """无 target/broadcast 的 MEDIUM 工具（如 send_script_event）默认审批。"""
+    engine = PolicyEngine.from_settings(_Settings())
+    decision = engine.decide(
+        "send_script_event",
+        {"content": "ping", "message_id": "server:data"},
+        player_name="Steve",
+    )
+    assert decision.action == PolicyDecisionKind.REQUIRE_APPROVAL
+
+    fetch = engine.decide(
+        "fetch_url_text",
+        {"url": "https://example.com"},
+        player_name="Steve",
+    )
+    assert fetch.action == PolicyDecisionKind.REQUIRE_APPROVAL
+
+
 @pytest.mark.asyncio
 async def test_low_risk_auto_executes_in_real_tool_chain() -> None:
     counter: dict[str, int] = {}

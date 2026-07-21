@@ -142,6 +142,26 @@ class ConnectionManager:
             # 清理提示词管理器中该连接下所有玩家的模板和变量状态
             get_prompt_manager().clear_connection(str(connection_id))
 
+            # 清理该连接下待审批工具调用（best-effort：runtime 关闭中不阻断注销）
+            try:
+                from services.agent.runtime import get_agent_runtime
+
+                cleared = get_agent_runtime().pending_approvals.clear_connection(
+                    str(connection_id)
+                )
+                if cleared:
+                    logger.info(
+                        "pending_approvals_cleared_on_disconnect",
+                        connection_id=str(connection_id),
+                        cleared=cleared,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "pending_approvals_clear_failed",
+                    connection_id=str(connection_id),
+                    error=str(exc),
+                )
+
             # 从消息代理注销
             self.broker.unregister_connection(connection_id)
 

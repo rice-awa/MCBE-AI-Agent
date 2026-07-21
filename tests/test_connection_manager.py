@@ -47,6 +47,111 @@ def test_unregister_should_resolve_pending_and_queued_command_futures() -> None:
     asyncio.run(_run())
 
 
+def test_unregister_should_clear_pending_approvals_for_connection() -> None:
+    async def _run() -> None:
+        import time
+
+        from pydantic_ai.messages import ToolCallPart
+        from pydantic_ai.tools import DeferredToolRequests
+
+        from services.agent.harness.approvals import PendingApproval
+        from services.agent.runtime import get_agent_runtime, set_agent_runtime, AgentRuntime
+
+        broker = MessageBroker()
+        manager = ConnectionManager(broker)
+        original_runtime = get_agent_runtime()
+        runtime = AgentRuntime()
+        set_agent_runtime(runtime)
+
+        state = ConnectionState()
+        other_state = ConnectionState()
+        state.response_queue = broker.register_connection(state.id)
+        other_state.response_queue = broker.register_connection(other_state.id)
+
+        connection_id = str(state.id)
+        other_connection_id = str(other_state.id)
+        now = time.time()
+        reqs = DeferredToolRequests(
+            approvals=[
+                ToolCallPart(
+                    tool_name="run_minecraft_command",
+                    args={"command": "x"},
+                    tool_call_id="tc1",
+                )
+            ]
+        )
+
+        try:
+            store = runtime.pending_approvals
+            store.put(
+                PendingApproval(
+                    approval_id="ap-conn",
+                    connection_id=connection_id,
+                    player_name="Steve",
+                    conversation_id="conv",
+                    run_id="r1",
+                    tool_call_id="tc1",
+                    tool_name="run_minecraft_command",
+                    normalized_args={"command": "x"},
+                    args_summary="command=x",
+                    args_hash="h",
+                    policy_version="v",
+                    messages=[],
+                    requests=reqs,
+                    provider="test",
+                    delivery="tellraw",
+                    use_context=True,
+                    broadcast_ai_chat=False,
+                    created_at=now,
+                    expires_at=now + 120,
+                )
+            )
+            store.put(
+                PendingApproval(
+                    approval_id="ap-other",
+                    connection_id=other_connection_id,
+                    player_name="Alex",
+                    conversation_id="conv2",
+                    run_id="r2",
+                    tool_call_id="tc2",
+                    tool_name="run_minecraft_command",
+                    normalized_args={"command": "y"},
+                    args_summary="command=y",
+                    args_hash="h2",
+                    policy_version="v",
+                    messages=[],
+                    requests=reqs,
+                    provider="test",
+                    delivery="tellraw",
+                    use_context=True,
+                    broadcast_ai_chat=False,
+                    created_at=now,
+                    expires_at=now + 120,
+                )
+            )
+
+            manager._connections[state.id] = state
+            manager._connections[other_state.id] = other_state
+            manager._sender_tasks[state.id] = asyncio.create_task(asyncio.sleep(60))
+
+            await manager.unregister(state.id)
+
+            assert (
+                store.get(connection_id, "Steve", "conv", "ap-conn") is None
+            )
+            assert (
+                store.get(other_connection_id, "Alex", "conv2", "ap-other") is not None
+            )
+            assert manager.get_connection(state.id) is None
+        finally:
+            runtime.pending_approvals.clear()
+            set_agent_runtime(original_runtime)
+            if manager.get_connection(other_state.id) is not None:
+                await manager.unregister(other_state.id)
+
+    asyncio.run(_run())
+
+
 def test_unregister_should_clear_prompt_manager_state_for_all_players() -> None:
     async def _run() -> None:
         from services.agent.prompt import get_prompt_manager
