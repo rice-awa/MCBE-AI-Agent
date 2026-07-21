@@ -49,13 +49,13 @@ def test_build_player_message_uses_mcbe_event_shape() -> None:
 def test_dispatcher_returns_command_response_with_same_request_id() -> None:
     dispatcher = CommandRequestDispatcher(McbeCommandSimulator(player_name="fantong7038"))
 
-    responses = dispatcher.handle(_command_request("scriptevent mcbeai:ai_resp {}", "req-script"))
+    responses = dispatcher.handle(_command_request("scriptevent mcbews:text_resp {}", "req-script"))
     data = json.loads(responses[0])
 
     assert data["header"]["messagePurpose"] == "commandResponse"
     assert data["header"]["requestId"] == "req-script"
     assert data["body"]["statusCode"] == 0
-    assert data["body"]["statusMessage"] == "Script event mcbeai:ai_resp has been sent"
+    assert data["body"]["statusMessage"] == "Script event mcbews:text_resp has been sent"
 
 
 def test_give_command_response_matches_recorded_mcbe_shape() -> None:
@@ -205,7 +205,7 @@ def test_bridge_snapshot_capabilities_return_success_payloads() -> None:
     }
 
     responses = simulator.handle_command(
-        "scriptevent mcbeai:bridge_request " + json.dumps(bridge_payload, ensure_ascii=False),
+        "scriptevent mcbews:bridge_req " + json.dumps(bridge_payload, ensure_ascii=False),
         "req-bridge",
     )
     command_response = json.loads(responses[0])
@@ -213,8 +213,8 @@ def test_bridge_snapshot_capabilities_return_success_payloads() -> None:
 
     assert command_response["header"]["requestId"] == "req-bridge"
     assert command_response["body"]["statusCode"] == 0
-    assert bridge_event["body"]["sender"] == "MCBEAI_TOOL"
-    assert bridge_event["body"]["message"].startswith("MCBEAI|RESP|addon-req-1|1/1|")
+    assert bridge_event["body"]["sender"] == "MCBEWS_BRIDGE"
+    assert bridge_event["body"]["message"].startswith("MCBEWS|BRIDGE|addon-req-1|1/1|")
     encoded_payload = bridge_event["body"]["message"].split("|", 4)[4]
     payload = json.loads(encoded_payload)
     assert payload["ok"] is True

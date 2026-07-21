@@ -122,7 +122,7 @@ async def test_session_recorder_filters_tool_player_echoes(tmp_path: Path) -> No
         base_dir=tmp_path,
         mode="record",
         session_id="session-a",
-        ignored_echo_receivers={"MCBEAI_TOOL"},
+        ignored_echo_receivers={"MCBEWS_BRIDGE"},
     )
 
     filtered = await recorder.record_message(
@@ -131,7 +131,7 @@ async def test_session_recorder_filters_tool_player_echoes(tmp_path: Path) -> No
         message=json.dumps(
             {
                 "header": {"messagePurpose": "event", "eventName": "PlayerMessage"},
-                "body": {"sender": "外部", "receiver": "MCBEAI_TOOL", "message": "hello"},
+                "body": {"sender": "外部", "receiver": "MCBEWS_BRIDGE", "message": "hello"},
             },
             ensure_ascii=False,
         ),

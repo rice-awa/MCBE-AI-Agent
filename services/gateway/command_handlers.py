@@ -20,7 +20,8 @@ from models.messages import ChatRequest
 from services.auth.jwt_handler import JWTHandler
 from services.gateway.session_store import HostConnectionSession, HostSessionStore
 from services.gateway.ws_command_runner import WsCommandRunner
-from services.websocket.minecraft import MinecraftProtocolHandler, TellrawMessage
+from mcbe_ws_sdk import MinecraftProtocolHandler
+from mcbe_ws_sdk.gateway.handler import TellrawMessage
 
 logger = get_logger(__name__)
 

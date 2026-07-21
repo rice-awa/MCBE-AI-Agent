@@ -24,7 +24,7 @@ from services.gateway.command_handlers import CommandHandlers
 from services.gateway.hook import HostConnectionHook
 from services.gateway.session_store import HostSessionStore
 from services.gateway.ws_command_runner import WsCommandRunner
-from services.websocket.minecraft import MinecraftProtocolHandler
+from services.gateway.settings_map import build_protocol_handler
 
 
 class _FakeJwt:
@@ -98,7 +98,7 @@ def _build_hook(*, settings=None, jwt=None, broker=None):
     ws_commands = WsCommandRunner(flow, timeout=1.0)
     addon = MagicMock()
     bridge = BrokerResponseBridge(broker, flow, ws_commands)
-    protocol = MinecraftProtocolHandler(settings.minecraft)
+    protocol = build_protocol_handler(settings)
     handlers = CommandHandlers(
         broker,
         settings,

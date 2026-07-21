@@ -861,9 +861,14 @@ class AgentWorker:
         return run_command
 
     def _create_addon_bridge_client(self, connection_id: UUID):
-        """创建 addon 桥接客户端。"""
+        """创建 addon 桥接客户端。
+
+        Returns ``None`` when no ``AddonBridgeService`` was injected (unit tests
+        or hosts without addon tooling). Runtime ``cli.py serve`` always injects
+        the shared service from ``HostGatewayServer``.
+        """
         if self._addon is None:
-            raise RuntimeError("AddonBridgeService not configured")
+            return None
         return self._addon.create_client(
             connection_id=connection_id,
             send_command=self._create_command_callback(connection_id),

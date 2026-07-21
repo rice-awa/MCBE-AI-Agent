@@ -5,7 +5,7 @@ MCBE WebSocket 与 Addon bridge 模拟客户端。
 1. 先启动 MCBE AI Agent 服务，默认 WebSocket 地址为 ws://127.0.0.1:8080。
 2. simulate-client 会模拟 Minecraft/Addon 客户端连接服务端，发送玩家 PlayerMessage。
 3. 模拟器会接收服务端 commandRequest，并自动回传对应 commandResponse。
-4. 对 scriptevent mcbeai:bridge_request，模拟器会额外用 MCBEAI_TOOL 发送 MCBEAI|RESP|... bridge 响应分片。
+4. 对 scriptevent mcbews:bridge_req，模拟器会额外用 MCBEWS_BRIDGE 发送 MCBEWS|BRIDGE|... bridge 响应分片。
 5. replay-record-with-simulation 会从真实录制中提取玩家输入，再补齐 MCBE/Addon 响应闭环。
 6. inspect-record 可检查录制文件里的 commandRequest/commandResponse 配对情况。
 7. 运行真实 LLM 请求时建议加 --wait-after，避免请求未完成就提前断开。
@@ -30,7 +30,12 @@ from typing import Any
 
 import websockets
 
-from services.addon.protocol import BRIDGE_TOOL_PLAYER_NAME
+from mcbe_ws_sdk import MCBEWS_V1
+
+BRIDGE_TOOL_PLAYER_NAME = MCBEWS_V1.bridge_sender
+BRIDGE_REQUEST_MESSAGE_ID = MCBEWS_V1.bridge_request_message_id
+BRIDGE_RESPONSE_PREFIX = MCBEWS_V1.bridge_response_prefix
+TEXT_RESP_MESSAGE_ID = MCBEWS_V1.response_message_id
 from tools_mcbe_ws_recorder import PacketRecord, RecorderLogger, SessionRecorder, load_replay_packets, replay_delay
 
 MCBE_VERSION = 17104896
@@ -120,9 +125,9 @@ def build_command_response(request_id: str, body: dict[str, Any]) -> str:
 
 
 def command_kind(command_line: str) -> str:
-    if command_line.startswith("scriptevent mcbeai:bridge_request "):
+    if command_line.startswith("scriptevent mcbews:bridge_req "):
         return "scriptevent_bridge_request"
-    if command_line.startswith("scriptevent mcbeai:ai_resp "):
+    if command_line.startswith("scriptevent mcbews:text_resp "):
         return "scriptevent_ai_resp"
     if command_line.startswith("scriptevent "):
         return "scriptevent"
@@ -225,7 +230,7 @@ class AddonBridgeSimulator:
         encoded_payload = json.dumps(response_payload, ensure_ascii=False, separators=(",", ":"))
         return build_player_message(
             BRIDGE_TOOL_PLAYER_NAME,
-            f"MCBEAI|RESP|{request_id}|1/1|{encoded_payload}",
+            f"{BRIDGE_RESPONSE_PREFIX}|{request_id}|1/1|{encoded_payload}",
             message_type="chat",
         )
 
@@ -297,13 +302,13 @@ class McbeCommandSimulator:
         self.emit_say_event = emit_say_event
 
     def handle_command(self, command_line: str, request_id: str) -> list[str]:
-        if command_line.startswith("scriptevent mcbeai:bridge_request "):
+        if command_line.startswith("scriptevent mcbews:bridge_req "):
             return self._handle_bridge_request(command_line, request_id)
-        if command_line.startswith("scriptevent mcbeai:ai_resp "):
+        if command_line.startswith("scriptevent mcbews:text_resp "):
             return [
                 build_command_response(
                     request_id,
-                    {"statusCode": 0, "statusMessage": "Script event mcbeai:ai_resp has been sent"},
+                    {"statusCode": 0, "statusMessage": "Script event mcbews:text_resp has been sent"},
                 )
             ]
         if command_line.startswith("scriptevent "):
@@ -334,7 +339,7 @@ class McbeCommandSimulator:
         return [build_command_response(request_id, self.command_result_for(command_line))]
 
     def _handle_bridge_request(self, command_line: str, request_id: str) -> list[str]:
-        raw_payload = command_line.removeprefix("scriptevent mcbeai:bridge_request ")
+        raw_payload = command_line.removeprefix("scriptevent mcbews:bridge_req ")
         try:
             payload = json.loads(raw_payload)
         except json.JSONDecodeError:
@@ -347,7 +352,7 @@ class McbeCommandSimulator:
         return [
             build_command_response(
                 request_id,
-                {"statusCode": 0, "statusMessage": "Script event mcbeai:bridge_request has been sent"},
+                {"statusCode": 0, "statusMessage": "Script event mcbews:bridge_req has been sent"},
             ),
             self.addon_bridge.handle_request(payload),
         ]

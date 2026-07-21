@@ -15,10 +15,13 @@ from services.gateway.broker_bridge import BrokerResponseBridge
 from services.gateway.command_handlers import CommandHandlers
 from services.gateway.hook import HostConnectionHook
 from services.gateway.session_store import HostSessionStore
-from services.gateway.settings_map import build_command_registry, build_gateway_settings
+from services.gateway.settings_map import (
+    build_command_registry,
+    build_gateway_settings,
+    build_protocol_handler,
+)
 from services.gateway.sink import HostResponseSink
 from services.gateway.ws_command_runner import WsCommandRunner
-from services.websocket.minecraft import MinecraftProtocolHandler
 
 logger = get_logger(__name__)
 
@@ -52,7 +55,8 @@ class HostGatewayServer:
             profile=self._gateway_settings.addon.profile,
             log_raw=settings.enable_ws_raw_log,
         )
-        self._protocol = MinecraftProtocolHandler(settings.minecraft)
+        self._registry = build_command_registry(settings)
+        self._protocol = build_protocol_handler(settings, registry=self._registry)
         self._handlers = CommandHandlers(
             broker,
             settings,
@@ -80,7 +84,6 @@ class HostGatewayServer:
             self._gateway_settings.flow,
             log_raw_payloads=settings.enable_ws_raw_log,
         )
-        self._registry = build_command_registry(settings)
         self._facade = McbeServerFacade(
             settings=self._gateway_settings,
             hook=self._hook,

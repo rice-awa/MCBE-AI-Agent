@@ -1,10 +1,10 @@
 import type { ScriptEventCommandMessageAfterEvent } from "@minecraft/server";
 import { system } from "@minecraft/server";
 
-import { BRIDGE_MESSAGE_ID } from "./constants";
+import { BRIDGE_MESSAGE_ID, BRIDGE_REQUEST_MESSAGE_ID } from "./constants";
 
 let isBridgeRouterRegistered = false;
-export { BRIDGE_MESSAGE_ID };
+export { BRIDGE_MESSAGE_ID, BRIDGE_REQUEST_MESSAGE_ID };
 
 type BridgeCapabilityHandler = (
   event: ScriptEventCommandMessageAfterEvent,

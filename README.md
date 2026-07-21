@@ -356,7 +356,7 @@ npm run local-deploy
 AGENT 聊天 请读取我的玩家状态并告诉我当前位置
 ```
 
-3. Python 侧应向游戏发送 `scriptevent mcbeai:bridge_request <json>`。
+3. Python 侧应向游戏发送 `scriptevent mcbews:bridge_req <json>`。
 4. Addon 侧处理后，会驱动 `MCBEAI_TOOL` 以聊天分片形式回传 `MCBEAI|RESP|...`。
 5. Python 侧会在 WebSocket `PlayerMessage` 事件流中拦截这些分片并完成重组，最终把工具结果继续交给 Agent。
 
@@ -387,7 +387,7 @@ AGENT 聊天 请读取我的玩家状态并告诉我当前位置
 - Python 侧通过 WebSocket `PlayerMessage` 事件流拦截桥接分片，因此桥接能力依赖聊天事件正常上送。
 - `run_world_command` 在当前本地依赖版本下基于同步 `runCommand` 实现，不是异步命令管线。
 - 第一阶段 UI 不新增 Addon -> Python 专用上行协议，也不伪造真实玩家聊天事件；如果 UI 消息没有进入 Python，请按面板提示手动发送等价聊天命令。
-- 响应同步尚未启用，统计中的响应片段数会保持为 0；后续可通过 `scriptevent mcbeai:ui_event <json>` 接入 Python -> Addon UI 同步。
+- 响应同步尚未启用，统计中的响应片段数会保持为 0；后续可通过 `scriptevent mcbews:text_resp <json>` 接入 Python -> Addon UI 同步。
 
 ## Termux 部署指南
 
@@ -838,7 +838,7 @@ chat_agent.tool(your_tool)
 
 ### 自定义命令
 
-在 `services/websocket/minecraft.py` 的 `COMMANDS` 中添加：
+在 `config.json` 的 `minecraft.commands`（及默认命令配置）中添加：
 
 ```python
 COMMANDS = {

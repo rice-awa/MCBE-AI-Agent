@@ -8,6 +8,8 @@ from mcbe_ws_sdk import (
     FlowControlSettings,
     GatewaySettings,
     McbewsV1Profile,
+    MessageSurfaceConfig,
+    MinecraftProtocolHandler,
     WebsocketTransportConfig,
 )
 
@@ -69,3 +71,29 @@ def build_gateway_settings(settings: Settings) -> GatewaySettings:
 def build_command_registry(settings: Settings) -> CommandRegistry:
     """Construct SDK ``CommandRegistry`` from ``settings.minecraft.commands``."""
     return CommandRegistry(commands_config=settings.minecraft.commands)
+
+def build_message_surface(settings: Settings) -> MessageSurfaceConfig:
+    """Map host ``settings.minecraft`` presentation strings onto SDK surface."""
+    mc = settings.minecraft
+    return MessageSurfaceConfig(
+        welcome_message_template=mc.welcome_message_template,
+        error_prefix=mc.error_prefix,
+        info_prefix=mc.info_prefix,
+        success_prefix=mc.success_prefix,
+        error_color=mc.error_color,
+        info_color=mc.info_color,
+        success_color=mc.success_color,
+    )
+
+
+def build_protocol_handler(
+    settings: Settings,
+    *,
+    registry: CommandRegistry | None = None,
+) -> MinecraftProtocolHandler:
+    """Build SDK ``MinecraftProtocolHandler`` for welcome/status tellraw rendering."""
+    return MinecraftProtocolHandler(
+        registry if registry is not None else build_command_registry(settings),
+        build_message_surface(settings),
+    )
+

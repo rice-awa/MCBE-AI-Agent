@@ -4,14 +4,14 @@
 1. 先启动 MCBE AI Agent 服务，默认 WebSocket 地址为 ws://127.0.0.1:8080。
 2. 启动录制代理后，在 Minecraft 中连接代理地址，而不是直接连接服务端。
 3. 录制结果会写入输出目录下的时间戳会话目录，包含 packets.jsonl、packets.json 和 SUMMARY.md。
-4. record 默认过滤 receiver=MCBEAI_TOOL 的 PlayerMessage 回声；如需调整可使用 --filter-echo-receiver。
+4. record 默认过滤 receiver=MCBEWS_BRIDGE 的 PlayerMessage 回声；如需调整可使用 --filter-echo-receiver。
 5. replay-server 只回放录制文件中的 client_to_server 文本包，适合复现玩家输入侧数据流。
 
 示例命令：
 - 启动服务端：python cli.py serve
 - 启动录制代理：python tools_mcbe_ws_recorder.py record --listen-host 0.0.0.0 --listen-port 18080 --target ws://127.0.0.1:8080
 - Minecraft 连接代理：/wsserver <本机或服务器IP>:18080
-- 指定多个回声接收者过滤：python tools_mcbe_ws_recorder.py record --filter-echo-receiver MCBEAI_TOOL --filter-echo-receiver SomeBot
+- 指定多个回声接收者过滤：python tools_mcbe_ws_recorder.py record --filter-echo-receiver MCBEWS_BRIDGE --filter-echo-receiver SomeBot
 - 关闭默认回声过滤：python tools_mcbe_ws_recorder.py record --filter-echo-receiver ""
 - 回放录制文件：python tools_mcbe_ws_recorder.py replay-server --input test_logs/ws_records/<session>/packets.jsonl --target ws://127.0.0.1:8080 --speed 1.0
 """
@@ -547,7 +547,7 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument(
         "--filter-echo-receiver",
         action="append",
-        default=["MCBEAI_TOOL"],
+        default=["MCBEWS_BRIDGE"],
         help="过滤指定 receiver 的 PlayerMessage 回声；可重复传入，传空字符串关闭默认过滤",
     )
 

@@ -22,7 +22,7 @@ from services.gateway.broker_bridge import BrokerResponseBridge
 from services.gateway.command_handlers import CommandHandlers
 from services.gateway.session_store import HostSessionStore
 from services.gateway.ws_command_runner import WsCommandRunner
-from services.websocket.minecraft import MinecraftProtocolHandler
+from mcbe_ws_sdk import MinecraftProtocolHandler
 
 logger = get_logger(__name__)
 
@@ -90,11 +90,18 @@ class HostConnectionHook(NoOpHook):
                 message="开发模式: 自动认证",
             )
 
-        welcome_text = self.protocol.create_welcome_message(
-            connection_id=str(state.id),
-            model=self.settings.get_provider_config().model,
+        help_prefix = (
+            self.protocol.command_registry.get_command_prefix("help") or "帮助"
+        )
+        mc = self.settings.minecraft
+        welcome_text = mc.welcome_message_template.format(
+            version=getattr(self.settings, "version", "")
+            or __import__("_version", fromlist=["__version__"]).__version__,
+            connection_id=str(state.id)[:8],
             provider=self.settings.default_provider,
-            context_enabled=True,
+            model=self.settings.get_provider_config().model,
+            context_status=mc.context_enabled_text,
+            help_command=help_prefix,
         )
         welcome = self.protocol.create_info_message(welcome_text)
         if state.send_payload is not None:

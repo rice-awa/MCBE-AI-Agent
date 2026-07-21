@@ -29,51 +29,56 @@ python cli.py info
 ## Architecture
 
 ```
-Minecraft Client ←→ WebSocket Server ←→ Message Broker ←→ Agent Worker (PydanticAI)
-                              ↑                    ↑
-                         Connection          Request/Response
-                         Manager              Queues
+Minecraft Client
+      │ /wsserver
+      ▼
+McbeServerFacade (mcbe-ws-sdk)
+  ├─ HostConnectionHook → MessageBroker / 鉴权 / 命令
+  ├─ HostResponseSink + BrokerResponseBridge → 出站 tellraw / scriptevent / mcbews:text_resp
+  └─ AddonBridgeService (mcbews v1)
+      ▼
+Message Broker ←→ Agent Worker (PydanticAI)
 ```
 
 核心设计：
-- **非阻塞**: WebSocket 处理与 LLM 请求完全分离
-- **消息队列**: asyncio.Queue 实现生产者-消费者模式
+- **SDK 传输**: 运行时 WebSocket / 分片 / 桥协议由 `mcbe-ws-sdk` 拥有；宿主只实现 `services/gateway/` 适配层
+- **非阻塞**: 钩子内禁止 await LLM / 桥 RTT；一律 `asyncio.create_task`
+- **消息队列**: asyncio.Queue 生产者-消费者；LLM 与连接完全分离
 - **类型安全**: Pydantic 进行数据验证和配置管理
-- **多人会话隔离**: MCBE 单个 `/wsserver` 连接可承载多个玩家，历史、锁、上下文、模型、模板和变量均按 `(connection_id, player_name)` 分桶
-- **统一流控**: 所有下行长文本统一经过 FlowControlMiddleware 分片，避免 MCBE 拒绝超长 commandRequest
+- **多人会话隔离**: 身份只用 `event.sender` / 显式 `player_name`；历史、锁、上下文按 `(connection_id, player_name)` 分桶（`HostSessionStore`）
+- **统一流控**: 出站长文本走 SDK `FlowControlSettings` / `McbeOutboundDelivery` / `McbewsV1Delivery`
+- **线协议**: 仅 **mcbews v1**（`mcbews:bridge_req` / `mcbews:text_resp` / `MCBEWS|*`）；禁止运行时 `mcbeai:*`
 
-## Flow Control Middleware
+## Flow Control (via mcbe-ws-sdk)
 
-`services/websocket/flow_control.py` 是出站消息的统一流控中间件，负责把长文本拆分为 MCBE 可安全接受的命令负载。
+出站长文本由 SDK `FlowControlSettings` + `McbeOutboundDelivery` 分片，避免 MCBE 拒绝超长 `commandRequest`。
 
-- `chunk_tellraw()`：拆分游戏内可见的 `tellraw` 文本。
-- `chunk_scriptevent()`：拆分 Addon/脚本事件 `scriptevent` 载荷。
-- `chunk_ai_response()`：生成 `mcbeai:ai_resp` 分片事件，客户端按 `id/i/n/p/r/c` 元数据重组。
-- `chunk_raw_command()`：只包装原始命令，不做语义不安全的截断；超长时抛出 `ValueError`。
-- `chunk_delay_for()`：统一提供 tellraw、scriptevent、AI 响应等场景的分片发送间隔。
+- tellraw / scriptevent 分片：`McbeOutboundDelivery`
+- AI / UI 文本同步：`McbewsV1Delivery` → `mcbews:text_resp`
+- 宿主侧不要再手写 `commandLine` 分片
 
-流控参数全部可通过设置配置：
+流控参数（`config.json` → 映射到 SDK）：
 
-- `flow_control.command_line_byte_budget`（默认 461）：MCBE `commandLine` 实测安全字节上限
-- `flow_control.max_chunk_content_length`（默认 400）：单条消息内容字符上限
-- `flow_control.chunk_sentence_mode`（默认 true）：是否优先按句子语义分片
-- `flow_control.chunk_delays.tellraw / scriptevent / ai_resp / ai_resp_prelude`（默认 0.05 / 0.05 / 0.15 / 0.5）：各场景分片发送间隔
-- `flow_control.non_stream_batch_max_chars`（默认 150）：非流式模式下每批发送最大字符数
-- `flow_control.non_stream_send_delay`（默认 0.1）：非流式模式下批次间发送间隔
+- `flow_control.command_line_byte_budget`（默认 461）
+- `flow_control.max_chunk_content_length`（默认 400）
+- `flow_control.chunk_sentence_mode`（默认 true）
+- `flow_control.chunk_delays.tellraw / scriptevent / text_resp / text_resp_prelude`
+  - 旧键 `ai_resp` / `ai_resp_prelude` 仍可从 JSON 读入并映射到 `text_resp*`
+- `flow_control.non_stream_batch_max_chars` / `non_stream_send_delay`（宿主非流式批处理）
 
-新增下行发送路径时应复用该中间件，不要在调用点重复实现分片逻辑。
+新增下行发送路径应走 `BrokerResponseBridge` 或 SDK delivery，不要复制分片逻辑。
 
 ## Multiplayer Session Isolation
 
-MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多名玩家会共享同一个 `connection_id`。因此所有玩家相关状态必须显式携带并使用当前消息的 `sender` / `player_name`，不能把 `ConnectionState.player_name` 当作会话身份来源。
+MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多名玩家会共享同一个 `connection_id`。因此所有玩家相关状态必须显式携带并使用当前消息的 `sender` / `player_name`。
 
-- `MessageBroker` 的对话历史和处理锁按 `(connection_id, player_name)` 隔离；同玩家请求串行，不同玩家可并行。
-- `ConnectionState.get_player_session(player_name)` 管理每名玩家独立的 `context_enabled`、`current_provider`、`current_template` 和 `custom_variables`。
-- `PromptManager` 的模板和变量按玩家分桶；旧的 connection 级 API 仅作为匿名玩家桶兼容层。
-- 注销连接时需要清理该连接下的所有玩家会话，优先使用 `clear_connection_sessions()`。
-- 新增聊天、UI、上下文、模板、变量或切换模型路径时，必须从本次事件传递 `player_name`，避免多人串上下文或响应推送到错误玩家。
+- **禁止**用 SDK `ConnectionState.player_name` 做业务分支（该属性在 SDK 侧为只读，且不代表多人身份）。
+- `MessageBroker` 的对话历史和处理锁按 `(connection_id, player_name)` 隔离。
+- `HostSessionStore` / `HostConnectionSession.get_player_session(player_name)` 管理每名玩家的 `context_enabled`、`current_provider`、`current_template`、`custom_variables` 与 AI 广播开关。
+- `PromptManager` 的模板和变量按玩家分桶。
+- 断开连接时清理会话、bridge 循环、pending WS commands 与 addon client。
 
-参考修复说明：`claude_md/fix/MULTIPLAYER_SESSION_FIX.md`。
+参考：`claude_md/fix/MULTIPLAYER_SESSION_FIX.md`、`docs/addon-bridge-protocol.md`。
 
 ## Working Guidelines
 
@@ -90,19 +95,23 @@ MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多
 
 | File | Purpose |
 |------|---------|
-| `cli.py` | 应用入口，CLI 命令组 |
-| `config/settings.py` | Pydantic Settings 配置管理 |
-| `core/queue.py` | MessageBroker 消息队列；对话历史和会话锁按 `(connection_id, player_name)` 隔离 |
-| `models/constants.py` | 跨模块共享的语义常量（默认玩家键、对话 ID、显示名），由 `core/session.py` 导出 |
-| `core/conversation.py` | 对话历史压缩、保存和恢复，按玩家会话桶读写 |
+| `cli.py` | 应用入口；组装 `HostGatewayServer` + AgentWorkers |
+| `config/settings.py` | Pydantic Settings；协议默认 mcbews；`text_resp*` 流控键 |
+| `core/queue.py` | MessageBroker；历史/锁按 `(connection_id, player_name)` |
+| `models/constants.py` | 默认玩家键 / 对话 ID / 显示名 |
+| `core/conversation.py` | 对话压缩、保存和恢复 |
+| `services/gateway/server.py` | `HostGatewayServer`：SDK Facade 生命周期 |
+| `services/gateway/hook.py` | `HostConnectionHook`：连接与命令路由（非阻塞） |
+| `services/gateway/command_handlers.py` | 游戏内命令业务 |
+| `services/gateway/broker_bridge.py` | Broker 响应 → SDK 出站 |
+| `services/gateway/ws_command_runner.py` | WS `commandRequest` 关联 |
+| `services/gateway/session_store.py` | 宿主会话 / 登录态 / 玩家桶 |
+| `services/gateway/settings_map.py` | Settings → SDK GatewaySettings |
 | `services/agent/core.py` | PydanticAI Agent 核心 |
-| `services/agent/providers.py` | LLM Provider 注册表 |
-| `services/agent/prompt.py` | 系统提示词、模板和变量管理；模板/变量按玩家会话隔离 |
-| `services/agent/worker.py` | Agent Worker，消费队列请求；按玩家锁串行化同一玩家请求 |
-| `services/websocket/server.py` | WebSocket 服务器；每条玩家消息必须直传当前 `sender` |
-| `services/websocket/connection.py` | 连接管理；`PlayerSession` 保存玩家级上下文、模型、模板和变量 |
-| `services/websocket/flow_control.py` | 统一流控中间件，负责出站长文本分片与字节安全校验 |
-| `services/agent/tools.py` | Agent Tools (MC命令执行、MCWiki搜索) |
+| `services/agent/worker.py` | 消费队列；注入 SDK `AddonBridgeService` |
+| `services/agent/tools.py` | Agent Tools |
+| `mcbe-ws-sdk/` | 可编辑 path 依赖（gitignore；勿改源码除非另开 SDK PR） |
+| `docs/addon-bridge-protocol.md` | mcbews 桥协议说明 |
 
 ## Supported LLM Providers
 
@@ -142,7 +151,7 @@ MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多
 - `agent.agent_retries` / `agent.worker_http_timeout` / `agent.worker_poll_timeout` / `agent.run_command_timeout` / `agent.system_prompt` / `agent.max_history_turns` / `agent.compression_*` / `agent.stream_sentence_mode` / `agent.llm_warmup_enabled`
 - `queue.llm_worker_count` / `queue.max_size`
 - `flow_control.command_line_byte_budget` / `flow_control.chunk_delays.*` / `flow_control.non_stream_*` / `flow_control.max_chunk_content_length` / `flow_control.chunk_sentence_mode`
-- `addon.protocol.bridge_message_id` / `bridge_prefix` / `ui_chat_prefix` / `bridge_tool_player_name` / `ai_resp_message_id`
+- `addon.protocol.*`（文档镜像；运行时强制 mcbews v1，旧 mcbeai 值会被忽略）
 - `storage.conversations_dir` / `storage.tokens_file`
 - `logging.level` / `logging.enable_file_logging` / `logging.log_dir` / `logging.files.*` / `logging.rotation_*`
 - `mcp.enabled` / `mcp.servers`

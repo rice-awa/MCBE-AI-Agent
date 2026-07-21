@@ -1,5 +1,5 @@
 """服务层模块"""
 
-from . import agent, auth, websocket
+from . import agent, auth, gateway
 
-__all__ = ["agent", "auth", "websocket"]
+__all__ = ["agent", "auth", "gateway"]
