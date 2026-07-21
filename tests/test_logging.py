@@ -153,3 +153,70 @@ def test_setup_logging_skips_log_dir_when_file_logging_disabled(tmp_path: Path) 
     setup_logging(settings)
     assert not _all_file_handlers()
     assert not log_dir.exists()
+
+
+def test_raw_log_settings_default_to_false() -> None:
+    """Task4a：enable_ws_raw_log / enable_llm_raw_log 默认关闭。"""
+    settings = Settings()
+    assert settings.enable_ws_raw_log is False
+    assert settings.enable_llm_raw_log is False
+
+
+def test_llm_raw_log_disabled_does_not_install_hooks_or_read_body(monkeypatch) -> None:
+    """关闭 raw 日志时不安装 event_hooks，因此不会读取 response body。"""
+    from config.settings import LLMProviderConfig
+    from services.agent.providers import RuntimeAdapterRegistry
+
+    monkeypatch.setattr(
+        RuntimeAdapterRegistry,
+        "_is_llm_raw_log_enabled",
+        staticmethod(lambda: False),
+    )
+    registry = RuntimeAdapterRegistry()
+    config = LLMProviderConfig(name="deepseek", model="test-model", timeout=5)
+
+    # 显式禁用：即使 settings 被误开，override 也应关闭
+    client = registry._create_llm_http_client(
+        config,
+        "deepseek",
+        enable_llm_raw_log=False,
+    )
+    try:
+        hooks = client.event_hooks
+        assert hooks.get("request", []) == []
+        assert hooks.get("response", []) == []
+    finally:
+        # 不 await；关闭连接池即可，避免事件循环依赖
+        client._transport = None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_llm_raw_log_enabled_does_not_force_aread(monkeypatch) -> None:
+    """开启 raw 时仅读取已缓冲 body，不调用 response.aread()。"""
+    from config.settings import LLMProviderConfig
+    from services.agent.providers import RuntimeAdapterRegistry
+
+    registry = RuntimeAdapterRegistry()
+    config = LLMProviderConfig(name="deepseek", model="test-model", timeout=5)
+    client = registry._create_llm_http_client(
+        config,
+        "deepseek",
+        enable_llm_raw_log=True,
+    )
+    try:
+        hooks = client.event_hooks.get("response", [])
+        assert len(hooks) == 1
+        on_response = hooks[0]
+
+        class _Resp:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+            request = type("R", (), {"url": "https://example.test/v1/chat"})()
+            _content = False  # 未缓冲
+
+            async def aread(self):  # pragma: no cover - must not be called
+                raise AssertionError("aread must not be called when body is unread")
+
+        await on_response(_Resp())
+    finally:
+        await client.aclose()

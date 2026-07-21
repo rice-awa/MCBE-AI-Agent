@@ -207,6 +207,7 @@ class AgentWorker:
                 connection_id=str(connection_id),
                 player=request.player_name,
                 conversation_id=request.conversation_id,
+                run_id=run_id,
                 history_message_count=len(message_history),
                 cleared_reasoning_content_count=cleared_count,
             )
@@ -311,6 +312,7 @@ class AgentWorker:
                 "using_provider",
                 provider=provider_name,
                 model=provider_config.model,
+                run_id=run_id,
             )
 
         except Exception as e:
@@ -503,6 +505,7 @@ class AgentWorker:
                                     connection_id=str(connection_id),
                                     player=request.player_name,
                                     conversation_id=request.conversation_id,
+                                    run_id=run_id,
                                 )
 
                     response_text = "".join(response_parts)

@@ -70,7 +70,8 @@
       "hard_deny_command_roots": ["op", "deop", "stop", "whitelist", "permission", "wsserver"],
       "mcp_tool_allowlist": [],
       "tool_policy_version": "2026-07-21.1"
-    }
+    },
+    "pydantic_ai_instrumentation": false
   },
   "queue": {
     "max_size": 100,

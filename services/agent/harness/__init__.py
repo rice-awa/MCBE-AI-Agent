@@ -3,8 +3,14 @@
 from services.agent.harness.analyze import analyze_records, read_recent_records
 from services.agent.harness.approvals import PendingApproval, PendingApprovalStore
 from services.agent.harness.audit import (
+    AuditWriter,
     build_audit_record,
+    enqueue_audit_record,
+    flush_audit_writer,
+    get_audit_writer,
     preview_parameters,
+    start_audit_writer,
+    stop_audit_writer,
     summarize_result,
     wrap_registered_tools,
     wrap_tool_function,
@@ -39,11 +45,15 @@ from services.agent.harness.prompting import (
 
 __all__ = [
     "POLICY_VERSION",
+    "AuditWriter",
     "PendingApproval",
     "PendingApprovalStore",
     "analyze_records",
     "build_audit_record",
     "build_harness_capability",
+    "enqueue_audit_record",
+    "flush_audit_writer",
+    "get_audit_writer",
     "ParameterPreviewPolicy",
     "ToolCatalogEntry",
     "ToolIntent",
@@ -64,6 +74,8 @@ __all__ = [
     "render_tool_cards",
     "render_tool_decision_tree",
     "reset_idempotency_store",
+    "start_audit_writer",
+    "stop_audit_writer",
     "summarize_result",
     "wrap_registered_tools",
     "wrap_tool_function",

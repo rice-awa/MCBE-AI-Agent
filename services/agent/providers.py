@@ -1,7 +1,6 @@
 """LLM Provider 注册表"""
 
 import hashlib
-import json
 from typing import Any
 
 import httpx
@@ -11,6 +10,7 @@ from pydantic_ai.providers.deepseek import DeepSeekProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from config.logging import get_logger
+from config.redaction import format_body_for_log, redact_exception, sanitize_headers, sanitize_url
 from config.settings import LLMProviderConfig, Settings
 from core.exceptions import ProviderNotConfiguredError, ProviderNotFoundError
 
@@ -21,7 +21,7 @@ llm_raw_logger = get_logger("llm.raw")
 class RuntimeAdapterRegistry:
     """Owns LLM model adapters and their HTTP client lifecycle."""
 
-    _raw_body_max_chars = 20_000
+    _raw_body_max_chars = 2_000
 
     def __init__(self) -> None:
         self._model_cache: dict[str, Model] = {}
@@ -325,9 +325,12 @@ class RuntimeAdapterRegistry:
                 provider=provider_name,
                 model=config.model,
                 method=request.method,
-                url=str(request.url),
-                headers=self._sanitize_headers(dict(request.headers)),
-                body=self._format_raw_body(request.content),
+                url=sanitize_url(request.url),
+                headers=sanitize_headers(dict(request.headers)),
+                body=format_body_for_log(
+                    request.content,
+                    max_length=self._raw_body_max_chars,
+                ),
             )
 
         async def on_response(response: httpx.Response) -> None:
@@ -338,17 +341,17 @@ class RuntimeAdapterRegistry:
                 if raw is False or raw is None:
                     body = "<stream-or-unread-body-not-buffered>"
                 else:
-                    body = self._format_raw_body(raw)
+                    body = format_body_for_log(raw, max_length=self._raw_body_max_chars)
             except Exception as e:
-                body = f"<response_read_error: {str(e)}>"
+                body = f"<response_read_error: {redact_exception(e)}>"
 
             llm_raw_logger.info(
                 "llm_raw_response",
                 provider=provider_name,
                 model=config.model,
                 status_code=response.status_code,
-                url=str(response.request.url),
-                headers=self._sanitize_headers(dict(response.headers)),
+                url=sanitize_url(response.request.url),
+                headers=sanitize_headers(dict(response.headers)),
                 body=body,
             )
 
@@ -367,42 +370,12 @@ class RuntimeAdapterRegistry:
             return False
 
     def _format_raw_body(self, content: bytes | str | None) -> str | None:
-        if content is None:
-            return None
-
-        if isinstance(content, bytes):
-            text = content.decode("utf-8", errors="replace")
-        else:
-            text = str(content)
-
-        text = text.strip()
-        if not text:
-            return None
-
-        try:
-            parsed = json.loads(text)
-            text = json.dumps(parsed, ensure_ascii=False)
-        except Exception:
-            pass
-
-        if len(text) > self._raw_body_max_chars:
-            return (
-                text[: self._raw_body_max_chars]
-                + f"...<truncated:{len(text) - self._raw_body_max_chars}>"
-            )
-
-        return text
+        """兼容旧调用；统一走 shared redaction helper。"""
+        return format_body_for_log(content, max_length=self._raw_body_max_chars)
 
     @staticmethod
     def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
-        sensitive_keys = {"authorization", "api-key", "x-api-key"}
-        sanitized: dict[str, str] = {}
-        for key, value in headers.items():
-            if key.lower() in sensitive_keys:
-                sanitized[key] = "***"
-            else:
-                sanitized[key] = value
-        return sanitized
+        return sanitize_headers(headers)
 
 
 class ProviderRegistry:

@@ -257,6 +257,7 @@ REQUIRED_CONFIG_PATHS = (
     "agent.runtime_harness.hard_deny_command_roots",
     "agent.runtime_harness.mcp_tool_allowlist",
     "agent.runtime_harness.tool_policy_version",
+    "agent.pydantic_ai_instrumentation",
     "queue.max_size",
     "queue.llm_worker_count",
     "websocket.ping_interval",
@@ -479,6 +480,8 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["mcp_tool_allowlist"] = runtime_harness["mcp_tool_allowlist"]
     if "tool_policy_version" in runtime_harness:
         result["tool_policy_version"] = runtime_harness["tool_policy_version"]
+    if "pydantic_ai_instrumentation" in agent:
+        result["pydantic_ai_instrumentation"] = agent["pydantic_ai_instrumentation"]
 
     if "max_size" in queue:
         result["queue_max_size"] = queue["max_size"]
@@ -777,6 +780,10 @@ class Settings(BaseSettings):
     )
     mcp_tool_allowlist: list[str] = Field(default_factory=list)
     tool_policy_version: str = "2026-07-21.1"
+    # PydanticAI 原生 OpenTelemetry instrumentation 开关；默认关闭 exporter，
+    # 关闭时仍依赖 structlog 的 run_id 因果链。开启时 include_content=False，
+    # 避免把完整 prompt/completion 写入 trace。
+    pydantic_ai_instrumentation: bool = False
 
     # 队列配置
     queue_max_size: int = 100

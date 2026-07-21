@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from config.logging import get_logger
 from config.settings import Settings
 from services.agent.harness.approvals import PendingApprovalStore
+from services.agent.harness.audit import flush_audit_writer, start_audit_writer, stop_audit_writer
 from services.agent.model_metadata import ModelMetadataService
 from services.agent.providers import RuntimeAdapterRegistry
 
@@ -27,6 +28,7 @@ class AgentRuntime:
     mcp_manager: MCPManager | None = None
     model_metadata_service: ModelMetadataService | None = None
     pending_approvals: PendingApprovalStore = field(default_factory=PendingApprovalStore)
+    _audit_writer_started: bool = False
 
     def get_agent_manager(self) -> ChatAgentManager:
         if self.chat_agent_manager is None:
@@ -50,6 +52,12 @@ class AgentRuntime:
         return self.pending_approvals
 
     async def initialize(self, settings: Settings) -> bool:
+        # 审计 writer 生命周期由 runtime 持有；完整 shutdown 聚合留给 4c
+        try:
+            start_audit_writer(settings)
+            self._audit_writer_started = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("audit_writer_start_failed", error=str(e))
         await self.initialize_model_metadata(settings)
         await self.warmup_models(settings)
         mcp_manager = self.get_mcp_manager(settings)
@@ -90,7 +98,25 @@ class AgentRuntime:
         agent_manager = self.get_agent_manager()
         agent_manager.refresh_mcp_toolsets(mcp_manager.get_healthy_toolsets())
 
+    async def flush_audit(self, timeout: float = 5.0) -> None:
+        """刷新审计队列；失败只告警。"""
+        try:
+            flush_audit_writer(timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("audit_writer_flush_failed", error=str(e))
+
     async def shutdown(self) -> None:
+        # 4a：仅确保 audit writer flush/stop；完整错误聚合留给 4c
+        try:
+            if self._audit_writer_started:
+                stop_audit_writer()
+            else:
+                await self.flush_audit()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("audit_writer_shutdown_failed", error=str(e))
+        finally:
+            self._audit_writer_started = False
+
         if self.mcp_manager is not None:
             await self.mcp_manager.shutdown()
             self.mcp_manager = None

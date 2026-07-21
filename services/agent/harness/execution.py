@@ -22,7 +22,7 @@ from config.logging import get_logger
 from services.agent.harness.audit import (
     audit_enabled,
     build_audit_record,
-    write_audit_record,
+    enqueue_audit_record,
 )
 from services.agent.harness.catalog import (
     POLICY_VERSION,
@@ -641,6 +641,7 @@ class HarnessToolset(WrapperToolset[Any]):
         effective = settings or getattr(getattr(ctx, "deps", None), "settings", None)
         if not audit_enabled(effective):
             return
+        entry = get_tool_entry(tool_name)
         record = build_audit_record(
             tool_name=tool_name,
             parameters=parameters,
@@ -649,17 +650,15 @@ class HarnessToolset(WrapperToolset[Any]):
             duration_ms=duration_ms,
             result=result,
             exception=exception,
+            tool_call_id=getattr(ctx, "tool_call_id", None),
+            policy_version=(
+                entry.policy_version if entry is not None else self.policy.policy_version
+            ),
+            run_id=getattr(getattr(ctx, "deps", None), "run_id", None),
         )
-        # 补充策略版本
-        entry = get_tool_entry(tool_name)
-        record["policy_version"] = (
-            entry.policy_version if entry is not None else self.policy.policy_version
-        )
-        record["tool_call_id"] = getattr(ctx, "tool_call_id", None)
-        record["run_id"] = getattr(getattr(ctx, "deps", None), "run_id", None)
         path = getattr(effective, "runtime_harness_audit_path", "logs/runtime_harness_tools.jsonl")
         max_records = getattr(effective, "runtime_harness_audit_max_records", 5000)
-        write_audit_record(record, path, max_records)
+        enqueue_audit_record(record, path, max_records)
 
 
 @dataclass

@@ -61,6 +61,27 @@ class RunBudgetSettings(Protocol):
         ...
 
 
+def _resolve_instrumentation(settings: Any) -> Any:
+    """可配置的 PydanticAI instrumentation；默认关闭 exporter。
+
+    即使关闭，structlog 事件仍通过 deps.run_id 形成因果链。
+    开启时强制 include_content=False，禁止把完整正文写入 trace。
+    """
+    enabled = bool(getattr(settings, "pydantic_ai_instrumentation", False))
+    if not enabled:
+        return False
+    try:
+        from pydantic_ai.models.instrumented import InstrumentationSettings
+
+        return InstrumentationSettings(include_content=False, include_binary_content=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "pydantic_ai_instrumentation_unavailable",
+            error=str(exc),
+        )
+        return False
+
+
 def build_usage_limits(settings: Any, provider_name: str | None = None) -> UsageLimits:
     """从 Settings 构建 PydanticAI UsageLimits。
 
@@ -185,6 +206,7 @@ class ChatAgentManager:
         default_provider_config = settings.get_provider_config(settings.default_provider)
         harness_cap = build_harness_capability(settings)
         history_processor = build_context_history_processor(settings)
+        instrument = _resolve_instrumentation(settings)
         agent: Agent[AgentDependencies, str | DeferredToolRequests] = Agent(
             f"{settings.default_provider}:{default_provider_config.model}",  # 默认模型，运行时可覆盖
             deps_type=AgentDependencies,
@@ -195,6 +217,7 @@ class ChatAgentManager:
             max_concurrency=getattr(settings, "max_tool_concurrency", 4),
             capabilities=[harness_cap],
             history_processors=[history_processor],
+            instrument=instrument,
         )
 
         @agent.system_prompt
@@ -628,6 +651,7 @@ def _mark_mcp_failure_from_exception(exc: BaseException, diagnostic: str) -> Non
         "mcp_failure_without_server_evidence",
         error=diagnostic,
         servers=list(mcp_manager.servers.keys()),
+        # run_id 在调用侧日志补充；此处无 deps
     )
 
 
