@@ -34,3 +34,6 @@ test_logs/*
 
 data/*
 .pytest_cache
+
+mcbe-ws-sdk
+mcbe-ws-sdk/*
