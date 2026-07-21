@@ -39,9 +39,26 @@ DEFAULT_HARD_DENY_COMMAND_ROOTS: frozenset[str] = frozenset(
     {"op", "deop", "stop", "whitelist", "permission", "wsserver"}
 )
 DEFAULT_HARD_DENY_TOOLS: frozenset[str] = frozenset()
+DEFAULT_APPROVAL_COMMAND_ROOTS: frozenset[str] = frozenset(
+    {
+        "clear",
+        "clone",
+        "damage",
+        "fill",
+        "kill",
+        "replaceitem",
+        "setblock",
+        "structure",
+        "summon",
+    }
+)
 DEFAULT_MAX_BATCH_COMMANDS = 10
 DEFAULT_IDEMPOTENCY_TTL_SECONDS = 600.0
 DEFAULT_IDEMPOTENCY_MAX_ENTRIES = 2048
+
+_COMMAND_APPROVAL_TOOLS: frozenset[str] = frozenset(
+    {"run_minecraft_command", "run_minecraft_commands"}
+)
 
 # 省略 target 时的已知工具默认目标（与 tools.py 签名默认值对齐）。
 # 仅当默认明确是「当前玩家」时才可自动允许 MEDIUM；@a / 多目标默认必须审批。
@@ -204,6 +221,9 @@ class PolicyEngine:
     hard_deny_command_roots: frozenset[str] = field(
         default_factory=lambda: DEFAULT_HARD_DENY_COMMAND_ROOTS
     )
+    approval_command_roots: frozenset[str] = field(
+        default_factory=lambda: DEFAULT_APPROVAL_COMMAND_ROOTS
+    )
     max_batch_commands: int = DEFAULT_MAX_BATCH_COMMANDS
     mcp_tool_allowlist: frozenset[str] = field(default_factory=frozenset)
     policy_version: str = POLICY_VERSION
@@ -222,12 +242,17 @@ class PolicyEngine:
         # 内置 deny 集合不可被清空：始终并入默认根
         hard_roots |= set(DEFAULT_HARD_DENY_COMMAND_ROOTS)
 
+        approval_roots = set(DEFAULT_APPROVAL_COMMAND_ROOTS)
+        configured_approval_roots = getattr(settings, "approval_command_roots", None) or []
+        approval_roots.update(str(root).lower() for root in configured_approval_roots)
+
         allowlist = getattr(settings, "mcp_tool_allowlist", None) or []
         max_batch = int(getattr(settings, "max_batch_commands", DEFAULT_MAX_BATCH_COMMANDS) or DEFAULT_MAX_BATCH_COMMANDS)
         version = str(getattr(settings, "tool_policy_version", POLICY_VERSION) or POLICY_VERSION)
         return cls(
             hard_deny_tools=frozenset(hard_tools),
             hard_deny_command_roots=frozenset(hard_roots),
+            approval_command_roots=frozenset(approval_roots),
             max_batch_commands=max(1, max_batch),
             mcp_tool_allowlist=frozenset(str(x) for x in allowlist),
             policy_version=version,
@@ -251,7 +276,7 @@ class PolicyEngine:
             )
 
         # 命令根硬拒绝（适用于命令类参数）
-        denied_root = self._find_denied_command_root(tool_name, normalized_args)
+        denied_root = self._find_command_root(normalized_args, self.hard_deny_command_roots)
         if denied_root is not None:
             return PolicyDecision(
                 action=PolicyDecisionKind.DENY,
@@ -269,6 +294,30 @@ class PolicyEngine:
                     policy_version=self.policy_version,
                     metadata={"count": len(commands), "max": self.max_batch_commands},
                 )
+
+        approval_root = None
+        if tool_name in _COMMAND_APPROVAL_TOOLS:
+            approval_root = self._find_command_root(normalized_args, self.approval_command_roots)
+            if approval_root is not None:
+                if approved:
+                    return PolicyDecision(
+                        action=PolicyDecisionKind.ALLOW,
+                        reason=f"需审批命令根 '{approval_root}' 已获批准",
+                        policy_version=self.policy_version,
+                        metadata={"command_root": approval_root},
+                    )
+                return PolicyDecision(
+                    action=PolicyDecisionKind.REQUIRE_APPROVAL,
+                    reason=f"命令根 '{approval_root}' 需要玩家审批",
+                    policy_version=self.policy_version,
+                    metadata={"command_root": approval_root},
+                )
+
+            return PolicyDecision(
+                action=PolicyDecisionKind.ALLOW,
+                reason="命令根不在审批列表，自动允许",
+                policy_version=self.policy_version,
+            )
 
         # 未编目 MCP 工具：默认拒绝执行（且通常不会暴露）
         if entry is None:
@@ -338,7 +387,11 @@ class PolicyEngine:
             return True
         return tool_name in self.mcp_tool_allowlist
 
-    def _find_denied_command_root(self, tool_name: str, args: dict[str, Any]) -> str | None:
+    @staticmethod
+    def _find_command_root(
+        args: dict[str, Any],
+        command_roots: frozenset[str],
+    ) -> str | None:
         candidates: list[str] = []
         if "command" in args and isinstance(args["command"], str):
             candidates.append(args["command"])
@@ -347,7 +400,7 @@ class PolicyEngine:
             candidates.extend(c for c in commands if isinstance(c, str))
         for command in candidates:
             root = extract_command_root(command)
-            if root and root in self.hard_deny_command_roots:
+            if root and root in command_roots:
                 return root
         return None
 

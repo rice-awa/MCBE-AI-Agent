@@ -68,6 +68,7 @@
       "max_batch_commands": 10,
       "hard_deny_tools": [],
       "hard_deny_command_roots": ["op", "deop", "stop", "whitelist", "permission", "wsserver"],
+      "approval_command_roots": ["clear", "clone", "damage", "fill", "kill", "replaceitem", "setblock", "structure", "summon"],
       "mcp_tool_allowlist": [],
       "tool_policy_version": "2026-07-21.1"
     },

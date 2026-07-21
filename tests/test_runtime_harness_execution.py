@@ -45,15 +45,20 @@ class _Settings:
     runtime_harness_audit_max_records = 100
     hard_deny_tools: list[str] = []
     hard_deny_command_roots: list[str] = []
+    approval_command_roots: list[str] = ["a", "b"]
     max_batch_commands = 10
     mcp_tool_allowlist: list[str] = []
     tool_policy_version = "2026-07-21.1"
     approval_ttl = 120.0
 
 
-def _build_agent(side_effect_counter: dict[str, int] | None = None) -> Agent[_Deps, str | DeferredToolRequests]:
+def _build_agent(
+    side_effect_counter: dict[str, int] | None = None,
+    *,
+    policy_settings: Any | None = None,
+) -> Agent[_Deps, str | DeferredToolRequests]:
     counter = side_effect_counter if side_effect_counter is not None else {}
-    policy = PolicyEngine.from_settings(_Settings())
+    policy = PolicyEngine.from_settings(policy_settings or _Settings())
     agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
         "test",
         deps_type=_Deps,
@@ -95,18 +100,45 @@ def test_policy_low_risk_allows_and_hard_deny_blocks() -> None:
     assert "op" in deny.reason
 
 
-def test_policy_high_risk_requires_approval() -> None:
+def test_policy_only_configured_destructive_command_roots_require_approval() -> None:
     engine = PolicyEngine.from_settings(_Settings())
+
+    for command in ("give Steve diamond 1", "time set day"):
+        decision = engine.decide(
+            "run_minecraft_command",
+            {"command": command},
+            player_name="Steve",
+        )
+        assert decision.action == PolicyDecisionKind.ALLOW
+
     decision = engine.decide(
         "run_minecraft_command",
-        {"command": "time set day"},
+        {"command": "fill ~ ~ ~ ~1 ~1 ~1 air"},
         player_name="Steve",
     )
     assert decision.action == PolicyDecisionKind.REQUIRE_APPROVAL
+    assert decision.metadata["command_root"] == "fill"
 
     approved = engine.decide(
         "run_minecraft_command",
-        {"command": "time set day"},
+        {"command": "fill ~ ~ ~ ~1 ~1 ~1 air"},
+        player_name="Steve",
+        approved=True,
+    )
+    assert approved.action == PolicyDecisionKind.ALLOW
+
+
+def test_policy_batch_requires_approval_when_any_command_root_matches() -> None:
+    engine = PolicyEngine.from_settings(_Settings())
+    commands = {"commands": ["give Steve diamond 1", "setblock ~ ~ ~ air"]}
+
+    decision = engine.decide("run_minecraft_commands", commands, player_name="Steve")
+    assert decision.action == PolicyDecisionKind.REQUIRE_APPROVAL
+    assert decision.metadata["command_root"] == "setblock"
+
+    approved = engine.decide(
+        "run_minecraft_commands",
+        commands,
         player_name="Steve",
         approved=True,
     )
@@ -213,7 +245,7 @@ async def test_low_risk_auto_executes_in_real_tool_chain() -> None:
 
 
 @pytest.mark.asyncio
-async def test_high_risk_pauses_for_approval_without_side_effect() -> None:
+async def test_blacklisted_command_pauses_for_approval_without_side_effect() -> None:
     counter: dict[str, int] = {}
     agent = _build_agent(counter)
     deps = _Deps(settings=_Settings(), run_id="run-high")
@@ -227,6 +259,24 @@ async def test_high_risk_pauses_for_approval_without_side_effect() -> None:
     assert isinstance(result.output, DeferredToolRequests)
     assert result.output.approvals
     assert counter.get("run_minecraft_command", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_non_blacklisted_command_auto_executes_in_real_tool_chain() -> None:
+    counter: dict[str, int] = {}
+    settings = _Settings()
+    settings.approval_command_roots = []
+    agent = _build_agent(counter, policy_settings=settings)
+    deps = _Deps(settings=settings, run_id="run-command-auto")
+
+    result = await agent.run(
+        "run a normal command",
+        deps=deps,
+        model=TestModel(call_tools=["run_minecraft_command"]),
+    )
+
+    assert not isinstance(result.output, DeferredToolRequests)
+    assert counter.get("run_minecraft_command") == 1
 
 
 @pytest.mark.asyncio

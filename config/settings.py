@@ -262,6 +262,7 @@ REQUIRED_CONFIG_PATHS = (
     "agent.runtime_harness.max_batch_commands",
     "agent.runtime_harness.hard_deny_tools",
     "agent.runtime_harness.hard_deny_command_roots",
+    "agent.runtime_harness.approval_command_roots",
     "agent.runtime_harness.mcp_tool_allowlist",
     "agent.runtime_harness.tool_policy_version",
     "agent.pydantic_ai_instrumentation",
@@ -483,6 +484,8 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["hard_deny_tools"] = runtime_harness["hard_deny_tools"]
     if "hard_deny_command_roots" in runtime_harness:
         result["hard_deny_command_roots"] = runtime_harness["hard_deny_command_roots"]
+    if "approval_command_roots" in runtime_harness:
+        result["approval_command_roots"] = runtime_harness["approval_command_roots"]
     if "mcp_tool_allowlist" in runtime_harness:
         result["mcp_tool_allowlist"] = runtime_harness["mcp_tool_allowlist"]
     if "tool_policy_version" in runtime_harness:
@@ -822,6 +825,19 @@ class Settings(BaseSettings):
     hard_deny_tools: list[str] = Field(default_factory=list)
     hard_deny_command_roots: list[str] = Field(
         default_factory=lambda: ["op", "deop", "stop", "whitelist", "permission", "wsserver"]
+    )
+    approval_command_roots: list[str] = Field(
+        default_factory=lambda: [
+            "clear",
+            "clone",
+            "damage",
+            "fill",
+            "kill",
+            "replaceitem",
+            "setblock",
+            "structure",
+            "summon",
+        ]
     )
     mcp_tool_allowlist: list[str] = Field(default_factory=list)
     tool_policy_version: str = "2026-07-21.1"
