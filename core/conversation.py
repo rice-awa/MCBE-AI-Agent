@@ -726,33 +726,74 @@ class ConversationManager:
 
         return file_path
 
-    async def load_conversation(
+    @staticmethod
+    def _assert_owner(data: dict, player_name: str | None) -> str | None:
+        """校验持久化 owner 是否与请求者一致。
+
+        使用精确字符串匹配（与运行时 (connection_id, player_name) 分桶一致）。
+        缺少 player_name 的旧文件视为无主，仅当请求者也是 None 时允许访问。
+        """
+        owner = data.get("player_name")
+        if owner != player_name:
+            return "无权访问该会话：所有者不匹配"
+        return None
+
+    async def _read_session_data(
         self,
         session_id: str,
-    ) -> tuple[bool, list[ModelMessage] | str]:
-        """
-        从持久化存储加载对话
-
-        Args:
-            session_id: 会话 ID
-
-        Returns:
-            (是否成功, 对话历史或错误消息)
-        """
+    ) -> tuple[bool, dict | str, Path | None]:
+        """读取并解析会话文件；返回 (成功, 数据或错误, 文件路径)。"""
         try:
             file_path = self._get_session_file_path(session_id)
         except ValueError as e:
-            return False, str(e)
+            return False, str(e), None
 
         if not file_path.exists():
-            return False, f"会话不存在: {session_id}"
+            return False, f"会话不存在: {session_id}", None
 
         try:
             async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
                 content = await f.read()
-                data = json.loads(content)
+            return True, json.loads(content), file_path
+        except Exception as e:
+            logger.error(
+                "read_session_data_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return False, f"加载失败: {str(e)}", file_path
 
-            # 反序列化消息
+    async def load_conversation(
+        self,
+        session_id: str,
+        player_name: str | None,
+    ) -> tuple[bool, list[ModelMessage] | str]:
+        """
+        从持久化存储加载对话（要求请求者与持久化 owner 一致）。
+
+        Args:
+            session_id: 会话 ID
+            player_name: 请求者玩家名（owner 校验）
+
+        Returns:
+            (是否成功, 对话历史或错误消息)
+        """
+        success, data_or_error, _file_path = await self._read_session_data(session_id)
+        if not success:
+            return False, data_or_error
+
+        data = data_or_error
+        owner_error = self._assert_owner(data, player_name)
+        if owner_error:
+            logger.warning(
+                "load_conversation_owner_mismatch",
+                session_id=session_id,
+                requester=player_name,
+                owner=data.get("player_name"),
+            )
+            return False, owner_error
+
+        try:
             messages = ModelMessagesTypeAdapter.validate_json(
                 json.dumps(data["messages"])
             )
@@ -760,6 +801,7 @@ class ConversationManager:
             logger.info(
                 "conversation_loaded",
                 session_id=session_id,
+                player=player_name,
                 message_count=len(messages),
             )
 
@@ -781,17 +823,19 @@ class ConversationManager:
         conversation_id: str | None = None,
     ) -> tuple[bool, str]:
         """
-        恢复对话到指定连接
+        恢复对话到指定连接的玩家桶。
+
+        仅当持久化 owner 与 player_name 一致时允许恢复，防止跨玩家注入历史。
 
         Args:
             connection_id: 连接 ID
             session_id: 会话 ID
-            player_name: 玩家名（恢复到该玩家的桶里）
+            player_name: 玩家名（恢复到该玩家的桶，同时用于 owner 校验）
 
         Returns:
             (是否成功, 消息)
         """
-        success, result = await self.load_conversation(session_id)
+        success, result = await self.load_conversation(session_id, player_name)
 
         if not success:
             return False, result
@@ -802,7 +846,7 @@ class ConversationManager:
         if bump_epoch is not None:
             bump_epoch(connection_id, player_name, conversation_id)
 
-        # 设置到 broker（按 player_name 分桶）
+        # 设置到 broker（按 player_name 分桶；owner 已校验）
         self.broker.set_conversation_history(connection_id, player_name, messages, conversation_id)
 
         logger.info(
@@ -816,9 +860,12 @@ class ConversationManager:
 
         return True, f"已恢复会话 {session_id} 到对话 {conversation_id or 'default'}，共 {len(messages)} 条消息"
 
-    async def list_conversations(self) -> list[dict]:
+    async def list_conversations(self, player_name: str | None) -> list[dict]:
         """
-        列出所有已保存的对话
+        列出当前玩家已保存的对话（默认仅返回 owner 匹配的会话）。
+
+        Args:
+            player_name: 请求者玩家名；仅返回 owner 精确匹配的会话
 
         Returns:
             对话列表（按更新时间排序）
@@ -830,6 +877,9 @@ class ConversationManager:
                 async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
                     content = await f.read()
                     data = json.loads(content)
+
+                if data.get("player_name") != player_name:
+                    continue
 
                 conversations.append(
                     {
@@ -859,30 +909,45 @@ class ConversationManager:
 
         return conversations
 
-    async def delete_conversation(self, session_id: str) -> tuple[bool, str]:
+    async def delete_conversation(
+        self,
+        session_id: str,
+        player_name: str | None,
+    ) -> tuple[bool, str]:
         """
         删除指定的已保存对话文件；不影响当前连接内的运行时对话。
 
+        仅当持久化 owner 与请求者一致时允许删除。
+
         Args:
             session_id: 会话 ID
+            player_name: 请求者玩家名（owner 校验）
 
         Returns:
             (是否成功, 消息)
         """
-        try:
-            file_path = self._get_session_file_path(session_id)
-        except ValueError as e:
-            return False, str(e)
+        success, data_or_error, file_path = await self._read_session_data(session_id)
+        if not success:
+            return False, data_or_error
 
-        if not file_path.exists():
-            return False, f"会话不存在: {session_id}"
+        owner_error = self._assert_owner(data_or_error, player_name)
+        if owner_error:
+            logger.warning(
+                "delete_conversation_owner_mismatch",
+                session_id=session_id,
+                requester=player_name,
+                owner=data_or_error.get("player_name"),
+            )
+            return False, owner_error
 
         try:
+            assert file_path is not None
             file_path.unlink()
 
             logger.info(
                 "conversation_deleted",
                 session_id=session_id,
+                player=player_name,
             )
 
             return True, f"已删除会话: {session_id}"

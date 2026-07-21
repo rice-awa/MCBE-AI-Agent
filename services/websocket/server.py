@@ -701,7 +701,7 @@ class WebSocketServer:
                 if success else self.protocol_handler.create_error_message(result)
             )
         elif action in ("已保存", "saved"):
-            conversations = await conv_manager.list_conversations()
+            conversations = await conv_manager.list_conversations(player_name=actor)
             list_text = conv_manager.format_conversation_list(conversations)
             return self.protocol_handler.create_info_message(list_text)
         elif action in ("删除", "delete"):
@@ -709,7 +709,9 @@ class WebSocketServer:
                 return self.protocol_handler.create_error_message(
                     "请指定要删除的保存会话 ID\n用法: AGENT 对话 delete <保存ID>"
                 )
-            success, result = await conv_manager.delete_conversation(arg)
+            success, result = await conv_manager.delete_conversation(
+                arg, player_name=actor
+            )
             return (
                 self.protocol_handler.create_success_message(result)
                 if success else self.protocol_handler.create_error_message(result)
