@@ -1191,7 +1191,7 @@ class AgentWorker:
                 f"参数: {args_summary}\n"
                 f"原因: {meta.get('reason') or '需要确认'}"
                 f"{batch_hint}\n"
-                f"请执行: AGENT 工具审批 {approval_id} 允许|拒绝"
+                f"请执行: AGENT 同意 {approval_id}  或  AGENT 拒绝 {approval_id}"
             )
             chunk = StreamChunk(
                 connection_id=connection_id,

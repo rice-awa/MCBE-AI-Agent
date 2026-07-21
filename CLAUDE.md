@@ -128,6 +128,8 @@ MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多
 | `AGENT 聊天 <消息>` | 与 AI 对话 |
 | `AGENT 脚本 <消息>` | 使用 ScriptEvent 发送 |
 | `AGENT 上下文 <开启/关闭/状态>` | 管理对话上下文 |
+| `AGENT 同意 <approval_id>` | 同意待审批的高风险工具调用 |
+| `AGENT 拒绝 <approval_id>` | 拒绝待审批的高风险工具调用 |
 | `切换模型 <提供商>` | 切换 LLM 提供商 |
 | `运行命令 <MC命令>` | 执行 Minecraft 命令 |
 | `帮助` | 显示帮助信息 |

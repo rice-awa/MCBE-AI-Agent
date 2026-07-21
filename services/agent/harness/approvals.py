@@ -60,7 +60,7 @@ class PendingApproval:
 class PendingApprovalStore:
     """按 (connection_id, player_name, conversation_id, approval_id) 索引的进程内审批表。
 
-    多工具 defer 时按 batch 聚合决策：单个 `AGENT 工具审批` 只记录一项；
+    多工具 defer 时按 batch 聚合决策：单个 `AGENT 同意|拒绝` 只记录一项；
     当 batch 内全部 approval_id 都有决策后，一次性弹出并返回完整结果。
     """
 

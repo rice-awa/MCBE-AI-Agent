@@ -102,7 +102,8 @@ class CommandRequest(BaseMessage):
         "switch_model",
         "help",
         "ai_broadcast",
-        "tool_approval",
+        "tool_approve",
+        "tool_deny",
     ]
     content: str | None = None
 

@@ -1,4 +1,4 @@
-"""Tool approval command registration + PendingApprovalStore boundaries."""
+"""Tool approve/deny command registration + PendingApprovalStore boundaries."""
 
 from __future__ import annotations
 
@@ -12,12 +12,28 @@ from mcbe_ws_sdk.command.registry import CommandRegistry
 from services.agent.harness.approvals import PendingApproval, PendingApprovalStore
 
 
-def test_tool_approval_command_is_registered_in_defaults() -> None:
+def test_tool_approve_and_deny_commands_are_registered_in_defaults() -> None:
     registry = CommandRegistry(MinecraftConfig().commands)
-    parsed = registry.resolve_parsed("AGENT 工具审批 abcd 允许")
-    assert parsed is not None
-    assert parsed.type == "tool_approval"
-    assert parsed.content == "abcd 允许"
+
+    approve = registry.resolve_parsed("AGENT 同意 abcd")
+    assert approve is not None
+    assert approve.type == "tool_approve"
+    assert approve.content == "abcd"
+
+    deny = registry.resolve_parsed("AGENT 拒绝 abcd")
+    assert deny is not None
+    assert deny.type == "tool_deny"
+    assert deny.content == "abcd"
+
+    approve_alias = registry.resolve_parsed("AGENT approve abcd")
+    assert approve_alias is not None
+    assert approve_alias.type == "tool_approve"
+    assert approve_alias.content == "abcd"
+
+    deny_alias = registry.resolve_parsed("AI deny abcd")
+    assert deny_alias is not None
+    assert deny_alias.type == "tool_deny"
+    assert deny_alias.content == "abcd"
 
 
 def test_pending_approval_owner_expired_cross_player_boundaries() -> None:

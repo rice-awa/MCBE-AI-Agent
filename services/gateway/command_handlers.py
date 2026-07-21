@@ -164,8 +164,11 @@ class CommandHandlers:
             "ai_broadcast": lambda: self.handle_ai_broadcast(
                 state, content, player_name=player_name
             ),
-            "tool_approval": lambda: self.handle_tool_approval(
-                state, content, player_name=player_name
+            "tool_approve": lambda: self.handle_tool_approval(
+                state, content, approved=True, player_name=player_name
+            ),
+            "tool_deny": lambda: self.handle_tool_approval(
+                state, content, approved=False, player_name=player_name
             ),
             "switch_model": lambda: self.handle_switch_model(
                 state, content, player_name=player_name
@@ -843,35 +846,26 @@ class CommandHandlers:
         self,
         state: ConnectionState,
         content: str,
+        *,
+        approved: bool,
         player_name: str | None = None,
     ) -> None:
-        """处理 `AGENT 工具审批 <approval_id> <允许|拒绝>`。
+        """处理 `AGENT 同意|拒绝 <approval_id>`。
 
         同一 DeferredToolRequests 批内每条命令只记录一项决策；待 batch 全部决策后，
         用完整 DeferredToolResults 恢复 run，避免 partial results。
         """
         from services.agent.runtime import get_agent_runtime
 
-        parts = content.strip().split()
-        if len(parts) < 2:
+        source = "tool_approve" if approved else "tool_deny"
+        approval_id = content.strip().split(None, 1)[0] if content.strip() else ""
+        if not approval_id:
+            verb = "同意" if approved else "拒绝"
             msg = self.protocol.create_error_message(
-                "用法: AGENT 工具审批 <approval_id> <允许|拒绝>"
+                f"用法: AGENT {verb} <approval_id>"
             )
             await self._send_player_reply(
-                state, msg, source="tool_approval", player_name=player_name
-            )
-            return
-
-        approval_id = parts[0]
-        decision_raw = parts[1].lower()
-        if decision_raw in ("允许", "allow", "approve", "yes", "y", "true", "1"):
-            approved = True
-        elif decision_raw in ("拒绝", "deny", "reject", "no", "n", "false", "0"):
-            approved = False
-        else:
-            msg = self.protocol.create_error_message("第二参数必须是 允许 或 拒绝")
-            await self._send_player_reply(
-                state, msg, source="tool_approval", player_name=player_name
+                state, msg, source=source, player_name=player_name
             )
             return
 
@@ -890,7 +884,7 @@ class CommandHandlers:
         if pending is None:
             msg = self.protocol.create_error_message(reject_reason or "审批不可用")
             await self._send_player_reply(
-                state, msg, source="tool_approval", player_name=player_name
+                state, msg, source=source, player_name=player_name
             )
             return
 
@@ -903,7 +897,7 @@ class CommandHandlers:
                 f"已批准工具调用 [{approval_id}] {pending.tool_name}"
             )
         await self._send_player_reply(
-            state, msg, source="tool_approval", player_name=player_name
+            state, msg, source=source, player_name=player_name
         )
 
         if completed_batch is None:
@@ -912,7 +906,7 @@ class CommandHandlers:
                 f"全部决策后才会继续执行（batch={pending.batch_id}）"
             )
             await self._send_player_reply(
-                state, wait_msg, source="tool_approval", player_name=player_name
+                state, wait_msg, source=source, player_name=player_name
             )
             return
 
@@ -930,7 +924,7 @@ class CommandHandlers:
             f"批次 {pending.batch_id} 决策完成（{len(completed_batch)} 项），继续执行..."
         )
         await self._send_player_reply(
-            state, resume_msg, source="tool_approval", player_name=player_name
+            state, resume_msg, source=source, player_name=player_name
         )
 
         generation = self.broker.get_conversation_generation(

@@ -87,11 +87,17 @@ class MinecraftConfig(BaseModel):
             "description": "控制多人 AI 聊天广播",
             "usage": "<状态/关闭/全服 开启|关闭/玩家 <玩家名> 开启|关闭>"
         },
-        "AGENT 工具审批": {
-            "type": "tool_approval",
-            "aliases": ["AGENT tool-approval", "AI 工具审批", "AI tool-approval"],
-            "description": "审批高风险工具调用",
-            "usage": "<approval_id> <允许|拒绝>",
+        "AGENT 同意": {
+            "type": "tool_approve",
+            "aliases": ["AGENT approve", "AGENT allow", "AI 同意", "AI approve", "AI allow"],
+            "description": "同意待审批的高风险工具调用",
+            "usage": "<approval_id>",
+        },
+        "AGENT 拒绝": {
+            "type": "tool_deny",
+            "aliases": ["AGENT deny", "AGENT reject", "AI 拒绝", "AI deny", "AI reject"],
+            "description": "拒绝待审批的高风险工具调用",
+            "usage": "<approval_id>",
         },
         "运行命令": {
             "type": "run_command",
@@ -121,7 +127,8 @@ class MinecraftConfig(BaseModel):
         "context": ("管理上下文开关", "<启用/关闭/状态>"),
         "mcp": ("MCP 服务器管理", "<list/status/reload>"),
         "ai_broadcast": ("控制多人 AI 聊天广播", "<状态/关闭/全服 开启|关闭/玩家 <玩家名> 开启|关闭>"),
-        "tool_approval": ("审批高风险工具调用", "<approval_id> <允许|拒绝>"),
+        "tool_approve": ("同意高风险工具调用", "<approval_id>"),
+        "tool_deny": ("拒绝高风险工具调用", "<approval_id>"),
         "switch_model": ("切换 LLM", "<provider>"),
         "save": ("保存当前对话历史", None),
         "run_command": ("执行游戏命令", "<命令>"),
