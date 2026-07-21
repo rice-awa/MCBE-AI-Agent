@@ -15,6 +15,7 @@ from pydantic_ai import Agent
 from config.settings import LLMProviderConfig, Settings
 from models.agent import AgentDependencies
 from models.minecraft import MinecraftCommand
+from services.agent.harness.audit import flush_audit_writer, start_audit_writer, stop_audit_writer
 from services.agent.harness.prompting import render_schema_description_prefix
 from services.agent.tool_results import CommandResult, ToolResult
 from services.agent.tools import (
@@ -26,6 +27,15 @@ from services.agent.tools import (
     iter_registered_tools,
     register_agent_tools,
 )
+
+
+def _flush_audit() -> None:
+    """Async audit writer needs a drain before tests read JSONL."""
+    try:
+        start_audit_writer()
+    except Exception:
+        pass
+    flush_audit_writer(timeout=2.0)
 
 
 def _unwrap_registered_tool_function(function):
@@ -232,6 +242,7 @@ async def test_registered_tool_function_writes_audit_jsonl(tmp_path) -> None:
     result = await _tool(agent, "run_minecraft_command").function(ctx, "say hi")
 
     assert result == "ok"
+    _flush_audit()
     records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
     assert records[0]["tool_name"] == "run_minecraft_command"
     assert records[0]["player_name"] == "Alex"
@@ -264,6 +275,7 @@ async def test_registered_tool_audit_uses_structured_failure(tmp_path) -> None:
     result = await _tool(agent, "run_minecraft_command").function(ctx, "say hi")
 
     assert "bad cmd" in str(result) or "失败" in str(result)
+    _flush_audit()
     records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
     assert records[0]["tool_name"] == "run_minecraft_command"
     assert records[0]["status"] == "failure"
@@ -331,6 +343,7 @@ async def test_run_command_tool_structured_status_shared_by_model_and_audit(
     model_text = await _tool(agent, "run_minecraft_command").function(ctx, "say hi")
     assert model_text == mapped.output
 
+    _flush_audit()
     records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
     assert records[0]["result"]["success"] == expected_status
     if expected_status == "failure":
