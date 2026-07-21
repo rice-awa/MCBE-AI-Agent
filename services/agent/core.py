@@ -188,6 +188,16 @@ def classify_run_exception(exc: BaseException) -> tuple[ErrorKind, str, str]:
     return "INTERNAL", player_facing_error("INTERNAL"), detail
 
 
+def _is_generator_exit_cleanup_error(exc: BaseException) -> bool:
+    """识别 agent.iter 在 GeneratorExit 清理时产生的 RuntimeError。"""
+    if isinstance(exc, GeneratorExit):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        return "generator exit" in msg or "generatorexit" in msg
+    return False
+
+
 TOOL_USAGE_GUIDE = """
 你可以使用工具与 Minecraft 交互。
 - 当用户要求"执行命令/给物品/发送消息/发标题/查询 Wiki"等可操作任务时，优先调用对应工具执行，而不是只解释步骤。
@@ -780,6 +790,8 @@ class _HandlerContext:
 
     sequence: int = 0
     sentence_buffer: str = ""
+    # 思考内容单独缓冲，按完整句子下发；与正文 buffer 隔离，避免互相串句。
+    reasoning_buffer: str = ""
     sent_text: str = ""
     emitted_content: bool = False
     all_messages: list[ModelMessage] = field(default_factory=list)
@@ -824,6 +836,22 @@ async def _send_reasoning_event(
     )
     ctx.sequence += 1
     return event
+
+
+def _append_reasoning_and_extract(ctx: _HandlerContext, chunk: str) -> list[str]:
+    """将思考增量写入独立缓冲，并提取已完成的句子。"""
+    if not chunk:
+        return []
+    ctx.reasoning_buffer += chunk
+    sentences, ctx.reasoning_buffer = _extract_complete_sentences(ctx.reasoning_buffer)
+    return sentences
+
+
+async def _flush_reasoning_buffer(ctx: _HandlerContext) -> AsyncIterator[StreamEvent]:
+    """冲刷未完成的思考缓冲（思考结束或 run 结束时调用）。"""
+    if ctx.reasoning_buffer.strip():
+        yield await _send_reasoning_event(ctx, ctx.reasoning_buffer)
+    ctx.reasoning_buffer = ""
 
 
 async def stream_response_handler(
@@ -871,6 +899,11 @@ async def stream_response_handler(
 
     usage_limits = build_usage_limits(deps.settings, deps.provider)
     run_timeout = get_run_timeout(deps.settings)
+    # 审批事件必须在 agent.iter() 上下文干净退出后再 yield。
+    # 若在 async with 内 yield+return，消费者停止迭代时会注入 GeneratorExit，
+    # pydantic-ai 的 iter 清理会变成 RuntimeError("coroutine ignored GeneratorExit")，
+    # 进而拖垮 worker。
+    approval_event: StreamEvent | None = None
 
     try:
         async with asyncio.timeout(run_timeout):
@@ -908,9 +941,10 @@ async def stream_response_handler(
                                         index=event.index,
                                         connection_id=str(deps.connection_id),
                                         current_buffer=ctx.sentence_buffer,
+                                        reasoning_buffer=ctx.reasoning_buffer,
                                     )
                                     part = event.part
-                                    # ThinkingPart：作为 reasoning 事件输出，不进文本缓冲区
+                                    # ThinkingPart：进入独立思考缓冲，按完整句子作为 reasoning 输出
                                     if isinstance(part, ThinkingPart) and part.content:
                                         logger.debug(
                                             "agent_part_start_thinking",
@@ -918,9 +952,18 @@ async def stream_response_handler(
                                             content=part.content,
                                             connection_id=str(deps.connection_id),
                                         )
-                                        yield await _send_reasoning_event(ctx, part.content)
-                                    # TextPart：初始内容进文本缓冲区，按完整句子发送
+                                        for sentence in _append_reasoning_and_extract(
+                                            ctx, part.content
+                                        ):
+                                            yield await _send_reasoning_event(
+                                                ctx, sentence
+                                            )
+                                    # TextPart：先冲刷思考缓冲，再按完整句子发送正文
                                     elif isinstance(part, TextPart) and part.content:
+                                        async for reasoning_event in _flush_reasoning_buffer(
+                                            ctx
+                                        ):
+                                            yield reasoning_event
                                         logger.debug(
                                             "agent_part_start_content",
                                             index=event.index,
@@ -941,7 +984,7 @@ async def stream_response_handler(
                                 # 处理增量事件
                                 elif isinstance(event, PartDeltaEvent):
                                     delta = event.delta
-                                    # ThinkingPartDelta：作为 reasoning 事件输出
+                                    # ThinkingPartDelta：进入独立思考缓冲，按完整句子输出
                                     if isinstance(delta, ThinkingPartDelta):
                                         chunk = delta.content_delta
                                         if chunk:
@@ -950,10 +993,20 @@ async def stream_response_handler(
                                                 chunk=chunk,
                                                 index=event.index,
                                                 connection_id=str(deps.connection_id),
+                                                reasoning_buffer_before=ctx.reasoning_buffer,
                                             )
-                                            yield await _send_reasoning_event(ctx, chunk)
-                                    # TextPartDelta：文本增量缓冲并按完整句子发送
+                                            for sentence in _append_reasoning_and_extract(
+                                                ctx, chunk
+                                            ):
+                                                yield await _send_reasoning_event(
+                                                    ctx, sentence
+                                                )
+                                    # TextPartDelta：先冲刷思考缓冲，再缓冲并按完整句子发送正文
                                     elif isinstance(delta, TextPartDelta):
+                                        async for reasoning_event in _flush_reasoning_buffer(
+                                            ctx
+                                        ):
+                                            yield reasoning_event
                                         chunk = delta.content_delta
                                         logger.debug(
                                             "agent_text_delta",
@@ -982,6 +1035,9 @@ async def stream_response_handler(
 
                     # 处理工具调用节点 - 工具由框架自动执行
                     elif Agent.is_call_tools_node(node):
+                        # 进入工具阶段前冲刷思考缓冲，保证思考先于工具显示
+                        async for reasoning_event in _flush_reasoning_buffer(ctx):
+                            yield reasoning_event
                         async with node.stream(run.ctx) as handle_stream:
                             async for event in handle_stream:
                                 # 工具调用事件
@@ -1048,6 +1104,8 @@ async def stream_response_handler(
                     # 处理结束节点
                     elif Agent.is_end_node(node):
                         # 仅在整个执行结束时再冲刷尾部 buffer，避免跨节点半句提前下发
+                        async for reasoning_event in _flush_reasoning_buffer(ctx):
+                            yield reasoning_event
                         if ctx.sentence_buffer.strip():
                             yield await _send_content_event(ctx, ctx.sentence_buffer)
                             ctx.sentence_buffer = ""
@@ -1061,10 +1119,11 @@ async def stream_response_handler(
                             )
                             deferred = _extract_deferred_requests(run.result)
                             if deferred is not None:
-                                yield _build_approval_required_event(
+                                # 先记下审批事件，退出 agent.iter 后再 yield
+                                approval_event = _build_approval_required_event(
                                     ctx, deps, deferred, run.result
                                 )
-                                return
+                                break
                         logger.debug(
                             "agent_run_complete",
                             connection_id=str(deps.connection_id),
@@ -1075,40 +1134,55 @@ async def stream_response_handler(
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        error_kind, player_msg, diagnostic = classify_run_exception(e)
-
-        # MCP 故障：只标记有证据关联的 server，不在本 run 内递归重放
-        if _is_mcp_timeout_error(e):
-            logger.warning(
-                "mcp_connection_timeout_no_replay",
-                error=diagnostic,
+        # agent.iter 在 GeneratorExit 清理失败时可能抛出 RuntimeError；
+        # 若审批事件已就绪，视为成功暂停，不再当错误上报。
+        if approval_event is not None and _is_generator_exit_cleanup_error(e):
+            logger.debug(
+                "stream_approval_cleanup_suppressed",
+                error=str(e),
                 connection_id=str(deps.connection_id),
                 run_id=deps.run_id,
             )
-            _mark_mcp_failure_from_exception(e, diagnostic)
-            error_kind = "TRANSIENT"
-            player_msg = player_facing_error("TRANSIENT")
+        else:
+            error_kind, player_msg, diagnostic = classify_run_exception(e)
 
-        logger.error(
-            "stream_response_handler_error",
-            error=diagnostic,
-            error_kind=error_kind,
-            connection_id=str(deps.connection_id),
-            run_id=deps.run_id,
-            exc_info=True,  # 保留完整堆栈
-        )
-        yield StreamEvent(
-            event_type="error",
-            content=player_msg,
-            sequence=ctx.sequence,
-            metadata={
-                "error_kind": error_kind,
-                "diagnostic_summary": diagnostic,
-                "run_id": deps.run_id,
-                "conversation_id": deps.conversation_id,
-                "player_name": deps.player_name,
-            },
-        )
+            # MCP 故障：只标记有证据关联的 server，不在本 run 内递归重放
+            if _is_mcp_timeout_error(e):
+                logger.warning(
+                    "mcp_connection_timeout_no_replay",
+                    error=diagnostic,
+                    connection_id=str(deps.connection_id),
+                    run_id=deps.run_id,
+                )
+                _mark_mcp_failure_from_exception(e, diagnostic)
+                error_kind = "TRANSIENT"
+                player_msg = player_facing_error("TRANSIENT")
+
+            logger.error(
+                "stream_response_handler_error",
+                error=diagnostic,
+                error_kind=error_kind,
+                connection_id=str(deps.connection_id),
+                run_id=deps.run_id,
+                exc_info=True,  # 保留完整堆栈
+            )
+            yield StreamEvent(
+                event_type="error",
+                content=player_msg,
+                sequence=ctx.sequence,
+                metadata={
+                    "error_kind": error_kind,
+                    "diagnostic_summary": diagnostic,
+                    "run_id": deps.run_id,
+                    "conversation_id": deps.conversation_id,
+                    "player_name": deps.player_name,
+                },
+            )
+            return
+
+    if approval_event is not None:
+        yield approval_event
+        return
 
 
 async def non_stream_response_handler(
@@ -1181,9 +1255,10 @@ async def non_stream_response_handler(
             yield _build_approval_required_event(ctx, deps, deferred, result)
             return
 
-        # 从结果消息中提取思考内容（ThinkingPart），在正文之前作为 reasoning 事件输出
+        # 从结果消息中提取思考内容（ThinkingPart），在正文之前按完整句子作为 reasoning 事件输出
         for reasoning_chunk in _extract_reasoning_from_messages(ctx.new_messages):
-            yield await _send_reasoning_event(ctx, reasoning_chunk)
+            for batch in _iter_sentence_batches(reasoning_chunk):
+                yield await _send_reasoning_event(ctx, batch)
 
         # 提取完整响应文本
         full_response = _extract_result_output(result)

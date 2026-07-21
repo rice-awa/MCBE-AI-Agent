@@ -6,8 +6,10 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
+import pytest
 from pydantic_ai import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
@@ -16,6 +18,7 @@ from pydantic_ai import (
     TextPartDelta,
 )
 from pydantic_ai.messages import TextPart, ThinkingPart, ThinkingPartDelta, ToolCallPart, ToolReturnPart
+from pydantic_ai.tools import DeferredToolRequests
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
@@ -767,7 +770,7 @@ def test_chat_agent_manager_explicit_agent_overrides_fallback(monkeypatch) -> No
 
 
 def test_thinking_part_start_should_yield_reasoning_not_content(monkeypatch) -> None:
-    """ThinkingPart 的 PartStartEvent 应作为 reasoning 事件，不应混入 content。"""
+    """ThinkingPart 应按句子缓冲为 reasoning，不应混入 content。"""
     _patch_agent_node_adapter(monkeypatch)
 
     request_node_events = [
@@ -789,8 +792,41 @@ def test_thinking_part_start_should_yield_reasoning_not_content(monkeypatch) -> 
     reasoning_events = [e for e in events if e.event_type == "reasoning" and e.content]
     content_events = [e for e in events if e.event_type == "content" and e.content]
 
-    assert "".join(e.content for e in reasoning_events) == "玩家打了个招呼"
+    # 无句末标点时，正文开始前应整段冲刷一次，而不是逐 token 下发
+    assert [e.content for e in reasoning_events] == ["玩家打了个招呼"]
     assert "".join(e.content for e in content_events) == "嗨！"
+
+
+def test_thinking_deltas_should_buffer_until_sentence_end(monkeypatch) -> None:
+    """思考流式增量应缓冲到完整句子，再作为 reasoning 下发。"""
+    _patch_agent_node_adapter(monkeypatch)
+
+    request_node_events = [
+        [
+            make_thinking_part_start_event(0, "玩家"),
+            make_thinking_part_delta_event(0, "打了个"),
+            make_thinking_part_delta_event(0, "招呼，"),
+            make_thinking_part_delta_event(0, "我需要"),
+            make_thinking_part_delta_event(0, "友好"),
+            make_thinking_part_delta_event(0, "地回应一下。"),
+            make_part_start_event(1, "你好！"),
+        ]
+    ]
+
+    mock_agent = MockAgent(
+        request_node_events=request_node_events,
+        result_output="你好！",
+    )
+    monkeypatch.setattr(core, "chat_agent", mock_agent)
+
+    events = asyncio.run(_collect_events("hi", _build_deps(True), model="fake"))
+    reasoning_events = [e for e in events if e.event_type == "reasoning" and e.content]
+    content_events = [e for e in events if e.event_type == "content" and e.content]
+
+    assert [e.content for e in reasoning_events] == [
+        "玩家打了个招呼，我需要友好地回应一下。"
+    ]
+    assert [e.content for e in content_events] == ["你好！"]
 
 
 def test_thinking_part_delta_after_text_should_not_merge_into_content(monkeypatch) -> None:
@@ -818,6 +854,44 @@ def test_thinking_part_delta_after_text_should_not_merge_into_content(monkeypatc
     assert "".join(e.content for e in content_events) == "回答。"
 
 
+def test_thinking_tail_should_flush_before_tool_call(monkeypatch) -> None:
+    """思考缓冲的未完成尾巴应在进入工具节点前冲刷。"""
+    _patch_agent_node_adapter(monkeypatch)
+
+    request_node_events = [
+        [
+            make_thinking_part_start_event(0, "先"),
+            make_thinking_part_delta_event(0, "查一下"),
+        ]
+    ]
+    tool_events = [
+        make_function_tool_call_event(
+            "run_minecraft_command", {"command": "time query daytime"}
+        ),
+        make_function_tool_result_event("test_call_id", "ok"),
+    ]
+
+    mock_agent = MockAgent(
+        request_node_events=request_node_events,
+        tool_events=tool_events,
+        result_output="白天。",
+    )
+    monkeypatch.setattr(core, "chat_agent", mock_agent)
+
+    events = asyncio.run(_collect_events("hi", _build_deps(True), model="fake"))
+    typed = [
+        (e.event_type, e.content)
+        for e in events
+        if e.content or e.event_type == "tool_call"
+    ]
+    reasoning = [c for t, c in typed if t == "reasoning"]
+    assert reasoning == ["先查一下"]
+    # 思考必须先于工具调用
+    first_reasoning_idx = next(i for i, (t, _) in enumerate(typed) if t == "reasoning")
+    first_tool_idx = next(i for i, (t, _) in enumerate(typed) if t == "tool_call")
+    assert first_reasoning_idx < first_tool_idx
+
+
 def test_non_stream_mode_should_yield_reasoning_from_thinking_parts(monkeypatch) -> None:
     """非流式模式：应从结果消息的 ThinkingPart 提取 reasoning 并在 content 之前 yield。"""
     _patch_agent_node_adapter(monkeypatch)
@@ -843,3 +917,159 @@ def test_non_stream_mode_should_yield_reasoning_from_thinking_parts(monkeypatch)
     first_reasoning_idx = next(i for i, (t, _) in enumerate(typed) if t == "reasoning")
     first_content_idx = next(i for i, (t, _) in enumerate(typed) if t == "content")
     assert first_reasoning_idx < first_content_idx
+
+
+def test_stream_approval_required_exits_agent_iter_before_yield(monkeypatch) -> None:
+    """审批暂停应先干净退出 agent.iter，再 yield approval_required，且不带 is_complete。"""
+    _patch_agent_node_adapter(monkeypatch)
+
+    deferred = DeferredToolRequests(
+        approvals=[
+            ToolCallPart(
+                tool_name="run_minecraft_commands",
+                tool_call_id="call-approve-1",
+                args={"commands": ["fill ~ ~ ~ ~ ~ ~ stone"]},
+            )
+        ]
+    )
+    mock_agent = MockAgent(
+        text_chunks=[],
+        result_output=deferred,
+        result_messages=[],
+    )
+    monkeypatch.setattr(core, "chat_agent", mock_agent)
+
+    events = asyncio.run(_collect_events("建个房子", _build_deps(True), model="fake"))
+    approval_events = [e for e in events if e.event_type == "approval_required"]
+    complete_events = [
+        e for e in events if e.metadata and e.metadata.get("is_complete")
+    ]
+
+    assert len(approval_events) == 1
+    assert approval_events[0].metadata is not None
+    assert isinstance(
+        approval_events[0].metadata.get("deferred_requests"), DeferredToolRequests
+    )
+    # 审批暂停不应再发 is_complete 完成事件
+    assert complete_events == []
+    assert events[-1].event_type == "approval_required"
+
+
+@pytest.mark.asyncio
+async def test_worker_approval_required_does_not_cancel_on_return(monkeypatch):
+    """Worker 收到 approval_required 后应登记审批并正常返回。"""
+    from models.agent import StreamEvent
+    from models.messages import ChatRequest, StreamChunk
+    from services.agent.harness.approvals import PendingApprovalStore
+    from services.agent.worker import AgentWorker
+
+    settings = MagicMock()
+    settings.worker_http_timeout = 5.0
+    settings.worker_poll_timeout = 0.1
+    settings.max_history_turns = 20
+    settings.enable_reasoning_output = True
+    settings.tool_response_verbose = False
+    settings.approval_ttl = 120.0
+    settings.tool_policy_version = "test"
+    settings.default_provider = "deepseek"
+    settings.request_limit = 8
+    settings.tool_calls_limit = 8
+    settings.input_tokens_limit = None
+    settings.output_tokens_limit = None
+    settings.total_tokens_limit = None
+    settings.run_timeout = 90.0
+    settings.max_tool_concurrency = 4
+    settings.context_output_reserve_tokens = 1024
+    settings.count_tokens_before_request = False
+    settings.stream_sentence_mode = True
+    settings.storage = SimpleNamespace(conversations_dir="/tmp/mcbe-ai-test-conversations")
+
+    broker = MagicMock()
+    broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+    broker.get_conversation_history = MagicMock(return_value=[])
+    broker.send_response = AsyncMock(return_value=True)
+    broker.get_response_queue = MagicMock(return_value=object())
+    broker.set_conversation_history = MagicMock(return_value=True)
+    worker = AgentWorker(broker, settings)
+
+    deferred = DeferredToolRequests(
+        approvals=[
+            ToolCallPart(
+                tool_name="run_minecraft_commands",
+                tool_call_id="call-w-1",
+                args={"commands": ["time set day"]},
+            )
+        ]
+    )
+
+    async def fake_stream_chat(*_args, **_kwargs):
+        yield StreamEvent(
+            event_type="tool_call",
+            content="run_minecraft_commands",
+            sequence=0,
+            metadata={
+                "tool_name": "run_minecraft_commands",
+                "tool_call_id": "call-w-1",
+                "args": {"commands": ["time set day"]},
+            },
+        )
+        yield StreamEvent(
+            event_type="approval_required",
+            content="工具调用需要玩家审批",
+            sequence=1,
+            metadata={
+                "deferred_requests": deferred,
+                "all_messages": [],
+                "run_id": "run-approve",
+            },
+        )
+
+    store = PendingApprovalStore(default_ttl_seconds=120.0)
+    runtime = SimpleNamespace(
+        get_pending_approval_store=lambda _settings=None: store,
+        refresh_mcp_tools=lambda _s: None,
+        get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
+            check_and_compress=AsyncMock(return_value=(False, "")),
+        ),
+    )
+    monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+    monkeypatch.setattr(
+        "services.agent.providers.ProviderRegistry.get_model",
+        lambda _config: object(),
+    )
+    monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+    monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        "core.conversation.get_conversation_manager",
+        lambda *_a, **_k: SimpleNamespace(
+            check_and_compress=AsyncMock(return_value=(False, "")),
+        ),
+    )
+
+    connection_id = uuid4()
+    await worker._process_request_locked(
+        ChatRequest(
+            connection_id=connection_id,
+            content="set day",
+            player_name="Alex",
+            run_id="run-approve",
+        ),
+        connection_id,
+    )
+
+    # 应发送 tool_call + approval_required 提示
+    assert broker.send_response.await_count >= 2
+    approval_chunks = [
+        call.args[1]
+        for call in broker.send_response.await_args_list
+        if isinstance(call.args[1], StreamChunk)
+        and call.args[1].chunk_type == "approval_required"
+    ]
+    assert len(approval_chunks) == 1
+    assert "AGENT 同意" in approval_chunks[0].content
+    # store 中应有 pending 记录
+    pending_items = list(store._items.values())  # noqa: SLF001
+    assert len(pending_items) == 1
+    assert pending_items[0].player_name == "Alex"
+    assert pending_items[0].run_id == "run-approve"
+    assert pending_items[0].tool_name == "run_minecraft_commands"

@@ -646,6 +646,15 @@ class AgentWorker:
                 # tool_result 事件已根据配置决定是否发送
                 # is_complete 事件不需要发送到游戏
 
+        except asyncio.CancelledError:
+            # 审批暂停或上游取消：正常退出，不记成 stream_processing_error
+            logger.info(
+                "stream_processing_cancelled",
+                worker_id=self.worker_id,
+                connection_id=str(connection_id),
+                run_id=run_id,
+            )
+            raise
         except Exception as e:
             error_kind, player_msg, diagnostic = classify_run_exception(e)
 
