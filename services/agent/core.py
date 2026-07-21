@@ -766,7 +766,9 @@ async def stream_response_handler(
                                 logger.info(
                                     "agent_tool_result",
                                     tool_call_id=event.tool_call_id,
-                                    result_preview=result_content[:100],
+                                    tool_name=ctx.tool_call_names.get(event.tool_call_id),
+                                    result=result_content,
+                                    result_length=len(result_content),
                                     connection_id=str(deps.connection_id),
                                 )
                                 # 发送工具返回事件
