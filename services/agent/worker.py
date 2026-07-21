@@ -250,6 +250,7 @@ class AgentWorker:
             get_context_info=get_context_info,
             run_id=run_id,
             conversation_id=request.conversation_id,
+            auto_approve_tools=bool(request.auto_approve_tools),
         )
 
         stream_target = "@a" if request.broadcast_ai_chat else request.player_name
@@ -1200,7 +1201,9 @@ class AgentWorker:
                 f"参数: {args_summary}\n"
                 f"原因: {meta.get('reason') or '需要确认'}"
                 f"{batch_hint}\n"
-                f"请执行: AGENT 同意 {approval_id}  或  AGENT 拒绝 {approval_id}"
+                f"请执行: AGENT 同意  或  AGENT 拒绝"
+                f"（也可指定 id: AGENT 同意 {approval_id}；"
+                f"AGENT 同意 对话 / AGENT 同意 永远 可跳过后续审批）"
             )
             chunk = StreamChunk(
                 connection_id=connection_id,

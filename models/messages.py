@@ -34,6 +34,8 @@ class ChatRequest(BaseMessage):
     # 管理操作失效 epoch；clear/switch/new/restore/switch_model 等运行时状态变更会递增。
     conversation_invalidation_epoch: int = 0
     broadcast_ai_chat: bool = False
+    # 会话级自动批准高风险工具（AGENT 同意 对话|永远 打开后写入）。
+    auto_approve_tools: bool = False
     # 审批恢复：不把批准文本作为新 prompt，而是用原 messages + deferred results 恢复。
     resume_approval_id: str | None = None
     deferred_tool_results: dict | None = None

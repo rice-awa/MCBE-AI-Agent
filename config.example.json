@@ -144,14 +144,14 @@
       "AGENT 同意": {
         "type": "tool_approve",
         "aliases": ["AGENT approve", "AGENT allow", "AI 同意", "AI approve", "AI allow"],
-        "description": "同意待审批的高风险工具调用",
-        "usage": "<approval_id>"
+        "description": "同意待审批的高风险工具调用（可省略 id；对话/永远开启自动同意）",
+        "usage": "[approval_id|对话|永远]"
       },
       "AGENT 拒绝": {
         "type": "tool_deny",
         "aliases": ["AGENT deny", "AGENT reject", "AI 拒绝", "AI deny", "AI reject"],
-        "description": "拒绝待审批的高风险工具调用",
-        "usage": "<approval_id>"
+        "description": "拒绝待审批的高风险工具调用（可省略 id；对话/永远关闭自动同意）",
+        "usage": "[approval_id|对话|永远]"
       },
       "运行命令": {
         "type": "run_command",

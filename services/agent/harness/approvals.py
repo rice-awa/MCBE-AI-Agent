@@ -151,6 +151,75 @@ class PendingApprovalStore:
             return None, "审批已过期"
         return pending, None
 
+    def list_pending_for_owner(
+        self,
+        *,
+        connection_id: str,
+        player_name: str,
+        conversation_id: str | None = None,
+    ) -> list[PendingApproval]:
+        """列出该玩家（可选限定对话）下尚未决策且未过期的审批，按创建时间升序。"""
+        with self._lock:
+            self._purge_expired_unlocked()
+            items = [
+                item
+                for key, item in self._items.items()
+                if key[0] == str(connection_id)
+                and key[1] == str(player_name)
+                and (conversation_id is None or key[2] == str(conversation_id))
+                and item.decision is None
+                and not item.is_expired()
+            ]
+        items.sort(key=lambda item: item.created_at)
+        return items
+
+    def resolve_target_approval_id(
+        self,
+        *,
+        connection_id: str,
+        player_name: str,
+        conversation_id: str,
+        approval_id: str | None = None,
+    ) -> tuple[str | None, str | None]:
+        """解析要决策的 approval_id。
+
+        - 显式 id：校验存在后返回
+        - 省略 id：若仅有一批未决策审批，自动取该批最早一项；多批冲突则报错
+
+        Returns:
+            (resolved_id, reject_reason)
+        """
+        explicit = (approval_id or "").strip()
+        if explicit:
+            pending, reason = self.get_for_owner(
+                connection_id=connection_id,
+                player_name=player_name,
+                conversation_id=conversation_id,
+                approval_id=explicit,
+            )
+            if pending is None:
+                return None, reason or "未找到该审批或已处理"
+            return pending.approval_id, None
+
+        pending_items = self.list_pending_for_owner(
+            connection_id=connection_id,
+            player_name=player_name,
+            conversation_id=conversation_id,
+        )
+        if not pending_items:
+            return None, "当前没有待审批的工具调用"
+        batch_ids = {item.batch_id for item in pending_items}
+        if len(batch_ids) > 1:
+            return (
+                None,
+                "存在多个待审批批次，请使用 AGENT 同意|拒绝 <approval_id> 指定",
+            )
+        # 同批内按创建时间取最早未决策项
+        undecided = [item for item in pending_items if item.decision is None]
+        if not undecided:
+            return None, "当前没有待审批的工具调用"
+        return undecided[0].approval_id, None
+
     def record_decision(
         self,
         *,

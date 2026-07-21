@@ -511,11 +511,15 @@ class HarnessToolset(WrapperToolset[Any]):
                 return materialize_tool_result(cached.result)
 
         # 2) 策略决策
+        # 会话级自动批准（AGENT 同意 对话|永远）视为已批准；
+        # pydantic-ai 恢复路径的 tool_call_approved 仍优先。
+        session_auto = bool(getattr(deps, "auto_approve_tools", False))
+        already_approved = bool(getattr(ctx, "tool_call_approved", False)) or session_auto
         decision = self.policy.decide(
             name,
             normalized,
             player_name=player_name,
-            approved=bool(getattr(ctx, "tool_call_approved", False)),
+            approved=already_approved,
         )
 
         if decision.action == PolicyDecisionKind.DENY:

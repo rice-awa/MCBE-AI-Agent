@@ -111,6 +111,7 @@ class CommandHandlers:
         host = self._require_host(state)
         sender = player_name or state._player_name
         session = host.get_player_session(sender)
+        resolved_conversation = conversation_id or DEFAULT_CONVERSATION_ID
         return ChatRequest(
             connection_id=state.id,
             content=content,
@@ -118,7 +119,10 @@ class CommandHandlers:
             use_context=session.context_enabled,
             provider=session.current_provider,
             delivery=delivery or "tellraw",
-            conversation_id=conversation_id or DEFAULT_CONVERSATION_ID,
+            conversation_id=resolved_conversation,
+            auto_approve_tools=host.should_auto_approve_tools(
+                sender, resolved_conversation
+            ),
         )
 
     # -- routing -------------------------------------------------------------------
@@ -850,30 +854,181 @@ class CommandHandlers:
         approved: bool,
         player_name: str | None = None,
     ) -> None:
-        """处理 `AGENT 同意|拒绝 <approval_id>`。
+        """处理 `AGENT 同意|拒绝 [approval_id|对话|永远]`。
 
-        同一 DeferredToolRequests 批内每条命令只记录一项决策；待 batch 全部决策后，
-        用完整 DeferredToolResults 恢复 run，避免 partial results。
+        - 无参数：智能选择当前对话下唯一待审批批次的最早一项
+        - 显式 id：按 id 决策
+        - `对话` / `永远`（仅同意）：打开自动批准，并尽量把当前待审批一并批掉
+          - 对话：仅当前对话生效，切换对话后需重新开启
+          - 永远：本连接该玩家所有对话生效（切换对话仍生效，断线清零）
         """
         from services.agent.runtime import get_agent_runtime
 
         source = "tool_approve" if approved else "tool_deny"
-        approval_id = content.strip().split(None, 1)[0] if content.strip() else ""
-        if not approval_id:
-            verb = "同意" if approved else "拒绝"
-            msg = self.protocol.create_error_message(
-                f"用法: AGENT {verb} <approval_id>"
-            )
-            await self._send_player_reply(
-                state, msg, source=source, player_name=player_name
-            )
-            return
+        raw = content.strip()
+        token = raw.split(None, 1)[0] if raw else ""
+        token_lower = token.casefold()
 
         host = self._require_host(state)
         owner = player_name or state._player_name or DEFAULT_PLAYER_DISPLAY_NAME
         conversation_id = self.broker.get_active_conversation_id(state.id, owner)
         store = get_agent_runtime().get_pending_approval_store(self.settings)
 
+        # `AGENT 同意 对话|永远` / `AGENT 拒绝 对话|永远`
+        scope_tokens = {
+            "对话": "conversation",
+            "conv": "conversation",
+            "conversation": "conversation",
+            "永远": "forever",
+            "always": "forever",
+            "forever": "forever",
+            "永久": "forever",
+        }
+        scope = scope_tokens.get(token_lower) if token else None
+        if scope is not None:
+            if not approved:
+                if scope == "forever":
+                    host.clear_auto_approve_tools(owner, forever=True)
+                    msg = self.protocol.create_success_message(
+                        "已关闭本连接的自动同意（永远）"
+                    )
+                else:
+                    host.clear_auto_approve_tools(
+                        owner, conversation_id=conversation_id
+                    )
+                    msg = self.protocol.create_success_message(
+                        f"已关闭当前对话的自动同意（对话={conversation_id}）"
+                    )
+                await self._send_player_reply(
+                    state, msg, source=source, player_name=player_name
+                )
+                return
+
+            if scope == "forever":
+                host.enable_auto_approve_tools_forever(owner)
+                scope_label = "本连接（永远，切换对话仍生效）"
+            else:
+                host.enable_auto_approve_tools_conversation(owner, conversation_id)
+                scope_label = f"当前对话（{conversation_id}）"
+            msg = self.protocol.create_success_message(
+                f"已开启工具自动同意：{scope_label}"
+            )
+            await self._send_player_reply(
+                state, msg, source=source, player_name=player_name
+            )
+            # 若当前有待审批，尽量整批自动批掉（多批时只处理最早一批）
+            await self._auto_approve_pending_batches(
+                state,
+                store=store,
+                owner=owner,
+                conversation_id=conversation_id,
+                player_name=player_name,
+                source=source,
+            )
+            return
+
+        # 省略 id → 智能解析；显式 id 走原路径
+        approval_id, resolve_reason = store.resolve_target_approval_id(
+            connection_id=str(state.id),
+            player_name=owner,
+            conversation_id=conversation_id,
+            approval_id=token or None,
+        )
+        if approval_id is None:
+            verb = "同意" if approved else "拒绝"
+            hint = resolve_reason or f"用法: AGENT {verb} [approval_id|对话|永远]"
+            msg = self.protocol.create_error_message(hint)
+            await self._send_player_reply(
+                state, msg, source=source, player_name=player_name
+            )
+            return
+
+        await self._apply_approval_decision(
+            state,
+            store=store,
+            owner=owner,
+            conversation_id=conversation_id,
+            approval_id=approval_id,
+            approved=approved,
+            player_name=player_name,
+            source=source,
+        )
+
+    async def _auto_approve_pending_batches(
+        self,
+        state: ConnectionState,
+        *,
+        store: Any,
+        owner: str,
+        conversation_id: str,
+        player_name: str | None,
+        source: str,
+    ) -> None:
+        """开启自动同意后，把当前对话最早一批待审批全部批掉并 resume。"""
+        pending_items = store.list_pending_for_owner(
+            connection_id=str(state.id),
+            player_name=owner,
+            conversation_id=conversation_id,
+        )
+        if not pending_items:
+            return
+        # 只处理最早一批，避免多批交叉 resume
+        first_batch = pending_items[0].batch_id
+        batch_items = [
+            item for item in pending_items if item.batch_id == first_batch
+        ]
+        completed_batch: list[Any] | None = None
+        last_pending = None
+        for item in batch_items:
+            pending, reason, completed = store.record_decision(
+                connection_id=str(state.id),
+                player_name=owner,
+                conversation_id=conversation_id,
+                approval_id=item.approval_id,
+                approved=True,
+            )
+            if pending is None:
+                logger.warning(
+                    "auto_approve_batch_item_failed",
+                    approval_id=item.approval_id,
+                    reason=reason,
+                )
+                continue
+            last_pending = pending
+            if completed is not None:
+                completed_batch = completed
+        if last_pending is None:
+            return
+        info = self.protocol.create_info_message(
+            f"已自动批准当前批次 {first_batch}（{len(batch_items)} 项）"
+        )
+        await self._send_player_reply(
+            state, info, source=source, player_name=player_name
+        )
+        if completed_batch is None:
+            return
+        await self._resume_from_completed_batch(
+            state,
+            completed_batch=completed_batch,
+            pending=last_pending,
+            owner=owner,
+            conversation_id=conversation_id,
+            player_name=player_name,
+            source=source,
+        )
+
+    async def _apply_approval_decision(
+        self,
+        state: ConnectionState,
+        *,
+        store: Any,
+        owner: str,
+        conversation_id: str,
+        approval_id: str,
+        approved: bool,
+        player_name: str | None,
+        source: str,
+    ) -> None:
         pending, reject_reason, completed_batch = store.record_decision(
             connection_id=str(state.id),
             player_name=owner,
@@ -910,6 +1065,28 @@ class CommandHandlers:
             )
             return
 
+        await self._resume_from_completed_batch(
+            state,
+            completed_batch=completed_batch,
+            pending=pending,
+            owner=owner,
+            conversation_id=conversation_id,
+            player_name=player_name,
+            source=source,
+        )
+
+    async def _resume_from_completed_batch(
+        self,
+        state: ConnectionState,
+        *,
+        completed_batch: list[Any],
+        pending: Any,
+        owner: str,
+        conversation_id: str,
+        player_name: str | None,
+        source: str,
+    ) -> None:
+        host = self._require_host(state)
         approvals_payload: dict[str, Any] = {}
         for item in completed_batch:
             if item.decision is True:
@@ -945,6 +1122,9 @@ class CommandHandlers:
             conversation_generation=generation,
             conversation_invalidation_epoch=invalidation_epoch,
             broadcast_ai_chat=pending.broadcast_ai_chat,
+            auto_approve_tools=host.should_auto_approve_tools(
+                owner, conversation_id
+            ),
             run_id=pending.run_id,
             resume_approval_id=pending.batch_id,
             deferred_tool_results={"approvals": approvals_payload},

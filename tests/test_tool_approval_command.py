@@ -1,8 +1,17 @@
-"""Tool approve/deny command registration + PendingApprovalStore boundaries."""
+"""Tool approve/deny command registration + PendingApprovalStore boundaries.
+
+覆盖：
+- 命令注册 / 别名
+- owner / 过期 / 跨玩家边界
+- 同批多工具齐套决策
+- 省略 id 的智能解析
+- 会话级自动同意（对话 / 永远）作用域
+"""
 
 from __future__ import annotations
 
 import time
+from uuid import uuid4
 
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import DeferredToolRequests
@@ -10,6 +19,54 @@ from pydantic_ai.tools import DeferredToolRequests
 from config.settings import MinecraftConfig
 from mcbe_ws_sdk.command.registry import CommandRegistry
 from services.agent.harness.approvals import PendingApproval, PendingApprovalStore
+from services.gateway.session_store import HostSessionStore
+
+
+def _make_pending(
+    *,
+    approval_id: str,
+    connection_id: str = "conn-1",
+    player_name: str = "Steve",
+    conversation_id: str = "conv-1",
+    tool_call_id: str = "tc1",
+    batch_id: str = "",
+    sibling_ids: list[str] | None = None,
+    ttl: float = 120.0,
+    cmd: str = "x",
+) -> PendingApproval:
+    now = time.time()
+    reqs = DeferredToolRequests(
+        approvals=[
+            ToolCallPart(
+                tool_name="run_minecraft_command",
+                args={"command": cmd},
+                tool_call_id=tool_call_id,
+            )
+        ]
+    )
+    return PendingApproval(
+        approval_id=approval_id,
+        connection_id=connection_id,
+        player_name=player_name,
+        conversation_id=conversation_id,
+        run_id="run-1",
+        tool_call_id=tool_call_id,
+        tool_name="run_minecraft_command",
+        normalized_args={"command": cmd},
+        args_summary=f"command={cmd}",
+        args_hash="h",
+        policy_version="v",
+        messages=[],
+        requests=reqs,
+        provider="test",
+        delivery="tellraw",
+        use_context=True,
+        broadcast_ai_chat=False,
+        created_at=now,
+        expires_at=now + ttl,
+        batch_id=batch_id or approval_id,
+        sibling_approval_ids=sibling_ids or [approval_id],
+    )
 
 
 def test_tool_approve_and_deny_commands_are_registered_in_defaults() -> None:
@@ -35,41 +92,27 @@ def test_tool_approve_and_deny_commands_are_registered_in_defaults() -> None:
     assert deny_alias.type == "tool_deny"
     assert deny_alias.content == "abcd"
 
+    # 省略 id / 对话 / 永远 也应被解析为 tool_approve，content 保留子命令
+    bare = registry.resolve_parsed("AGENT 同意")
+    assert bare is not None
+    assert bare.type == "tool_approve"
+    assert bare.content == ""
+
+    forever = registry.resolve_parsed("AGENT 同意 永远")
+    assert forever is not None
+    assert forever.type == "tool_approve"
+    assert forever.content == "永远"
+
+    conv = registry.resolve_parsed("AGENT 同意 对话")
+    assert conv is not None
+    assert conv.type == "tool_approve"
+    assert conv.content == "对话"
+
 
 def test_pending_approval_owner_expired_cross_player_boundaries() -> None:
     """审批边界：owner / 过期 / 跨玩家。"""
     store = PendingApprovalStore(default_ttl_seconds=0.05)
-    reqs = DeferredToolRequests(
-        approvals=[
-            ToolCallPart(
-                tool_name="run_minecraft_command",
-                args={"command": "x"},
-                tool_call_id="tc1",
-            )
-        ]
-    )
-    now = time.time()
-    pending = PendingApproval(
-        approval_id="ap1",
-        connection_id="conn-1",
-        player_name="Steve",
-        conversation_id="conv-1",
-        run_id="run-1",
-        tool_call_id="tc1",
-        tool_name="run_minecraft_command",
-        normalized_args={"command": "x"},
-        args_summary="command=x",
-        args_hash="h",
-        policy_version="v",
-        messages=[],
-        requests=reqs,
-        provider="test",
-        delivery="tellraw",
-        use_context=True,
-        broadcast_ai_chat=False,
-        created_at=now,
-        expires_at=now + 0.05,
-    )
+    pending = _make_pending(approval_id="ap1", ttl=0.05)
     store.put(pending)
 
     owner, reason = store.get_for_owner(
@@ -103,46 +146,15 @@ def test_pending_approval_owner_expired_cross_player_boundaries() -> None:
 def test_pending_approval_batch_waits_until_all_decisions() -> None:
     """同批多工具：单项决策不 pop；齐套后一次返回完整 batch。"""
     store = PendingApprovalStore(default_ttl_seconds=120.0)
-    reqs = DeferredToolRequests(
-        approvals=[
-            ToolCallPart(
-                tool_name="run_minecraft_command",
-                args={"command": "a"},
-                tool_call_id="tc1",
-            ),
-            ToolCallPart(
-                tool_name="run_minecraft_command",
-                args={"command": "b"},
-                tool_call_id="tc2",
-            ),
-        ]
-    )
-    now = time.time()
     batch_id = "batch-1"
     for ap_id, tc_id, cmd in (("ap1", "tc1", "a"), ("ap2", "tc2", "b")):
         store.put(
-            PendingApproval(
+            _make_pending(
                 approval_id=ap_id,
-                connection_id="conn-1",
-                player_name="Steve",
-                conversation_id="conv-1",
-                run_id="run-1",
                 tool_call_id=tc_id,
-                tool_name="run_minecraft_command",
-                normalized_args={"command": cmd},
-                args_summary=f"command={cmd}",
-                args_hash="h",
-                policy_version="v",
-                messages=[],
-                requests=reqs,
-                provider="test",
-                delivery="tellraw",
-                use_context=True,
-                broadcast_ai_chat=False,
-                created_at=now,
-                expires_at=now + 120,
                 batch_id=batch_id,
-                sibling_approval_ids=["ap1", "ap2"],
+                sibling_ids=["ap1", "ap2"],
+                cmd=cmd,
             )
         )
 
@@ -180,3 +192,114 @@ def test_pending_approval_batch_waits_until_all_decisions() -> None:
         "tc2": False,
     }
     assert len(store) == 0
+
+
+def test_resolve_target_approval_id_omitted_picks_single_batch() -> None:
+    """省略 id：仅有一批时自动取最早未决策项。"""
+    store = PendingApprovalStore(default_ttl_seconds=120.0)
+    store.put(
+        _make_pending(
+            approval_id="ap1",
+            tool_call_id="tc1",
+            batch_id="batch-1",
+            sibling_ids=["ap1", "ap2"],
+            cmd="a",
+        )
+    )
+    # 稍晚创建的同批项
+    later = _make_pending(
+        approval_id="ap2",
+        tool_call_id="tc2",
+        batch_id="batch-1",
+        sibling_ids=["ap1", "ap2"],
+        cmd="b",
+    )
+    later.created_at += 0.01
+    store.put(later)
+
+    resolved, reason = store.resolve_target_approval_id(
+        connection_id="conn-1",
+        player_name="Steve",
+        conversation_id="conv-1",
+        approval_id=None,
+    )
+    assert reason is None
+    assert resolved == "ap1"
+
+
+def test_resolve_target_approval_id_empty_and_multi_batch() -> None:
+    store = PendingApprovalStore(default_ttl_seconds=120.0)
+
+    empty_id, empty_reason = store.resolve_target_approval_id(
+        connection_id="conn-1",
+        player_name="Steve",
+        conversation_id="conv-1",
+    )
+    assert empty_id is None
+    assert "没有待审批" in (empty_reason or "")
+
+    store.put(_make_pending(approval_id="ap1", batch_id="b1", tool_call_id="tc1"))
+    store.put(
+        _make_pending(
+            approval_id="ap2",
+            batch_id="b2",
+            tool_call_id="tc2",
+            cmd="y",
+        )
+    )
+    multi_id, multi_reason = store.resolve_target_approval_id(
+        connection_id="conn-1",
+        player_name="Steve",
+        conversation_id="conv-1",
+    )
+    assert multi_id is None
+    assert "多个待审批批次" in (multi_reason or "")
+
+
+def test_resolve_target_approval_id_explicit_still_works() -> None:
+    store = PendingApprovalStore(default_ttl_seconds=120.0)
+    store.put(_make_pending(approval_id="ap9"))
+    resolved, reason = store.resolve_target_approval_id(
+        connection_id="conn-1",
+        player_name="Steve",
+        conversation_id="conv-1",
+        approval_id="ap9",
+    )
+    assert reason is None
+    assert resolved == "ap9"
+
+    missing, missing_reason = store.resolve_target_approval_id(
+        connection_id="conn-1",
+        player_name="Steve",
+        conversation_id="conv-1",
+        approval_id="nope",
+    )
+    assert missing is None
+    assert missing_reason is not None
+
+
+def test_session_auto_approve_conversation_vs_forever() -> None:
+    """对话级不跨对话；永远跨对话但按玩家隔离。"""
+    store = HostSessionStore()
+    cid = uuid4()
+    host = store.create(cid, authenticated=True)
+
+    assert host.should_auto_approve_tools("Steve", "conv-a") is False
+
+    host.enable_auto_approve_tools_conversation("Steve", "conv-a")
+    assert host.should_auto_approve_tools("Steve", "conv-a") is True
+    assert host.should_auto_approve_tools("Steve", "conv-b") is False
+    assert host.should_auto_approve_tools("Alex", "conv-a") is False
+
+    host.enable_auto_approve_tools_forever("Steve")
+    assert host.should_auto_approve_tools("Steve", "conv-a") is True
+    assert host.should_auto_approve_tools("Steve", "conv-b") is True
+    assert host.should_auto_approve_tools("Alex", "conv-b") is False
+
+    host.clear_auto_approve_tools("Steve", forever=True)
+    # 连接级清掉后，对话级仍在
+    assert host.should_auto_approve_tools("Steve", "conv-a") is True
+    assert host.should_auto_approve_tools("Steve", "conv-b") is False
+
+    host.clear_auto_approve_tools("Steve", conversation_id="conv-a")
+    assert host.should_auto_approve_tools("Steve", "conv-a") is False

@@ -35,6 +35,7 @@ class _Deps:
     run_id: str = "run-1"
     conversation_id: str = "conv-1"
     provider: str = "test"
+    auto_approve_tools: bool = False
 
 
 class _Settings:
@@ -226,6 +227,23 @@ async def test_high_risk_pauses_for_approval_without_side_effect() -> None:
     assert isinstance(result.output, DeferredToolRequests)
     assert result.output.approvals
     assert counter.get("run_minecraft_command", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_session_auto_approve_skips_deferred_and_executes() -> None:
+    """deps.auto_approve_tools=True 时高风险工具不再 defer，直接执行。"""
+    counter: dict[str, int] = {}
+    agent = _build_agent(counter)
+    deps = _Deps(settings=_Settings(), run_id="run-auto", auto_approve_tools=True)
+
+    result = await agent.run(
+        "run command",
+        deps=deps,
+        model=TestModel(call_tools=["run_minecraft_command"]),
+    )
+
+    assert not isinstance(result.output, DeferredToolRequests)
+    assert counter.get("run_minecraft_command") == 1
 
 
 @pytest.mark.asyncio
