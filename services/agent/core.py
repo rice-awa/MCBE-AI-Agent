@@ -82,12 +82,28 @@ def _resolve_instrumentation(settings: Any) -> Any:
         return False
 
 
+# pydantic-ai 1.94 中实现了 Model.count_tokens 的 provider。
+# OpenAIChatModel / OllamaModel / FunctionModel / TestModel 会直接 NotImplementedError。
+# deepseek 与 openai 均走 OpenAIChatModel，不能开启 count_tokens_before_request。
+_PROVIDERS_SUPPORTING_COUNT_TOKENS = frozenset({"anthropic"})
+
+
+def provider_supports_count_tokens(provider_name: str | None) -> bool:
+    """当前运行时的 Model 是否支持请求前 count_tokens。"""
+    if not provider_name:
+        return False
+    return provider_name.lower() in _PROVIDERS_SUPPORTING_COUNT_TOKENS
+
+
 def build_usage_limits(settings: Any, provider_name: str | None = None) -> UsageLimits:
     """从 Settings 构建 PydanticAI UsageLimits。
 
-    ContextBuilder 负责正常历史退化；`count_tokens_before_request=True`
+    ContextBuilder 负责正常历史退化；在模型支持时 `count_tokens_before_request`
     作为最终硬边界，阻止估算误差导致的超窗请求。
     若 context_window 元数据缺失，不回退到无限预算。
+
+    注意：OpenAI / DeepSeek / Ollama 的 Model 未实现 count_tokens；
+    即便 settings 开启也会自动关闭，避免 NotImplementedError 打断对话。
     """
     request_limit = int(getattr(settings, "request_limit", 8) or 8)
     tool_calls_limit = int(getattr(settings, "tool_calls_limit", 8) or 8)
@@ -121,16 +137,23 @@ def build_usage_limits(settings: Any, provider_name: str | None = None) -> Usage
         if total_tokens_limit is None:
             total_tokens_limit = 8192
 
+    want_count_tokens = bool(getattr(settings, "count_tokens_before_request", True))
+    supports_count_tokens = provider_supports_count_tokens(provider_name)
+    count_tokens_before_request = want_count_tokens and supports_count_tokens
+    if want_count_tokens and not supports_count_tokens:
+        logger.debug(
+            "count_tokens_before_request_disabled_for_provider",
+            provider=provider_name,
+            reason="model_does_not_implement_count_tokens",
+        )
+
     return UsageLimits(
         request_limit=request_limit,
         tool_calls_limit=tool_calls_limit,
         input_tokens_limit=input_tokens_limit,
         output_tokens_limit=output_tokens_limit,
         total_tokens_limit=total_tokens_limit,
-        # 生产默认开启；FunctionModel/TestModel 不支持 count_tokens，测试可在 settings 关闭
-        count_tokens_before_request=bool(
-            getattr(settings, "count_tokens_before_request", True)
-        ),
+        count_tokens_before_request=count_tokens_before_request,
     )
 
 

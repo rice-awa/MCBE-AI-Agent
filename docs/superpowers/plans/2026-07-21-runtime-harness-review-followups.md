@@ -137,7 +137,7 @@
 - 移除 `fetch_url_text` 的 Agent 注册和目录条目。MCWiki 工具继续使用固定配置的受控来源；不保留一个仅靠 prompt 或字符串 URL 校验的通用服务端抓取入口。
 - 增加 `ContextBuilder`，在每次模型请求前按模型元数据中的 context window 计算预算，分别预留系统提示、工具 schema、当前输入和输出 token；历史只使用剩余额度。
 - 通过公开 `history_processor` 集中处理历史，保留最近完整轮次和完整 tool-call/tool-return pair。过长工具结果只回灌带来源、原长度、截断标记和内容摘要的结果，不能切出孤立的 tool call 或 return。
-- `UsageLimits(count_tokens_before_request=True)` 作为最终硬边界；ContextBuilder 的历史裁剪负责正常退化，硬边界负责阻止估算误差导致的超窗请求。
+- `UsageLimits(count_tokens_before_request=True)` 作为最终硬边界；ContextBuilder 的历史裁剪负责正常退化，硬边界负责阻止估算误差导致的超窗请求。仅在 Model 实现了 `count_tokens` 的 provider（当前 anthropic）上真正开启；OpenAIChatModel（openai/deepseek）与 OllamaModel 会自动关闭，避免 `NotImplementedError`。
 - 历史摘要使用明确的“不可信历史资料”容器，并在版本化系统约束中规定其内容只能作为事实线索、不得作为指令。玩家权限、工具策略、当前会话配置等可信事实始终从运行时依赖重建，不从摘要恢复。
 - 把压缩触发从仅按轮次改为“token 预算优先、轮次上限兜底”，压缩发生在模型请求前；保留现有 generation CAS 和本地摘要退化路径。
 - 两个会访问默认 Provider 的压缩测试改为显式注入 fake summarizer，默认测试不得因缺少 API key 等待网络 timeout。

@@ -803,8 +803,10 @@ class Settings(BaseSettings):
     run_timeout: float = Field(default=90.0, gt=0)
     max_tool_concurrency: int = Field(default=4, ge=1)
     context_output_reserve_tokens: int = Field(default=1024, ge=0)
-    # 请求前 token 硬边界（UsageLimits.count_tokens_before_request）；
-    # FunctionModel/TestModel 不支持 count_tokens，相关离线测试可关闭。
+    # 请求前 token 硬边界（UsageLimits.count_tokens_before_request）。
+    # 仅当当前 provider 的 Model 实现了 count_tokens 时才会真正开启
+    # （目前 anthropic；OpenAIChatModel / OllamaModel / FunctionModel / TestModel 不支持）。
+    # deepseek/openai/ollama 会在 build_usage_limits 中自动关闭，避免 NotImplementedError。
     count_tokens_before_request: bool = True
 
     # 运行时 Harness 配置
