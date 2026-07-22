@@ -701,17 +701,18 @@ class HarnessToolset(WrapperToolset[Any]):
             else args_hash
         )
 
-        # 1) 方块工具按实际执行投影幂等；兼容已按授权/原始参数写入的旧记录。
+        # 1) 方块工具只按实际执行投影幂等；非方块工具保持原参数哈希兼容。
         if run_id and tool_call_id:
             cached = self.idempotency.get(
                 str(run_id), str(tool_call_id), idempotency_args_hash
             )
-            for legacy_hash in (args_hash, original_args_hash):
-                if cached is not None or legacy_hash == idempotency_args_hash:
-                    continue
-                cached = self.idempotency.get(
-                    str(run_id), str(tool_call_id), legacy_hash
-                )
+            if name not in _BLOCK_OPS_TOOLS:
+                for legacy_hash in (args_hash, original_args_hash):
+                    if cached is not None or legacy_hash == idempotency_args_hash:
+                        continue
+                    cached = self.idempotency.get(
+                        str(run_id), str(tool_call_id), legacy_hash
+                    )
             if cached is not None:
                 logger.info(
                     "tool_idempotent_hit",

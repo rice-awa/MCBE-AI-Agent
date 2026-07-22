@@ -1552,6 +1552,27 @@ async def test_auto_approved_fill_uses_execution_projection_idempotency_key() ->
         "from_pos": {"x": 2, "y": 64, "z": 2},
         "to_pos": {"x": 1, "y": 64, "z": 1},
     }
+    python_tool_args = {
+        **original_args,
+        "position": None,
+        "positions": None,
+        "states": None,
+        "replace_any": False,
+        "expected_previous": None,
+        "locked_targets": None,
+        "phase": None,
+    }
+    plan = build_block_preflight_plan("edit_blocks", python_tool_args, preflight_payload)
+    execution_hash = hash_normalized_args(normalize_tool_args(plan.execute_args))
+    authorization_hash = hash_normalized_args(normalize_tool_args(plan.authorized_args))
+    original_hash = hash_normalized_args(normalize_tool_args(original_args))
+    assert execution_hash != authorization_hash
+    assert execution_hash != original_hash
+    # Legacy entries could have been produced by a different execution projection.
+    # They must not suppress this exact world mutation.
+    store = get_idempotency_store()
+    store.put("run-auto-fill", "tc-auto-fill", authorization_hash, ToolResult.ok("stale-auth"))
+    store.put("run-auto-fill", "tc-auto-fill", original_hash, ToolResult.ok("stale-original"))
 
     model_calls = 0
 
@@ -1579,22 +1600,9 @@ async def test_auto_approved_fill_uses_execution_projection_idempotency_key() ->
         for capability, payload in bridge.calls
         if capability == "edit_blocks"
     ] == ["preflight", "execute"]
-    python_tool_args = {
-        **original_args,
-        "position": None,
-        "positions": None,
-        "states": None,
-        "replace_any": False,
-        "expected_previous": None,
-        "locked_targets": None,
-        "phase": None,
-    }
-    plan = build_block_preflight_plan("edit_blocks", python_tool_args, preflight_payload)
-    execution_hash = hash_normalized_args(normalize_tool_args(plan.execute_args))
-    authorization_hash = hash_normalized_args(normalize_tool_args(plan.authorized_args))
-    assert execution_hash != authorization_hash
     assert get_idempotency_store().get("run-auto-fill", "tc-auto-fill", execution_hash)
-    assert not get_idempotency_store().get("run-auto-fill", "tc-auto-fill", authorization_hash)
+    assert get_idempotency_store().get("run-auto-fill", "tc-auto-fill", authorization_hash)
+    assert get_idempotency_store().get("run-auto-fill", "tc-auto-fill", original_hash)
 
 
 @pytest.mark.asyncio
