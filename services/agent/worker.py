@@ -333,6 +333,8 @@ class AgentWorker:
                 target=stream_target,
                 error_kind="INTERNAL",
                 run_id=run_id,
+                trace_id=request.trace_id or run_id,
+                attempt_id=request.attempt_id,
             )
             return
 
@@ -396,6 +398,7 @@ class AgentWorker:
                         target=stream_target,
                         tool_name=tool_name,
                         tool_args=tool_args,
+                        **self._chunk_correlation(request),
                     )
                     await self.broker.send_response(connection_id, tool_chunk)
                     sequence += 1
@@ -428,6 +431,7 @@ class AgentWorker:
                             target=stream_target,
                             tool_name=tool_name,
                             tool_result_preview=truncate_text(result_content, 80),
+                            **self._chunk_correlation(request),
                         )
                         await self.broker.send_response(connection_id, result_chunk)
                         sequence += 1
@@ -579,6 +583,7 @@ class AgentWorker:
                         delivery=request.delivery,
                         player_name=request.player_name,
                         target=stream_target,
+                        **self._chunk_correlation(request),
                     )
                     await self.broker.send_response(connection_id, chunk)
                     sequence += 1
@@ -601,6 +606,7 @@ class AgentWorker:
                                 delivery=request.delivery,
                                 player_name=request.player_name,
                                 target=stream_target,
+                                **self._chunk_correlation(request),
                             )
                             await self.broker.send_response(connection_id, start_chunk)
                             sequence += 1
@@ -621,6 +627,7 @@ class AgentWorker:
                                 delivery=request.delivery,
                                 player_name=request.player_name,
                                 target=stream_target,
+                                **self._chunk_correlation(request),
                             )
                             await self.broker.send_response(connection_id, end_chunk)
                             sequence += 1
@@ -640,6 +647,7 @@ class AgentWorker:
                                 delivery=request.delivery,
                                 player_name=request.player_name,
                                 target=stream_target,
+                                **self._chunk_correlation(request),
                             )
                             await self.broker.send_response(connection_id, chunk)
                             sequence += 1
@@ -701,6 +709,8 @@ class AgentWorker:
                 target=stream_target,
                 error_kind=error_kind,
                 run_id=run_id,
+                trace_id=request.trace_id or run_id,
+                attempt_id=request.attempt_id,
             )
 
     async def _generate_title_for_conversation(
@@ -1049,6 +1059,14 @@ class AgentWorker:
             send_command=send_command_for_addon,
         )
 
+    @staticmethod
+    def _chunk_correlation(request: ChatRequest) -> dict[str, str | None]:
+        """从 ChatRequest 提取 StreamChunk correlation（不含正文）。"""
+        return {
+            "trace_id": request.trace_id or request.run_id,
+            "attempt_id": request.attempt_id,
+        }
+
     async def _send_error_chunk(
         self,
         connection_id: UUID,
@@ -1059,6 +1077,8 @@ class AgentWorker:
         *,
         error_kind: str | None = None,
         run_id: str | None = None,
+        trace_id: str | None = None,
+        attempt_id: str | None = None,
     ) -> None:
         """发送错误消息块（玩家可见文案，不含堆栈）。"""
         chunk = StreamChunk(
@@ -1068,6 +1088,8 @@ class AgentWorker:
             sequence=sequence,
             player_name=player_name,
             target=target,
+            trace_id=trace_id or run_id,
+            attempt_id=attempt_id,
         )
         await self.broker.send_response(connection_id, chunk)
 
@@ -1119,6 +1141,8 @@ class AgentWorker:
                 target=stream_target,
                 error_kind="INTERNAL",
                 run_id=request.run_id,
+                trace_id=request.trace_id or request.run_id,
+                attempt_id=request.attempt_id,
             )
             return
 
@@ -1139,6 +1163,8 @@ class AgentWorker:
                 target=stream_target,
                 error_kind="INTERNAL",
                 run_id=request.run_id,
+                trace_id=request.trace_id or request.run_id,
+                attempt_id=request.attempt_id,
             )
             return
 
@@ -1214,6 +1240,7 @@ class AgentWorker:
                 player_name=request.player_name,
                 target=stream_target or request.player_name,
                 tool_name=call.tool_name,
+                **self._chunk_correlation(request),
             )
             await self.broker.send_response(connection_id, chunk)
             sequence += 1

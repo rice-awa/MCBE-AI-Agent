@@ -15,7 +15,7 @@ from config.logging import get_logger
 from config.settings import Settings
 from core.queue import MessageBroker, normalize_conversation_id
 from core.session import DEFAULT_CONVERSATION_ID
-from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
+from models.constants import DEFAULT_PLAYER_DISPLAY_NAME, DEFAULT_PLAYER_KEY
 from models.messages import ChatRequest
 from services.auth.jwt_handler import JWTHandler
 from services.gateway.session_store import HostConnectionSession, HostSessionStore
@@ -145,7 +145,7 @@ class CommandHandlers:
             attempt_id=attempt_id,
             message_id=str(chat_req.id),
             connection_id=str(chat_req.connection_id),
-            player_name=chat_req.player_name or DEFAULT_PLAYER_DISPLAY_NAME,
+            player_name=chat_req.player_name or DEFAULT_PLAYER_KEY,
             conversation_id=chat_req.conversation_id or DEFAULT_CONVERSATION_ID,
         )
 
@@ -172,7 +172,7 @@ class CommandHandlers:
                     attempt_id=str(uuid4()),
                     message_id="",
                     connection_id=str(state.id),
-                    player_name=player_name or DEFAULT_PLAYER_DISPLAY_NAME,
+                    player_name=player_name or DEFAULT_PLAYER_KEY,
                     conversation_id=DEFAULT_CONVERSATION_ID,
                 )
             if context is None:

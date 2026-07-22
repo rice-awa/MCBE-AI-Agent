@@ -262,6 +262,7 @@ async def test_approval_resume_keeps_trace_and_uses_new_attempt():
     assert resumed.trace_id == "trace-original"
     assert resumed.run_id == "trace-original"
     assert resumed.attempt_id
+    assert resumed.attempt_id != resumed.trace_id
     assert resumed.attempt_id != "attempt-original"
     assert item.trace_context is not None
     assert item.trace_context.trace_id == "trace-original"
