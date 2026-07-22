@@ -715,5 +715,70 @@ async def test_harness_deny_emits_denied_execution_status(tmp_path):
         ]
         assert denied, f"expected denied execution event, got {names}"
         assert all("payload" not in e or e.get("payload") is None for e in events)
+        # Content-off: free-text policy reason must not appear in attributes
+        policy_events = [e for e in events if e["event_name"] == "policy.decided"]
+        assert policy_events
+        assert "reason" not in (policy_events[0].get("attributes") or {})
+    finally:
+        set_trace_recorder(None)
+
+
+@pytest.mark.asyncio
+async def test_harness_cancelled_emits_tool_execution_cancelled(tmp_path):
+    """asyncio.CancelledError during tool invoke emits tool.execution.cancelled."""
+    import json
+    from pathlib import Path
+
+    from services.agent.trace import TraceContext, TraceRecorder, set_trace_recorder
+
+    path = tmp_path / "harness_cancel.jsonl"
+    recorder = TraceRecorder(path=path, enabled=True, include_content=False, max_records=100)
+    await recorder.start()
+    set_trace_recorder(recorder)
+    try:
+        context = TraceContext(
+            trace_id="trace-cancel",
+            run_id="trace-cancel",
+            attempt_id="attempt-c",
+            message_id="m",
+            connection_id="c",
+            player_name="Steve",
+            conversation_id="conv",
+        )
+        deps = _Deps(settings=_Settings(), run_id="trace-cancel")
+        deps.trace_context = context  # type: ignore[attr-defined]
+        deps.trace_recorder = recorder  # type: ignore[attr-defined]
+
+        policy = PolicyEngine.from_settings(_Settings())
+        agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+            "test",
+            deps_type=_Deps,
+            output_type=[str, DeferredToolRequests],
+            capabilities=[HarnessCapability(policy=policy)],
+        )
+
+        @agent.tool
+        async def list_available_providers(ctx: RunContext[_Deps]) -> str:
+            raise asyncio.CancelledError()
+
+        with pytest.raises(asyncio.CancelledError):
+            await agent.run(
+                "list providers please",
+                deps=deps,
+                model=TestModel(call_tools=["list_available_providers"]),
+            )
+
+        await recorder.stop()
+        events = [
+            json.loads(line)
+            for line in Path(path).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        names = [e["event_name"] for e in events]
+        assert "tool.execution.started" in names
+        assert "tool.execution.cancelled" in names
+        cancelled = next(e for e in events if e["event_name"] == "tool.execution.cancelled")
+        assert cancelled["attributes"]["execution_status"] == "cancelled"
+        assert cancelled["attributes"]["tool_name"] == "list_available_providers"
     finally:
         set_trace_recorder(None)

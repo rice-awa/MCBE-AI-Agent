@@ -611,6 +611,20 @@ class AgentWorker:
                         sequence += 1
 
                 elif event.event_type == "approval_required":
+                    # Flush model pairs for this attempt before suspend so the
+                    # model leg is present even when tools never execute.
+                    if resolved_context is not None and event.metadata:
+                        new_messages = event.metadata.get("new_messages_serialized")
+                        if not isinstance(new_messages, list):
+                            new_messages = event.metadata.get("new_messages")
+                        usage = event.metadata.get("usage")
+                        usage_dict = usage if isinstance(usage, dict) else None
+                        self._record_model_pairs_from_messages(
+                            resolved_context,
+                            new_messages if isinstance(new_messages, list) else None,
+                            usage=usage_dict,
+                            provider=provider_name,
+                        )
                     await self._handle_approval_required(
                         request=request,
                         connection_id=connection_id,
@@ -1470,34 +1484,26 @@ class AgentWorker:
             approval_ids.append(approval_id)
 
             if trace_context is not None:
+                # tool.proposed is already emitted by harness call_tool; worker
+                # only writes approval.requested (+ related attributes).
                 try:
                     recorder = get_trace_recorder(self.settings)
-                    recorder.record_tool_call(
-                        trace_context,
-                        tool_name=call.tool_name,
-                        tool_call_id=call.tool_call_id,
-                        tool_args=normalized_args if isinstance(normalized_args, dict) else None,
-                        event_name="tool.proposed",
-                        status="info",
-                        attributes={
-                            "approval_id": approval_id,
-                            "batch_id": batch_id,
-                            "args_summary": args_summary,
-                        },
-                    )
+                    approval_attrs: dict = {
+                        "approval_id": approval_id,
+                        "batch_id": batch_id,
+                        "tool_name": call.tool_name,
+                        "policy_version": policy_version,
+                        "ttl_seconds": ttl,
+                    }
+                    # Free-text args_summary only when content mode is on
+                    if getattr(recorder, "include_content", False):
+                        approval_attrs["args_summary"] = args_summary
                     recorder.emit(
                         "approval.requested",
                         trace_context,
                         status="info",
                         tool_call_id=call.tool_call_id,
-                        attributes={
-                            "approval_id": approval_id,
-                            "batch_id": batch_id,
-                            "tool_name": call.tool_name,
-                            "args_summary": args_summary,
-                            "policy_version": policy_version,
-                            "ttl_seconds": ttl,
-                        },
+                        attributes=approval_attrs,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("trace_approval_requested_failed", error=str(exc))

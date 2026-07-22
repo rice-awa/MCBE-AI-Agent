@@ -154,25 +154,15 @@ class BrokerResponseBridge:
         delivery_type = "scriptevent" if chunk.delivery == "scriptevent" else "tellraw"
         target = chunk.target or chunk.player_name or "@a"
         content_len = len(chunk.content or "")
-        self._emit_delivery(
-            "delivery.enqueued",
-            chunk,
-            status="info",
-            attributes={
-                "target": target,
-                "delivery_type": delivery_type,
-                "chunk_type": chunk.chunk_type,
-                "sequence": chunk.sequence,
-                "byte_count": content_len,
-                "chunk_count": 1,
-            },
-        )
+
+        # Early-return chunk types never leave the host — skip delivery.* so
+        # we do not orphan delivery.enqueued without started/completed.
+        if chunk.chunk_type == "thinking_end":
+            return
 
         if chunk.chunk_type == "thinking_start":
             message = f"{MCColor.GRAY}{MCPrefix.THINKING}思考中..."
             color = MCColor.GRAY
-        elif chunk.chunk_type == "thinking_end":
-            return
         elif chunk.chunk_type == "content":
             message = chunk.content
             color = MCColor.GREEN
@@ -194,6 +184,20 @@ class BrokerResponseBridge:
 
         if not message:
             return
+
+        self._emit_delivery(
+            "delivery.enqueued",
+            chunk,
+            status="info",
+            attributes={
+                "target": target,
+                "delivery_type": delivery_type,
+                "chunk_type": chunk.chunk_type,
+                "sequence": chunk.sequence,
+                "byte_count": content_len,
+                "chunk_count": 1,
+            },
+        )
 
         delivery = self._delivery(state)
         if delivery is None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -635,6 +636,13 @@ class HarnessToolset(WrapperToolset[Any]):
         if decision.action == PolicyDecisionKind.REQUIRE_APPROVAL:
             summary = summarize_args_for_player(name, normalized)
             # 审批挂起：记 not_executed，真正 approval.requested 由 Worker 写
+            not_exec_attrs: dict[str, Any] = {
+                "policy_action": str(decision.action),
+            }
+            if trace_recorder is not None and getattr(
+                trace_recorder, "include_content", False
+            ):
+                not_exec_attrs["reason"] = decision.reason
             self._trace_tool_result(
                 trace_recorder,
                 trace_context,
@@ -643,10 +651,7 @@ class HarnessToolset(WrapperToolset[Any]):
                 result=None,
                 status="not_executed",
                 duration_ms=_duration_ms(start),
-                attributes={
-                    "policy_action": str(decision.action),
-                    "reason": decision.reason,
-                },
+                attributes=not_exec_attrs,
             )
             raise ApprovalRequired(
                 metadata={
@@ -673,6 +678,20 @@ class HarnessToolset(WrapperToolset[Any]):
         try:
             raw_result = await super().call_tool(name, tool_args, ctx, tool)
         except ApprovalRequired:
+            raise
+        except asyncio.CancelledError:
+            # CancelledError is BaseException in 3.11+; must not fall through
+            # as a silent miss of tool.execution.cancelled.
+            self._trace_tool_result(
+                trace_recorder,
+                trace_context,
+                tool_name=name,
+                tool_call_id=str(tool_call_id) if tool_call_id else None,
+                result=None,
+                status="cancelled",
+                duration_ms=_duration_ms(start),
+                attributes={"reason": "CancelledError"},
+            )
             raise
         except Exception as exc:
             classified = classify_tool_exception(exc, tool_name=name)
@@ -804,18 +823,21 @@ class HarnessToolset(WrapperToolset[Any]):
         if recorder is None or context is None:
             return
         try:
+            attrs: dict[str, Any] = {
+                "tool_name": tool_name,
+                "action": str(getattr(decision, "action", "")),
+                "policy_version": getattr(decision, "policy_version", None),
+                "already_approved": already_approved,
+            }
+            # Free-text reason only when content mode is enabled
+            if getattr(recorder, "include_content", False):
+                attrs["reason"] = getattr(decision, "reason", None)
             recorder.emit(
                 "policy.decided",
                 context,
                 status="info",
                 tool_call_id=tool_call_id,
-                attributes={
-                    "tool_name": tool_name,
-                    "action": str(getattr(decision, "action", "")),
-                    "reason": getattr(decision, "reason", None),
-                    "policy_version": getattr(decision, "policy_version", None),
-                    "already_approved": already_approved,
-                },
+                attributes=attrs,
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("trace_policy_decided_failed", error=str(exc))

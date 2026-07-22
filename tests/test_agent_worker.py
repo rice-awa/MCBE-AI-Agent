@@ -625,3 +625,133 @@ async def test_stream_error_emits_trace_failed_once(tmp_path, monkeypatch):
         assert failed[0]["attributes"]["error_kind"] == "DENIED"
     finally:
         set_trace_recorder(None)
+
+
+@pytest.mark.asyncio
+async def test_approval_suspended_records_model_pairs_without_duplicate_proposed(
+    tmp_path, monkeypatch
+):
+    """approval_required flushes model pairs before suspended; no worker tool.proposed."""
+    from types import SimpleNamespace
+
+    from pydantic_ai.messages import ToolCallPart
+    from pydantic_ai.tools import DeferredToolRequests
+
+    from services.agent.core import StreamEvent
+    from services.agent.harness.approvals import PendingApprovalStore
+    from services.agent.trace import TraceRecorder, set_trace_recorder
+
+    settings = _make_settings()
+    settings.approval_ttl = 120.0
+    settings.tool_policy_version = "test"
+    path = tmp_path / "worker_trace_approval.jsonl"
+    recorder = TraceRecorder(
+        path=path, enabled=True, include_content=True, max_records=500
+    )
+    await recorder.start()
+    set_trace_recorder(recorder)
+    try:
+        broker = MagicMock()
+        broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+        broker.get_conversation_history = MagicMock(return_value=[])
+        broker.set_conversation_history = MagicMock(return_value=True)
+        broker.get_response_queue = MagicMock(return_value=object())
+        broker.send_response = AsyncMock(return_value=True)
+        broker.mark_conversation_title_generating = MagicMock(return_value=False)
+        worker = AgentWorker(broker, settings)
+
+        new_messages = [
+            {
+                "kind": "request",
+                "parts": [{"part_kind": "user-prompt", "content": "set day"}],
+            },
+            {
+                "kind": "response",
+                "parts": [
+                    {
+                        "part_kind": "tool-call",
+                        "tool_name": "run_minecraft_command",
+                        "tool_call_id": "tc-ap1",
+                        "args": {"command": "time set day"},
+                    }
+                ],
+                "finish_reason": "tool_calls",
+            },
+        ]
+        deferred = DeferredToolRequests(
+            approvals=[
+                ToolCallPart(
+                    tool_name="run_minecraft_command",
+                    tool_call_id="tc-ap1",
+                    args={"command": "time set day"},
+                )
+            ],
+            metadata={
+                "tc-ap1": {
+                    "normalized_args": {"command": "time set day"},
+                    "args_summary": "command=time set day",
+                    "args_hash": "h",
+                    "policy_version": "test",
+                    "reason": "needs approval",
+                }
+            },
+        )
+
+        async def fake_stream_chat(*_args, **_kwargs):
+            yield StreamEvent(
+                event_type="approval_required",
+                content="工具调用需要玩家审批",
+                sequence=0,
+                metadata={
+                    "deferred_requests": deferred,
+                    "all_messages": [],
+                    "new_messages": new_messages,
+                    "new_messages_serialized": new_messages,
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                    "run_id": "trace-ap-susp",
+                },
+            )
+
+        store = PendingApprovalStore(default_ttl_seconds=120.0)
+        runtime = SimpleNamespace(
+            get_pending_approval_store=lambda _settings=None: store,
+            refresh_mcp_tools=lambda _s: None,
+            get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
+                check_and_compress=AsyncMock(return_value=(False, "")),
+            ),
+        )
+        monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+        monkeypatch.setattr(
+            "services.agent.providers.ProviderRegistry.get_model",
+            lambda _config: object(),
+        )
+        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+        monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: runtime)
+
+        connection_id = uuid4()
+        await worker._process_request_locked(
+            ChatRequest(
+                connection_id=connection_id,
+                content="set day",
+                player_name="Alex",
+                run_id="trace-ap-susp",
+                trace_id="trace-ap-susp",
+                attempt_id="attempt-ap",
+            ),
+            connection_id,
+        )
+
+        events = await _flush_trace(recorder)
+        names = [e["event_name"] for e in events]
+        assert "model.request.completed" in names
+        assert "approval.requested" in names
+        assert "trace.suspended" in names
+        # Worker no longer re-emits tool.proposed (harness owns that boundary).
+        assert "tool.proposed" not in names
+        assert names.index("model.request.completed") < names.index("trace.suspended")
+        assert names.index("approval.requested") < names.index("trace.suspended")
+        suspended = [e for e in events if e["event_name"] == "trace.suspended"]
+        assert len(suspended) == 1
+        assert suspended[0]["status"] == "suspended"
+    finally:
+        set_trace_recorder(None)
