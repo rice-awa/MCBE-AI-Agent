@@ -57,6 +57,12 @@ class MinecraftConfig(BaseModel):
             "description": "管理对话",
             "usage": "<new/switch/clear/status/list/save/restore>"
         },
+        "AGENT 连续模式": {
+            "type": "continuous_mode",
+            "aliases": ["AGENT 连续", "AGENT continuous", "AGENT auto"],
+            "description": "开启/关闭连续AI聊天模式（无需前缀自动触发AI）",
+            "usage": "<开启|关闭|状态>"
+        },
         "AGENT 上下文": {
             "type": "context",
             "aliases": ["AGENT context", "AI 上下文", "AI context"],
@@ -125,6 +131,7 @@ class MinecraftConfig(BaseModel):
         "chat_script": ("使用脚本事件发送", "<内容>"),
         "conversation": ("管理对话", "<new/switch/clear/status/list/save/restore>"),
         "context": ("管理上下文开关", "<启用/关闭/状态>"),
+        "continuous_mode": ("开启/关闭连续AI聊天模式", "<开启|关闭|状态>"),
         "mcp": ("MCP 服务器管理", "<list/status/reload>"),
         "ai_broadcast": ("控制多人 AI 聊天广播", "<状态/关闭/全服 开启|关闭/玩家 <玩家名> 开启|关闭>"),
         "tool_approve": ("同意高风险工具调用", "[approval_id|对话|永远]"),

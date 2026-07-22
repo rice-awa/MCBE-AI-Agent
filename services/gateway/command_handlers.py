@@ -248,6 +248,9 @@ class CommandHandlers:
             "context": lambda: self.handle_context(
                 state, content, player_name=player_name
             ),
+            "continuous_mode": lambda: self.handle_continuous_mode(
+                state, content, player_name=player_name
+            ),
             "conversation": lambda: self.handle_conversation(
                 state, content, player_name=player_name
             ),
@@ -548,6 +551,29 @@ class CommandHandlers:
 
         await self._send_player_reply(
             state, msg, source="context", player_name=player_name
+        )
+
+    async def handle_continuous_mode(
+        self, state: ConnectionState, option: str, player_name: str | None = None
+    ) -> None:
+        host = self._require_host(state)
+        session = host.get_player_session(player_name)
+
+        action = option.strip().lower() if option.strip() else "状态"
+        if action in ("开启", "启用", "on", "enable", "开"):
+            session.continuous_mode = True
+            msg = self.protocol.create_success_message(
+                "连续AI聊天模式已开启，您可以直接发送消息与AI对话"
+            )
+        elif action in ("关闭", "off", "disable", "关"):
+            session.continuous_mode = False
+            msg = self.protocol.create_info_message("连续AI聊天模式已关闭")
+        else:
+            status = "开启" if session.continuous_mode else "关闭"
+            msg = self.protocol.create_info_message(f"连续AI聊天模式: {status}")
+
+        await self._send_player_reply(
+            state, msg, source="continuous_mode", player_name=player_name
         )
 
     async def handle_conversation(

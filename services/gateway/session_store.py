@@ -14,6 +14,7 @@ class PlayerSession:
 
     player_name: str
     context_enabled: bool = True
+    continuous_mode: bool = False
     current_provider: str | None = None
     current_template: str = "default"
     custom_variables: dict[str, str] = field(default_factory=dict)

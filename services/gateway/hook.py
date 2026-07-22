@@ -201,10 +201,40 @@ class HostConnectionHook(NoOpHook):
         event: PlayerMessageEvent,
         parsed: ParsedCommand | None,
     ) -> None:
+        player_name = event.sender
+
         if parsed is None:
+            # 非命令消息：检查 @AI 标签或连续模式
+            if not self.settings.dev_mode and not await self.handlers.check_auth(state):
+                return
+
+            message = event.message.strip()
+            if not message:
+                return
+
+            # 1. 检查 @AI 标签（消息中任意位置，不区分大小写）
+            ai_tag = "@AI"
+            ai_idx = message.upper().find(ai_tag)
+            if ai_idx != -1:
+                content = message[ai_idx + len(ai_tag):].strip()
+                if content:
+                    await self.handlers.handle_chat(
+                        state, content, delivery="tellraw", player_name=player_name
+                    )
+                    return
+
+            # 2. 检查连续模式
+            host = self.sessions.get(state.id)
+            if host is not None:
+                session = host.get_player_session(player_name)
+                if session.continuous_mode:
+                    await self.handlers.handle_chat(
+                        state, message, delivery="tellraw", player_name=player_name
+                    )
+                    return
+
             return
 
-        player_name = event.sender
         if parsed.type == "login":
             await self.handlers.handle_login(
                 state, parsed.content, player_name=player_name

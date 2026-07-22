@@ -108,6 +108,7 @@ class CommandRequest(BaseMessage):
         "login",
         "save",
         "context",
+        "continuous_mode",
         "conversation",
         "run_command",
         "switch_model",
