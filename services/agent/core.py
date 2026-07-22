@@ -586,6 +586,41 @@ def _extract_new_messages(result: Any) -> list[ModelMessage]:
     return _extract_all_messages(result)
 
 
+def serialize_model_messages(messages: list[ModelMessage] | None) -> list[dict[str, Any]]:
+    """将 ModelRequest/ModelResponse 序列化为 JSON-safe 字典列表。
+
+    使用 pydantic_core.to_jsonable_python 保留 role/kind、part 顺序、
+    tool-call ID、finish reason、provider/model 元数据与 usage。
+    不序列化 streaming delta 或 HTTP raw body。
+    """
+    if not messages:
+        return []
+    try:
+        from pydantic_core import to_jsonable_python
+
+        raw = to_jsonable_python(messages)
+        if isinstance(raw, list):
+            return [item if isinstance(item, dict) else {"value": str(item)} for item in raw]
+    except Exception:  # noqa: BLE001
+        pass
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        if hasattr(msg, "model_dump"):
+            try:
+                out.append(msg.model_dump(mode="json"))  # type: ignore[union-attr]
+                continue
+            except Exception:  # noqa: BLE001
+                pass
+        if is_dataclass(msg):
+            try:
+                out.append(asdict(msg))
+                continue
+            except Exception:  # noqa: BLE001
+                pass
+        out.append({"value": str(msg)})
+    return out
+
+
 def _extract_result_usage(result: Any) -> Any | None:
     """兼容不同 pydantic-ai 版本，提取 usage。"""
     usage_attr = getattr(result, "usage", None)
@@ -627,6 +662,7 @@ def _build_approval_required_event(
     result: Any,
 ) -> StreamEvent:
     """构造审批暂停事件，供 Worker 写入 PendingApprovalStore 并提示玩家。"""
+    new_messages = _extract_new_messages(result)
     return StreamEvent(
         event_type="approval_required",
         content="工具调用需要玩家审批",
@@ -634,7 +670,9 @@ def _build_approval_required_event(
         metadata={
             "deferred_requests": deferred,
             "all_messages": _extract_all_messages(result),
-            "new_messages": _extract_new_messages(result),
+            # 原始对象供 Worker/history；序列化副本供 trace 边界消费
+            "new_messages": new_messages,
+            "new_messages_serialized": serialize_model_messages(new_messages),
             "tool_events": ctx.tool_events,
             "usage": ctx.serialized_usage,
             "run_id": deps.run_id,
@@ -1394,6 +1432,8 @@ async def stream_chat(
                 "is_complete": True,
                 "usage": ctx.serialized_usage,
                 "all_messages": ctx.all_messages,
+                "new_messages": ctx.new_messages,
+                "new_messages_serialized": serialize_model_messages(ctx.new_messages),
                 "tool_events": ctx.tool_events,
                 "run_id": deps.run_id,
                 "conversation_id": deps.conversation_id,

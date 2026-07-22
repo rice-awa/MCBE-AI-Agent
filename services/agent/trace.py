@@ -316,7 +316,11 @@ class TraceRecorder:
             attrs.setdefault("player_name", context.player_name)
             attrs.setdefault("conversation_id", context.conversation_id)
 
-            line = json.dumps(event.model_dump(mode="json"), ensure_ascii=False, default=str)
+            dumped = event.model_dump(mode="json")
+            # content 关闭时不保留 null payload 键，便于审计侧区分「无正文」。
+            if dumped.get("payload") is None:
+                dumped.pop("payload", None)
+            line = json.dumps(dumped, ensure_ascii=False, default=str)
             queue = self._ensure_queue()
             try:
                 queue.put_nowait(line)
@@ -338,6 +342,162 @@ class TraceRecorder:
                 event_name=event_name,
                 error=str(exc),
             )
+
+    def record_model_messages(
+        self,
+        context: TraceContext,
+        *,
+        messages: list[Any],
+        usage: dict[str, Any] | None = None,
+        provider: str | None = None,
+        model_name: str | None = None,
+        finish_reason: str | None = None,
+        duration_ms: int | None = None,
+        attributes: dict[str, Any] | None = None,
+        status: str = "completed",
+        span_id: str | None = None,
+        parent_span_id: str | None = None,
+    ) -> None:
+        """记录一轮 model request/response（正文仅经 payload 白名单门控）。"""
+        attrs = dict(attributes or {})
+        if provider is not None:
+            attrs.setdefault("provider", provider)
+        if model_name is not None:
+            attrs.setdefault("model_name", model_name)
+        if finish_reason is not None:
+            attrs.setdefault("finish_reason", finish_reason)
+        payload: dict[str, Any] = {"messages": messages}
+        if usage is not None:
+            payload["usage"] = usage
+        if finish_reason is not None:
+            payload["finish_reason"] = finish_reason
+        if model_name is not None:
+            payload["model_name"] = model_name
+        if provider is not None:
+            payload["provider"] = provider
+        self.emit(
+            "model.request.completed",
+            context,
+            status=status,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+            duration_ms=duration_ms,
+            attributes=attrs,
+            payload=payload,
+        )
+
+    def record_tool_call(
+        self,
+        context: TraceContext,
+        *,
+        tool_name: str,
+        tool_call_id: str | None = None,
+        tool_args: dict[str, Any] | None = None,
+        parameters: dict[str, Any] | None = None,
+        event_name: str = "tool.proposed",
+        status: str = "info",
+        attributes: dict[str, Any] | None = None,
+        span_id: str | None = None,
+        parent_span_id: str | None = None,
+    ) -> None:
+        """记录工具提议/调用参数（args 仅在 include_content 时进入 payload）。"""
+        attrs = dict(attributes or {})
+        attrs.setdefault("tool_name", tool_name)
+        if tool_call_id is not None:
+            attrs.setdefault("tool_call_id", tool_call_id)
+        args = parameters if parameters is not None else tool_args
+        payload: dict[str, Any] | None = None
+        if args is not None:
+            payload = {"tool_args": args, "parameters": args}
+        self.emit(
+            event_name,
+            context,
+            status=status,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+            tool_call_id=tool_call_id,
+            attributes=attrs,
+            payload=payload,
+        )
+
+    def record_tool_result(
+        self,
+        context: TraceContext,
+        *,
+        tool_name: str,
+        tool_call_id: str | None = None,
+        result: Any = None,
+        status: str = "succeeded",
+        event_name: str | None = None,
+        duration_ms: int | None = None,
+        attributes: dict[str, Any] | None = None,
+        span_id: str | None = None,
+        parent_span_id: str | None = None,
+    ) -> None:
+        """记录工具执行结果；status 使用归一化执行态。"""
+        normalized = str(status or "succeeded")
+        if event_name is None:
+            if normalized in {"failed", "denied", "timeout_unknown"}:
+                event_name = "tool.execution.failed"
+            elif normalized == "cancelled":
+                event_name = "tool.execution.cancelled"
+            elif normalized == "not_executed":
+                event_name = "tool.execution.completed"
+            else:
+                event_name = "tool.execution.completed"
+        attrs = dict(attributes or {})
+        attrs.setdefault("tool_name", tool_name)
+        attrs.setdefault("execution_status", normalized)
+        if tool_call_id is not None:
+            attrs.setdefault("tool_call_id", tool_call_id)
+        payload: dict[str, Any] | None = None
+        if result is not None:
+            payload = {"tool_result": result, "result": result}
+        self.emit(
+            event_name,
+            context,
+            status=normalized if normalized in {
+                "succeeded",
+                "failed",
+                "denied",
+                "cancelled",
+                "timeout_unknown",
+                "not_executed",
+                "info",
+                "completed",
+            } else "info",
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+            tool_call_id=tool_call_id,
+            duration_ms=duration_ms,
+            attributes=attrs,
+            payload=payload,
+        )
+
+    def record_final_response(
+        self,
+        context: TraceContext,
+        *,
+        content: str,
+        attributes: dict[str, Any] | None = None,
+        duration_ms: int | None = None,
+        status: str = "completed",
+        event_name: str = "trace.completed",
+    ) -> None:
+        """记录终态与用户可见最终答复（正文仅 content 门控）。"""
+        attrs = dict(attributes or {})
+        payload = {
+            "content": content,
+            "final_response": content,
+        }
+        self.emit(
+            event_name,
+            context,
+            status=status,
+            duration_ms=duration_ms,
+            attributes=attrs,
+            payload=payload,
+        )
 
     async def _writer_loop(self) -> None:
         queue = self._ensure_queue()

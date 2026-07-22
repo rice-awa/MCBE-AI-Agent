@@ -541,6 +541,17 @@ class HarnessToolset(WrapperToolset[Any]):
         tool_call_id = getattr(ctx, "tool_call_id", None) or ""
         settings = getattr(deps, "settings", None)
         entry = get_tool_entry(name)
+        trace_context = getattr(deps, "trace_context", None)
+        trace_recorder = getattr(deps, "trace_recorder", None)
+
+        # tool.proposed at the boundary (fail-soft)
+        self._trace_tool_proposed(
+            trace_recorder,
+            trace_context,
+            tool_name=name,
+            tool_call_id=str(tool_call_id) if tool_call_id else None,
+            tool_args=normalized,
+        )
 
         # 1) 幂等命中
         if run_id and tool_call_id:
@@ -561,6 +572,16 @@ class HarnessToolset(WrapperToolset[Any]):
                     duration_ms=_duration_ms(start),
                     result=cached.result,
                 )
+                self._trace_tool_result(
+                    trace_recorder,
+                    trace_context,
+                    tool_name=name,
+                    tool_call_id=str(tool_call_id) if tool_call_id else None,
+                    result=cached.result,
+                    status="succeeded",
+                    duration_ms=_duration_ms(start),
+                    attributes={"idempotent_hit": True},
+                )
                 return materialize_tool_result(cached.result)
 
         # 2) 策略决策
@@ -573,6 +594,14 @@ class HarnessToolset(WrapperToolset[Any]):
             normalized,
             player_name=player_name,
             approved=already_approved,
+        )
+        self._trace_policy_decided(
+            trace_recorder,
+            trace_context,
+            tool_name=name,
+            tool_call_id=str(tool_call_id) if tool_call_id else None,
+            decision=decision,
+            already_approved=already_approved,
         )
 
         if decision.action == PolicyDecisionKind.DENY:
@@ -591,10 +620,34 @@ class HarnessToolset(WrapperToolset[Any]):
                 duration_ms=_duration_ms(start),
                 result=denied,
             )
+            self._trace_tool_result(
+                trace_recorder,
+                trace_context,
+                tool_name=name,
+                tool_call_id=str(tool_call_id) if tool_call_id else None,
+                result=decision.reason,
+                status="denied",
+                duration_ms=_duration_ms(start),
+                attributes={"policy_action": str(decision.action)},
+            )
             return ToolDenied(message=decision.reason)
 
         if decision.action == PolicyDecisionKind.REQUIRE_APPROVAL:
             summary = summarize_args_for_player(name, normalized)
+            # 审批挂起：记 not_executed，真正 approval.requested 由 Worker 写
+            self._trace_tool_result(
+                trace_recorder,
+                trace_context,
+                tool_name=name,
+                tool_call_id=str(tool_call_id) if tool_call_id else None,
+                result=None,
+                status="not_executed",
+                duration_ms=_duration_ms(start),
+                attributes={
+                    "policy_action": str(decision.action),
+                    "reason": decision.reason,
+                },
+            )
             raise ApprovalRequired(
                 metadata={
                     "tool_name": name,
@@ -611,6 +664,12 @@ class HarnessToolset(WrapperToolset[Any]):
             )
 
         # 3) 执行
+        self._trace_tool_started(
+            trace_recorder,
+            trace_context,
+            tool_name=name,
+            tool_call_id=str(tool_call_id) if tool_call_id else None,
+        )
         try:
             raw_result = await super().call_tool(name, tool_args, ctx, tool)
         except ApprovalRequired:
@@ -626,6 +685,18 @@ class HarnessToolset(WrapperToolset[Any]):
                 duration_ms=_duration_ms(start),
                 result=classified,
                 exception=exc,
+            )
+            exec_status = "timeout_unknown" if (
+                isinstance(classified, ToolResult) and classified.external_state_unknown
+            ) else "failed"
+            self._trace_tool_result(
+                trace_recorder,
+                trace_context,
+                tool_name=name,
+                tool_call_id=str(tool_call_id) if tool_call_id else None,
+                result=classified,
+                status=exec_status,
+                duration_ms=_duration_ms(start),
             )
             return materialize_tool_result(classified)
 
@@ -681,7 +752,132 @@ class HarnessToolset(WrapperToolset[Any]):
                 run_id=run_id,
                 tool_call_id=tool_call_id,
             )
+            exec_status = "timeout_unknown"
+        elif success:
+            exec_status = "succeeded"
+        else:
+            exec_status = "failed"
+        self._trace_tool_result(
+            trace_recorder,
+            trace_context,
+            tool_name=name,
+            tool_call_id=str(tool_call_id) if tool_call_id else None,
+            result=raw_result if isinstance(raw_result, ToolResult) else result_for_model,
+            status=exec_status,
+            duration_ms=_duration_ms(start),
+        )
         return result_for_model
+
+    def _trace_tool_proposed(
+        self,
+        recorder: Any,
+        context: Any,
+        *,
+        tool_name: str,
+        tool_call_id: str | None,
+        tool_args: dict[str, Any],
+    ) -> None:
+        if recorder is None or context is None:
+            return
+        try:
+            recorder.record_tool_call(
+                context,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                tool_args=tool_args,
+                event_name="tool.proposed",
+                status="info",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("trace_tool_proposed_failed", error=str(exc))
+
+    def _trace_policy_decided(
+        self,
+        recorder: Any,
+        context: Any,
+        *,
+        tool_name: str,
+        tool_call_id: str | None,
+        decision: Any,
+        already_approved: bool,
+    ) -> None:
+        if recorder is None or context is None:
+            return
+        try:
+            recorder.emit(
+                "policy.decided",
+                context,
+                status="info",
+                tool_call_id=tool_call_id,
+                attributes={
+                    "tool_name": tool_name,
+                    "action": str(getattr(decision, "action", "")),
+                    "reason": getattr(decision, "reason", None),
+                    "policy_version": getattr(decision, "policy_version", None),
+                    "already_approved": already_approved,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("trace_policy_decided_failed", error=str(exc))
+
+    def _trace_tool_started(
+        self,
+        recorder: Any,
+        context: Any,
+        *,
+        tool_name: str,
+        tool_call_id: str | None,
+    ) -> None:
+        if recorder is None or context is None:
+            return
+        try:
+            recorder.emit(
+                "tool.execution.started",
+                context,
+                status="started",
+                tool_call_id=tool_call_id,
+                attributes={"tool_name": tool_name},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("trace_tool_started_failed", error=str(exc))
+
+    def _trace_tool_result(
+        self,
+        recorder: Any,
+        context: Any,
+        *,
+        tool_name: str,
+        tool_call_id: str | None,
+        result: Any,
+        status: str,
+        duration_ms: int | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        if recorder is None or context is None:
+            return
+        try:
+            safe_result = result
+            if isinstance(result, ToolResult):
+                safe_result = {
+                    "success": result.is_success,
+                    "output": getattr(result, "output", None),
+                    "error_kind": getattr(result, "error_kind", None),
+                    "diagnostic_summary": getattr(result, "diagnostic_summary", None),
+                    "external_state_unknown": getattr(
+                        result, "external_state_unknown", False
+                    ),
+                }
+            recorder.record_tool_result(
+                context,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                result=safe_result,
+                status=status,
+                duration_ms=duration_ms,
+                attributes=attributes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("trace_tool_result_failed", error=str(exc))
 
     def _audit(
         self,

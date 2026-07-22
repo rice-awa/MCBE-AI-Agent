@@ -31,6 +31,7 @@ from models.agent import (
 )
 from config.settings import Settings
 from config.logging import get_logger
+from services.agent.trace import TraceContext, get_trace_recorder
 
 logger = get_logger(__name__)
 
@@ -150,6 +151,8 @@ class AgentWorker:
         """
         request: ChatRequest = item.payload
         connection_id: UUID = item.connection_id
+        trace_context = getattr(item, "trace_context", None)
+        enqueued_at_ns = int(getattr(item, "enqueued_at_ns", 0) or 0)
 
         # 同一 (连接, 玩家) 串行；不同玩家可并行，避免上下文乱序又不互相阻塞。
         session_lock = self.broker.get_session_lock(
@@ -159,13 +162,126 @@ class AgentWorker:
             await self._process_request_locked(
                 request,
                 connection_id,
+                trace_context=trace_context,
+                enqueued_at_ns=enqueued_at_ns,
             )
+
+    def _resolve_trace_context(
+        self,
+        request: ChatRequest,
+        connection_id: UUID,
+        *,
+        trace_context: TraceContext | None = None,
+    ) -> TraceContext | None:
+        """优先使用 QueueItem.trace_context；否则从 ChatRequest correlation 重建。"""
+        if trace_context is not None:
+            return trace_context
+        trace_id = request.trace_id or request.run_id
+        attempt_id = request.attempt_id
+        if not trace_id or not attempt_id:
+            return None
+        from models.constants import DEFAULT_CONVERSATION_ID, DEFAULT_PLAYER_KEY
+
+        return TraceContext(
+            trace_id=trace_id,
+            run_id=request.run_id or trace_id,
+            attempt_id=attempt_id,
+            message_id=str(request.id),
+            connection_id=str(connection_id),
+            player_name=request.player_name or DEFAULT_PLAYER_KEY,
+            conversation_id=request.conversation_id or DEFAULT_CONVERSATION_ID,
+        )
+
+    def _emit_lifecycle(
+        self,
+        event_name: str,
+        context: TraceContext | None,
+        *,
+        status: str = "info",
+        duration_ms: int | None = None,
+        attributes: dict | None = None,
+        payload: dict | None = None,
+        tool_call_id: str | None = None,
+    ) -> None:
+        """Fail-soft lifecycle emit via process TraceRecorder."""
+        if context is None:
+            return
+        try:
+            recorder = get_trace_recorder(self.settings)
+            recorder.emit(
+                event_name,
+                context,
+                status=status,
+                duration_ms=duration_ms,
+                attributes=attributes,
+                payload=payload,
+                tool_call_id=tool_call_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("trace_emit_failed", event=event_name, error=str(exc))
+
+    def _record_model_pairs_from_messages(
+        self,
+        context: TraceContext | None,
+        messages: list | None,
+        *,
+        usage: dict | None = None,
+        provider: str | None = None,
+    ) -> None:
+        """从 new_messages 按 request/response 对写入 model.request.completed。"""
+        if context is None or not messages:
+            return
+        try:
+            from services.agent.core import serialize_model_messages
+            from services.agent.trace import get_trace_recorder
+
+            recorder = get_trace_recorder(self.settings)
+            serialized = serialize_model_messages(messages)
+            # 若已是 dict 列表（测试 fixture）直接使用
+            if messages and isinstance(messages[0], dict):
+                serialized = list(messages)  # type: ignore[arg-type]
+
+            pair: list[dict] = []
+            pairs: list[list[dict]] = []
+            for msg in serialized:
+                kind = msg.get("kind") if isinstance(msg, dict) else None
+                if kind == "request":
+                    if pair:
+                        pairs.append(pair)
+                    pair = [msg]
+                elif kind == "response":
+                    pair.append(msg)
+                    pairs.append(pair)
+                    pair = []
+                else:
+                    pair.append(msg)
+            if pair:
+                pairs.append(pair)
+
+            for idx, group in enumerate(pairs):
+                finish_reason = None
+                for item in group:
+                    if isinstance(item, dict) and item.get("kind") == "response":
+                        finish_reason = item.get("finish_reason")
+                recorder.record_model_messages(
+                    context,
+                    messages=group,
+                    usage=usage if idx == len(pairs) - 1 else None,
+                    provider=provider,
+                    finish_reason=finish_reason,
+                    attributes={"pair_index": idx},
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("trace_model_pairs_failed", error=str(exc))
 
     async def _process_request_locked(
         self,
         request: ChatRequest,
         connection_id: UUID,
         conversation_generation: int | None = None,
+        *,
+        trace_context: TraceContext | None = None,
+        enqueued_at_ns: int = 0,
     ) -> None:
         """处理单个请求（已持有会话锁）"""
         if conversation_generation is None:
@@ -176,6 +292,49 @@ class AgentWorker:
         run_id = request.run_id or str(uuid4())
         if not request.run_id:
             request.run_id = run_id
+        if not request.trace_id:
+            request.trace_id = run_id
+        if not request.attempt_id:
+            request.attempt_id = str(uuid4())
+
+        resolved_context = self._resolve_trace_context(
+            request, connection_id, trace_context=trace_context
+        )
+        recorder = get_trace_recorder(self.settings)
+        terminal_emitted = False
+
+        # queue.dequeued + agent.attempt.started / resumed
+        dequeue_ms = None
+        if enqueued_at_ns > 0:
+            dequeue_ms = max(0, int((time.time_ns() - enqueued_at_ns) / 1_000_000))
+        self._emit_lifecycle(
+            "queue.dequeued",
+            resolved_context,
+            status="info",
+            duration_ms=dequeue_ms,
+            attributes={"worker_id": self.worker_id},
+        )
+        if request.resume_approval_id and request.deferred_tool_results is not None:
+            self._emit_lifecycle(
+                "agent.attempt.resumed",
+                resolved_context,
+                status="resumed",
+                attributes={
+                    "worker_id": self.worker_id,
+                    "resume_approval_id": request.resume_approval_id,
+                    "provider": request.provider or self.settings.default_provider,
+                },
+            )
+        else:
+            self._emit_lifecycle(
+                "agent.attempt.started",
+                resolved_context,
+                status="started",
+                attributes={
+                    "worker_id": self.worker_id,
+                    "provider": request.provider or self.settings.default_provider,
+                },
+            )
 
         logger.info(
             "processing_chat_request",
@@ -249,8 +408,11 @@ class AgentWorker:
             provider=request.provider or self.settings.default_provider,
             get_context_info=get_context_info,
             run_id=run_id,
+            attempt_id=request.attempt_id,
             conversation_id=request.conversation_id,
             auto_approve_tools=bool(request.auto_approve_tools),
+            trace_context=resolved_context,
+            trace_recorder=recorder,
         )
 
         stream_target = "@a" if request.broadcast_ai_chat else request.player_name
@@ -336,6 +498,18 @@ class AgentWorker:
                 trace_id=request.trace_id or run_id,
                 attempt_id=request.attempt_id,
             )
+            if not terminal_emitted:
+                self._emit_lifecycle(
+                    "trace.failed",
+                    resolved_context,
+                    status="failed",
+                    attributes={
+                        "error_kind": "INTERNAL",
+                        "diagnostic_summary": str(e)[:200],
+                        "provider": provider_name,
+                    },
+                )
+                terminal_emitted = True
             return
 
         # 流式处理
@@ -443,7 +617,19 @@ class AgentWorker:
                         event=event,
                         sequence=sequence,
                         stream_target=stream_target,
+                        trace_context=resolved_context,
                     )
+                    if not terminal_emitted:
+                        self._emit_lifecycle(
+                            "trace.suspended",
+                            resolved_context,
+                            status="suspended",
+                            attributes={
+                                "reason": "approval_required",
+                                "worker_id": self.worker_id,
+                            },
+                        )
+                        terminal_emitted = True
                     return
 
                 if event.metadata and event.metadata.get("is_complete"):
@@ -556,6 +742,36 @@ class AgentWorker:
                             "role": "assistant",
                             "text": response_text,
                         })
+
+                    # Trace: model pairs + final response (exactly once)
+                    if not terminal_emitted and resolved_context is not None:
+                        new_messages = event.metadata.get("new_messages_serialized")
+                        if not isinstance(new_messages, list):
+                            new_messages = event.metadata.get("new_messages")
+                        usage = event.metadata.get("usage")
+                        usage_dict = usage if isinstance(usage, dict) else None
+                        self._record_model_pairs_from_messages(
+                            resolved_context,
+                            new_messages if isinstance(new_messages, list) else None,
+                            usage=usage_dict,
+                            provider=provider_name,
+                        )
+                        try:
+                            recorder.record_final_response(
+                                resolved_context,
+                                content=response_text,
+                                duration_ms=duration_ms,
+                                status="completed",
+                                attributes={
+                                    "chunk_count": event_count,
+                                    "tool_events_count": len(
+                                        event.metadata.get("tool_events") or []
+                                    ),
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("trace_final_response_failed", error=str(exc))
+                        terminal_emitted = True
                 elif event.event_type == "error":
                     response_text = "".join(response_parts)
                     error_kind = (
@@ -587,6 +803,21 @@ class AgentWorker:
                     )
                     await self.broker.send_response(connection_id, chunk)
                     sequence += 1
+                    if not terminal_emitted:
+                        self._emit_lifecycle(
+                            "trace.failed",
+                            resolved_context,
+                            status="failed",
+                            attributes={
+                                "error_kind": error_kind,
+                                "diagnostic_summary": (
+                                    (event.metadata or {}).get("diagnostic_summary")
+                                    if event.metadata
+                                    else None
+                                ),
+                            },
+                        )
+                        terminal_emitted = True
 
                 # content 和 reasoning 事件需要发送到游戏
                 elif event.event_type in ("content", "reasoning"):
@@ -663,6 +894,14 @@ class AgentWorker:
                 connection_id=str(connection_id),
                 run_id=run_id,
             )
+            if not terminal_emitted:
+                self._emit_lifecycle(
+                    "trace.cancelled",
+                    resolved_context,
+                    status="cancelled",
+                    attributes={"worker_id": self.worker_id},
+                )
+                terminal_emitted = True
             raise
         except Exception as e:
             error_kind, player_msg, diagnostic = classify_run_exception(e)
@@ -712,6 +951,17 @@ class AgentWorker:
                 trace_id=request.trace_id or run_id,
                 attempt_id=request.attempt_id,
             )
+            if not terminal_emitted:
+                self._emit_lifecycle(
+                    "trace.failed",
+                    resolved_context,
+                    status="failed",
+                    attributes={
+                        "error_kind": error_kind,
+                        "diagnostic_summary": diagnostic,
+                    },
+                )
+                terminal_emitted = True
 
     async def _generate_title_for_conversation(
         self,
@@ -1126,6 +1376,7 @@ class AgentWorker:
         event,
         sequence: int,
         stream_target: str | None,
+        trace_context: TraceContext | None = None,
     ) -> None:
         """把 DeferredToolRequests 落盘到 PendingApprovalStore，并提示玩家审批。"""
         import time as _time
@@ -1210,10 +1461,46 @@ class AgentWorker:
                 metadata={
                     "risk": meta.get("risk"),
                     "reason": meta.get("reason"),
+                    "trace_id": (trace_context.trace_id if trace_context else request.trace_id),
+                    "attempt_id": (trace_context.attempt_id if trace_context else request.attempt_id),
+                    "message_id": (trace_context.message_id if trace_context else str(request.id)),
                 },
             )
             store.put(pending)
             approval_ids.append(approval_id)
+
+            if trace_context is not None:
+                try:
+                    recorder = get_trace_recorder(self.settings)
+                    recorder.record_tool_call(
+                        trace_context,
+                        tool_name=call.tool_name,
+                        tool_call_id=call.tool_call_id,
+                        tool_args=normalized_args if isinstance(normalized_args, dict) else None,
+                        event_name="tool.proposed",
+                        status="info",
+                        attributes={
+                            "approval_id": approval_id,
+                            "batch_id": batch_id,
+                            "args_summary": args_summary,
+                        },
+                    )
+                    recorder.emit(
+                        "approval.requested",
+                        trace_context,
+                        status="info",
+                        tool_call_id=call.tool_call_id,
+                        attributes={
+                            "approval_id": approval_id,
+                            "batch_id": batch_id,
+                            "tool_name": call.tool_name,
+                            "args_summary": args_summary,
+                            "policy_version": policy_version,
+                            "ttl_seconds": ttl,
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("trace_approval_requested_failed", error=str(exc))
 
             batch_hint = ""
             if len(sibling_ids) > 1:

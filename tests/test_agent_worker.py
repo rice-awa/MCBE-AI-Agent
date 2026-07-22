@@ -361,3 +361,267 @@ async def test_stream_chunks_carry_trace_correlation(monkeypatch):
     for chunk in chunks:
         assert chunk.trace_id == "trace-abc"
         assert chunk.attempt_id == "attempt-xyz"
+
+
+async def _flush_trace(recorder) -> list[dict]:
+    """Stop writer and return parsed journal lines for the active path."""
+    await recorder.stop()
+    path = recorder.path
+    if not path.exists():
+        return []
+    import json
+
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+@pytest.mark.asyncio
+async def test_single_tool_trace_contains_model_tool_model_and_final_response(
+    tmp_path, monkeypatch
+):
+    """Worker terminal path records model pairs + final response when content enabled."""
+    from services.agent.core import StreamEvent
+    from services.agent.trace import TraceRecorder, set_trace_recorder
+
+    settings = _make_settings()
+    path = tmp_path / "worker_trace.jsonl"
+    recorder = TraceRecorder(
+        path=path, enabled=True, include_content=True, max_records=500
+    )
+    await recorder.start()
+    set_trace_recorder(recorder)
+    try:
+        broker = MagicMock()
+        broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+        broker.get_conversation_history = MagicMock(return_value=[])
+        broker.set_conversation_history = MagicMock(return_value=True)
+        broker.get_response_queue = MagicMock(return_value=object())
+        broker.send_response = AsyncMock(return_value=True)
+        broker.mark_conversation_title_generating = MagicMock(return_value=False)
+        worker = AgentWorker(broker, settings)
+
+        final_text = "钻石剑在箱子里"
+        new_messages = [
+            {
+                "kind": "request",
+                "parts": [{"part_kind": "user-prompt", "content": "查一下钻石剑"}],
+            },
+            {
+                "kind": "response",
+                "parts": [
+                    {
+                        "part_kind": "tool-call",
+                        "tool_name": "find_entities",
+                        "tool_call_id": "tc1",
+                        "args": {"entity_type": "item"},
+                    }
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {
+                "kind": "request",
+                "parts": [
+                    {
+                        "part_kind": "tool-return",
+                        "tool_name": "find_entities",
+                        "tool_call_id": "tc1",
+                        "content": "found 1",
+                    }
+                ],
+            },
+            {
+                "kind": "response",
+                "parts": [{"part_kind": "text", "content": final_text}],
+                "finish_reason": "stop",
+            },
+        ]
+
+        async def fake_stream_chat(*_args, **_kwargs):
+            yield StreamEvent(
+                event_type="content",
+                content=final_text,
+                sequence=0,
+                metadata=None,
+            )
+            yield StreamEvent(
+                event_type="content",
+                content="",
+                sequence=1,
+                metadata={
+                    "is_complete": True,
+                    "all_messages": [],
+                    "new_messages": new_messages,
+                    "new_messages_serialized": new_messages,
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                    "tool_events": [{"tool_name": "find_entities"}],
+                },
+            )
+
+        monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+        monkeypatch.setattr(
+            "services.agent.providers.ProviderRegistry.get_model",
+            lambda _config: object(),
+        )
+        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+
+        connection_id = uuid4()
+        await worker._process_request_locked(
+            ChatRequest(
+                connection_id=connection_id,
+                content="查一下钻石剑",
+                player_name="Alex",
+                run_id="trace-tool-1",
+                trace_id="trace-tool-1",
+                attempt_id="attempt-1",
+            ),
+            connection_id,
+        )
+
+        events = await _flush_trace(recorder)
+        names = [e["event_name"] for e in events]
+        assert "queue.dequeued" in names
+        assert "agent.attempt.started" in names
+        assert names.index("model.request.completed") < names.index("trace.completed")
+        assert sum(name == "model.request.completed" for name in names) == 2
+        completed = [e for e in events if e["event_name"] == "trace.completed"]
+        assert len(completed) == 1
+        assert completed[0]["payload"]["content"] == final_text
+    finally:
+        set_trace_recorder(None)
+
+
+@pytest.mark.asyncio
+async def test_content_disabled_keeps_metadata_but_omits_messages_and_results(
+    tmp_path, monkeypatch
+):
+    """include_content=False keeps lifecycle events but drops payload bodies."""
+    from services.agent.core import StreamEvent
+    from services.agent.trace import TraceRecorder, set_trace_recorder
+
+    settings = _make_settings()
+    path = tmp_path / "worker_trace_meta.jsonl"
+    recorder = TraceRecorder(
+        path=path, enabled=True, include_content=False, max_records=500
+    )
+    await recorder.start()
+    set_trace_recorder(recorder)
+    try:
+        broker = MagicMock()
+        broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+        broker.get_conversation_history = MagicMock(return_value=[])
+        broker.set_conversation_history = MagicMock(return_value=True)
+        broker.get_response_queue = MagicMock(return_value=object())
+        broker.send_response = AsyncMock(return_value=True)
+        broker.mark_conversation_title_generating = MagicMock(return_value=False)
+        worker = AgentWorker(broker, settings)
+
+        new_messages = [
+            {"kind": "request", "parts": [{"part_kind": "user-prompt", "content": "secret prompt"}]},
+            {
+                "kind": "response",
+                "parts": [{"part_kind": "text", "content": "ok"}],
+                "finish_reason": "stop",
+            },
+        ]
+
+        async def fake_stream_chat(*_args, **_kwargs):
+            yield StreamEvent(
+                event_type="content",
+                content="ok",
+                sequence=0,
+            )
+            yield StreamEvent(
+                event_type="content",
+                content="",
+                sequence=1,
+                metadata={
+                    "is_complete": True,
+                    "all_messages": [],
+                    "new_messages": new_messages,
+                    "new_messages_serialized": new_messages,
+                    "usage": None,
+                    "tool_events": [{"tool_name": "list_available_providers"}],
+                },
+            )
+
+        monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+        monkeypatch.setattr(
+            "services.agent.providers.ProviderRegistry.get_model",
+            lambda _config: object(),
+        )
+        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+
+        connection_id = uuid4()
+        await worker._process_request_locked(
+            ChatRequest(
+                connection_id=connection_id,
+                content="secret prompt",
+                player_name="Alex",
+                run_id="trace-secret",
+                trace_id="trace-secret",
+                attempt_id="attempt-s",
+            ),
+            connection_id,
+        )
+
+        events = await _flush_trace(recorder)
+        assert events
+        assert all("payload" not in e or e.get("payload") is None for e in events)
+        assert any(e["event_name"] == "trace.completed" for e in events)
+        raw = path.read_text(encoding="utf-8")
+        assert "secret prompt" not in raw
+    finally:
+        set_trace_recorder(None)
+
+
+@pytest.mark.asyncio
+async def test_stream_error_emits_trace_failed_once(tmp_path, monkeypatch):
+    from services.agent.core import StreamEvent
+    from services.agent.trace import TraceRecorder, set_trace_recorder
+
+    settings = _make_settings()
+    path = tmp_path / "worker_trace_err.jsonl"
+    recorder = TraceRecorder(path=path, enabled=True, include_content=False, max_records=100)
+    await recorder.start()
+    set_trace_recorder(recorder)
+    try:
+        broker = MagicMock()
+        broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+        broker.get_conversation_history = MagicMock(return_value=[])
+        broker.send_response = AsyncMock(return_value=True)
+        broker.get_response_queue = MagicMock(return_value=object())
+        worker = AgentWorker(broker, settings)
+
+        async def fake_stream_chat(*_args, **_kwargs):
+            yield StreamEvent(
+                event_type="error",
+                content="预算超限",
+                sequence=0,
+                metadata={"error_kind": "DENIED", "diagnostic_summary": "UsageLimitExceeded"},
+            )
+
+        monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+        monkeypatch.setattr(
+            "services.agent.providers.ProviderRegistry.get_model",
+            lambda _config: object(),
+        )
+        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+
+        connection_id = uuid4()
+        await worker._process_request_locked(
+            ChatRequest(
+                connection_id=connection_id,
+                content="budget",
+                player_name="Alex",
+                run_id="trace-err",
+                trace_id="trace-err",
+                attempt_id="attempt-err",
+            ),
+            connection_id,
+        )
+        events = await _flush_trace(recorder)
+        failed = [e for e in events if e["event_name"] == "trace.failed"]
+        assert len(failed) == 1
+        assert failed[0]["status"] == "failed"
+        assert failed[0]["attributes"]["error_kind"] == "DENIED"
+    finally:
+        set_trace_recorder(None)
