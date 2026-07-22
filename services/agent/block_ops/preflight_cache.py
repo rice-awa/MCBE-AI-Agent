@@ -16,6 +16,8 @@ class PreflightCacheEntry:
     tool_call_id: str
     original_args_hash: str
     canonical_args: dict[str, Any]
+    execute_args: dict[str, Any] = field(default_factory=dict)
+    approval_metadata: dict[str, Any] = field(default_factory=dict)
     preflight_payload: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     connection_id: str | None = None
@@ -40,6 +42,8 @@ class PreflightCache:
         tool_call_id: str,
         original_args_hash: str,
         canonical_args: dict[str, Any],
+        execute_args: dict[str, Any] | None = None,
+        approval_metadata: dict[str, Any] | None = None,
         preflight_payload: dict[str, Any] | None = None,
         connection_id: str | None = None,
     ) -> PreflightCacheEntry:
@@ -48,6 +52,8 @@ class PreflightCache:
             tool_call_id=str(tool_call_id or ""),
             original_args_hash=str(original_args_hash or ""),
             canonical_args=dict(canonical_args or {}),
+            execute_args=dict(execute_args or {}),
+            approval_metadata=dict(approval_metadata or {}),
             preflight_payload=dict(preflight_payload or {}),
             connection_id=str(connection_id) if connection_id is not None else None,
         )

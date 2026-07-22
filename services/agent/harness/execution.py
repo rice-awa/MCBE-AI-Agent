@@ -657,12 +657,24 @@ class HarnessToolset(WrapperToolset[Any]):
             return ToolDenied(message=decision.reason)
 
         if decision.action == PolicyDecisionKind.REQUIRE_APPROVAL:
+            try:
+                execute_args = _python_tool_args(name, effective_args)
+            except ValueError as exc:
+                classified = classify_tool_exception(exc, tool_name=name)
+                self._audit(
+                    settings=settings, tool_name=name, parameters=normalized, ctx=ctx,
+                    status="failure", duration_ms=_duration_ms(start), result=classified,
+                )
+                return materialize_tool_result(classified)
             summary = summarize_args_for_player(name, normalized)
             raise ApprovalRequired(
                 metadata={
                     "tool_name": name,
                     "normalized_args": normalized,
                     "args_hash": args_hash,
+                    "execute_args": execute_args,
+                    "execution_args_hash": hash_normalized_args(normalize_tool_args(execute_args)),
+                    "approval_metadata": {},
                     "original_args_hash": original_args_hash,
                     "args_summary": summary,
                     "policy_version": decision.policy_version,
@@ -675,7 +687,15 @@ class HarnessToolset(WrapperToolset[Any]):
             )
 
         # 3) 执行（使用 canonical args；映射 fill 的 from/to → from_pos/to_pos）
-        execute_args = _python_tool_args(name, effective_args)
+        try:
+            execute_args = _python_tool_args(name, effective_args)
+        except ValueError as exc:
+            classified = classify_tool_exception(exc, tool_name=name)
+            self._audit(
+                settings=settings, tool_name=name, parameters=normalized, ctx=ctx,
+                status="failure", duration_ms=_duration_ms(start), result=classified,
+            )
+            return materialize_tool_result(classified)
         try:
             raw_result = await super().call_tool(name, execute_args, ctx, tool)
         except ApprovalRequired:
@@ -790,8 +810,13 @@ class HarnessToolset(WrapperToolset[Any]):
         already_approved = bool(getattr(ctx, "tool_call_approved", False)) or bool(
             getattr(getattr(ctx, "deps", None), "auto_approve_tools", False)
         )
-        # After approval, prefer locked targets already embedded in args.
-        if already_approved and tool_args.get("locked_targets"):
+        # Approved block calls are never allowed to fall back to model args or a
+        # fresh preflight: the persisted override must already be executable.
+        if already_approved:
+            try:
+                _python_tool_args(name, tool_args)
+            except ValueError as exc:
+                return classify_tool_exception(exc, tool_name=name), None
             return None, dict(tool_args)
 
         try:
@@ -812,6 +837,7 @@ class HarnessToolset(WrapperToolset[Any]):
                 tool_call_id=tool_call_id,
                 original_args_hash=original_args_hash,
                 canonical_args=canonical,
+                execute_args=_python_tool_args(name, canonical),
                 preflight_payload=canonical,
                 connection_id=connection_id or None,
             )
@@ -891,15 +917,14 @@ def _duration_ms(start: float) -> int:
 
 
 def _python_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Map bridge/canonical field names onto Python tool parameter names."""
-    if tool_name != "edit_blocks":
+    """Build Python call args through the block operation signature whitelist."""
+    if tool_name not in _BLOCK_OPS_TOOLS:
         return dict(args or {})
-    out = dict(args or {})
-    if "from_pos" not in out and isinstance(out.get("from"), dict):
-        out["from_pos"] = out["from"]
-    if "to_pos" not in out and isinstance(out.get("to"), dict):
-        out["to_pos"] = out["to"]
-    # Drop reserved keys that are not function parameters (still kept in audit via effective_args).
-    out.pop("from", None)
-    out.pop("to", None)
-    return out
+    if tool_name == "inspect_block" and args.get("phase") != "execute":
+        return {
+            key: value for key, value in dict(args or {}).items()
+            if key in {"coordinate_mode", "dimension", "position", "positions", "locked_targets", "phase"}
+        }
+    from services.agent.block_ops.tools_impl import project_block_execute_args
+
+    return project_block_execute_args(tool_name, dict(args or {}))

@@ -15,7 +15,7 @@ from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
-from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved
 
 from config.settings import Settings
 from services.agent.block_ops.bridge import map_addon_bridge_result, map_bridge_exception
@@ -660,6 +660,173 @@ async def test_harness_preflight_before_approval_for_edit_blocks() -> None:
     cached = cache.get("run-pf-1", approval.tool_call_id, original_hash)
     assert cached is not None
     assert cached.canonical_args.get("locked_targets")
+
+
+@pytest.mark.asyncio
+async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() -> None:
+    locked_targets = [
+        {"dimension": "minecraft:overworld", "x": x, "y": 64, "z": z}
+        for x in range(2, 5)
+        for z in range(1, 4)
+    ]
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {
+                "ok": True,
+                "payload": {
+                    "capabilities": {
+                        "block_ops": {"inspect": True, "edit": True, "schema_version": "1"}
+                    }
+                },
+            }
+        if capability == "edit_blocks" and payload.get("phase") == "preflight":
+            return {
+                "ok": True,
+                "payload": {
+                    "schema_version": "1",
+                    "ok": True,
+                    "phase": "preflight",
+                    "mode": "fill",
+                    "type_id": "minecraft:stone",
+                    "coordinate_mode": "absolute",
+                    "dimension": "minecraft:overworld",
+                    "bounds": {
+                        "min": {"x": 2, "y": 64, "z": 1},
+                        "max": {"x": 4, "y": 64, "z": 3},
+                    },
+                    "locked_targets": locked_targets,
+                    "repairs_applied": ["reversed_bounds"],
+                    "facing": "south",
+                    "player_origin": {"x": 100, "y": 64, "z": 100},
+                    "before_samples": [{"type_id": "minecraft:air"}],
+                    "future_preflight_evidence": {"source": "addon"},
+                },
+            }
+        if capability == "edit_blocks" and payload.get("phase") == "execute":
+            return {
+                "ok": True,
+                "payload": {
+                    "schema_version": "1",
+                    "ok": True,
+                    "phase": "execute",
+                    "changed": len(locked_targets),
+                },
+            }
+        return {
+            "ok": False,
+            "payload": {"code": "INTERNAL_ERROR", "message": "unexpected bridge request"},
+        }
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    policy = PolicyEngine.from_settings(_Settings())
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=policy)],
+    )
+
+    @agent.tool
+    async def edit_blocks(
+        ctx: RunContext[_Deps],
+        type_id: str,
+        mode: str = "place",
+        coordinate_mode: str = "absolute",
+        dimension: str | None = None,
+        position: dict[str, Any] | None = None,
+        positions: list[dict[str, Any]] | None = None,
+        from_pos: dict[str, Any] | None = None,
+        to_pos: dict[str, Any] | None = None,
+        states: dict[str, Any] | None = None,
+        replace_any: bool = False,
+        expected_previous: dict[str, Any] | None = None,
+        locked_targets: list[dict[str, Any]] | None = None,
+        phase: str | None = None,
+    ) -> str:
+        result = await edit_blocks_impl(
+            ctx,  # type: ignore[arg-type]
+            type_id=type_id,
+            mode=mode,  # type: ignore[arg-type]
+            coordinate_mode=coordinate_mode,  # type: ignore[arg-type]
+            dimension=dimension,
+            position=position,
+            positions=positions,
+            from_pos=from_pos,
+            to_pos=to_pos,
+            states=states,
+            replace_any=replace_any,
+            expected_previous=expected_previous,
+            locked_targets=locked_targets,
+            phase=phase,
+        )
+        return str(result)
+
+    model_calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls > 1:
+            return ModelResponse(parts=[TextPart(content="done")])
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="edit_blocks",
+                    tool_call_id="tc-fill-reverse",
+                    args={
+                        "type_id": "minecraft:stone",
+                        "mode": "fill",
+                        "coordinate_mode": "absolute",
+                        "dimension": "minecraft:overworld",
+                        "from_pos": {"x": 4, "y": 64, "z": 3},
+                        "to_pos": {"x": 2, "y": 64, "z": 1},
+                    },
+                )
+            ]
+        )
+
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-fill")
+    first = await agent.run("fill reverse bounds", model=FunctionModel(model_fn), deps=deps)
+    assert isinstance(first.output, DeferredToolRequests)
+    approval = first.output.approvals[0]
+    metadata = first.output.metadata[approval.tool_call_id]
+    authorized_args = metadata["normalized_args"]
+    assert authorized_args["from"] == {"x": 2, "y": 64, "z": 1}
+    assert authorized_args["to"] == {"x": 4, "y": 64, "z": 3}
+    execute_args = metadata["execute_args"]
+    assert execute_args["from_pos"] == {"x": 2, "y": 64, "z": 1}
+    assert execute_args["to_pos"] == {"x": 4, "y": 64, "z": 3}
+    assert "repairs_applied" not in execute_args
+    assert "facing" not in execute_args
+
+    # Approval recovery must use the persisted strict execution projection,
+    # not the in-process preflight cache or bridge-facing authorization args.
+    reset_preflight_cache()
+
+    second = await agent.run(
+        message_history=first.all_messages(),
+        deferred_tool_results=DeferredToolResults(
+            approvals={
+                approval.tool_call_id: ToolApproved(override_args=execute_args),
+            }
+        ),
+        model=FunctionModel(model_fn),
+        deps=deps,
+    )
+
+    assert not isinstance(second.output, DeferredToolRequests)
+    execute_calls = [
+        payload
+        for capability, payload in bridge.calls
+        if capability == "edit_blocks" and payload.get("phase") == "execute"
+    ]
+    assert len(execute_calls) == 1
+    assert execute_calls[0]["from"] == {"x": 2, "y": 64, "z": 1}
+    assert execute_calls[0]["to"] == {"x": 4, "y": 64, "z": 3}
+    assert execute_calls[0]["locked_targets"] == locked_targets
 
 
 @pytest.mark.asyncio

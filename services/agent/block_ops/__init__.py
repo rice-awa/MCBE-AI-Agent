@@ -32,15 +32,19 @@ from services.agent.block_ops.schema import (
 )
 from services.agent.block_ops.tools_impl import (
     BLOCK_TOOL_NAMES,
+    BlockPreflightPlan,
+    build_block_preflight_plan,
     edit_blocks_impl,
     inspect_block_impl,
     merge_canonical_from_preflight,
+    project_block_execute_args,
     run_block_preflight,
 )
 
 __all__ = [
     "BLOCK_OPS_SCHEMA_VERSION",
     "BLOCK_TOOL_NAMES",
+    "BlockPreflightPlan",
     "BlockCapabilityCache",
     "BlockCapabilityRecord",
     "BlockCapabilityStatus",
@@ -48,6 +52,7 @@ __all__ = [
     "BlockToolsLimits",
     "PreflightCache",
     "build_error_response",
+    "build_block_preflight_plan",
     "build_success_response",
     "call_block_capability",
     "clear_block_capability",
@@ -64,6 +69,7 @@ __all__ = [
     "map_addon_bridge_result",
     "map_bridge_exception",
     "merge_canonical_from_preflight",
+    "project_block_execute_args",
     "reset_block_capability_cache",
     "reset_preflight_cache",
     "run_block_preflight",

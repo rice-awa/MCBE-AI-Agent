@@ -11,8 +11,11 @@
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
+import pytest
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import DeferredToolRequests
 
@@ -20,6 +23,7 @@ from config.settings import MinecraftConfig
 from mcbe_ws_sdk.command.registry import CommandRegistry
 from services.agent.harness.approvals import PendingApproval, PendingApprovalStore
 from services.gateway.session_store import HostSessionStore
+from services.gateway.command_handlers import CommandHandlers
 
 
 def _make_pending(
@@ -303,3 +307,41 @@ def test_session_auto_approve_conversation_vs_forever() -> None:
 
     host.clear_auto_approve_tools("Steve", conversation_id="conv-a")
     assert host.should_auto_approve_tools("Steve", "conv-a") is False
+
+
+@pytest.mark.asyncio
+async def test_gateway_approval_resume_uses_override_only_for_block_tools() -> None:
+    """Approved block ops resume with saved execute args; regular tools retain boolean approval."""
+    handler = object.__new__(CommandHandlers)
+    handler.protocol = MagicMock()
+    handler.protocol.create_success_message.return_value = "ok"
+    handler._send_player_reply = AsyncMock()
+    handler.broker = MagicMock()
+    handler.broker.get_conversation_generation.return_value = 1
+    handler.broker.get_conversation_invalidation_epoch.return_value = 1
+    handler.broker.submit_request = AsyncMock()
+    session = SimpleNamespace(current_provider="test")
+    handler._require_host = lambda _state: SimpleNamespace(
+        get_player_session=lambda _owner: session,
+        should_auto_approve_tools=lambda *_args: False,
+    )
+    state = SimpleNamespace(id=uuid4())
+    block = _make_pending(approval_id="b", tool_call_id="tc-block")
+    block.tool_name = "edit_blocks"
+    block.normalized_args = {
+        "type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld", "position": {"x": 1, "y": 64, "z": 1},
+        "locked_targets": [{"x": 1, "y": 64, "z": 1}], "phase": "execute",
+    }
+    block.execute_args = dict(block.normalized_args)
+    regular = _make_pending(approval_id="r", tool_call_id="tc-regular")
+    block.decision = regular.decision = True
+
+    await handler._resume_from_completed_batch(
+        state, completed_batch=[block, regular], pending=block, owner="Steve",
+        conversation_id="conv-1", player_name="Steve", source="test",
+    )
+
+    payload = handler.broker.submit_request.await_args.args[1].deferred_tool_results["approvals"]
+    assert payload["tc-block"] == {"kind": "tool-approved", "override_args": block.execute_args}
+    assert payload["tc-regular"] is True

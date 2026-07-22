@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic_ai import RunContext
@@ -27,6 +28,45 @@ logger = get_logger(__name__)
 BLOCK_TOOL_NAMES = frozenset({"inspect_block", "edit_blocks"})
 CoordinateMode = Literal["absolute", "player_relative"]
 EditMode = Literal["place", "batch", "fill"]
+
+
+@dataclass(frozen=True)
+class BlockPreflightPlan:
+    """Separated preflight artifacts for approval, invocation, and evidence."""
+
+    authorized_args: dict[str, Any]
+    execute_args: dict[str, Any]
+    approval_metadata: dict[str, Any]
+
+
+_EDIT_EXECUTE_FIELDS = frozenset({
+    "type_id", "mode", "coordinate_mode", "dimension", "position", "positions",
+    "from_pos", "to_pos", "states", "replace_any", "expected_previous",
+    "locked_targets", "phase",
+})
+_INSPECT_EXECUTE_FIELDS = frozenset({
+    "coordinate_mode", "dimension", "position", "positions", "locked_targets", "phase",
+})
+
+
+def project_block_execute_args(tool_name: str, authorized_args: dict[str, Any]) -> dict[str, Any]:
+    """Strictly project bridge-facing authorization into public Python arguments."""
+    fields = _EDIT_EXECUTE_FIELDS if tool_name == "edit_blocks" else _INSPECT_EXECUTE_FIELDS
+    if tool_name not in BLOCK_TOOL_NAMES:
+        raise ValueError(f"unsupported block tool: {tool_name}")
+    projected = {key: value for key, value in authorized_args.items() if key in fields}
+    if tool_name == "edit_blocks":
+        if isinstance(authorized_args.get("from"), dict):
+            projected["from_pos"] = authorized_args["from"]
+        if isinstance(authorized_args.get("to"), dict):
+            projected["to_pos"] = authorized_args["to"]
+        required = {"type_id", "mode", "coordinate_mode", "dimension", "phase", "locked_targets"}
+    else:
+        required = {"coordinate_mode", "dimension", "phase", "locked_targets"}
+    missing = [key for key in required if key not in projected]
+    if missing or projected.get("phase") != "execute" or not projected.get("locked_targets"):
+        raise ValueError("block preflight execution contract is incomplete")
+    return projected
 
 
 def _connection_id(deps: AgentDependencies) -> str:
@@ -358,9 +398,6 @@ def merge_canonical_from_preflight(
         "from",
         "to",
         "locked_targets",
-        "repairs_applied",
-        "facing",
-        "origin",
     ):
         if key in preflight_payload and preflight_payload[key] is not None:
             canonical[key] = preflight_payload[key]
@@ -427,6 +464,21 @@ def merge_canonical_from_preflight(
     # Mark as ready for execute phase.
     canonical["phase"] = "execute"
     return canonical
+
+
+def build_block_preflight_plan(
+    tool_name: str,
+    original_args: dict[str, Any],
+    preflight_payload: dict[str, Any],
+) -> BlockPreflightPlan:
+    authorized_args = merge_canonical_from_preflight(original_args, preflight_payload)
+    execute_args = project_block_execute_args(tool_name, authorized_args)
+    approval_metadata = {
+        key: value
+        for key, value in preflight_payload.items()
+        if key not in authorized_args and key not in {"schema_version", "ok"}
+    }
+    return BlockPreflightPlan(authorized_args, execute_args, approval_metadata)
 
 
 async def run_block_preflight(
@@ -575,7 +627,6 @@ async def inspect_block_impl(
     positions: list[dict[str, Any]] | None = None,
     locked_targets: list[dict[str, Any]] | None = None,
     phase: str | None = None,
-    **_extra: Any,
 ) -> ToolResult:
     """Query one or more block snapshots via addon bridge."""
     deps = ctx.deps
@@ -636,20 +687,9 @@ async def edit_blocks_impl(
     expected_previous: dict[str, Any] | None = None,
     locked_targets: list[dict[str, Any]] | None = None,
     phase: str | None = None,
-    **_extra: Any,
 ) -> ToolResult:
     """Mutate blocks via place | batch | fill after approval."""
     deps = ctx.deps
-    # Accept JSON keys "from"/"to" when callers pass them via kwargs.
-    if from_pos is None:
-        raw_from = _extra.get("from") or _extra.get("from_pos")
-        if isinstance(raw_from, dict):
-            from_pos = raw_from
-    if to_pos is None:
-        raw_to = _extra.get("to") or _extra.get("to_pos")
-        if isinstance(raw_to, dict):
-            to_pos = raw_to
-
     logger.info(
         "agent_tool_call",
         tool="edit_blocks",

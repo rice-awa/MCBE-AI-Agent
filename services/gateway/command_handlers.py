@@ -1091,7 +1091,31 @@ class CommandHandlers:
         approvals_payload: dict[str, Any] = {}
         for item in completed_batch:
             if item.decision is True:
-                approvals_payload[item.tool_call_id] = True
+                if item.tool_name in {"inspect_block", "edit_blocks"}:
+                    from services.agent.block_ops.tools_impl import project_block_execute_args
+
+                    try:
+                        expected_execute_args = project_block_execute_args(
+                            item.tool_name, item.authorized_args
+                        )
+                    except ValueError:
+                        msg = self.protocol.create_error_message("方块工具审批参数契约无效")
+                        await self._send_player_reply(
+                            state, msg, source=source, player_name=player_name
+                        )
+                        return
+                    if expected_execute_args != item.execute_args:
+                        msg = self.protocol.create_error_message("方块工具审批参数不一致")
+                        await self._send_player_reply(
+                            state, msg, source=source, player_name=player_name
+                        )
+                        return
+                    approvals_payload[item.tool_call_id] = {
+                        "kind": "tool-approved",
+                        "override_args": item.execute_args,
+                    }
+                else:
+                    approvals_payload[item.tool_call_id] = True
             else:
                 approvals_payload[item.tool_call_id] = {
                     "kind": "tool-denied",

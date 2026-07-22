@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 import httpx
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ThinkingPart
-from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDenied
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 
 from core.queue import MessageBroker
 from services.agent.core import stream_chat, _extract_exception_details, player_facing_error, classify_run_exception
@@ -1088,6 +1088,11 @@ class AgentWorker:
                     results.approvals[tool_call_id] = ToolDenied(
                         message=str(value.get("message") or "已拒绝")
                     )
+                elif isinstance(value, dict) and value.get("kind") == "tool-approved":
+                    override_args = value.get("override_args")
+                    if not isinstance(override_args, dict):
+                        raise ValueError("tool-approved requires override_args")
+                    results.approvals[tool_call_id] = ToolApproved(override_args=override_args)
                 else:
                     results.approvals[tool_call_id] = value
         if isinstance(calls, dict):
@@ -1154,6 +1159,10 @@ class AgentWorker:
                 args = call.args if isinstance(call.args, dict) else {}
                 normalized_args = args
             args_hash = str(meta.get("args_hash") or "")
+            execute_args = meta.get("execute_args")
+            if not isinstance(execute_args, dict):
+                execute_args = normalized_args
+            execution_args_hash = str(meta.get("execution_args_hash") or "")
             args_summary = str(
                 meta.get("args_summary")
                 or summarize_args_for_player(call.tool_name, normalized_args)
@@ -1168,8 +1177,10 @@ class AgentWorker:
                 tool_call_id=call.tool_call_id,
                 tool_name=call.tool_name,
                 normalized_args=normalized_args,
+                execute_args=execute_args,
                 args_summary=args_summary,
                 args_hash=args_hash,
+                execution_args_hash=execution_args_hash,
                 policy_version=policy_version,
                 messages=list(messages),
                 requests=deferred,
@@ -1184,6 +1195,7 @@ class AgentWorker:
                 metadata={
                     "risk": meta.get("risk"),
                     "reason": meta.get("reason"),
+                    "approval_metadata": meta.get("approval_metadata", {}),
                 },
             )
             store.put(pending)

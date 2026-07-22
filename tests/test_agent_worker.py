@@ -44,6 +44,31 @@ def test_worker_stores_http_timeout_settings():
     assert worker.settings.run_command_timeout == 5.0
 
 
+def test_worker_coerces_block_tool_approval_override_args() -> None:
+    """Gateway's block approval payload must become PydanticAI's concrete override type."""
+    from pydantic_ai.tools import ToolApproved
+
+    worker = AgentWorker(MagicMock(), _make_settings())
+    execute_args = {
+        "type_id": "minecraft:stone",
+        "mode": "fill",
+        "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld",
+        "from_pos": {"x": 2, "y": 64, "z": 1},
+        "to_pos": {"x": 4, "y": 64, "z": 3},
+        "locked_targets": [{"x": 2, "y": 64, "z": 1}],
+        "phase": "execute",
+    }
+
+    results = worker._coerce_deferred_tool_results(
+        {"approvals": {"tc-fill": {"kind": "tool-approved", "override_args": execute_args}}}
+    )
+
+    approved = results.approvals["tc-fill"]
+    assert isinstance(approved, ToolApproved)
+    assert approved.override_args == execute_args
+
+
 @pytest.mark.asyncio
 async def test_start_passes_http_timeout_to_httpx_client():
     """start() 应将 settings.worker_http_timeout 传给 httpx.AsyncClient。"""
