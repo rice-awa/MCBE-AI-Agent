@@ -28,6 +28,7 @@ from services.agent.harness.execution import (
     normalize_tool_args,
     reset_idempotency_store,
 )
+from services.agent.block_ops.bridge import map_bridge_exception
 from services.agent.tool_results import ToolResult
 
 
@@ -126,6 +127,20 @@ def test_edit_invocation_exception_returns_unknown_state_without_exception_detai
     assert "bridge-secret" not in result.output
 
 
+def test_projection_failure_keeps_redacted_internal_diagnostic() -> None:
+    result = classify_tool_exception(
+        ValueError("block preflight execution contract token=bridge-secret"),
+        tool_name="edit_blocks",
+        execution_stage="projection",
+    )
+
+    assert json.loads(result.output)["code"] == "INTERNAL_ERROR"
+    assert result.error_type == "ValueError"
+    assert result.diagnostic_summary == "ValueError: block preflight execution contract token=[REDACTED]"
+    assert "bridge-secret" not in result.output
+    assert "bridge-secret" not in result.diagnostic_summary
+
+
 def test_block_projection_failure_is_safe_and_definitely_not_sent() -> None:
     result = classify_tool_exception(
         ValueError("block preflight execution contract token=bridge-secret"),
@@ -182,6 +197,34 @@ def test_block_failure_log_is_correlated_and_omits_exception_text(monkeypatch) -
     assert captured["diagnostic_summary"].startswith("RuntimeError")
     assert captured["external_state_unknown"] is True
     assert captured["execution_stage"] == "invocation"
+    assert "bridge-secret" not in json.dumps(captured)
+
+
+def test_mapped_bridge_failure_log_uses_original_exception_type(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def capture(event: str, **fields: Any) -> None:
+        captured["event"] = event
+        captured.update(fields)
+
+    monkeypatch.setattr("services.agent.harness.execution.logger.error", capture)
+    ctx = type(
+        "Context",
+        (), {"deps": _Deps(run_id="run-bridge", player_name="Alex"), "tool_call_id": "tc-bridge"},
+    )()
+    result = map_bridge_exception(
+        TimeoutError("token=bridge-secret timed out"), tool_name="edit_blocks"
+    )
+
+    log_tool_execution_failed(
+        tool_name="edit_blocks",
+        ctx=ctx,
+        result=result,
+        execution_stage="invocation",
+    )
+
+    assert captured["error_type"] == "TimeoutError"
+    assert captured["diagnostic_summary"] == "TimeoutError: token=[REDACTED] timed out"
     assert "bridge-secret" not in json.dumps(captured)
 
 

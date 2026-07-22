@@ -501,6 +501,13 @@ def merge_canonical_from_preflight(
     elif mode == "fill":
         canonical.pop("position", None)
         canonical.pop("positions", None)
+        if "from" not in canonical and isinstance(original_args.get("from_pos"), dict):
+            canonical["from"] = original_args["from_pos"]
+        if "to" not in canonical and isinstance(original_args.get("to_pos"), dict):
+            canonical["to"] = original_args["to_pos"]
+        # 授权和审计使用桥协议字段名；Python 签名别名只存在于严格执行投影。
+        canonical.pop("from_pos", None)
+        canonical.pop("to_pos", None)
 
     # Mark as ready for execute phase.
     canonical["phase"] = "execute"

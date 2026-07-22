@@ -56,6 +56,7 @@ from services.agent.harness.execution import (
     HarnessCapability,
     PolicyDecisionKind,
     PolicyEngine,
+    get_idempotency_store,
     hash_normalized_args,
     normalize_tool_args,
     reset_idempotency_store,
@@ -239,6 +240,9 @@ def test_edit_bridge_exception_is_unknown_and_does_not_leak_transport_detail() -
         "external_state_unknown": True,
         "fallback_allowed": False,
     }
+    assert result.error_type == "TimeoutError"
+    assert result.diagnostic_summary == "TimeoutError: token=[REDACTED] timed out"
+    assert "bridge-secret" not in result.diagnostic_summary
     assert "bridge-secret" not in result.output
     assert result.retryable is False
     assert result.external_state_unknown is True
@@ -471,6 +475,45 @@ def test_merge_canonical_locks_absolute_place() -> None:
     assert canonical["position"] == {"x": 10, "y": 64, "z": 5}
     assert canonical["dimension"] == "minecraft:overworld"
     assert canonical["locked_targets"]
+
+
+def test_fill_canonical_args_exclude_python_bound_aliases_from_authorization_hash() -> None:
+    original = {
+        "mode": "fill",
+        "type_id": "minecraft:stone",
+        "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld",
+        "from_pos": {"x": 4, "y": 64, "z": 3},
+        "to_pos": {"x": 2, "y": 64, "z": 1},
+    }
+    locked_targets = [
+        {"dimension": "minecraft:overworld", "x": x, "y": 64, "z": z}
+        for x in range(2, 5)
+        for z in range(1, 4)
+    ]
+    plan = build_block_preflight_plan(
+        "edit_blocks",
+        original,
+        {
+            "mode": "fill",
+            "coordinate_mode": "absolute",
+            "dimension": "minecraft:overworld",
+            "bounds": {
+                "min": {"x": 2, "y": 64, "z": 1},
+                "max": {"x": 4, "y": 64, "z": 3},
+            },
+            "locked_targets": locked_targets,
+        },
+    )
+
+    assert plan.authorized_args["from"] == {"x": 2, "y": 64, "z": 1}
+    assert plan.authorized_args["to"] == {"x": 4, "y": 64, "z": 3}
+    assert "from_pos" not in plan.authorized_args
+    assert "to_pos" not in plan.authorized_args
+    assert "from_pos" not in normalize_tool_args(plan.authorized_args)
+    assert "to_pos" not in normalize_tool_args(plan.authorized_args)
+    assert plan.execute_args["from_pos"] == plan.authorized_args["from"]
+    assert plan.execute_args["to_pos"] == plan.authorized_args["to"]
 
 
 def test_policy_edit_blocks_requires_approval_inspect_allows() -> None:
@@ -854,7 +897,7 @@ async def test_harness_preflight_exception_is_safe_projection_failure_and_is_log
         "player_name": "Steve",
         "error_kind": "INTERNAL",
         "error_type": "RuntimeError",
-        "diagnostic_summary": "block execution contract rejected",
+        "diagnostic_summary": "RuntimeError: package.module.preflight(token=[REDACTED], password=[REDACTED])",
         "external_state_unknown": False,
         "execution_stage": "projection",
     }
@@ -1151,6 +1194,22 @@ async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() 
     assert execute_calls[0]["to"] == {"x": 4, "y": 64, "z": 3}
     assert execute_calls[0]["locked_targets"] == locked_targets
 
+    repeated = await agent.run(
+        message_history=first.all_messages(),
+        deferred_tool_results=DeferredToolResults(
+            approvals={approval.tool_call_id: ToolApproved(override_args=execute_args)}
+        ),
+        model=FunctionModel(model_fn),
+        deps=deps,
+    )
+    assert not isinstance(repeated.output, DeferredToolRequests)
+    repeated_execute_calls = [
+        payload
+        for capability, payload in bridge.calls
+        if capability == "edit_blocks" and payload.get("phase") == "execute"
+    ]
+    assert len(repeated_execute_calls) == 1
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -1439,6 +1498,103 @@ async def test_auto_approved_edit_preflights_then_executes_locked_operation() ->
     assert phases == ["preflight", "execute"]
     execute_payload = [payload for name, payload in bridge.calls if name == "edit_blocks"][-1]
     assert execute_payload["locked_targets"]
+
+
+@pytest.mark.asyncio
+async def test_auto_approved_fill_uses_execution_projection_idempotency_key() -> None:
+    locked_targets = [
+        {"dimension": "minecraft:overworld", "x": x, "y": 64, "z": z}
+        for x in range(1, 3)
+        for z in range(1, 3)
+    ]
+    preflight_payload = {
+        "schema_version": "1",
+        "ok": True,
+        "phase": "preflight",
+        "mode": "fill",
+        "type_id": "minecraft:stone",
+        "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld",
+        "bounds": {
+            "min": {"x": 1, "y": 64, "z": 1},
+            "max": {"x": 2, "y": 64, "z": 2},
+        },
+        "locked_targets": locked_targets,
+    }
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {
+                "ok": True,
+                "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}},
+            }
+        if capability == "edit_blocks" and payload.get("phase") == "preflight":
+            return {"ok": True, "payload": preflight_payload}
+        if capability == "edit_blocks" and payload.get("phase") == "execute":
+            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": 4}}
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent: Agent[_Deps, str] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=str,
+        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    )
+    register_agent_tools(agent)
+    original_args = {
+        "type_id": "minecraft:stone",
+        "mode": "fill",
+        "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld",
+        "from_pos": {"x": 2, "y": 64, "z": 2},
+        "to_pos": {"x": 1, "y": 64, "z": 1},
+    }
+
+    model_calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls > 1:
+            return ModelResponse(parts=[TextPart(content="done")])
+        return ModelResponse(parts=[ToolCallPart(
+            tool_name="edit_blocks", tool_call_id="tc-auto-fill", args=original_args,
+        )])
+
+    deps = _Deps(
+        connection_id=cid,
+        addon_bridge=bridge,
+        settings=_Settings(),
+        run_id="run-auto-fill",
+        auto_approve_tools=True,
+    )
+    result = await agent.run("fill", model=FunctionModel(model_fn), deps=deps)
+
+    assert result.output == "done"
+    assert [
+        payload["phase"]
+        for capability, payload in bridge.calls
+        if capability == "edit_blocks"
+    ] == ["preflight", "execute"]
+    python_tool_args = {
+        **original_args,
+        "position": None,
+        "positions": None,
+        "states": None,
+        "replace_any": False,
+        "expected_previous": None,
+        "locked_targets": None,
+        "phase": None,
+    }
+    plan = build_block_preflight_plan("edit_blocks", python_tool_args, preflight_payload)
+    execution_hash = hash_normalized_args(normalize_tool_args(plan.execute_args))
+    authorization_hash = hash_normalized_args(normalize_tool_args(plan.authorized_args))
+    assert execution_hash != authorization_hash
+    assert get_idempotency_store().get("run-auto-fill", "tc-auto-fill", execution_hash)
+    assert not get_idempotency_store().get("run-auto-fill", "tc-auto-fill", authorization_hash)
 
 
 @pytest.mark.asyncio

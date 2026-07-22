@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Protocol
 
+from config.redaction import redact_exception
 from services.agent.block_ops.schema import (
     BlockErrorCode,
     build_error_response,
@@ -100,6 +101,8 @@ def map_bridge_exception(
     tool_name: str | None = None,
 ) -> ToolResult:
     """Map bridge transport exceptions to ToolResult.failure."""
+    diagnostic_summary = redact_exception(exc) or exc.__class__.__name__
+    error_type = exc.__class__.__name__
     if tool_name == "edit_blocks":
         body = build_error_response(
             BlockErrorCode.STATE_UNKNOWN,
@@ -113,7 +116,8 @@ def map_bridge_exception(
             error_kind="PERMANENT",
             retryable=False,
             external_state_unknown=True,
-            diagnostic_summary=exc.__class__.__name__,
+            diagnostic_summary=diagnostic_summary,
+            error_type=error_type,
         )
 
     code = BlockErrorCode.ADDON_UNAVAILABLE
@@ -129,7 +133,8 @@ def map_bridge_exception(
         error_kind="TRANSIENT",
         retryable=True,
         external_state_unknown=False,
-        diagnostic_summary=exc.__class__.__name__,
+        diagnostic_summary=diagnostic_summary,
+        error_type=error_type,
     )
 
 

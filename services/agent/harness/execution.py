@@ -527,7 +527,8 @@ def classify_tool_exception(
             ),
             error_kind="INTERNAL",
             retryable=False,
-            diagnostic_summary="block execution contract rejected",
+            diagnostic_summary=diagnostic_summary,
+            error_type=exc.__class__.__name__,
         )
     if tool_name == "edit_blocks" and stage == "invocation":
         from services.agent.block_ops.schema import BlockErrorCode, build_error_response, dumps_payload
@@ -546,6 +547,7 @@ def classify_tool_exception(
             retryable=False,
             external_state_unknown=True,
             diagnostic_summary=diagnostic_summary,
+            error_type=exc.__class__.__name__,
         )
     if "timeout" in lower or "deadline" in lower:
         entry = get_tool_entry(tool_name)
@@ -556,12 +558,14 @@ def classify_tool_exception(
             retryable=not side_effect and (entry is not None and entry.risk == ToolRisk.LOW),
             external_state_unknown=side_effect,
             diagnostic_summary=diagnostic_summary,
+            error_type=exc.__class__.__name__,
         )
     return ToolResult.failure(
         f"工具执行失败: {tool_name}",
         error_kind="INTERNAL",
         retryable=False,
         diagnostic_summary=diagnostic_summary,
+        error_type=exc.__class__.__name__,
     )
 
 
@@ -571,7 +575,7 @@ def log_tool_execution_failed(
     ctx: Any,
     result: ToolResult,
     execution_stage: Literal["projection", "invocation"],
-    error_type: str,
+    error_type: str | None = None,
 ) -> None:
     """Emit a correlation-safe failure event for tool boundary failures."""
     deps = getattr(ctx, "deps", None)
@@ -584,7 +588,7 @@ def log_tool_execution_failed(
         connection_id_short=connection_id[-8:] if connection_id else "",
         player_name=getattr(deps, "player_name", None),
         error_kind=result.error_kind,
-        error_type=error_type,
+        error_type=result.error_type or error_type or type(result).__name__,
         diagnostic_summary=result.diagnostic_summary or "tool execution failed",
         external_state_unknown=result.external_state_unknown,
         execution_stage=execution_stage,
@@ -688,13 +692,25 @@ class HarnessToolset(WrapperToolset[Any]):
 
         normalized = normalize_tool_args(effective_args)
         args_hash = hash_normalized_args(normalized)
+        execute_args = (
+            dict(preflight_plan.execute_args) if preflight_plan is not None else None
+        )
+        idempotency_args_hash = (
+            hash_normalized_args(normalize_tool_args(execute_args))
+            if name in _BLOCK_OPS_TOOLS and execute_args is not None
+            else args_hash
+        )
 
-        # 1) 幂等命中（优先 canonical hash；兼容原始 hash）
+        # 1) 方块工具按实际执行投影幂等；兼容已按授权/原始参数写入的旧记录。
         if run_id and tool_call_id:
-            cached = self.idempotency.get(str(run_id), str(tool_call_id), args_hash)
-            if cached is None and args_hash != original_args_hash:
+            cached = self.idempotency.get(
+                str(run_id), str(tool_call_id), idempotency_args_hash
+            )
+            for legacy_hash in (args_hash, original_args_hash):
+                if cached is not None or legacy_hash == idempotency_args_hash:
+                    continue
                 cached = self.idempotency.get(
-                    str(run_id), str(tool_call_id), original_args_hash
+                    str(run_id), str(tool_call_id), legacy_hash
                 )
             if cached is not None:
                 logger.info(
@@ -746,7 +762,7 @@ class HarnessToolset(WrapperToolset[Any]):
 
         if decision.action == PolicyDecisionKind.REQUIRE_APPROVAL:
             try:
-                execute_args = _python_tool_args(name, effective_args)
+                execute_args = execute_args or _python_tool_args(name, effective_args)
             except (TypeError, ValueError, KeyError) as exc:
                 classified = classify_tool_exception(
                     exc, tool_name=name, execution_stage="projection"
@@ -784,7 +800,7 @@ class HarnessToolset(WrapperToolset[Any]):
                     "execute_args": (
                         preflight_plan.execute_args if preflight_plan is not None else execute_args
                     ),
-                    "execution_args_hash": hash_normalized_args(normalize_tool_args(execute_args)),
+                    "execution_args_hash": idempotency_args_hash,
                     "approval_metadata": (
                         preflight_plan.approval_metadata if preflight_plan is not None else {}
                     ),
@@ -801,7 +817,7 @@ class HarnessToolset(WrapperToolset[Any]):
 
         # 3) 执行（使用 canonical args；映射 fill 的 from/to → from_pos/to_pos）
         try:
-            execute_args = _python_tool_args(name, effective_args)
+            execute_args = execute_args or _python_tool_args(name, effective_args)
         except (TypeError, ValueError, KeyError) as exc:
             classified = classify_tool_exception(
                 exc, tool_name=name, execution_stage="projection"
@@ -858,14 +874,14 @@ class HarnessToolset(WrapperToolset[Any]):
                     ctx=ctx,
                     result=raw_result,
                     execution_stage="invocation",
-                    error_type="ToolResult",
+                    error_type=raw_result.error_type,
                 )
             # 状态未知的副作用：不写入可重放成功缓存之外的自动重试语义
             if raw_result.is_success and run_id and tool_call_id:
                 self.idempotency.put(
                     str(run_id),
                     str(tool_call_id),
-                    args_hash,
+                    idempotency_args_hash,
                     raw_result,
                     external_state_unknown=False,
                 )
@@ -883,7 +899,7 @@ class HarnessToolset(WrapperToolset[Any]):
                 self.idempotency.put(
                     str(run_id),
                     str(tool_call_id),
-                    args_hash,
+                    idempotency_args_hash,
                     result_for_model,
                     external_state_unknown=False,
                 )
