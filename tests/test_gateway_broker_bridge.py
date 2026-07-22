@@ -1,6 +1,7 @@
 """BrokerResponseBridge unit tests."""
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from uuid import uuid4
@@ -49,4 +50,10 @@ async def test_stream_chunk_becomes_outbound_payload():
         await asyncio.sleep(0.02)
     await bridge.stop(cid)
     assert sent, "expected tellraw payloads"
-    assert any("你好" in p for p in sent)
+    payloads = [json.loads(payload) for payload in sent]
+    assert any("你好" in payload["body"]["commandLine"] for payload in payloads)
+    assert all(payload["body"]["origin"]["type"] == "player" for payload in payloads)
+    assert all(
+        payload["body"]["commandLine"].startswith("tellraw Steve ")
+        for payload in payloads
+    )

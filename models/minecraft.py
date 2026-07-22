@@ -3,10 +3,9 @@
 import json
 import re
 from typing import Any, Literal
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
-
 
 _TELLRAW_TARGET_UNQUOTED_RE = re.compile(
     r"^(?:@[a-z](?:\[[A-Za-z0-9_.,=!:-]*\])?|[A-Za-z0-9_.-]+)$"
@@ -108,7 +107,6 @@ class MinecraftCommand(BaseModel):
         command_line = f"tellraw {safe_target} {rawtext}"
         return cls(
             body=MinecraftCommandBody(
-                origin=MinecraftOrigin(type="say"),
                 commandLine=command_line,
             )
         )
