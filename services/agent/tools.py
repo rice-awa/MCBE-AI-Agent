@@ -960,9 +960,22 @@ def register_agent_tools(
         include_liquid_blocks: bool = False,
         include_passable_blocks: bool = False,
     ) -> str:
-        """通过 addon 桥接获取玩家视线命中的方块（getBlockFromViewDirection）。
+        """
+        获取玩家视线正对着的方块（射线检测 getBlockFromViewDirection）。
 
-        默认查询当前对话玩家。用于回答「我在看什么 / 前面是什么方块」。
+        用于回答「我在看什么 / 前面是什么方块」。默认查询当前对话玩家；
+        不要传 @s/@a 等选择器（会自动回退到当前玩家）。
+
+        Args:
+            ctx: 运行上下文
+            target: 玩家名；留空则使用当前对话玩家。不要使用选择器。
+            max_distance: 最大检测距离（格），默认 8，有效范围 1–64
+            include_liquid_blocks: 是否把液体（水、岩浆）当作挡射线方块；默认 False
+            include_passable_blocks: 是否把可穿过方块（花、藤蔓等）当作命中；默认 False
+
+        Returns:
+            JSON 字符串：命中时含 typeId、坐标、维度、命中面 face、faceLocation；
+            未命中时 hit=false；玩家不在线时返回错误信息
         """
         if ctx.deps.addon_bridge is None:
             return _tool_failure("Addon 桥接不可用", error_kind="TRANSIENT", retryable=True)
