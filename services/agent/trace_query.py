@@ -10,6 +10,7 @@ their last event is younger than ``ABANDONED_AFTER_SECONDS``, otherwise
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,14 @@ def _ts_key(value: Any) -> str:
     return str(value or "")
 
 
+def _safe_sequence(value: Any) -> int:
+    """Coerce sequence for sort; bad values sort as 0 (event still kept)."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
 def _attr(event: dict[str, Any], key: str, default: Any = None) -> Any:
     attrs = event.get("attributes")
     if isinstance(attrs, dict) and key in attrs:
@@ -85,6 +94,7 @@ class TraceQuery:
         self._events_by_trace: dict[str, list[dict[str, Any]]] = {}
         self._loaded = False
         self._file_size = 0
+        self._lock = threading.RLock()
 
     def _reset_stats(self) -> None:
         self._parsed_lines = 0
@@ -95,7 +105,10 @@ class TraceQuery:
         self._loaded = False
 
     def _load(self) -> None:
-        """Reload journal from disk (always fresh for read-only API)."""
+        """Reload journal from disk (always fresh for read-only API).
+
+        Caller must hold ``self._lock``.
+        """
         self._reset_stats()
         path = self.path
         if not path.exists() or not path.is_file():
@@ -108,7 +121,8 @@ class TraceQuery:
             self._file_size = 0
 
         try:
-            with path.open("r", encoding="utf-8") as fh:
+            # errors="replace" so non-UTF-8 bytes never raise UnicodeDecodeError
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
                 for raw_line in fh:
                     line = raw_line.strip()
                     if not line:
@@ -143,7 +157,7 @@ class TraceQuery:
         for trace_id, events in self._events_by_trace.items():
             events.sort(
                 key=lambda e: (
-                    int(e.get("sequence") or 0),
+                    _safe_sequence(e.get("sequence")),
                     str(e.get("event_id") or ""),
                 )
             )
@@ -153,6 +167,7 @@ class TraceQuery:
 
     def _ensure_loaded(self) -> None:
         # Always re-read so concurrent writers are reflected; cheap for offline tests.
+        # Caller must hold ``self._lock``.
         self._load()
 
     def _derive_status(
@@ -442,51 +457,60 @@ class TraceQuery:
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         """Return newest-first trace summaries; apply limit after filters."""
-        self._ensure_loaded()
-        now = datetime.now(UTC)
-        summaries: list[dict[str, Any]] = []
-        for trace_id, events in self._events_by_trace.items():
-            if not events:
-                continue
-            summary = self._build_summary(trace_id, events, now=now)
-            if status is not None and summary.get("status") != status:
-                continue
-            if player is not None and summary.get("player_name") != player:
-                continue
-            summaries.append(summary)
+        with self._lock:
+            self._ensure_loaded()
+            now = datetime.now(UTC)
+            summaries: list[dict[str, Any]] = []
+            for trace_id, events in self._events_by_trace.items():
+                if not events:
+                    continue
+                summary = self._build_summary(trace_id, events, now=now)
+                if status is not None and summary.get("status") != status:
+                    continue
+                if player is not None and summary.get("player_name") != player:
+                    continue
+                summaries.append(summary)
 
-        # Newest first: prefer ended_at, else last_event_timestamp, else started_at
-        def sort_key(s: dict[str, Any]) -> str:
-            return _ts_key(
-                s.get("ended_at") or s.get("last_event_timestamp") or s.get("started_at")
-            )
+            # Newest first: prefer ended_at, else last_event_timestamp, else started_at
+            def sort_key(s: dict[str, Any]) -> str:
+                return _ts_key(
+                    s.get("ended_at") or s.get("last_event_timestamp") or s.get("started_at")
+                )
 
-        summaries.sort(key=sort_key, reverse=True)
-        lim = max(0, int(limit))
-        return summaries[:lim]
+            summaries.sort(key=sort_key, reverse=True)
+            lim = max(0, int(limit))
+            return summaries[:lim]
 
     def get_trace(self, trace_id: str) -> dict[str, Any] | None:
         """Return full aggregation for one trace, or None if missing."""
-        self._ensure_loaded()
-        events = self._events_by_trace.get(trace_id)
-        if not events:
-            return None
-        now = datetime.now(UTC)
-        # Return event dicts as recorded (shallow copy of each line object)
-        events_out = [dict(e) for e in events]
-        return {
-            "summary": self._build_summary(trace_id, events, now=now),
-            "events": events_out,
-            "attempts": self._group_attempts(events_out),
-            "models": self._group_models(events_out),
-            "tools": self._group_tools(events_out),
-            "approvals": self._group_approvals(events_out),
-            "delivery": self._group_delivery(events_out),
-        }
+        with self._lock:
+            self._ensure_loaded()
+            events = self._events_by_trace.get(trace_id)
+            if not events:
+                return None
+            now = datetime.now(UTC)
+            # Return event dicts as recorded (shallow copy of each line object)
+            events_out = [dict(e) for e in events]
+            return {
+                "summary": self._build_summary(trace_id, events, now=now),
+                "events": events_out,
+                "attempts": self._group_attempts(events_out),
+                "models": self._group_models(events_out),
+                "tools": self._group_tools(events_out),
+                "approvals": self._group_approvals(events_out),
+                "delivery": self._group_delivery(events_out),
+            }
 
     def health(self) -> dict[str, Any]:
         """Journal + optional recorder health snapshot."""
-        self._ensure_loaded()
+        with self._lock:
+            self._ensure_loaded()
+            parsed_lines = self._parsed_lines
+            malformed_lines = self._malformed_lines
+            last_event_timestamp = self._last_event_timestamp
+            file_size = self._file_size
+            trace_count = len(self._events_by_trace)
+
         recorder_health: dict[str, Any] | None = None
         try:
             from services.agent.trace import get_trace_recorder
@@ -500,11 +524,11 @@ class TraceQuery:
         return {
             "path": str(self.path),
             "exists": self.path.exists() and self.path.is_file(),
-            "file_size": self._file_size,
-            "parsed_lines": self._parsed_lines,
-            "malformed_lines": self._malformed_lines,
-            "last_event_timestamp": self._last_event_timestamp,
-            "trace_count": len(self._events_by_trace),
+            "file_size": file_size,
+            "parsed_lines": parsed_lines,
+            "malformed_lines": malformed_lines,
+            "last_event_timestamp": last_event_timestamp,
+            "trace_count": trace_count,
             "abandoned_after_seconds": ABANDONED_AFTER_SECONDS,
             "recorder": recorder_health,
         }

@@ -361,6 +361,103 @@ def test_list_newest_first(tmp_path: Path) -> None:
     assert [s["trace_id"] for s in listed] == ["newer", "older"]
 
 
+def test_non_numeric_sequence_does_not_abort_load(tmp_path: Path) -> None:
+    """Bad sequence values sort as 0; other events still load and group."""
+    path = tmp_path / "agent_traces.jsonl"
+    base = datetime(2026, 7, 22, 9, 0, 0, tzinfo=UTC)
+    good = _event(
+        event_name="trace.completed",
+        trace_id="t-good",
+        sequence=1,
+        status="completed",
+        timestamp=(base + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+    )
+    bad_seq = _event(
+        event_name="trace.started",
+        trace_id="t-good",
+        sequence=0,  # overwritten below
+        status="started",
+        timestamp=base.isoformat().replace("+00:00", "Z"),
+    )
+    bad_seq["sequence"] = "x"
+    other = _event(
+        event_name="trace.completed",
+        trace_id="t-other",
+        sequence=0,
+        status="completed",
+        timestamp=(base + timedelta(seconds=2)).isoformat().replace("+00:00", "Z"),
+    )
+    list_bad = _event(
+        event_name="agent.attempt.started",
+        trace_id="t-good",
+        sequence=2,
+        status="started",
+        timestamp=(base + timedelta(seconds=0.5)).isoformat().replace("+00:00", "Z"),
+    )
+    list_bad["sequence"] = ["not", "an", "int"]
+    path.write_text(
+        "\n".join(json.dumps(e) for e in [good, bad_seq, other, list_bad]) + "\n",
+        encoding="utf-8",
+    )
+    q = TraceQuery(path)
+    # Must not raise
+    listed = q.list_traces(limit=50)
+    health = q.health()
+    detail = q.get_trace("t-good")
+    assert health["parsed_lines"] == 4
+    assert health["malformed_lines"] == 0
+    assert {s["trace_id"] for s in listed} == {"t-good", "t-other"}
+    assert detail is not None
+    assert detail["summary"]["status"] == "completed"
+    assert detail["summary"]["event_count"] == 3
+    # Bad sequences treated as 0; stable by event_id among ties
+    sequences = [e.get("sequence") for e in detail["events"]]
+    assert "x" in sequences
+    assert ["not", "an", "int"] in sequences
+    # Numeric 1 still present and order is defined (no exception)
+    assert 1 in sequences
+
+
+def test_non_utf8_bytes_do_not_raise(tmp_path: Path) -> None:
+    """Invalid UTF-8 in journal must not crash load/list/detail/health."""
+    path = tmp_path / "agent_traces.jsonl"
+    good = _event(
+        event_name="trace.completed",
+        sequence=0,
+        status="completed",
+        timestamp=datetime(2026, 7, 22, 11, 0, 0, tzinfo=UTC)
+        .isoformat()
+        .replace("+00:00", "Z"),
+    )
+    # Mix valid line + raw invalid UTF-8 bytes + another valid line
+    payload = (
+        json.dumps(good).encode("utf-8")
+        + b"\n"
+        + b'{"event_name":"trace.started","trace_id":"t-bad","sequence":0,\xff\xfe}\n'
+        + json.dumps(
+            _event(
+                event_name="trace.started",
+                trace_id="t2",
+                sequence=0,
+                status="started",
+                timestamp=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            )
+        ).encode("utf-8")
+        + b"\n"
+    )
+    path.write_bytes(payload)
+    q = TraceQuery(path)
+    health = q.health()
+    listed = q.list_traces(limit=50)
+    detail = q.get_trace("trace-1")
+    assert health["exists"] is True
+    # At least the clean completed event is parsed
+    assert health["parsed_lines"] >= 1
+    assert detail is not None
+    assert detail["summary"]["status"] == "completed"
+    assert any(s["trace_id"] == "trace-1" for s in listed)
+
+
 def test_attempts_models_approvals_delivery_groups(tmp_path: Path) -> None:
     path = tmp_path / "agent_traces.jsonl"
     base = datetime(2026, 7, 22, 8, 0, 0, tzinfo=UTC)
