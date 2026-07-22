@@ -222,6 +222,45 @@ def _validate_edit_args(
     return None
 
 
+def _normalize_limits_input(limits: dict[str, int] | None) -> dict[str, int] | None:
+    """Accept host-side limit names and map them to Add-on top-level fields.
+
+    Host settings use ``max_discrete_positions``; Add-on handlers read:
+    - inspect: ``max_positions``
+    - place/batch: ``max_discrete``
+    - fill: ``max_fill_volume``, ``cells_per_tick``
+    """
+    if not limits:
+        return None
+    max_discrete = limits.get("max_discrete")
+    if max_discrete is None:
+        max_discrete = limits.get("max_discrete_positions")
+    if max_discrete is None:
+        max_discrete = limits.get("max_positions")
+    out: dict[str, int] = {}
+    if max_discrete is not None:
+        out["max_discrete"] = int(max_discrete)
+        out["max_positions"] = int(max_discrete)
+    if "max_fill_volume" in limits and limits["max_fill_volume"] is not None:
+        out["max_fill_volume"] = int(limits["max_fill_volume"])
+    if "cells_per_tick" in limits and limits["cells_per_tick"] is not None:
+        out["cells_per_tick"] = int(limits["cells_per_tick"])
+    return out or None
+
+
+def apply_limits_to_payload(payload: dict[str, Any], limits: dict[str, int] | None) -> dict[str, Any]:
+    """Write Add-on-facing limit fields at the **top level** of the bridge payload.
+
+    Nested ``payload.limits`` is intentionally not used: Add-on common/fill/inspect
+    read top-level keys only.
+    """
+    normalized = _normalize_limits_input(limits)
+    if not normalized:
+        return payload
+    payload.update(normalized)
+    return payload
+
+
 def build_inspect_payload(
     *,
     coordinate_mode: str,
@@ -247,8 +286,7 @@ def build_inspect_payload(
         payload["phase"] = phase
     if locked_targets is not None:
         payload["locked_targets"] = locked_targets
-    if limits is not None:
-        payload["limits"] = limits
+    apply_limits_to_payload(payload, limits)
     return payload
 
 
@@ -294,8 +332,7 @@ def build_edit_payload(
         payload["expected_previous"] = expected_previous
     if locked_targets is not None:
         payload["locked_targets"] = locked_targets
-    if limits is not None:
-        payload["limits"] = limits
+    apply_limits_to_payload(payload, limits)
     return payload
 
 

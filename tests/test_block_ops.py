@@ -42,6 +42,9 @@ from services.agent.block_ops.schema import (
     build_success_response,
 )
 from services.agent.block_ops.tools_impl import (
+    apply_limits_to_payload,
+    build_edit_payload,
+    build_inspect_payload,
     edit_blocks_impl,
     inspect_block_impl,
     merge_canonical_from_preflight,
@@ -232,6 +235,66 @@ def test_limits_hard_clamp() -> None:
     assert limits.max_discrete_positions == HARD_MAX_DISCRETE_POSITIONS
     assert limits.max_fill_volume == 16384
     assert limits.cells_per_tick == 512
+
+
+def test_bridge_payload_limits_are_top_level_addon_fields() -> None:
+    """Host settings names must be flattened to Add-on top-level keys (not nested limits)."""
+    host_limits = {
+        "max_discrete_positions": 512,
+        "max_fill_volume": 2048,
+        "cells_per_tick": 64,
+    }
+    inspect_payload = build_inspect_payload(
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        position={"x": 0, "y": 64, "z": 0},
+        positions=None,
+        player_name="Steve",
+        limits=host_limits,
+    )
+    assert "limits" not in inspect_payload
+    assert inspect_payload["max_positions"] == 512
+    assert inspect_payload["max_discrete"] == 512
+
+    edit_payload = build_edit_payload(
+        mode="fill",
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        position=None,
+        positions=None,
+        from_pos={"x": 0, "y": 64, "z": 0},
+        to_pos={"x": 1, "y": 64, "z": 1},
+        type_id="minecraft:stone",
+        states=None,
+        replace_any=False,
+        expected_previous=None,
+        player_name="Steve",
+        phase="preflight",
+        limits=host_limits,
+    )
+    assert "limits" not in edit_payload
+    assert edit_payload["max_discrete"] == 512
+    assert edit_payload["max_positions"] == 512
+    assert edit_payload["max_fill_volume"] == 2048
+    assert edit_payload["cells_per_tick"] == 64
+
+
+def test_apply_limits_maps_host_names() -> None:
+    payload: dict[str, Any] = {}
+    apply_limits_to_payload(
+        payload,
+        {
+            "max_discrete_positions": 100,
+            "max_fill_volume": 50,
+            "cells_per_tick": 10,
+        },
+    )
+    assert payload == {
+        "max_discrete": 100,
+        "max_positions": 100,
+        "max_fill_volume": 50,
+        "cells_per_tick": 10,
+    }
 
 
 @pytest.mark.asyncio
