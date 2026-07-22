@@ -911,6 +911,69 @@ async def test_harness_rejects_incomplete_non_deferred_execute_projection(monkey
     assert captured["execution_stage"] == "projection"
     assert captured["run_id"] == "run-fast-projection"
     assert captured["tool_call_id"] == "tc-fast-projection"
+
+
+@pytest.mark.asyncio
+async def test_harness_rejects_unhashable_execute_mode_without_bridge_call(monkeypatch) -> None:
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent: Agent[_Deps, str] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=str,
+        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    )
+
+    @agent.tool
+    async def edit_blocks(
+        ctx: RunContext[_Deps],
+        type_id: str,
+        mode: Any,
+        coordinate_mode: str,
+        dimension: str,
+        locked_targets: list[dict[str, Any]],
+        phase: str,
+    ) -> str:
+        raise AssertionError("invalid projection must not invoke the Python tool")
+
+    captured: dict[str, Any] = {}
+
+    def capture(event: str, **fields: Any) -> None:
+        captured["event"] = event
+        captured.update(fields)
+
+    monkeypatch.setattr("services.agent.harness.execution.logger.error", capture)
+    calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return ModelResponse(parts=[TextPart(content="done")])
+        return ModelResponse(parts=[ToolCallPart(
+            tool_name="edit_blocks",
+            tool_call_id="tc-unhashable-mode",
+            args={
+                "type_id": "minecraft:stone", "mode": [],
+                "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
+                "phase": "execute", "locked_targets": [{"x": 1, "y": 64, "z": 1}],
+            },
+        )])
+
+    result = await agent.run(
+        "edit",
+        model=FunctionModel(model_fn),
+        deps=_Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-unhashable-mode"),
+    )
+
+    assert "INTERNAL_ERROR" in str(result.all_messages())
+    assert not any(
+        name == "edit_blocks" and payload.get("phase") == "execute"
+        for name, payload in bridge.calls
+    )
+    assert captured["event"] == "tool_execution_failed"
+    assert captured["execution_stage"] == "projection"
 @pytest.mark.asyncio
 async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() -> None:
     locked_targets = [

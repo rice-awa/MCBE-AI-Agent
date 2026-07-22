@@ -19,6 +19,7 @@ from pydantic_ai.toolsets.wrapper import WrapperToolset
 from pydantic_ai.tools import ToolDefinition
 
 from config.logging import get_logger
+from config.redaction import redact_exception
 from services.agent.harness.audit import (
     audit_enabled,
     build_audit_record,
@@ -506,6 +507,7 @@ def classify_tool_exception(
 ) -> ToolResult:
     """Map tool-boundary exceptions without exposing implementation details."""
     text = str(exc) or exc.__class__.__name__
+    diagnostic_summary = redact_exception(exc) or exc.__class__.__name__
     lower = text.lower()
     stage = execution_stage or (
         "projection" if "execution contract" in lower else "invocation"
@@ -543,7 +545,7 @@ def classify_tool_exception(
             error_kind="PERMANENT",
             retryable=False,
             external_state_unknown=True,
-            diagnostic_summary=exc.__class__.__name__,
+            diagnostic_summary=diagnostic_summary,
         )
     if "timeout" in lower or "deadline" in lower:
         entry = get_tool_entry(tool_name)
@@ -553,13 +555,13 @@ def classify_tool_exception(
             error_kind="TRANSIENT",
             retryable=not side_effect and (entry is not None and entry.risk == ToolRisk.LOW),
             external_state_unknown=side_effect,
-            diagnostic_summary=text,
+            diagnostic_summary=diagnostic_summary,
         )
     return ToolResult.failure(
         f"工具执行失败: {tool_name}",
         error_kind="INTERNAL",
         retryable=False,
-        diagnostic_summary=text,
+        diagnostic_summary=diagnostic_summary,
     )
 
 
@@ -589,7 +591,7 @@ def log_tool_execution_failed(
     )
 
 
-def _projection_failure(ctx: Any, tool_name: str, exc: ValueError) -> ToolResult:
+def _projection_failure(ctx: Any, tool_name: str, exc: BaseException) -> ToolResult:
     """Classify and log an invalid block execution projection once."""
     classified = classify_tool_exception(
         exc, tool_name=tool_name, execution_stage="projection"
@@ -745,7 +747,7 @@ class HarnessToolset(WrapperToolset[Any]):
         if decision.action == PolicyDecisionKind.REQUIRE_APPROVAL:
             try:
                 execute_args = _python_tool_args(name, effective_args)
-            except ValueError as exc:
+            except (TypeError, ValueError, KeyError) as exc:
                 classified = classify_tool_exception(
                     exc, tool_name=name, execution_stage="projection"
                 )
@@ -800,7 +802,7 @@ class HarnessToolset(WrapperToolset[Any]):
         # 3) 执行（使用 canonical args；映射 fill 的 from/to → from_pos/to_pos）
         try:
             execute_args = _python_tool_args(name, effective_args)
-        except ValueError as exc:
+        except (TypeError, ValueError, KeyError) as exc:
             classified = classify_tool_exception(
                 exc, tool_name=name, execution_stage="projection"
             )
@@ -940,7 +942,7 @@ class HarnessToolset(WrapperToolset[Any]):
         if deferred_approved:
             try:
                 execute_args = _python_tool_args(name, tool_args)
-            except ValueError as exc:
+            except (TypeError, ValueError, KeyError) as exc:
                 classified = classify_tool_exception(
                     exc, tool_name=name, execution_stage="projection"
                 )
@@ -968,7 +970,7 @@ class HarnessToolset(WrapperToolset[Any]):
             if tool_args.get("phase") == "execute" and tool_args.get("locked_targets"):
                 try:
                     execute_args = _python_tool_args(name, tool_args)
-                except ValueError as exc:
+                except (TypeError, ValueError, KeyError) as exc:
                     return _projection_failure(ctx, name, exc), None
                 return None, BlockPreflightPlan(dict(tool_args), execute_args, {})
 
@@ -993,7 +995,7 @@ class HarnessToolset(WrapperToolset[Any]):
         if plan_or_args is None:
             try:
                 execute_args = _python_tool_args(name, tool_args)
-            except ValueError as exc:
+            except (TypeError, ValueError, KeyError) as exc:
                 return _projection_failure(ctx, name, exc), None
             return None, BlockPreflightPlan(dict(tool_args), execute_args, {})
 
@@ -1003,7 +1005,7 @@ class HarnessToolset(WrapperToolset[Any]):
             canonical = dict(plan_or_args)
             try:
                 execute_args = _python_tool_args(name, canonical)
-            except ValueError as exc:
+            except (TypeError, ValueError, KeyError) as exc:
                 return _projection_failure(ctx, name, exc), None
             plan = BlockPreflightPlan(canonical, execute_args, {})
 

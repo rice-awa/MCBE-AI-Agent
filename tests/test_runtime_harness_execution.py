@@ -16,6 +16,7 @@ from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCall
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults
 
 from services.agent.harness.approvals import PendingApproval, PendingApprovalStore
+from services.agent.harness.audit import build_audit_record
 from services.agent.harness.execution import (
     HarnessCapability,
     PolicyDecisionKind,
@@ -170,20 +171,63 @@ def test_block_failure_log_is_correlated_and_omits_exception_text(monkeypatch) -
         error_type="RuntimeError",
     )
 
-    assert captured == {
-        "event": "tool_execution_failed",
-        "tool_name": "edit_blocks",
-        "run_id": "run-log",
-        "tool_call_id": "tc-log",
-        "connection_id_short": str(ctx.deps.connection_id)[-8:],
-        "player_name": "Alex",
-        "error_kind": "PERMANENT",
-        "error_type": "RuntimeError",
-        "diagnostic_summary": "RuntimeError",
-        "external_state_unknown": True,
-        "execution_stage": "invocation",
-    }
+    assert captured["event"] == "tool_execution_failed"
+    assert captured["tool_name"] == "edit_blocks"
+    assert captured["run_id"] == "run-log"
+    assert captured["tool_call_id"] == "tc-log"
+    assert captured["connection_id_short"] == str(ctx.deps.connection_id)[-8:]
+    assert captured["player_name"] == "Alex"
+    assert captured["error_kind"] == "PERMANENT"
+    assert captured["error_type"] == "RuntimeError"
+    assert captured["diagnostic_summary"].startswith("RuntimeError")
+    assert captured["external_state_unknown"] is True
+    assert captured["execution_stage"] == "invocation"
     assert "bridge-secret" not in json.dumps(captured)
+
+
+def test_inspect_invocation_failure_redacts_model_log_and_audit(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def capture(event: str, **fields: Any) -> None:
+        captured["event"] = event
+        captured.update(fields)
+
+    monkeypatch.setattr("services.agent.harness.execution.logger.error", capture)
+    ctx = type(
+        "Context",
+        (), {"deps": _Deps(run_id="run-inspect", player_name="Alex"), "tool_call_id": "tc-inspect"},
+    )()
+    result = classify_tool_exception(
+        RuntimeError('{"detail":"Bearer inspect-bearer","token":"inspect-secret"}'),
+        tool_name="inspect_block",
+        execution_stage="invocation",
+    )
+    log_tool_execution_failed(
+        tool_name="inspect_block",
+        ctx=ctx,
+        result=result,
+        execution_stage="invocation",
+        error_type="RuntimeError",
+    )
+    audit = build_audit_record(
+        tool_name="inspect_block",
+        parameters={},
+        ctx=ctx,
+        status="failure",
+        duration_ms=1,
+        result=result,
+    )
+
+    assert "inspect-secret" not in result.output
+    assert "inspect-bearer" not in result.output
+    assert "inspect-secret" not in json.dumps(captured)
+    assert "inspect-bearer" not in json.dumps(captured)
+    assert "inspect-secret" not in json.dumps(audit)
+    assert "inspect-bearer" not in json.dumps(audit)
+    assert captured["run_id"] == "run-inspect"
+    assert captured["tool_call_id"] == "tc-inspect"
+    assert captured["player_name"] == "Alex"
+    assert captured["execution_stage"] == "invocation"
 
 
 def test_policy_only_configured_destructive_command_roots_require_approval() -> None:

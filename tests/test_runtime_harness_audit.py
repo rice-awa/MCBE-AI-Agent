@@ -428,6 +428,25 @@ def test_redact_exception_handles_structured_and_python_repr_secrets(detail: str
         assert secret not in redacted
 
 
+@pytest.mark.parametrize(
+    "detail",
+    [
+        '{"detail":"Bearer json-bearer","note":"password=json-password","nested":[{"cookie":"json-cookie"}]}',
+        '"token=json-scalar-secret"',
+        "{'private_key': 'repr-private', 'nested': [{'access_key': 'repr-access'}, {'credential': 'repr-credential'}]}",
+    ],
+)
+def test_redact_exception_scrubs_all_structured_string_leaves(detail: str) -> None:
+    redacted = redact_exception(RuntimeError(detail))
+
+    assert redacted is not None
+    for secret in (
+        "json-bearer", "json-password", "json-cookie", "json-scalar-secret",
+        "repr-private", "repr-access", "repr-credential",
+    ):
+        assert secret not in redacted
+
+
 @pytest.mark.asyncio
 async def test_shutdown_flush_persists_queued_records(tmp_path):
     audit_path = tmp_path / "runtime_harness_tools.jsonl"
