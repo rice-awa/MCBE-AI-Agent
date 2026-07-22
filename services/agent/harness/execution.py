@@ -35,6 +35,8 @@ from services.agent.tool_results import ToolResult
 
 logger = get_logger(__name__)
 
+_BLOCK_OPS_TOOLS: frozenset[str] = frozenset({"inspect_block", "edit_blocks"})
+
 DEFAULT_HARD_DENY_COMMAND_ROOTS: frozenset[str] = frozenset(
     {"op", "deop", "stop", "whitelist", "permission", "wsserver"}
 )
@@ -382,10 +384,35 @@ class PolicyEngine:
             metadata={"risk": str(risk)},
         )
 
-    def is_tool_exposed(self, tool_name: str) -> bool:
+    def is_tool_exposed(self, tool_name: str, *, ctx: Any | None = None) -> bool:
+        if tool_name in _BLOCK_OPS_TOOLS:
+            return self._is_block_tool_exposed(tool_name, ctx)
         if tool_name in list_tool_names():
             return True
         return tool_name in self.mcp_tool_allowlist
+
+    def _is_block_tool_exposed(self, tool_name: str, ctx: Any | None) -> bool:
+        """Only expose dedicated block tools when connection capability is SUPPORTED."""
+        if tool_name not in list_tool_names():
+            return False
+        if ctx is None:
+            return False
+        deps = getattr(ctx, "deps", None)
+        if deps is None:
+            return False
+        connection_id = getattr(deps, "connection_id", None)
+        if connection_id is None:
+            return False
+        from services.agent.block_ops.capability import (
+            BlockCapabilityStatus,
+            get_block_capability_cache,
+        )
+
+        record = get_block_capability_cache().get(str(connection_id))
+        if record is None:
+            # Lazy sync view: hide until async probe completes via prepare_tools/get_tools.
+            return False
+        return record.status == BlockCapabilityStatus.SUPPORTED
 
     @staticmethod
     def _find_command_root(
@@ -518,11 +545,12 @@ class HarnessToolset(WrapperToolset[Any]):
     idempotency: IdempotencyStore = field(default_factory=get_idempotency_store)
 
     async def get_tools(self, ctx: RunContext[Any]) -> dict[str, ToolsetTool[Any]]:
+        await self._ensure_block_capability(ctx)
         tools = await self.wrapped.get_tools(ctx)
         return {
             name: tool
             for name, tool in tools.items()
-            if self.policy.is_tool_exposed(name)
+            if self.policy.is_tool_exposed(name, ctx=ctx)
         }
 
     async def call_tool(
@@ -533,18 +561,53 @@ class HarnessToolset(WrapperToolset[Any]):
         tool: ToolsetTool[Any],
     ) -> Any:
         start = time.perf_counter()
-        normalized = normalize_tool_args(tool_args)
-        args_hash = hash_normalized_args(normalized)
+        effective_args = dict(tool_args or {})
+        original_normalized = normalize_tool_args(effective_args)
+        original_args_hash = hash_normalized_args(original_normalized)
         deps = getattr(ctx, "deps", None)
         player_name = getattr(deps, "player_name", None)
         run_id = getattr(deps, "run_id", None) or getattr(ctx, "run_id", None) or ""
         tool_call_id = getattr(ctx, "tool_call_id", None) or ""
         settings = getattr(deps, "settings", None)
         entry = get_tool_entry(name)
+        connection_id = str(getattr(deps, "connection_id", "") or "")
 
-        # 1) 幂等命中
+        # 0) Block tools: preflight / relative resolution BEFORE policy & approval.
+        # Canonical args become the source for approval summaries, hashes, audit, execute.
+        if name in _BLOCK_OPS_TOOLS:
+            preflight_failure, canonical_args = await self._preflight_block_tool(
+                name=name,
+                tool_args=effective_args,
+                original_args_hash=original_args_hash,
+                ctx=ctx,
+                run_id=str(run_id),
+                tool_call_id=str(tool_call_id),
+                connection_id=connection_id,
+            )
+            if preflight_failure is not None:
+                self._audit(
+                    settings=settings,
+                    tool_name=name,
+                    parameters=original_normalized,
+                    ctx=ctx,
+                    status="failure",
+                    duration_ms=_duration_ms(start),
+                    result=preflight_failure,
+                )
+                return materialize_tool_result(preflight_failure)
+            if canonical_args is not None:
+                effective_args = canonical_args
+
+        normalized = normalize_tool_args(effective_args)
+        args_hash = hash_normalized_args(normalized)
+
+        # 1) 幂等命中（优先 canonical hash；兼容原始 hash）
         if run_id and tool_call_id:
             cached = self.idempotency.get(str(run_id), str(tool_call_id), args_hash)
+            if cached is None and args_hash != original_args_hash:
+                cached = self.idempotency.get(
+                    str(run_id), str(tool_call_id), original_args_hash
+                )
             if cached is not None:
                 logger.info(
                     "tool_idempotent_hit",
@@ -600,6 +663,7 @@ class HarnessToolset(WrapperToolset[Any]):
                     "tool_name": name,
                     "normalized_args": normalized,
                     "args_hash": args_hash,
+                    "original_args_hash": original_args_hash,
                     "args_summary": summary,
                     "policy_version": decision.policy_version,
                     "reason": decision.reason,
@@ -610,9 +674,10 @@ class HarnessToolset(WrapperToolset[Any]):
                 }
             )
 
-        # 3) 执行
+        # 3) 执行（使用 canonical args；映射 fill 的 from/to → from_pos/to_pos）
+        execute_args = _python_tool_args(name, effective_args)
         try:
-            raw_result = await super().call_tool(name, tool_args, ctx, tool)
+            raw_result = await super().call_tool(name, execute_args, ctx, tool)
         except ApprovalRequired:
             raise
         except Exception as exc:
@@ -683,6 +748,75 @@ class HarnessToolset(WrapperToolset[Any]):
             )
         return result_for_model
 
+    async def _ensure_block_capability(self, ctx: RunContext[Any]) -> None:
+        deps = getattr(ctx, "deps", None)
+        if deps is None:
+            return
+        connection_id = getattr(deps, "connection_id", None)
+        if connection_id is None:
+            return
+        from services.agent.block_ops.capability import ensure_block_capability
+
+        await ensure_block_capability(
+            str(connection_id),
+            getattr(deps, "addon_bridge", None),
+        )
+
+    async def _preflight_block_tool(
+        self,
+        *,
+        name: str,
+        tool_args: dict[str, Any],
+        original_args_hash: str,
+        ctx: RunContext[Any],
+        run_id: str,
+        tool_call_id: str,
+        connection_id: str,
+    ) -> tuple[ToolResult | None, dict[str, Any] | None]:
+        """Run block-ops preflight; return (failure, canonical_args)."""
+        from services.agent.block_ops.preflight_cache import get_preflight_cache
+        from services.agent.block_ops.tools_impl import run_block_preflight
+
+        # Reuse cached canonical args on approval recovery (same original hash).
+        cache = get_preflight_cache()
+        if run_id and tool_call_id:
+            cached = cache.get(run_id, tool_call_id, original_args_hash)
+            if cached is not None:
+                return None, dict(cached.canonical_args)
+            # Also accept lookup when tool_args already mark execute phase.
+            if tool_args.get("phase") == "execute" and tool_args.get("locked_targets"):
+                return None, dict(tool_args)
+
+        already_approved = bool(getattr(ctx, "tool_call_approved", False)) or bool(
+            getattr(getattr(ctx, "deps", None), "auto_approve_tools", False)
+        )
+        # After approval, prefer locked targets already embedded in args.
+        if already_approved and tool_args.get("locked_targets"):
+            return None, dict(tool_args)
+
+        try:
+            canonical, failure = await run_block_preflight(ctx, name, tool_args)
+        except Exception as exc:
+            classified = classify_tool_exception(exc, tool_name=name)
+            return classified, None
+
+        if failure is not None:
+            return failure, None
+
+        if canonical is None:
+            return None, dict(tool_args)
+
+        if run_id and tool_call_id:
+            cache.put(
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+                original_args_hash=original_args_hash,
+                canonical_args=canonical,
+                preflight_payload=canonical,
+                connection_id=connection_id or None,
+            )
+        return None, canonical
+
     def _audit(
         self,
         *,
@@ -734,7 +868,18 @@ class HarnessCapability(AbstractCapability[Any]):
         ctx: RunContext[Any],
         tool_defs: list[ToolDefinition],
     ) -> list[ToolDefinition]:
-        return [td for td in tool_defs if self.policy.is_tool_exposed(td.name)]
+        # Probe capability once so block tools can be filtered correctly.
+        deps = getattr(ctx, "deps", None)
+        if deps is not None:
+            connection_id = getattr(deps, "connection_id", None)
+            if connection_id is not None:
+                from services.agent.block_ops.capability import ensure_block_capability
+
+                await ensure_block_capability(
+                    str(connection_id),
+                    getattr(deps, "addon_bridge", None),
+                )
+        return [td for td in tool_defs if self.policy.is_tool_exposed(td.name, ctx=ctx)]
 
 
 def build_harness_capability(settings: Any | None = None) -> HarnessCapability:
@@ -743,3 +888,18 @@ def build_harness_capability(settings: Any | None = None) -> HarnessCapability:
 
 def _duration_ms(start: float) -> int:
     return max(0, round((time.perf_counter() - start) * 1000))
+
+
+def _python_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Map bridge/canonical field names onto Python tool parameter names."""
+    if tool_name != "edit_blocks":
+        return dict(args or {})
+    out = dict(args or {})
+    if "from_pos" not in out and isinstance(out.get("from"), dict):
+        out["from_pos"] = out["from"]
+    if "to_pos" not in out and isinstance(out.get("to"), dict):
+        out["to_pos"] = out["to"]
+    # Drop reserved keys that are not function parameters (still kept in audit via effective_args).
+    out.pop("from", None)
+    out.pop("to", None)
+    return out

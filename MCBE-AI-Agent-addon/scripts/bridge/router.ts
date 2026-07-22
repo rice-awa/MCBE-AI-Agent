@@ -9,7 +9,7 @@ export { BRIDGE_MESSAGE_ID, BRIDGE_REQUEST_MESSAGE_ID };
 type BridgeCapabilityHandler = (
   event: ScriptEventCommandMessageAfterEvent,
   payload: Record<string, unknown>,
-) => Record<string, unknown>;
+) => Record<string, unknown> | Promise<Record<string, unknown>>;
 
 async function loadCapabilityHandlers(): Promise<Record<string, BridgeCapabilityHandler>> {
   const [
@@ -17,11 +17,15 @@ async function loadCapabilityHandlers(): Promise<Record<string, BridgeCapability
     inventorySnapshotModule,
     findEntitiesModule,
     worldCommandModule,
+    capabilitiesModule,
+    blocksModule,
   ] = await Promise.all([
     import("./capabilities/getPlayerSnapshot"),
     import("./capabilities/getInventorySnapshot"),
     import("./capabilities/findEntities"),
     import("./capabilities/runWorldCommand"),
+    import("./capabilities/getCapabilities"),
+    import("./capabilities/blocks/index"),
   ]);
 
   return {
@@ -36,6 +40,12 @@ async function loadCapabilityHandlers(): Promise<Record<string, BridgeCapability
       ),
     run_world_command: (_event, payload) =>
       worldCommandModule.handleRunWorldCommand(payload as { command?: string }),
+    get_capabilities: (_event, payload) =>
+      capabilitiesModule.handleGetCapabilities(payload),
+    inspect_block: (_event, payload) =>
+      blocksModule.handleInspectBlock(payload as Parameters<typeof blocksModule.handleInspectBlock>[0]),
+    edit_blocks: (_event, payload) =>
+      blocksModule.handleEditBlocks(payload as Parameters<typeof blocksModule.handleEditBlocks>[0]),
   };
 }
 
@@ -57,14 +67,17 @@ export async function handleBridgeScriptEvent(
   };
   const capabilityHandlers = await loadCapabilityHandlers();
   const handler = capabilityHandlers[request.capability];
-  const response = handler
-    ? handler(event, request.payload ?? {})
-    : {
-        ok: false,
-        payload: {
-          error: `未知桥接能力: ${request.capability}`,
-        },
-      };
+  let response: Record<string, unknown>;
+  if (handler) {
+    response = await handler(event, request.payload ?? {});
+  } else {
+    response = {
+      ok: false,
+      payload: {
+        error: `未知桥接能力: ${request.capability}`,
+      },
+    };
+  }
 
   const { sendBridgeResponseChunks } = await import("./toolPlayer");
   sendBridgeResponseChunks(request.request_id, JSON.stringify(response));

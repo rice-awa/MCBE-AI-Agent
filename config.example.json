@@ -195,6 +195,11 @@
       "ui_chat_prefix": "MCBEWS|UI_CHAT",
       "bridge_tool_player_name": "MCBEWS_BRIDGE",
       "ai_resp_message_id": "mcbews:text_resp"
+    },
+    "block_tools": {
+      "max_discrete_positions": 256,
+      "max_fill_volume": 4096,
+      "cells_per_tick": 128
     }
   },
   "logging": {

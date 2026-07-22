@@ -153,6 +153,21 @@ class HostConnectionHook(NoOpHook):
                 connection_id=str(state.id),
                 error=str(exc),
             )
+        try:
+            from services.agent.block_ops import (
+                clear_block_capability,
+                clear_preflight_for_connection,
+            )
+
+            cid = str(state.id)
+            clear_block_capability(cid)
+            clear_preflight_for_connection(cid)
+        except Exception as exc:
+            logger.warning(
+                "block_ops_clear_failed",
+                connection_id=str(state.id),
+                error=str(exc),
+            )
         logger.info("client_disconnected", connection_id=str(state.id))
 
     async def on_player_message(

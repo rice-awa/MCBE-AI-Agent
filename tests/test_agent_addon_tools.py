@@ -87,3 +87,29 @@ async def test_agent_tool_find_entities_uses_addon_bridge_payload() -> None:
             {"entity_type": "minecraft:cow", "radius": 16, "target": "@s"},
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_ok_false_maps_to_failure_string() -> None:
+    class _FailBridge(_FakeAddonBridge):
+        async def request(self, capability: str, payload: dict[str, object]) -> dict[str, object]:
+            self.calls.append((capability, payload))
+            return {
+                "ok": False,
+                "payload": {"code": "INTERNAL_ERROR", "message": "addon boom"},
+            }
+
+    fake_addon = _FailBridge()
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent)
+    tool = iter_registered_tools(agent)["get_player_snapshot"]
+    ctx = _build_tool_context(fake_addon)
+    try:
+        result = await tool.function(ctx, target="Steve")
+    finally:
+        await ctx.deps.http_client.aclose()
+
+    text = result if isinstance(result, str) else str(result)
+    assert "addon boom" in text or "INTERNAL_ERROR" in text
+    # Must not look like a bare success payload of the request args
+    assert '"ok": false' in text.lower() or "ok\": false" in text or "INTERNAL_ERROR" in text

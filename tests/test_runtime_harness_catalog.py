@@ -26,6 +26,8 @@ REGISTERED_AGENT_TOOL_NAMES = {
     "get_inventory_snapshot",
     "find_entities",
     "run_world_command",
+    "inspect_block",
+    "edit_blocks",
 }
 
 
