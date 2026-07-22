@@ -223,6 +223,12 @@ class AddonBridgeSimulator:
             response_payload = self._handle_find_entities(capability_payload)
         elif capability == "get_look_block":
             response_payload = self._handle_look_block(capability_payload)
+        elif capability == "get_capabilities":
+            response_payload = self._handle_get_capabilities(capability_payload)
+        elif capability == "inspect_block":
+            response_payload = self._handle_inspect_block(capability_payload)
+        elif capability == "edit_blocks":
+            response_payload = self._handle_edit_blocks(capability_payload)
         else:
             response_payload = {
                 "ok": False,
@@ -305,6 +311,204 @@ class AddonBridgeSimulator:
             },
         }
 
+    def _handle_get_capabilities(self, _payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "payload": {
+                "capabilities": {
+                    "block_ops": {
+                        "inspect": True,
+                        "edit": True,
+                        "schema_version": "1",
+                    }
+                }
+            },
+        }
+
+    def _simulate_absolute_target(
+        self,
+        payload: dict[str, Any],
+        position: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        coord_mode = str(payload.get("coordinate_mode") or "absolute")
+        dimension = payload.get("dimension") or "minecraft:overworld"
+        if coord_mode == "player_relative" and isinstance(position, dict):
+            # Foot origin (0,64,0), facing south (+z); forward/right/up offsets.
+            forward = int(position.get("forward") or 0)
+            right = int(position.get("right") or 0)
+            up = int(position.get("up") or 0)
+            return {
+                "dimension": dimension if isinstance(dimension, str) else "minecraft:overworld",
+                "x": right,
+                "y": 64 + up,
+                "z": forward,
+            }
+        if isinstance(position, dict) and all(k in position for k in ("x", "y", "z")):
+            return {
+                "dimension": str(dimension),
+                "x": int(position["x"]),
+                "y": int(position["y"]),
+                "z": int(position["z"]),
+            }
+        return {"dimension": str(dimension), "x": 0, "y": 64, "z": 0}
+
+    def _handle_inspect_block(self, payload: dict[str, Any]) -> dict[str, Any]:
+        phase = payload.get("phase") or "execute"
+        positions = payload.get("positions")
+        single = payload.get("position")
+        locked = payload.get("locked_targets")
+        targets: list[dict[str, Any]] = []
+        if isinstance(locked, list) and locked:
+            targets = [t for t in locked if isinstance(t, dict)]
+        elif isinstance(positions, list):
+            targets = [self._simulate_absolute_target(payload, p if isinstance(p, dict) else None) for p in positions]
+        else:
+            targets = [self._simulate_absolute_target(payload, single if isinstance(single, dict) else None)]
+
+        blocks = [
+            {
+                "dimension": t.get("dimension", "minecraft:overworld"),
+                "x": t.get("x", 0),
+                "y": t.get("y", 64),
+                "z": t.get("z", 0),
+                "type_id": "minecraft:air",
+                "states": {},
+                "waterlogged": False,
+                "is_air": True,
+                "is_liquid": False,
+            }
+            for t in targets
+        ]
+        body: dict[str, Any] = {
+            "ok": True,
+            "schema_version": "1",
+            "phase": phase,
+            "blocks": blocks if len(blocks) > 1 else None,
+            "block": blocks[0] if len(blocks) == 1 else None,
+            "locked_targets": targets,
+            "coordinate_mode": "absolute",
+            "dimension": targets[0].get("dimension") if targets else payload.get("dimension"),
+        }
+        if len(blocks) == 1:
+            body.pop("blocks", None)
+        else:
+            body.pop("block", None)
+        return body
+
+    def _handle_edit_blocks(self, payload: dict[str, Any]) -> dict[str, Any]:
+        phase = payload.get("phase") or "execute"
+        mode = str(payload.get("mode") or "place")
+        type_id = str(payload.get("type_id") or "minecraft:stone")
+        locked = payload.get("locked_targets")
+        targets: list[dict[str, Any]] = []
+        if isinstance(locked, list) and locked:
+            targets = [t for t in locked if isinstance(t, dict)]
+        elif mode == "batch" and isinstance(payload.get("positions"), list):
+            targets = [
+                self._simulate_absolute_target(payload, p if isinstance(p, dict) else None)
+                for p in payload["positions"]
+            ]
+        elif mode == "fill":
+            from_pos = payload.get("from") if isinstance(payload.get("from"), dict) else {}
+            to_pos = payload.get("to") if isinstance(payload.get("to"), dict) else {}
+            a = self._simulate_absolute_target(payload, from_pos)
+            b = self._simulate_absolute_target(payload, to_pos)
+            xs = sorted([int(a["x"]), int(b["x"])])
+            ys = sorted([int(a["y"]), int(b["y"])])
+            zs = sorted([int(a["z"]), int(b["z"])])
+            for x in range(xs[0], xs[1] + 1):
+                for y in range(ys[0], ys[1] + 1):
+                    for z in range(zs[0], zs[1] + 1):
+                        targets.append({"dimension": a["dimension"], "x": x, "y": y, "z": z})
+        else:
+            targets = [
+                self._simulate_absolute_target(
+                    payload,
+                    payload.get("position") if isinstance(payload.get("position"), dict) else None,
+                )
+            ]
+
+        if phase == "preflight":
+            return {
+                "ok": True,
+                "schema_version": "1",
+                "phase": "preflight",
+                "mode": mode,
+                "type_id": type_id,
+                "states": payload.get("states") or {},
+                "replace_any": bool(payload.get("replace_any", False)),
+                "expected_previous": payload.get("expected_previous"),
+                "locked_targets": targets,
+                "coordinate_mode": "absolute",
+                "dimension": targets[0].get("dimension") if targets else payload.get("dimension"),
+                "position": (
+                    {"x": targets[0]["x"], "y": targets[0]["y"], "z": targets[0]["z"]}
+                    if mode == "place" and targets
+                    else None
+                ),
+                "positions": (
+                    [{"x": t["x"], "y": t["y"], "z": t["z"]} for t in targets]
+                    if mode == "batch"
+                    else None
+                ),
+                "from": (
+                    {
+                        "x": min(t["x"] for t in targets),
+                        "y": min(t["y"] for t in targets),
+                        "z": min(t["z"] for t in targets),
+                    }
+                    if mode == "fill" and targets
+                    else None
+                ),
+                "to": (
+                    {
+                        "x": max(t["x"] for t in targets),
+                        "y": max(t["y"] for t in targets),
+                        "z": max(t["z"] for t in targets),
+                    }
+                    if mode == "fill" and targets
+                    else None
+                ),
+                "count": len(targets),
+                "repairs_applied": [],
+            }
+
+        return {
+            "ok": True,
+            "schema_version": "1",
+            "phase": "execute",
+            "mode": mode,
+            "type_id": type_id,
+            "changed": len(targets),
+            "skipped": 0,
+            "locked_targets": targets,
+            "before": [
+                {
+                    "dimension": t.get("dimension"),
+                    "x": t.get("x"),
+                    "y": t.get("y"),
+                    "z": t.get("z"),
+                    "type_id": "minecraft:air",
+                    "states": {},
+                    "is_air": True,
+                }
+                for t in targets[:16]
+            ],
+            "after": [
+                {
+                    "dimension": t.get("dimension"),
+                    "x": t.get("x"),
+                    "y": t.get("y"),
+                    "z": t.get("z"),
+                    "type_id": type_id,
+                    "states": payload.get("states") or {},
+                    "is_air": type_id.endswith(":air"),
+                }
+                for t in targets[:16]
+            ],
+            "verification": {"ok": True},
+            "rollback": None,
+        }
 
 class McbeCommandSimulator:
     def __init__(

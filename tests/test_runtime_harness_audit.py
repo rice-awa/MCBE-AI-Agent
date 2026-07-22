@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 
 from config.settings import Settings
+from config.redaction import redact_exception
 from services.agent.harness.audit import (
     AuditWriter,
     build_audit_record,
@@ -336,6 +337,129 @@ def test_sensitive_fields_redacted_in_audit_record(tmp_path):
     on_disk = read_jsonl(audit_path)[0]
     assert on_disk["parameters"].get("api_key") == "[REDACTED]"
     assert "secret-value" not in json.dumps(on_disk)
+
+
+def test_block_approval_audit_keeps_authorized_preview_without_locked_targets() -> None:
+    settings = Settings()
+    ctx = SimpleNamespace(deps=DummyDeps(settings, run_id="run-block-audit"), tool_call_id="tc-block-audit")
+    record = build_audit_record(
+        tool_name="edit_blocks",
+        parameters={"mode": "fill", "type_id": "minecraft:stone"},
+        authorized_args={
+            "mode": "fill",
+            "coordinate_mode": "absolute",
+            "dimension": "minecraft:overworld",
+            "type_id": "minecraft:stone",
+            "locked_targets": [{"x": 1, "y": 64, "z": 1}],
+        },
+        approval_evidence={
+            "repairs_applied": ["normalized_bounds"],
+            "locked_targets": [{"x": 1, "y": 64, "z": 1}],
+            "bridge_payload": {"token": "bridge-secret"},
+        },
+        ctx=ctx,
+        status="approval_required",
+        duration_ms=4,
+        run_id="run-block-audit",
+        tool_call_id="tc-block-audit",
+    )
+
+    assert record["run_id"] == "run-block-audit"
+    assert record["tool_call_id"] == "tc-block-audit"
+    assert record["authorized_parameters"]["type_id"] == "minecraft:stone"
+    assert record["approval_evidence"] == {"repairs_applied": ["normalized_bounds"]}
+    dumped = json.dumps(record, ensure_ascii=False)
+    assert "locked_targets" not in dumped
+    assert "bridge-secret" not in dumped
+
+
+def test_audit_exception_redacts_sensitive_values_but_keeps_correlation() -> None:
+    settings = Settings()
+    ctx = SimpleNamespace(deps=DummyDeps(settings, run_id="run-exception"), tool_call_id="tc-exception")
+    record = build_audit_record(
+        tool_name="edit_blocks",
+        parameters={},
+        ctx=ctx,
+        status="failure",
+        duration_ms=5,
+        exception=RuntimeError(
+            "package.module.edit(token=bridge-secret, password=hunter2, authorization=Bearer abcdef)"
+        ),
+    )
+
+    dumped = json.dumps(record, ensure_ascii=False)
+    assert record["run_id"] == "run-exception"
+    assert record["tool_call_id"] == "tc-exception"
+    assert "bridge-secret" not in dumped
+    assert "hunter2" not in dumped
+    assert "Bearer abcdef" not in dumped
+
+    tool_failure = build_audit_record(
+        tool_name="edit_blocks",
+        parameters={},
+        ctx=ctx,
+        status="failure",
+        duration_ms=5,
+        result=ToolResult.failure(
+            "failed token=bridge-secret",
+            error_kind="INTERNAL",
+            diagnostic_summary="package.module.fn(password=hunter2, Bearer abcdef)",
+        ),
+    )
+    tool_dumped = json.dumps(tool_failure, ensure_ascii=False)
+    assert "bridge-secret" not in tool_dumped
+    assert "hunter2" not in tool_dumped
+    assert "Bearer abcdef" not in tool_dumped
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        '{"nested":{"api_key":"json-secret","authorization":"Bearer json-bearer"}}',
+        "{'token': 'repr-secret', 'nested': {'password': 'repr-password'}}",
+    ],
+)
+def test_redact_exception_handles_structured_and_python_repr_secrets(detail: str) -> None:
+    redacted = redact_exception(RuntimeError(detail))
+
+    assert redacted is not None
+    assert "RuntimeError" in redacted
+    for secret in ("json-secret", "json-bearer", "repr-secret", "repr-password"):
+        assert secret not in redacted
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        '{"detail":"Bearer json-bearer","note":"password=json-password","nested":[{"cookie":"json-cookie"}]}',
+        '"token=json-scalar-secret"',
+        "{'private_key': 'repr-private', 'nested': [{'access_key': 'repr-access'}, {'credential': 'repr-credential'}]}",
+    ],
+)
+def test_redact_exception_scrubs_all_structured_string_leaves(detail: str) -> None:
+    redacted = redact_exception(RuntimeError(detail))
+
+    assert redacted is not None
+    for secret in (
+        "json-bearer", "json-password", "json-cookie", "json-scalar-secret",
+        "repr-private", "repr-access", "repr-credential",
+    ):
+        assert secret not in redacted
+
+
+def test_redact_exception_handles_hyphen_and_underscore_sensitive_key_aliases() -> None:
+    redacted = redact_exception(
+        RuntimeError(
+            "api-key=api-secret access-key=access-secret private-key=private-secret "
+            "x_api_key=x-api-secret set_cookie=cookie-secret"
+        )
+    )
+
+    assert redacted is not None
+    for secret in (
+        "api-secret", "access-secret", "private-secret", "x-api-secret", "cookie-secret",
+    ):
+        assert secret not in redacted
 
 
 @pytest.mark.asyncio

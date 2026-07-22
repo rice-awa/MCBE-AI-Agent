@@ -656,7 +656,7 @@ def _extract_deferred_requests(result: Any) -> DeferredToolRequests | None:
 
 
 def _build_approval_required_event(
-    ctx: _HandlerContext,
+    ctx: "_HandlerContext",
     deps: AgentDependencies,
     deferred: DeferredToolRequests,
     result: Any,
