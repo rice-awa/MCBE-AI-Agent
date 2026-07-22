@@ -175,6 +175,8 @@ class AgentDependencies:
     get_context_info: Callable[[], ContextInfo | None] | None = None
     # 单次 run 身份：关联模型请求、工具调用与完成事件
     run_id: str = field(default_factory=lambda: str(uuid4()))
+    # 可选 attempt / TraceContext；Task 3 会完整注入，此处仅预留最小字段。
+    attempt_id: str | None = None
     conversation_id: str | None = None
     # 会话级自动批准（来自 ChatRequest；策略引擎据此跳过审批提示）
     auto_approve_tools: bool = False

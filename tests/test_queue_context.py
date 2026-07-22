@@ -981,3 +981,51 @@ def test_worker_sends_notification_when_auto_compression_runs(monkeypatch) -> No
     assert notifications[0].level == "info"
     assert "对话历史已自动压缩" in notifications[0].message
     assert "5轮 -> 3轮" in notifications[0].message
+
+
+def test_submit_request_populates_trace_context_from_chat_request() -> None:
+    """submit_request 应从 ChatRequest 的 correlation 字段构建 QueueItem.trace_context。"""
+
+    async def _run() -> None:
+        broker = MessageBroker()
+        connection_id = uuid4()
+        request = ChatRequest(
+            connection_id=connection_id,
+            content="hello",
+            player_name="alex",
+            conversation_id="default",
+            run_id="trace-1",
+            trace_id="trace-1",
+            attempt_id="attempt-1",
+        )
+        await broker.submit_request(connection_id, request)
+        item = await broker.get_request()
+        assert item.trace_context is not None
+        assert item.trace_context.trace_id == "trace-1"
+        assert item.trace_context.run_id == "trace-1"
+        assert item.trace_context.attempt_id == "attempt-1"
+        assert item.trace_context.player_name == "alex"
+        assert item.trace_context.connection_id == str(connection_id)
+        assert item.trace_context.message_id == str(request.id)
+        assert item.enqueued_at_ns > 0
+
+    asyncio.run(_run())
+
+
+def test_submit_request_without_trace_ids_leaves_context_none() -> None:
+    """无 trace 字段的请求保持向后兼容，trace_context 为 None。"""
+
+    async def _run() -> None:
+        broker = MessageBroker()
+        connection_id = uuid4()
+        request = ChatRequest(
+            connection_id=connection_id,
+            content="hello",
+            player_name="alex",
+        )
+        await broker.submit_request(connection_id, request)
+        item = await broker.get_request()
+        assert item.trace_context is None
+        assert item.enqueued_at_ns > 0
+
+    asyncio.run(_run())
