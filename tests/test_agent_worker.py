@@ -297,3 +297,67 @@ async def test_usage_limit_exceeded_does_not_continue_tools(monkeypatch):
     sent = broker.send_response.await_args_list[-1].args[1]
     assert getattr(sent, "chunk_type", None) == "error"
     assert "预算" in sent.content or "错误" in sent.content
+
+
+@pytest.mark.asyncio
+async def test_stream_chunks_carry_trace_correlation(monkeypatch):
+    """StreamChunk 构造应带上 request 的 trace_id / attempt_id。"""
+    from services.agent.core import StreamEvent
+
+    settings = _make_settings()
+    broker = MagicMock()
+    broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+    broker.get_conversation_history = MagicMock(return_value=[])
+    broker.send_response = AsyncMock(return_value=True)
+    broker.get_response_queue = MagicMock(return_value=object())
+    worker = AgentWorker(broker, settings)
+
+    async def fake_stream_chat(*_args, **_kwargs):
+        yield StreamEvent(
+            event_type="content",
+            content="hello",
+            sequence=0,
+            metadata=None,
+        )
+        yield StreamEvent(
+            event_type="content",
+            content="",
+            sequence=1,
+            metadata={
+                "is_complete": True,
+                "all_messages": [],
+                "usage": None,
+                "tool_events": [],
+            },
+        )
+
+    monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+    monkeypatch.setattr(
+        "services.agent.providers.ProviderRegistry.get_model",
+        lambda _config: object(),
+    )
+    monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+
+    connection_id = uuid4()
+    await worker._process_request_locked(
+        ChatRequest(
+            connection_id=connection_id,
+            content="hi",
+            player_name="Alex",
+            run_id="trace-abc",
+            trace_id="trace-abc",
+            attempt_id="attempt-xyz",
+        ),
+        connection_id,
+    )
+
+    chunks = [
+        call.args[1]
+        for call in broker.send_response.await_args_list
+        if getattr(call.args[1], "type", None) == "stream_chunk"
+        or getattr(call.args[1], "chunk_type", None)
+    ]
+    assert chunks, "expected at least one StreamChunk"
+    for chunk in chunks:
+        assert chunk.trace_id == "trace-abc"
+        assert chunk.attempt_id == "attempt-xyz"

@@ -1029,3 +1029,27 @@ def test_submit_request_without_trace_ids_leaves_context_none() -> None:
         assert item.enqueued_at_ns > 0
 
     asyncio.run(_run())
+
+
+def test_submit_request_trace_context_player_name_uses_default_key() -> None:
+    """TraceContext 的 player_name 回退应使用 DEFAULT_PLAYER_KEY（与分桶一致）。"""
+    from models.constants import DEFAULT_PLAYER_KEY
+
+    async def _run() -> None:
+        broker = MessageBroker()
+        connection_id = uuid4()
+        request = ChatRequest(
+            connection_id=connection_id,
+            content="hello",
+            player_name=None,
+            conversation_id="default",
+            run_id="trace-1",
+            trace_id="trace-1",
+            attempt_id="attempt-1",
+        )
+        await broker.submit_request(connection_id, request)
+        item = await broker.get_request()
+        assert item.trace_context is not None
+        assert item.trace_context.player_name == DEFAULT_PLAYER_KEY
+
+    asyncio.run(_run())
