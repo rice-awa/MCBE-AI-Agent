@@ -8,6 +8,7 @@ from typing import Any, Literal
 from pydantic_ai import RunContext
 
 from config.logging import get_logger
+from config.redaction import redact_exception
 from models.agent import AgentDependencies
 from services.agent.block_ops.bridge import call_block_capability
 from services.agent.block_ops.capability import (
@@ -117,7 +118,14 @@ async def _require_supported(ctx: RunContext[AgentDependencies]) -> ToolResult |
         return _unavailable_result("当前 Add-on 不支持专用方块工具（能力握手缺失 block_ops）")
     if record.status == BlockCapabilityStatus.UNAVAILABLE:
         return _unavailable_result("Addon 桥接不可用或超时")
-    return _unavailable_result(f"方块能力探测失败: {record.detail or 'unknown'}")
+    logger.warning(
+        "block_capability_probe_failed",
+        connection_id=_connection_id(deps),
+        run_id=deps.run_id,
+        player_name=deps.player_name,
+        diagnostic_summary=redact_exception(record.detail),
+    )
+    return _unavailable_result("方块能力探测失败")
 
 
 def _host_limit_error(

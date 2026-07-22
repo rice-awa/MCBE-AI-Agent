@@ -256,6 +256,25 @@ def test_invalid_bridge_response_does_not_leak_raw_payload() -> None:
 
 
 @pytest.mark.parametrize(
+    "response",
+    [
+        {"payload": {"token": "bridge-secret"}},
+        {"ok": "yes", "payload": {"token": "bridge-secret"}},
+        {"ok": True, "token": "bridge-secret"},
+    ],
+)
+def test_bridge_response_without_boolean_ok_is_safe_internal_error(response: dict[str, Any]) -> None:
+    result = map_addon_bridge_result(response)
+
+    body = json.loads(result.output)
+    assert body["code"] == "INTERNAL_ERROR"
+    assert body["retryable"] is False
+    assert body["external_state_unknown"] is False
+    assert body["fallback_allowed"] is False
+    assert "bridge-secret" not in result.output
+
+
+@pytest.mark.parametrize(
     ("code", "fallback_allowed"),
     [
         ("ADDON_UNAVAILABLE", True),
@@ -549,6 +568,37 @@ async def test_edit_blocks_impl_place() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_capability_probe_does_not_expose_internal_detail() -> None:
+    cid = str(uuid4())
+    get_block_capability_cache().set(
+        cid,
+        BlockCapabilityRecord(
+            status=BlockCapabilityStatus.FAILED,
+            probed_at=time.time(),
+            detail="package.module.probe(token=bridge-secret, password=hunter2)",
+        ),
+    )
+    ctx = SimpleNamespace(deps=_Deps(connection_id=cid, addon_bridge=_FakeBridge()))
+
+    result = await edit_blocks_impl(
+        ctx,  # type: ignore[arg-type]
+        mode="place",
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        position={"x": 1, "y": 64, "z": 1},
+        type_id="minecraft:stone",
+    )
+
+    body = json.loads(result.output)
+    assert body["code"] == "ADDON_UNAVAILABLE"
+    assert body["fallback_allowed"] is True
+    assert "独立审批" in body["message"]
+    assert "package.module" not in result.output
+    assert "bridge-secret" not in result.output
+    assert "hunter2" not in result.output
+
+
+@pytest.mark.asyncio
 async def test_edit_blocks_limit_exceeded() -> None:
     bridge = _FakeBridge()
     cid = str(uuid4())
@@ -719,6 +769,71 @@ async def test_harness_preflight_before_approval_for_edit_blocks() -> None:
     assert cached.canonical_args.get("locked_targets")
 
 
+@pytest.mark.asyncio
+async def test_harness_preflight_exception_is_safe_projection_failure_and_is_logged(monkeypatch) -> None:
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    )
+    register_agent_tools(agent)
+    captured: dict[str, Any] = {}
+
+    async def fail_preflight(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("package.module.preflight(token=bridge-secret, password=hunter2)")
+
+    def capture(event: str, **fields: Any) -> None:
+        captured["event"] = event
+        captured.update(fields)
+
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.run_block_preflight", fail_preflight)
+    monkeypatch.setattr("services.agent.harness.execution.logger.error", capture)
+    calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return ModelResponse(parts=[TextPart(content="done")])
+        return ModelResponse(parts=[ToolCallPart(
+            tool_name="edit_blocks",
+            tool_call_id="tc-preflight-error",
+            args={
+                "type_id": "minecraft:stone", "mode": "place",
+                "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
+                "position": {"x": 1, "y": 64, "z": 1},
+            },
+        )])
+
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-preflight-error")
+    result = await agent.run("edit", model=FunctionModel(model_fn), deps=deps)
+
+    contents = str(result.all_messages())
+    assert "INTERNAL_ERROR" in contents
+    assert "STATE_UNKNOWN" not in contents
+    assert "bridge-secret" not in contents
+    assert "hunter2" not in contents
+    assert not any(
+        name == "edit_blocks" and payload.get("phase") == "execute"
+        for name, payload in bridge.calls
+    )
+    assert captured == {
+        "event": "tool_execution_failed",
+        "tool_name": "edit_blocks",
+        "run_id": "run-preflight-error",
+        "tool_call_id": "tc-preflight-error",
+        "connection_id_short": cid[-8:],
+        "player_name": "Steve",
+        "error_kind": "INTERNAL",
+        "error_type": "RuntimeError",
+        "diagnostic_summary": "block execution contract rejected",
+        "external_state_unknown": False,
+        "execution_stage": "projection",
+    }
 @pytest.mark.asyncio
 async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() -> None:
     locked_targets = [

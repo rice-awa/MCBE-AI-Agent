@@ -956,7 +956,16 @@ class HarnessToolset(WrapperToolset[Any]):
         try:
             plan_or_args, failure = await run_block_preflight(ctx, name, tool_args)
         except Exception as exc:
-            classified = classify_tool_exception(exc, tool_name=name)
+            classified = classify_tool_exception(
+                exc, tool_name=name, execution_stage="projection"
+            )
+            log_tool_execution_failed(
+                tool_name=name,
+                ctx=ctx,
+                result=classified,
+                execution_stage="projection",
+                error_type=exc.__class__.__name__,
+            )
             return classified, None
 
         if failure is not None:

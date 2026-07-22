@@ -47,6 +47,22 @@ def map_addon_bridge_result(
         )
 
     ok = result.get("ok")
+    if not isinstance(ok, bool) or (ok is True and "payload" not in result):
+        text = dumps_payload(
+            build_error_response(
+                BlockErrorCode.INTERNAL_ERROR,
+                "Addon 返回了无效响应；本次操作未发送成功结果。",
+                retryable=False,
+                external_state_unknown=False,
+                fallback_allowed=False,
+            )
+        )
+        return ToolResult.failure(
+            text,
+            error_kind="INTERNAL",
+            retryable=False,
+            diagnostic_summary="invalid bridge response contract",
+        )
     payload = result.get("payload", result)
 
     if ok is False:

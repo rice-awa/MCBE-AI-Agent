@@ -210,14 +210,14 @@ def summarize_result(
             "success": result.status,
             "result_preview": None,
             "failure_reason": (
-                truncate_for_log(result.failure_reason, DEFAULT_EXCEPTION_MAX)
+                redact_exception(result.failure_reason, DEFAULT_EXCEPTION_MAX)
                 if not result.is_success and result.failure_reason
                 else None
             ),
             "error_kind": result.error_kind,
             "external_state_unknown": "true" if result.external_state_unknown else "false",
             "diagnostic_summary": (
-                truncate_for_log(result.diagnostic_summary, DEFAULT_EXCEPTION_MAX)
+                redact_exception(result.diagnostic_summary, DEFAULT_EXCEPTION_MAX)
                 if not result.is_success and result.diagnostic_summary
                 else None
             ),

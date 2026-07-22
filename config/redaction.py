@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -82,6 +83,13 @@ def redact_exception(exc: BaseException | str | None, max_length: int = DEFAULT_
         text = f"{type(exc).__name__}: {exc}"
     else:
         text = str(exc)
+    text = re.sub(
+        r"(?i)\b(token|password|passwd|secret|api[_-]?key|authorization)\s*[=:]\s*"
+        r"(?:bearer\s+)?[^,\s)\]}]+",
+        r"\1=[REDACTED]",
+        text,
+    )
+    text = re.sub(r"(?i)\bbearer\s+[^,\s)\]}]+", "Bearer [REDACTED]", text)
     return truncate_for_log(text, max_length)
 
 

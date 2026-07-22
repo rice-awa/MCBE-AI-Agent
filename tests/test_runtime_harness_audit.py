@@ -372,6 +372,45 @@ def test_block_approval_audit_keeps_authorized_preview_without_locked_targets() 
     assert "bridge-secret" not in dumped
 
 
+def test_audit_exception_redacts_sensitive_values_but_keeps_correlation() -> None:
+    settings = Settings()
+    ctx = SimpleNamespace(deps=DummyDeps(settings, run_id="run-exception"), tool_call_id="tc-exception")
+    record = build_audit_record(
+        tool_name="edit_blocks",
+        parameters={},
+        ctx=ctx,
+        status="failure",
+        duration_ms=5,
+        exception=RuntimeError(
+            "package.module.edit(token=bridge-secret, password=hunter2, authorization=Bearer abcdef)"
+        ),
+    )
+
+    dumped = json.dumps(record, ensure_ascii=False)
+    assert record["run_id"] == "run-exception"
+    assert record["tool_call_id"] == "tc-exception"
+    assert "bridge-secret" not in dumped
+    assert "hunter2" not in dumped
+    assert "Bearer abcdef" not in dumped
+
+    tool_failure = build_audit_record(
+        tool_name="edit_blocks",
+        parameters={},
+        ctx=ctx,
+        status="failure",
+        duration_ms=5,
+        result=ToolResult.failure(
+            "failed token=bridge-secret",
+            error_kind="INTERNAL",
+            diagnostic_summary="package.module.fn(password=hunter2, Bearer abcdef)",
+        ),
+    )
+    tool_dumped = json.dumps(tool_failure, ensure_ascii=False)
+    assert "bridge-secret" not in tool_dumped
+    assert "hunter2" not in tool_dumped
+    assert "Bearer abcdef" not in tool_dumped
+
+
 @pytest.mark.asyncio
 async def test_shutdown_flush_persists_queued_records(tmp_path):
     audit_path = tmp_path / "runtime_harness_tools.jsonl"
