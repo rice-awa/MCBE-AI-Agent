@@ -208,12 +208,16 @@ class AgentWorker:
             return
         try:
             recorder = get_trace_recorder(self.settings)
+            attrs = dict(attributes or {})
+            # Free-text diagnostics only when content mode is on (match harness)
+            if not getattr(recorder, "include_content", False):
+                attrs.pop("diagnostic_summary", None)
             recorder.emit(
                 event_name,
                 context,
                 status=status,
                 duration_ms=duration_ms,
-                attributes=attributes,
+                attributes=attrs or None,
                 payload=payload,
                 tool_call_id=tool_call_id,
             )
@@ -1329,6 +1333,7 @@ class AgentWorker:
         return {
             "trace_id": request.trace_id or request.run_id,
             "attempt_id": request.attempt_id,
+            "conversation_id": request.conversation_id,
         }
 
     async def _send_error_chunk(

@@ -21,6 +21,7 @@ from mcbe_ws_sdk.gateway.connection import ConnectionState
 from config.logging import get_logger
 from core.queue import MessageBroker
 from models.agent import MCColor, MCPrefix
+from core.session import DEFAULT_CONVERSATION_ID
 from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
 from models.messages import StreamChunk
 from models.messages import SystemNotification as HostSystemNotification
@@ -286,6 +287,7 @@ class BrokerResponseBridge:
         try:
             from services.agent.trace import TraceContext, get_trace_recorder
 
+            conversation_id = getattr(chunk, "conversation_id", None) or DEFAULT_CONVERSATION_ID
             context = TraceContext(
                 trace_id=str(trace_id),
                 run_id=str(trace_id),
@@ -293,7 +295,7 @@ class BrokerResponseBridge:
                 message_id=str(getattr(chunk, "id", "") or attempt_id),
                 connection_id=str(chunk.connection_id),
                 player_name=str(chunk.player_name or DEFAULT_PLAYER_DISPLAY_NAME),
-                conversation_id="default",
+                conversation_id=str(conversation_id),
             )
             get_trace_recorder().emit(
                 event_name,

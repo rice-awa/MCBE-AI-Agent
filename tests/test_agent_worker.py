@@ -361,6 +361,7 @@ async def test_stream_chunks_carry_trace_correlation(monkeypatch):
     for chunk in chunks:
         assert chunk.trace_id == "trace-abc"
         assert chunk.attempt_id == "attempt-xyz"
+        assert chunk.conversation_id is not None
 
 
 async def _flush_trace(recorder) -> list[dict]:
@@ -623,6 +624,10 @@ async def test_stream_error_emits_trace_failed_once(tmp_path, monkeypatch):
         assert len(failed) == 1
         assert failed[0]["status"] == "failed"
         assert failed[0]["attributes"]["error_kind"] == "DENIED"
+        # include_content=False must not leak free-text diagnostics into attributes
+        assert "diagnostic_summary" not in failed[0]["attributes"]
+        raw = path.read_text(encoding="utf-8")
+        assert "UsageLimitExceeded" not in raw
     finally:
         set_trace_recorder(None)
 

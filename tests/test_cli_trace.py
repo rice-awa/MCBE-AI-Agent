@@ -218,3 +218,6 @@ def test_trace_serve_uses_settings_defaults(
     assert captured["query_path"] == str(trace_fixture)
     assert captured["static_dir"].name == "trace"
     assert captured["static_dir"].parent.name == "web"
+    # Absolute path under repo root (not CWD-relative)
+    assert captured["static_dir"].is_absolute()
+    assert (captured["static_dir"].parent.parent / "cli.py").exists()

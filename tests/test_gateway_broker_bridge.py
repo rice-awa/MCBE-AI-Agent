@@ -93,6 +93,7 @@ async def test_stream_chunk_emits_delivery_events_without_body(tmp_path):
                 player_name="Steve",
                 trace_id="trace-del",
                 attempt_id="attempt-del",
+                conversation_id="conv-delivery",
             ),
         )
         for _ in range(50):
@@ -118,6 +119,7 @@ async def test_stream_chunk_emits_delivery_events_without_body(tmp_path):
         assert completed["attributes"]["delivery_type"] == "tellraw"
         assert completed["attributes"]["target"] == "Steve"
         assert completed["attributes"]["chunk_count"] == 1
+        assert completed["attributes"]["conversation_id"] == "conv-delivery"
         assert "payload" not in completed or completed.get("payload") is None
     finally:
         set_trace_recorder(None)

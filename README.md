@@ -341,7 +341,8 @@ python cli.py trace health
 - API 为**本地只读**（GET），不修改 journal。
 - 完整正文仅在 `agent_trace_include_content=true` 时写入；默认只有元数据与摘要字段。
 - WebSocket 原始报文日志（`enable_ws_raw_log`）与本 journal **相互独立**，不会互相替代。
-- 静态审计工作台：`web/trace/`（无构建步骤，由 `trace serve` 直接托管）。
+- 静态审计工作台：`web/trace/`（无构建步骤，由 `trace serve` 按仓库根路径托管，不依赖进程 CWD）。
+- journal 轮转会重写文件以保留最近 N 条记录（`agent_trace_max_records`），按设计面向本地/开发体量，不适合超大生产写入。
 - 离线验收夹具矩阵见 `tests/test_trace_integration.py`（no-tool / single-tool / approval / deny / failure / cancel / multiplayer / privacy）。
 
 ## Addon Bridge 桥接

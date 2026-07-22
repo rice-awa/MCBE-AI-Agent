@@ -79,6 +79,7 @@ class StreamChunk(BaseMessage):
     # 交付侧 correlation（不含消息正文）；Task 3 桥接会使用。
     trace_id: str | None = None
     attempt_id: str | None = None
+    conversation_id: str | None = None
 
 
 class SystemNotification(BaseMessage):
