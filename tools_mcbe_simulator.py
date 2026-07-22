@@ -221,6 +221,8 @@ class AddonBridgeSimulator:
             response_payload = self._handle_player_snapshot(capability_payload)
         elif capability == "find_entities":
             response_payload = self._handle_find_entities(capability_payload)
+        elif capability == "get_look_block":
+            response_payload = self._handle_look_block(capability_payload)
         else:
             response_payload = {
                 "ok": False,
@@ -283,6 +285,23 @@ class AddonBridgeSimulator:
                         "location": {"x": 2, "y": 64, "z": 2},
                     }
                 ]
+            },
+        }
+
+    def _handle_look_block(self, payload: dict[str, Any]) -> dict[str, Any]:
+        target = self._target_name(payload)
+        return {
+            "ok": True,
+            "payload": {
+                "player": target,
+                "hit": True,
+                "block": {
+                    "typeId": "minecraft:stone",
+                    "location": {"x": 1, "y": 64, "z": 2},
+                    "dimension": "minecraft:overworld",
+                },
+                "face": "North",
+                "faceLocation": {"x": 0.5, "y": 0.5, "z": 0.0},
             },
         }
 

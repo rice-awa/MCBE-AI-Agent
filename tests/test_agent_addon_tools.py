@@ -68,6 +68,65 @@ async def test_agent_tool_get_player_snapshot_uses_addon_bridge() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_tool_get_look_block_defaults_to_current_player() -> None:
+    fake_addon = _FakeAddonBridge()
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent)
+
+    tool = iter_registered_tools(agent)["get_look_block"]
+    ctx = _build_tool_context(fake_addon)
+    try:
+        result = await tool.function(ctx)
+    finally:
+        await ctx.deps.http_client.aclose()
+
+    assert "Steve" in result
+    assert fake_addon.calls == [
+        (
+            "get_look_block",
+            {
+                "target": "Steve",
+                "max_distance": 8,
+                "include_liquid_blocks": False,
+                "include_passable_blocks": False,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_get_look_block_resolves_selector_to_current_player() -> None:
+    fake_addon = _FakeAddonBridge()
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent)
+
+    tool = iter_registered_tools(agent)["get_look_block"]
+    ctx = _build_tool_context(fake_addon)
+    try:
+        result = await tool.function(
+            ctx,
+            target="@s",
+            max_distance=16,
+            include_liquid_blocks=True,
+        )
+    finally:
+        await ctx.deps.http_client.aclose()
+
+    assert "Steve" in result
+    assert fake_addon.calls == [
+        (
+            "get_look_block",
+            {
+                "target": "Steve",
+                "max_distance": 16,
+                "include_liquid_blocks": True,
+                "include_passable_blocks": False,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_agent_tool_find_entities_uses_addon_bridge_payload() -> None:
     fake_addon = _FakeAddonBridge()
     agent = Agent("test", deps_type=AgentDependencies, output_type=str)

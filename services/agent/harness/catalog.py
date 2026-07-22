@@ -215,6 +215,19 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         preview=ParameterPreviewPolicy(include=("target",)),
         may_have_external_side_effects=False,
     ),
+    "get_look_block": _entry(
+        "get_look_block",
+        ToolIntent.QUERY_WORLD,
+        ToolRisk.LOW,
+        "玩家询问自己或他人视线正对着的方块、前方是什么方块时使用。",
+        "不要用于放置、破坏、填充方块，也不要替代按坐标查询方块。",
+        "target 为玩家名（默认当前对话玩家）；max_distance 为最大检测距离（默认 8）；"
+        "include_liquid_blocks / include_passable_blocks 控制是否命中液体与可穿过方块。",
+        preview=ParameterPreviewPolicy(
+            include=("target", "max_distance", "include_liquid_blocks", "include_passable_blocks")
+        ),
+        may_have_external_side_effects=False,
+    ),
     "get_inventory_snapshot": _entry(
         "get_inventory_snapshot",
         ToolIntent.QUERY_WORLD,

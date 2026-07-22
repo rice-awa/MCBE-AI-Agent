@@ -368,6 +368,7 @@ AGENT 聊天 请读取我的玩家状态并告诉我当前位置
 ### 当前桥接能力
 
 - `get_player_snapshot`：获取目标玩家基础快照，包括位置、维度、朝向和基础状态。
+- `get_look_block`：获取目标玩家视线射线命中的方块（`getBlockFromViewDirection`），默认当前对话玩家。
 - `get_inventory_snapshot`：获取目标玩家背包槽位与物品快照。
 - `find_entities`：按类型、名称、标签、距离等条件查找实体。
 - `run_world_command`：由 Addon 在世界侧执行命令并返回结果。

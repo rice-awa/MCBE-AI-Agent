@@ -23,6 +23,7 @@ REGISTERED_AGENT_TOOL_NAMES = {
     "mcwiki_list_namespaces",
     "list_available_providers",
     "get_player_snapshot",
+    "get_look_block",
     "get_inventory_snapshot",
     "find_entities",
     "run_world_command",

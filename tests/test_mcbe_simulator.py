@@ -181,6 +181,7 @@ def test_bridge_snapshot_capabilities_return_success_payloads() -> None:
         ("get_inventory_snapshot", {"target": "tester"}, "inventory"),
         ("get_player_snapshot", {"target": "tester"}, "players"),
         ("find_entities", {"entity_type": "sheep", "radius": 16}, "entities"),
+        ("get_look_block", {"target": "tester", "max_distance": 8}, "block"),
     ]
 
     for capability, capability_payload, expected_key in capabilities:

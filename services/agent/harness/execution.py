@@ -68,6 +68,7 @@ _TOOL_TARGET_DEFAULTS: dict[str, str] = {
     "find_entities": "@s",
     "get_inventory_snapshot": "@a",
     "get_player_snapshot": "@a",
+    "get_look_block": "self",
 }
 
 # 无 target/broadcast 概念的 MEDIUM 工具中，可安全自动允许的极小集合（当前为空）。

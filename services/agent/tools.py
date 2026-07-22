@@ -953,6 +953,46 @@ def register_agent_tools(
             )
 
     @chat_agent.tool
+    async def get_look_block(
+        ctx: RunContext[AgentDependencies],
+        target: str = "",
+        max_distance: int = 8,
+        include_liquid_blocks: bool = False,
+        include_passable_blocks: bool = False,
+    ) -> str:
+        """通过 addon 桥接获取玩家视线命中的方块（getBlockFromViewDirection）。
+
+        默认查询当前对话玩家。用于回答「我在看什么 / 前面是什么方块」。
+        """
+        if ctx.deps.addon_bridge is None:
+            return _tool_failure("Addon 桥接不可用", error_kind="TRANSIENT", retryable=True)
+
+        resolved_target = (target or "").strip()
+        if not resolved_target or resolved_target.startswith("@"):
+            # 选择器（@s/@a 等）在 Script API getPlayers({name}) 中无效，回退到对话玩家。
+            resolved_target = ctx.deps.player_name
+
+        try:
+            result = await ctx.deps.addon_bridge.request(
+                "get_look_block",
+                {
+                    "target": resolved_target,
+                    "max_distance": max_distance,
+                    "include_liquid_blocks": include_liquid_blocks,
+                    "include_passable_blocks": include_passable_blocks,
+                },
+            )
+            return _tool_success(json.dumps(result.get("payload", result), ensure_ascii=False))
+        except Exception as e:
+            logger.error("agent_tool_error", tool="get_look_block", error=str(e))
+            return _tool_failure(
+                f"获取视线方块失败: {str(e)}",
+                error_kind="TRANSIENT",
+                retryable=True,
+                diagnostic_summary=str(e),
+            )
+
+    @chat_agent.tool
     async def get_inventory_snapshot(
         ctx: RunContext[AgentDependencies],
         target: str = "@a",
