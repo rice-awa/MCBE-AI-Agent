@@ -8,6 +8,7 @@ dropped/write_failed/gap 计数，绝不阻塞 Agent 主路径。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import tempfile
 import threading
@@ -107,6 +108,11 @@ class TraceEvent(BaseModel):
     payload: dict[str, Any] | None = None
 
 
+# system-prompt 超过该长度时只保留预览 + hash，避免 journal 被静态提示词撑爆。
+_SYSTEM_PROMPT_FULL_MAX_CHARS = 256
+_SYSTEM_PROMPT_PREVIEW_CHARS = 120
+
+
 def serialize_trace_payload(
     payload: Mapping[str, Any] | dict[str, Any] | None,
     *,
@@ -115,6 +121,7 @@ def serialize_trace_payload(
     """按白名单序列化完整正文；include_content=False 时返回 None。
 
     从不把任意 kwargs 原样写入 journal；敏感键与未知键被丢弃。
+    messages 内超长 system-prompt 会被压缩为 preview/hash 元数据。
     """
     if not include_content or payload is None:
         return None
@@ -125,8 +132,50 @@ def serialize_trace_payload(
         key_str = str(key)
         if key_str not in _PAYLOAD_ALLOWED_KEYS:
             continue
-        out[key_str] = _json_safe(value)
+        if key_str == "messages":
+            out[key_str] = _compact_trace_messages(value)
+        else:
+            out[key_str] = _json_safe(value)
     return out or None
+
+
+def _compact_trace_messages(messages: Any) -> Any:
+    """JSON-safe 化 messages，并把超长 system-prompt 压成元数据。"""
+    if not isinstance(messages, list):
+        return _json_safe(messages)
+    compacted: list[Any] = []
+    for msg in messages:
+        if not isinstance(msg, Mapping):
+            compacted.append(_json_safe(msg))
+            continue
+        msg_out: dict[str, Any] = {
+            str(k): _json_safe(v) for k, v in msg.items() if k != "parts"
+        }
+        parts = msg.get("parts")
+        if isinstance(parts, list):
+            msg_out["parts"] = [_compact_message_part(part) for part in parts]
+        elif parts is not None:
+            msg_out["parts"] = _json_safe(parts)
+        compacted.append(msg_out)
+    return compacted
+
+
+def _compact_message_part(part: Any) -> Any:
+    """压缩单个 message part；仅处理超长 system-prompt 正文。"""
+    if not isinstance(part, Mapping):
+        return _json_safe(part)
+    part_out = {str(k): _json_safe(v) for k, v in part.items()}
+    if part_out.get("part_kind") != "system-prompt":
+        return part_out
+    content = part_out.get("content")
+    if not isinstance(content, str) or len(content) <= _SYSTEM_PROMPT_FULL_MAX_CHARS:
+        return part_out
+    part_out.pop("content", None)
+    part_out["content_chars"] = len(content)
+    part_out["content_sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    part_out["content_preview"] = content[:_SYSTEM_PROMPT_PREVIEW_CHARS]
+    part_out["content_omitted"] = True
+    return part_out
 
 
 def _json_safe(value: Any) -> Any:
@@ -358,7 +407,12 @@ class TraceRecorder:
         span_id: str | None = None,
         parent_span_id: str | None = None,
     ) -> None:
-        """记录一轮 model request/response（正文仅经 payload 白名单门控）。"""
+        """记录一轮 model request/response。
+
+        payload 只保留完整 messages 正文（受 include_content 门控）；
+        usage/finish_reason/model_name/provider 全部归入 attributes（元数据层，
+        关闭 content 时仍可见，且不与 messages 内重复字段冗余）。
+        """
         attrs = dict(attributes or {})
         if provider is not None:
             attrs.setdefault("provider", provider)
@@ -366,15 +420,9 @@ class TraceRecorder:
             attrs.setdefault("model_name", model_name)
         if finish_reason is not None:
             attrs.setdefault("finish_reason", finish_reason)
-        payload: dict[str, Any] = {"messages": messages}
         if usage is not None:
-            payload["usage"] = usage
-        if finish_reason is not None:
-            payload["finish_reason"] = finish_reason
-        if model_name is not None:
-            payload["model_name"] = model_name
-        if provider is not None:
-            payload["provider"] = provider
+            attrs.setdefault("usage", usage)
+        payload: dict[str, Any] = {"messages": messages}
         self.emit(
             "model.request.completed",
             context,

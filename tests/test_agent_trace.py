@@ -92,6 +92,43 @@ def test_serialize_trace_payload_whitelist_and_content_gate():
     assert "unknown_blob" not in serialized
 
 
+def test_serialize_trace_payload_compacts_long_system_prompt():
+    import hashlib
+
+    long_prompt = "S" * 400
+    short_prompt = "keep-me-full"
+    raw = {
+        "messages": [
+            {
+                "kind": "request",
+                "parts": [
+                    {"part_kind": "system-prompt", "content": long_prompt},
+                    {"part_kind": "system-prompt", "content": short_prompt},
+                    {"part_kind": "user-prompt", "content": "hi player"},
+                ],
+            },
+            {
+                "kind": "response",
+                "parts": [{"part_kind": "text", "content": "hello"}],
+                "finish_reason": "stop",
+            },
+        ]
+    }
+    serialized = serialize_trace_payload(raw, include_content=True)
+    assert serialized is not None
+    parts = serialized["messages"][0]["parts"]
+    compacted = parts[0]
+    assert compacted["part_kind"] == "system-prompt"
+    assert "content" not in compacted
+    assert compacted["content_omitted"] is True
+    assert compacted["content_chars"] == 400
+    assert compacted["content_sha256"] == hashlib.sha256(long_prompt.encode()).hexdigest()
+    assert compacted["content_preview"] == "S" * 120
+    assert parts[1]["content"] == short_prompt
+    assert parts[2]["content"] == "hi player"
+    assert serialized["messages"][1]["parts"][0]["content"] == "hello"
+
+
 @pytest.mark.asyncio
 async def test_disabled_recorder_does_not_write_content(tmp_path, context):
     recorder = TraceRecorder(path=tmp_path / "trace.jsonl", enabled=False, include_content=True)
@@ -167,6 +204,64 @@ async def test_enabled_recorder_persists_whitelisted_payload_when_include_conten
     assert event["payload"]["messages"][0]["content"] == "final answer"
     assert "api_key" not in event["payload"]
     assert "sk-leak" not in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_record_model_messages_puts_usage_in_attributes_not_payload(tmp_path, context):
+    """usage/finish_reason/provider live in attributes; payload keeps only messages."""
+    path = tmp_path / "trace.jsonl"
+    recorder = TraceRecorder(path=path, enabled=True, include_content=True, max_records=100)
+    await recorder.start()
+    recorder.record_model_messages(
+        context,
+        messages=[{"kind": "request", "parts": [{"part_kind": "user-prompt", "content": "hi"}]}],
+        usage={"input_tokens": 10, "output_tokens": 3, "requests": 1, "tool_calls": 0},
+        provider="deepseek",
+        model_name="deepseek-v4-flash",
+        finish_reason="stop",
+        attributes={"pair_index": 0},
+    )
+    await recorder.stop()
+
+    event = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert event["event_name"] == "model.request.completed"
+    # Metadata fields go to attributes (visible even when content is off).
+    attrs = event["attributes"]
+    assert attrs["usage"] == {"input_tokens": 10, "output_tokens": 3, "requests": 1, "tool_calls": 0}
+    assert attrs["provider"] == "deepseek"
+    assert attrs["model_name"] == "deepseek-v4-flash"
+    assert attrs["finish_reason"] == "stop"
+    assert attrs["pair_index"] == 0
+    # Payload keeps only the messages body — no duplicated usage/finish_reason/provider.
+    payload = event["payload"]
+    assert set(payload.keys()) == {"messages"}
+    assert "usage" not in payload
+    assert "finish_reason" not in payload
+    assert "provider" not in payload
+    assert "model_name" not in payload
+
+
+@pytest.mark.asyncio
+async def test_record_model_messages_usage_visible_when_content_disabled(tmp_path, context):
+    """With include_content=False, usage still recorded in attributes."""
+    path = tmp_path / "trace.jsonl"
+    recorder = TraceRecorder(path=path, enabled=True, include_content=False, max_records=100)
+    await recorder.start()
+    recorder.record_model_messages(
+        context,
+        messages=[{"kind": "request", "parts": [{"part_kind": "user-prompt", "content": "hi"}]}],
+        usage={"input_tokens": 10, "output_tokens": 3},
+        provider="deepseek",
+        model_name="deepseek-v4-flash",
+        finish_reason="stop",
+    )
+    await recorder.stop()
+
+    event = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert "payload" not in event or event.get("payload") is None
+    assert event["attributes"]["usage"] == {"input_tokens": 10, "output_tokens": 3}
+    assert event["attributes"]["provider"] == "deepseek"
+    assert "hi" not in path.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio

@@ -659,6 +659,19 @@
       addKvSection(els.inspectorContent, "Attributes", attrPairs);
     }
 
+    // Usage: prefer payload (content mode), fall back to attributes (metadata mode).
+    const usageVal =
+      event.payload && event.payload.usage != null
+        ? event.payload.usage
+        : attrs && attrs.usage != null
+          ? attrs.usage
+          : null;
+    if (usageVal != null) {
+      addPreSection(els.inspectorContent, "Usage", prettyJson(usageVal), {
+        copyLabel: "复制",
+      });
+    }
+
     // Payload: only when present (content-gated on server)
     if (Object.prototype.hasOwnProperty.call(event, "payload") && event.payload != null) {
       const payloadText =
@@ -701,11 +714,6 @@
             stringifyContent(p.final_response != null ? p.final_response : p.response),
             { copyLabel: "复制" }
           );
-        }
-        if (p.usage != null) {
-          addPreSection(els.inspectorContent, "Usage", prettyJson(p.usage), {
-            copyLabel: "复制",
-          });
         }
       }
     } else {

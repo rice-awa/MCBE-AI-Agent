@@ -329,6 +329,7 @@ class TraceQuery:
                     "model_name": attrs.get("model_name") or (payload or {}).get("model_name"),
                     "finish_reason": attrs.get("finish_reason")
                     or (payload or {}).get("finish_reason"),
+                    "usage": attrs.get("usage") or (payload or {}).get("usage"),
                     "span_id": event.get("span_id"),
                     "parent_span_id": event.get("parent_span_id"),
                     "attempt_id": event.get("attempt_id"),

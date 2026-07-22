@@ -156,8 +156,7 @@ class BrokerResponseBridge:
         target = chunk.target or chunk.player_name or "@a"
         content_len = len(chunk.content or "")
 
-        # Early-return chunk types never leave the host — skip delivery.* so
-        # we do not orphan delivery.enqueued without started/completed.
+        # Early-return chunk types never leave the host — skip delivery.*.
         if chunk.chunk_type == "thinking_end":
             return
 
@@ -186,20 +185,9 @@ class BrokerResponseBridge:
         if not message:
             return
 
-        self._emit_delivery(
-            "delivery.enqueued",
-            chunk,
-            status="info",
-            attributes={
-                "target": target,
-                "delivery_type": delivery_type,
-                "chunk_type": chunk.chunk_type,
-                "sequence": chunk.sequence,
-                "byte_count": content_len,
-                "chunk_count": 1,
-            },
-        )
-
+        # Delivery trace only on failure. Successful delivery has no audit value
+        # beyond what trace.completed already records (chunk_count); per-chunk
+        # delivery.completed was pure noise on the success path.
         delivery = self._delivery(state)
         if delivery is None:
             self._emit_delivery(
@@ -210,6 +198,7 @@ class BrokerResponseBridge:
                     "target": target,
                     "delivery_type": delivery_type,
                     "chunk_type": chunk.chunk_type,
+                    "sequence": chunk.sequence,
                     "reason": "no_delivery",
                     "byte_count": content_len,
                     "chunk_count": 1,
@@ -218,18 +207,6 @@ class BrokerResponseBridge:
             )
             return
 
-        self._emit_delivery(
-            "delivery.started",
-            chunk,
-            status="started",
-            attributes={
-                "target": target,
-                "delivery_type": delivery_type,
-                "chunk_type": chunk.chunk_type,
-                "byte_count": len(message),
-                "chunk_count": 1,
-            },
-        )
         try:
             if chunk.delivery == "scriptevent":
                 await delivery.send_scriptevent(message, source="stream_scriptevent")
@@ -240,19 +217,6 @@ class BrokerResponseBridge:
                     source="stream_tellraw",
                     target=target,
                 )
-            self._emit_delivery(
-                "delivery.completed",
-                chunk,
-                status="completed",
-                attributes={
-                    "target": target,
-                    "delivery_type": delivery_type,
-                    "chunk_type": chunk.chunk_type,
-                    "byte_count": len(message),
-                    "chunk_count": 1,
-                },
-                duration_ms=int((time.perf_counter() - start) * 1000),
-            )
         except Exception as exc:
             self._emit_delivery(
                 "delivery.failed",
@@ -262,6 +226,7 @@ class BrokerResponseBridge:
                     "target": target,
                     "delivery_type": delivery_type,
                     "chunk_type": chunk.chunk_type,
+                    "sequence": chunk.sequence,
                     "reason": type(exc).__name__,
                     "byte_count": len(message),
                     "chunk_count": 1,
@@ -279,7 +244,7 @@ class BrokerResponseBridge:
         attributes: dict[str, Any] | None = None,
         duration_ms: int | None = None,
     ) -> None:
-        """Emit delivery.* events; never include chunk body or raw frames."""
+        """Emit delivery.* failure events; never include chunk body or raw frames."""
         trace_id = getattr(chunk, "trace_id", None)
         attempt_id = getattr(chunk, "attempt_id", None)
         if not trace_id or not attempt_id:

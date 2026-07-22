@@ -61,7 +61,7 @@ async def test_stream_chunk_becomes_outbound_payload():
 
 @pytest.mark.asyncio
 async def test_stream_chunk_emits_delivery_events_without_body(tmp_path):
-    """delivery.* events carry target/type/counts; never chunk body."""
+    """Successful delivery emits no delivery.* events; chunk body never traced."""
     from services.agent.trace import TraceRecorder, set_trace_recorder
 
     path = tmp_path / "delivery_trace.jsonl"
@@ -104,30 +104,84 @@ async def test_stream_chunk_emits_delivery_events_without_body(tmp_path):
         await recorder.stop()
 
         assert sent, "expected outbound payload"
-        events = [
-            json.loads(line)
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        # Success path records no delivery.* events (failures only).
+        events: list[dict] = []
+        if path.exists():
+            events = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
         names = [e["event_name"] for e in events]
-        assert "delivery.enqueued" in names
-        assert "delivery.started" in names
-        assert "delivery.completed" in names
-        raw = path.read_text(encoding="utf-8")
-        assert secret not in raw
-        completed = next(e for e in events if e["event_name"] == "delivery.completed")
-        assert completed["attributes"]["delivery_type"] == "tellraw"
-        assert completed["attributes"]["target"] == "Steve"
-        assert completed["attributes"]["chunk_count"] == 1
-        assert completed["attributes"]["conversation_id"] == "conv-delivery"
-        assert "payload" not in completed or completed.get("payload") is None
+        assert not any(name.startswith("delivery.") for name in names)
+        # Even if a trace file exists, the chunk body must never appear in it.
+        if path.exists():
+            assert secret not in path.read_text(encoding="utf-8")
     finally:
         set_trace_recorder(None)
 
 
 @pytest.mark.asyncio
-async def test_thinking_end_skips_delivery_enqueued(tmp_path):
-    """thinking_end early-return must not orphan delivery.enqueued."""
+async def test_delivery_failed_recorded_without_body(tmp_path):
+    """Failed delivery emits delivery.failed with counts/reason; never chunk body."""
+    from services.agent.trace import TraceRecorder, set_trace_recorder
+
+    path = tmp_path / "delivery_failed_trace.jsonl"
+    recorder = TraceRecorder(path=path, enabled=True, include_content=True, max_records=100)
+    await recorder.start()
+    set_trace_recorder(recorder)
+    try:
+        broker = MessageBroker(max_size=10)
+        cid = uuid4()
+        broker.register_connection(cid)
+
+        # send_payload=None makes _delivery() return None -> no_delivery failure path.
+        state = ConnectionState(id=cid, send_payload=None)
+        flow = FlowControlSettings()
+        runner = WsCommandRunner(flow)
+        bridge = BrokerResponseBridge(broker, flow, runner, profile=None)
+        await bridge.start(state)
+        secret = "SECRET_FAIL_BODY"
+        await broker.send_response(
+            cid,
+            StreamChunk(
+                connection_id=cid,
+                chunk_type="content",
+                content=secret,
+                sequence=2,
+                player_name="Steve",
+                trace_id="trace-fail",
+                attempt_id="attempt-fail",
+                conversation_id="conv-fail",
+            ),
+        )
+        await asyncio.sleep(0.05)
+        await bridge.stop(cid)
+        await recorder.stop()
+
+        assert path.exists(), "expected a delivery.failed trace event"
+        events = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        failed = [e for e in events if e["event_name"] == "delivery.failed"]
+        assert len(failed) == 1
+        attrs = failed[0]["attributes"]
+        assert attrs["reason"] == "no_delivery"
+        assert attrs["delivery_type"] == "tellraw"
+        assert attrs["target"] == "Steve"
+        assert attrs["chunk_count"] == 1
+        assert "payload" not in failed[0] or failed[0].get("payload") is None
+        # Chunk body must never be recorded in trace events.
+        assert secret not in path.read_text(encoding="utf-8")
+    finally:
+        set_trace_recorder(None)
+
+
+@pytest.mark.asyncio
+async def test_thinking_end_skips_delivery_events(tmp_path):
+    """thinking_end early-return must not emit any delivery.* events."""
     from services.agent.trace import TraceRecorder, set_trace_recorder
 
     path = tmp_path / "thinking_end_trace.jsonl"
@@ -172,7 +226,7 @@ async def test_thinking_end_skips_delivery_enqueued(tmp_path):
                 if line.strip()
             ]
         names = [e["event_name"] for e in events]
-        assert "delivery.enqueued" not in names
+        assert not any(name.startswith("delivery.") for name in names)
         assert sent == []
     finally:
         set_trace_recorder(None)
