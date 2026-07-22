@@ -498,10 +498,19 @@ class PolicyEngine:
         return bool(player_name) and target_text == player_name
 
 
-def classify_tool_exception(exc: BaseException, *, tool_name: str) -> ToolResult:
+def classify_tool_exception(
+    exc: BaseException,
+    *,
+    tool_name: str,
+    execution_stage: Literal["projection", "invocation"] | None = None,
+) -> ToolResult:
+    """Map tool-boundary exceptions without exposing implementation details."""
     text = str(exc) or exc.__class__.__name__
     lower = text.lower()
-    if tool_name in _BLOCK_OPS_TOOLS and "execution contract" in lower:
+    stage = execution_stage or (
+        "projection" if "execution contract" in lower else "invocation"
+    )
+    if tool_name in _BLOCK_OPS_TOOLS and stage == "projection":
         from services.agent.block_ops.schema import BlockErrorCode, build_error_response, dumps_payload
 
         return ToolResult.failure(
@@ -516,7 +525,25 @@ def classify_tool_exception(exc: BaseException, *, tool_name: str) -> ToolResult
             ),
             error_kind="INTERNAL",
             retryable=False,
-            diagnostic_summary=text,
+            diagnostic_summary="block execution contract rejected",
+        )
+    if tool_name == "edit_blocks" and stage == "invocation":
+        from services.agent.block_ops.schema import BlockErrorCode, build_error_response, dumps_payload
+
+        return ToolResult.failure(
+            dumps_payload(
+                build_error_response(
+                    BlockErrorCode.STATE_UNKNOWN,
+                    "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。",
+                    retryable=False,
+                    external_state_unknown=True,
+                    fallback_allowed=False,
+                )
+            ),
+            error_kind="PERMANENT",
+            retryable=False,
+            external_state_unknown=True,
+            diagnostic_summary=exc.__class__.__name__,
         )
     if "timeout" in lower or "deadline" in lower:
         entry = get_tool_entry(tool_name)
@@ -533,6 +560,32 @@ def classify_tool_exception(exc: BaseException, *, tool_name: str) -> ToolResult
         error_kind="INTERNAL",
         retryable=False,
         diagnostic_summary=text,
+    )
+
+
+def log_tool_execution_failed(
+    *,
+    tool_name: str,
+    ctx: Any,
+    result: ToolResult,
+    execution_stage: Literal["projection", "invocation"],
+    error_type: str,
+) -> None:
+    """Emit a correlation-safe failure event for tool boundary failures."""
+    deps = getattr(ctx, "deps", None)
+    connection_id = str(getattr(deps, "connection_id", "") or "")
+    logger.error(
+        "tool_execution_failed",
+        tool_name=tool_name,
+        run_id=getattr(deps, "run_id", None) or getattr(ctx, "run_id", None) or "",
+        tool_call_id=getattr(ctx, "tool_call_id", None) or "",
+        connection_id_short=connection_id[-8:] if connection_id else "",
+        player_name=getattr(deps, "player_name", None),
+        error_kind=result.error_kind,
+        error_type=error_type,
+        diagnostic_summary=result.diagnostic_summary or "tool execution failed",
+        external_state_unknown=result.external_state_unknown,
+        execution_stage=execution_stage,
     )
 
 
@@ -678,13 +731,34 @@ class HarnessToolset(WrapperToolset[Any]):
             try:
                 execute_args = _python_tool_args(name, effective_args)
             except ValueError as exc:
-                classified = classify_tool_exception(exc, tool_name=name)
+                classified = classify_tool_exception(
+                    exc, tool_name=name, execution_stage="projection"
+                )
+                log_tool_execution_failed(
+                    tool_name=name,
+                    ctx=ctx,
+                    result=classified,
+                    execution_stage="projection",
+                    error_type=exc.__class__.__name__,
+                )
                 self._audit(
                     settings=settings, tool_name=name, parameters=normalized, ctx=ctx,
                     status="failure", duration_ms=_duration_ms(start), result=classified,
                 )
                 return materialize_tool_result(classified)
             summary = summarize_args_for_player(name, normalized)
+            self._audit(
+                settings=settings,
+                tool_name=name,
+                parameters=normalized,
+                authorized_args=normalized,
+                approval_evidence=(
+                    preflight_plan.approval_metadata if preflight_plan is not None else {}
+                ),
+                ctx=ctx,
+                status="approval_required",
+                duration_ms=_duration_ms(start),
+            )
             raise ApprovalRequired(
                 metadata={
                     "tool_name": name,
@@ -712,7 +786,16 @@ class HarnessToolset(WrapperToolset[Any]):
         try:
             execute_args = _python_tool_args(name, effective_args)
         except ValueError as exc:
-            classified = classify_tool_exception(exc, tool_name=name)
+            classified = classify_tool_exception(
+                exc, tool_name=name, execution_stage="projection"
+            )
+            log_tool_execution_failed(
+                tool_name=name,
+                ctx=ctx,
+                result=classified,
+                execution_stage="projection",
+                error_type=exc.__class__.__name__,
+            )
             self._audit(
                 settings=settings, tool_name=name, parameters=normalized, ctx=ctx,
                 status="failure", duration_ms=_duration_ms(start), result=classified,
@@ -723,7 +806,16 @@ class HarnessToolset(WrapperToolset[Any]):
         except ApprovalRequired:
             raise
         except Exception as exc:
-            classified = classify_tool_exception(exc, tool_name=name)
+            classified = classify_tool_exception(
+                exc, tool_name=name, execution_stage="invocation"
+            )
+            log_tool_execution_failed(
+                tool_name=name,
+                ctx=ctx,
+                result=classified,
+                execution_stage="invocation",
+                error_type=exc.__class__.__name__,
+            )
             self._audit(
                 settings=settings,
                 tool_name=name,
@@ -743,6 +835,14 @@ class HarnessToolset(WrapperToolset[Any]):
         if isinstance(raw_result, ToolResult):
             success = raw_result.is_success
             external_unknown = raw_result.external_state_unknown
+            if not raw_result.is_success and name in _BLOCK_OPS_TOOLS:
+                log_tool_execution_failed(
+                    tool_name=name,
+                    ctx=ctx,
+                    result=raw_result,
+                    execution_stage="invocation",
+                    error_type="ToolResult",
+                )
             # 状态未知的副作用：不写入可重放成功缓存之外的自动重试语义
             if raw_result.is_success and run_id and tool_call_id:
                 self.idempotency.put(
@@ -826,7 +926,17 @@ class HarnessToolset(WrapperToolset[Any]):
             try:
                 execute_args = _python_tool_args(name, tool_args)
             except ValueError as exc:
-                return classify_tool_exception(exc, tool_name=name), None
+                classified = classify_tool_exception(
+                    exc, tool_name=name, execution_stage="projection"
+                )
+                log_tool_execution_failed(
+                    tool_name=name,
+                    ctx=ctx,
+                    result=classified,
+                    execution_stage="projection",
+                    error_type=exc.__class__.__name__,
+                )
+                return classified, None
             return None, BlockPreflightPlan(dict(tool_args), execute_args, {})
 
         # Reuse cached canonical args on approval recovery (same original hash).
@@ -885,6 +995,8 @@ class HarnessToolset(WrapperToolset[Any]):
         duration_ms: int,
         result: Any = None,
         exception: BaseException | None = None,
+        authorized_args: dict[str, Any] | None = None,
+        approval_evidence: dict[str, Any] | None = None,
     ) -> None:
         effective = settings or getattr(getattr(ctx, "deps", None), "settings", None)
         if not audit_enabled(effective):
@@ -903,6 +1015,8 @@ class HarnessToolset(WrapperToolset[Any]):
                 entry.policy_version if entry is not None else self.policy.policy_version
             ),
             run_id=getattr(getattr(ctx, "deps", None), "run_id", None),
+            authorized_args=authorized_args,
+            approval_evidence=approval_evidence,
         )
         path = getattr(effective, "runtime_harness_audit_path", "logs/runtime_harness_tools.jsonl")
         max_records = getattr(effective, "runtime_harness_audit_max_records", 5000)

@@ -93,9 +93,11 @@ def _unavailable_result(reason: str) -> ToolResult:
         BlockErrorCode.ADDON_UNAVAILABLE,
         (
             f"{reason}。"
-            "可另行调用 run_minecraft_command 作为可选回退；"
-            "本工具不会自动生成或执行 setblock/fill 命令。"
+            "可另行使用命令工具作为回退，但该命令仍需独立审批。"
         ),
+        retryable=True,
+        external_state_unknown=False,
+        fallback_allowed=True,
     )
     return ToolResult.failure(
         dumps_payload(body),

@@ -33,8 +33,10 @@ def map_addon_bridge_result(
         text = dumps_payload(
             build_error_response(
                 BlockErrorCode.INTERNAL_ERROR,
-                "invalid bridge response",
-                raw=str(result),
+                "Addon 返回了无效响应；本次操作未发送成功结果。",
+                retryable=False,
+                external_state_unknown=False,
+                fallback_allowed=False,
             )
         )
         return ToolResult.failure(
@@ -51,15 +53,11 @@ def map_addon_bridge_result(
         body: dict[str, Any]
         if isinstance(payload, dict):
             code = payload.get("code") or default_error_code
-            message = str(payload.get("message") or payload.get("error") or "addon returned ok:false")
-            body = build_error_response(code, message, **{
-                k: v for k, v in payload.items() if k not in {"code", "message"}
-            })
+            body = _safe_addon_error_body(str(code))
         else:
-            message = str(result.get("error") or payload or "addon returned ok:false")
-            body = build_error_response(default_error_code, message)
+            body = _safe_addon_error_body(str(default_error_code))
 
-        if failure_prefix and not body.get("message", "").startswith(failure_prefix):
+        if failure_prefix:
             body["message"] = f"{failure_prefix}: {body['message']}"
 
         text = dumps_payload(body)
@@ -87,25 +85,52 @@ def map_bridge_exception(
     tool_name: str | None = None,
 ) -> ToolResult:
     """Map bridge transport exceptions to ToolResult.failure."""
-    text = str(exc) or exc.__class__.__name__
-    lower = text.lower()
-    is_timeout = "timeout" in lower or "deadline" in lower
-    is_conn = any(
-        token in lower
-        for token in ("disconnect", "connection", "unavailable", "closed", "not connected")
-    )
+    if tool_name == "edit_blocks":
+        body = build_error_response(
+            BlockErrorCode.STATE_UNKNOWN,
+            "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。",
+            retryable=False,
+            external_state_unknown=True,
+            fallback_allowed=False,
+        )
+        return ToolResult.failure(
+            dumps_payload(body),
+            error_kind="PERMANENT",
+            retryable=False,
+            external_state_unknown=True,
+            diagnostic_summary=exc.__class__.__name__,
+        )
+
     code = BlockErrorCode.ADDON_UNAVAILABLE
     body = build_error_response(
         code,
-        f"Addon 桥接不可用: {text}" if not tool_name else f"{tool_name} 失败: Addon 桥接不可用 ({text})",
-        transient=True,
+        "Addon 桥接不可用；可另行使用命令工具作为回退，但该命令仍需独立审批。",
+        retryable=True,
+        external_state_unknown=False,
+        fallback_allowed=True,
     )
     return ToolResult.failure(
         dumps_payload(body),
         error_kind="TRANSIENT",
         retryable=True,
-        external_state_unknown=bool(is_timeout and not is_conn),
-        diagnostic_summary=text,
+        external_state_unknown=False,
+        diagnostic_summary=exc.__class__.__name__,
+    )
+
+
+def _safe_addon_error_body(code: str) -> dict[str, Any]:
+    """Return an external error envelope without mirroring bridge payload content."""
+    error_kind, retryable, external_unknown = _error_kind_for_code(code)
+    fallback_allowed = code == BlockErrorCode.ADDON_UNAVAILABLE
+    message = f"Addon 返回错误：{code}。"
+    if fallback_allowed:
+        message += "可另行使用命令工具作为回退，但该命令仍需独立审批。"
+    return build_error_response(
+        code,
+        message,
+        retryable=retryable,
+        external_state_unknown=external_unknown,
+        fallback_allowed=fallback_allowed,
     )
 
 
@@ -146,7 +171,10 @@ async def call_block_capability(
     if bridge is None:
         body = build_error_response(
             BlockErrorCode.ADDON_UNAVAILABLE,
-            "Addon 桥接不可用；可另行使用 run_minecraft_command 作为可选回退，本工具不会自动生成命令。",
+            "Addon 桥接不可用；可另行使用命令工具作为回退，但该命令仍需独立审批。",
+            retryable=True,
+            external_state_unknown=False,
+            fallback_allowed=True,
         )
         return ToolResult.failure(
             dumps_payload(body),

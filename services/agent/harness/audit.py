@@ -129,6 +129,8 @@ def build_audit_record(
     tool_call_id: str | None = None,
     policy_version: str | None = None,
     run_id: str | None = None,
+    authorized_args: dict[str, Any] | None = None,
+    approval_evidence: dict[str, Any] | None = None,
 ) -> AuditRecord:
     entry = get_tool_entry(tool_name)
     deps = getattr(ctx, "deps", None)
@@ -173,7 +175,20 @@ def build_audit_record(
         "result": result_summary,
         "error_kind": result_summary.get("error_kind"),
     }
+    if authorized_args is not None:
+        record["authorized_parameters"] = preview_parameters(tool_name, authorized_args)
+    if approval_evidence is not None:
+        record["approval_evidence"] = _summarize_approval_evidence(approval_evidence)
     return record
+
+
+def _summarize_approval_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Keep bounded approval evidence without recording payloads or locked targets."""
+    excluded = {"locked_targets", "payload", "raw_payload", "bridge_payload"}
+    return redact_mapping(
+        {key: value for key, value in evidence.items() if str(key).lower() not in excluded},
+        max_length=DEFAULT_PARAM_MAX,
+    )
 
 
 def summarize_result(

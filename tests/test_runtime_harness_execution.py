@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -19,8 +20,10 @@ from services.agent.harness.execution import (
     HarnessCapability,
     PolicyDecisionKind,
     PolicyEngine,
+    classify_tool_exception,
     get_idempotency_store,
     hash_normalized_args,
+    log_tool_execution_failed,
     normalize_tool_args,
     reset_idempotency_store,
 )
@@ -98,6 +101,89 @@ def test_policy_low_risk_allows_and_hard_deny_blocks() -> None:
     )
     assert deny.action == PolicyDecisionKind.DENY
     assert "op" in deny.reason
+
+
+def test_edit_invocation_exception_returns_unknown_state_without_exception_detail() -> None:
+    result = classify_tool_exception(
+        RuntimeError("edit_blocks_impl leaked token=bridge-secret"),
+        tool_name="edit_blocks",
+        execution_stage="invocation",
+    )
+
+    assert json.loads(result.output) == {
+        "schema_version": "1",
+        "ok": False,
+        "code": "STATE_UNKNOWN",
+        "message": "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。",
+        "retryable": False,
+        "external_state_unknown": True,
+        "fallback_allowed": False,
+    }
+    assert result.retryable is False
+    assert result.external_state_unknown is True
+    assert "RuntimeError" not in result.output
+    assert "bridge-secret" not in result.output
+
+
+def test_block_projection_failure_is_safe_and_definitely_not_sent() -> None:
+    result = classify_tool_exception(
+        ValueError("block preflight execution contract token=bridge-secret"),
+        tool_name="edit_blocks",
+        execution_stage="projection",
+    )
+
+    assert json.loads(result.output) == {
+        "schema_version": "1",
+        "ok": False,
+        "code": "INTERNAL_ERROR",
+        "message": "方块工具内部参数处理失败；本次操作未发送到 Add-on",
+        "retryable": False,
+        "external_state_unknown": False,
+        "fallback_allowed": False,
+    }
+    assert "bridge-secret" not in result.output
+
+
+def test_block_failure_log_is_correlated_and_omits_exception_text(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def capture(event: str, **fields: Any) -> None:
+        captured["event"] = event
+        captured.update(fields)
+
+    monkeypatch.setattr("services.agent.harness.execution.logger.error", capture)
+    ctx = type(
+        "Context",
+        (), {"deps": _Deps(run_id="run-log", player_name="Alex"), "tool_call_id": "tc-log"},
+    )()
+    result = classify_tool_exception(
+        RuntimeError("token=bridge-secret"),
+        tool_name="edit_blocks",
+        execution_stage="invocation",
+    )
+
+    log_tool_execution_failed(
+        tool_name="edit_blocks",
+        ctx=ctx,
+        result=result,
+        execution_stage="invocation",
+        error_type="RuntimeError",
+    )
+
+    assert captured == {
+        "event": "tool_execution_failed",
+        "tool_name": "edit_blocks",
+        "run_id": "run-log",
+        "tool_call_id": "tc-log",
+        "connection_id_short": str(ctx.deps.connection_id)[-8:],
+        "player_name": "Alex",
+        "error_kind": "PERMANENT",
+        "error_type": "RuntimeError",
+        "diagnostic_summary": "RuntimeError",
+        "external_state_unknown": True,
+        "execution_stage": "invocation",
+    }
+    assert "bridge-secret" not in json.dumps(captured)
 
 
 def test_policy_only_configured_destructive_command_roots_require_approval() -> None:

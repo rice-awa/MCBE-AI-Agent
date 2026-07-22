@@ -338,6 +338,40 @@ def test_sensitive_fields_redacted_in_audit_record(tmp_path):
     assert "secret-value" not in json.dumps(on_disk)
 
 
+def test_block_approval_audit_keeps_authorized_preview_without_locked_targets() -> None:
+    settings = Settings()
+    ctx = SimpleNamespace(deps=DummyDeps(settings, run_id="run-block-audit"), tool_call_id="tc-block-audit")
+    record = build_audit_record(
+        tool_name="edit_blocks",
+        parameters={"mode": "fill", "type_id": "minecraft:stone"},
+        authorized_args={
+            "mode": "fill",
+            "coordinate_mode": "absolute",
+            "dimension": "minecraft:overworld",
+            "type_id": "minecraft:stone",
+            "locked_targets": [{"x": 1, "y": 64, "z": 1}],
+        },
+        approval_evidence={
+            "repairs_applied": ["normalized_bounds"],
+            "locked_targets": [{"x": 1, "y": 64, "z": 1}],
+            "bridge_payload": {"token": "bridge-secret"},
+        },
+        ctx=ctx,
+        status="approval_required",
+        duration_ms=4,
+        run_id="run-block-audit",
+        tool_call_id="tc-block-audit",
+    )
+
+    assert record["run_id"] == "run-block-audit"
+    assert record["tool_call_id"] == "tc-block-audit"
+    assert record["authorized_parameters"]["type_id"] == "minecraft:stone"
+    assert record["approval_evidence"] == {"repairs_applied": ["normalized_bounds"]}
+    dumped = json.dumps(record, ensure_ascii=False)
+    assert "locked_targets" not in dumped
+    assert "bridge-secret" not in dumped
+
+
 @pytest.mark.asyncio
 async def test_shutdown_flush_persists_queued_records(tmp_path):
     audit_path = tmp_path / "runtime_harness_tools.jsonl"

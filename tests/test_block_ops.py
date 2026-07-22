@@ -224,6 +224,60 @@ def test_map_bridge_exception_transient() -> None:
     assert body["code"] == "ADDON_UNAVAILABLE"
 
 
+def test_edit_bridge_exception_is_unknown_and_does_not_leak_transport_detail() -> None:
+    result = map_bridge_exception(
+        TimeoutError("token=bridge-secret timed out"), tool_name="edit_blocks"
+    )
+
+    body = json.loads(result.output)
+    assert body == {
+        "schema_version": "1",
+        "ok": False,
+        "code": "STATE_UNKNOWN",
+        "message": "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。",
+        "retryable": False,
+        "external_state_unknown": True,
+        "fallback_allowed": False,
+    }
+    assert "bridge-secret" not in result.output
+    assert result.retryable is False
+    assert result.external_state_unknown is True
+
+
+def test_invalid_bridge_response_does_not_leak_raw_payload() -> None:
+    result = map_addon_bridge_result("payload token=bridge-secret")
+
+    body = json.loads(result.output)
+    assert body["code"] == "INTERNAL_ERROR"
+    assert body["retryable"] is False
+    assert body["external_state_unknown"] is False
+    assert body["fallback_allowed"] is False
+    assert "bridge-secret" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("code", "fallback_allowed"),
+    [
+        ("ADDON_UNAVAILABLE", True),
+        ("PROTECTED_BLOCK", False),
+        ("STATE_UNKNOWN", False),
+    ],
+)
+def test_explicit_addon_errors_preserve_code_and_only_unavailable_allows_fallback(
+    code: str, fallback_allowed: bool
+) -> None:
+    result = map_addon_bridge_result(
+        {"ok": False, "payload": {"code": code, "message": "token=bridge-secret"}}
+    )
+
+    body = json.loads(result.output)
+    assert body["code"] == code
+    assert body["fallback_allowed"] is fallback_allowed
+    assert "bridge-secret" not in result.output
+    if fallback_allowed:
+        assert "独立审批" in body["message"]
+
+
 def test_limits_hard_clamp() -> None:
     settings = SimpleNamespace(
         addon=SimpleNamespace(
