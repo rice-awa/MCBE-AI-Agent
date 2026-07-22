@@ -67,9 +67,28 @@ async def test_agent_tool_get_player_snapshot_uses_addon_bridge() -> None:
     assert fake_addon.calls == [("get_player_snapshot", {"target": "Steve"})]
 
 
+class _LookBlockAddonBridge(_FakeAddonBridge):
+    async def request(self, capability: str, payload: dict[str, object]) -> dict[str, object]:
+        self.calls.append((capability, payload))
+        return {
+            "ok": True,
+            "payload": {
+                "player": str(payload.get("target") or "Steve"),
+                "hit": True,
+                "block": {
+                    "typeId": "minecraft:stone",
+                    "location": {"x": 1, "y": 64, "z": 2},
+                    "dimension": "minecraft:overworld",
+                },
+                "face": "North",
+                "faceLocation": {"x": 0.5, "y": 0.5, "z": 0.0},
+            },
+        }
+
+
 @pytest.mark.asyncio
 async def test_agent_tool_get_look_block_defaults_to_current_player() -> None:
-    fake_addon = _FakeAddonBridge()
+    fake_addon = _LookBlockAddonBridge()
     agent = Agent("test", deps_type=AgentDependencies, output_type=str)
     register_agent_tools(agent)
 
@@ -80,7 +99,12 @@ async def test_agent_tool_get_look_block_defaults_to_current_player() -> None:
     finally:
         await ctx.deps.http_client.aclose()
 
-    assert "Steve" in result
+    # 默认只返回 typeId + 坐标，不含 player / face 等详情
+    assert "minecraft:stone" in result
+    assert "face" not in result
+    assert "faceLocation" not in result
+    assert "dimension" not in result
+    assert "Steve" not in result
     assert fake_addon.calls == [
         (
             "get_look_block",
@@ -96,7 +120,7 @@ async def test_agent_tool_get_look_block_defaults_to_current_player() -> None:
 
 @pytest.mark.asyncio
 async def test_agent_tool_get_look_block_resolves_selector_to_current_player() -> None:
-    fake_addon = _FakeAddonBridge()
+    fake_addon = _LookBlockAddonBridge()
     agent = Agent("test", deps_type=AgentDependencies, output_type=str)
     register_agent_tools(agent)
 
@@ -112,7 +136,8 @@ async def test_agent_tool_get_look_block_resolves_selector_to_current_player() -
     finally:
         await ctx.deps.http_client.aclose()
 
-    assert "Steve" in result
+    assert "minecraft:stone" in result
+    assert "face" not in result
     assert fake_addon.calls == [
         (
             "get_look_block",
@@ -120,6 +145,37 @@ async def test_agent_tool_get_look_block_resolves_selector_to_current_player() -
                 "target": "Steve",
                 "max_distance": 16,
                 "include_liquid_blocks": True,
+                "include_passable_blocks": False,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_get_look_block_include_details_returns_full_payload() -> None:
+    fake_addon = _LookBlockAddonBridge()
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent)
+
+    tool = iter_registered_tools(agent)["get_look_block"]
+    ctx = _build_tool_context(fake_addon)
+    try:
+        result = await tool.function(ctx, include_details=True)
+    finally:
+        await ctx.deps.http_client.aclose()
+
+    assert "minecraft:stone" in result
+    assert "face" in result
+    assert "faceLocation" in result
+    assert "dimension" in result
+    assert "Steve" in result
+    assert fake_addon.calls == [
+        (
+            "get_look_block",
+            {
+                "target": "Steve",
+                "max_distance": 8,
+                "include_liquid_blocks": False,
                 "include_passable_blocks": False,
             },
         )

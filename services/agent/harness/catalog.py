@@ -222,9 +222,16 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         "玩家询问自己或他人视线正对着的方块、前方是什么方块时使用。",
         "不要用于放置、破坏、填充方块，也不要替代按坐标查询方块。",
         "target 为玩家名（默认当前对话玩家）；max_distance 为最大检测距离（默认 8）；"
-        "include_liquid_blocks / include_passable_blocks 控制是否命中液体与可穿过方块。",
+        "include_liquid_blocks / include_passable_blocks 控制是否命中液体与可穿过方块；"
+        "include_details 默认 false，仅返回 typeId+坐标；仅当用户明确要求维度/命中面等细节时设为 true。",
         preview=ParameterPreviewPolicy(
-            include=("target", "max_distance", "include_liquid_blocks", "include_passable_blocks")
+            include=(
+                "target",
+                "max_distance",
+                "include_liquid_blocks",
+                "include_passable_blocks",
+                "include_details",
+            )
         ),
         may_have_external_side_effects=False,
     ),

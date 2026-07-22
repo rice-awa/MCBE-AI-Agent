@@ -138,6 +138,31 @@ async def _run_command_result(
     return CommandResult.ok(text or "命令执行成功")
 
 
+def _minimize_look_block_payload(payload: Any) -> Any:
+    """默认精简 get_look_block 返回：仅保留 hit、typeId、location。
+
+    错误 / 未命中 / 非 dict 结构原样返回；命中时丢弃 player、dimension、face、faceLocation。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    if payload.get("error") is not None or payload.get("hit") is not True:
+        return payload
+
+    block = payload.get("block")
+    type_id = payload.get("typeId")
+    location = payload.get("location")
+    if isinstance(block, dict):
+        type_id = block.get("typeId", type_id)
+        location = block.get("location", location)
+
+    minimal: dict[str, Any] = {"hit": True}
+    if type_id is not None:
+        minimal["typeId"] = type_id
+    if location is not None:
+        minimal["location"] = location
+    return minimal
+
+
 def register_agent_tools(
     chat_agent: Agent[AgentDependencies, str],
     settings: ToolRegistrationSettings | None = None,
@@ -959,6 +984,7 @@ def register_agent_tools(
         max_distance: int = 8,
         include_liquid_blocks: bool = False,
         include_passable_blocks: bool = False,
+        include_details: bool = False,
     ) -> str:
         """
         获取玩家视线正对着的方块（射线检测 getBlockFromViewDirection）。
@@ -966,16 +992,23 @@ def register_agent_tools(
         用于回答「我在看什么 / 前面是什么方块」。默认查询当前对话玩家；
         不要传 @s/@a 等选择器（会自动回退到当前玩家）。
 
+        默认只返回方块 typeId 与坐标；仅当用户明确要求维度、命中面、
+        faceLocation 等细节时，才将 include_details 设为 true。
+
         Args:
             ctx: 运行上下文
             target: 玩家名；留空则使用当前对话玩家。不要使用选择器。
             max_distance: 最大检测距离（格），默认 8，有效范围 1–64
             include_liquid_blocks: 是否把液体（水、岩浆）当作挡射线方块；默认 False
             include_passable_blocks: 是否把可穿过方块（花、藤蔓等）当作命中；默认 False
+            include_details: 是否返回完整详情（player、dimension、face、faceLocation）；
+                默认 False，仅返回 typeId 与坐标。除非用户明确要求更多字段，否则保持 False。
 
         Returns:
-            JSON 字符串：命中时含 typeId、坐标、维度、命中面 face、faceLocation；
-            未命中时 hit=false；玩家不在线时返回错误信息
+            JSON 字符串：
+            - 默认命中：{"hit": true, "typeId": "...", "location": {"x","y","z"}}
+            - include_details=true 命中：另含 player、block.dimension、face、faceLocation
+            - 未命中：hit=false；玩家不在线时返回错误信息
         """
         if ctx.deps.addon_bridge is None:
             return _tool_failure("Addon 桥接不可用", error_kind="TRANSIENT", retryable=True)
@@ -995,7 +1028,10 @@ def register_agent_tools(
                     "include_passable_blocks": include_passable_blocks,
                 },
             )
-            return _tool_success(json.dumps(result.get("payload", result), ensure_ascii=False))
+            payload = result.get("payload", result)
+            if not include_details:
+                payload = _minimize_look_block_payload(payload)
+            return _tool_success(json.dumps(payload, ensure_ascii=False))
         except Exception as e:
             logger.error("agent_tool_error", tool="get_look_block", error=str(e))
             return _tool_failure(
