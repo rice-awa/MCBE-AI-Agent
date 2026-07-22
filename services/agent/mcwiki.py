@@ -51,3 +51,19 @@ def build_page_url(base_url: str, page_name: str) -> str:
     """构建页面内容请求 URL"""
     encoded_name = quote(page_name, safe="")
     return build_mcwiki_url(base_url, f"api/page/{encoded_name}")
+
+
+def build_page_exists_url(base_url: str, page_name: str) -> str:
+    """构建页面存在性检查 URL"""
+    encoded_name = quote(page_name, safe="")
+    return build_mcwiki_url(base_url, f"api/page/{encoded_name}/exists")
+
+
+def build_health_url(base_url: str) -> str:
+    """构建 Wiki API 健康检查 URL"""
+    return build_mcwiki_url(base_url, "health")
+
+
+def build_namespaces_url(base_url: str) -> str:
+    """构建命名空间映射表 URL"""
+    return build_mcwiki_url(base_url, "api/search/namespaces")

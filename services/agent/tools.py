@@ -14,7 +14,10 @@ from models.minecraft import MinecraftCommand, sanitize_tellraw_target
 from services.agent.harness.prompting import render_schema_description_prefix
 from services.agent.tool_results import CommandResult, ToolResult
 from services.agent.mcwiki import (
+    build_health_url,
     build_mcwiki_url,
+    build_namespaces_url,
+    build_page_exists_url,
     build_page_url,
     build_search_params,
     normalize_limit,
@@ -491,24 +494,28 @@ def register_agent_tools(
     async def mcwiki_search(
         ctx: RunContext[AgentDependencies],
         query: str,
-        limit: int = 5,
+        limit: int = 10,
         namespaces: list[int] | None = None,
         use_cache: bool = True,
         pretty: bool = False,
     ) -> str:
-        """
-        搜索 Minecraft Wiki 内容，尽量不要使用多个搜索关键词。
+        """搜索 Minecraft 中文 Wiki。
+
+        用 1-3 个游戏名词查找匹配页面。多关键词会缩小范围（所有词须同时出现），
+        如需多角度搜索应分批调用，不要一次堆砌大量关键词。
 
         Args:
             ctx: 运行上下文
-            query: 搜索关键词
-            limit: 返回结果数量（1-50）
-            namespaces: 命名空间列表
-            use_cache: 是否使用缓存
-            pretty: 是否格式化 JSON
+            query: 搜索关键词，1-3 个游戏名词为佳。例：'信标 激活'，而不是
+                '信标 激活 怎么做 教程 步骤'。这不是搜索引擎，不要堆砌关键词。
+            limit: 返回结果数量，默认 10，最大 50
+            namespaces: 限定命名空间数字 ID 列表。0=Main 10=Template 14=Category
+                9994=Module。空则使用默认值。可用 mcwiki_list_namespaces 查询完整映射。
+            use_cache: 是否使用缓存，默认 true
+            pretty: 是否格式化 JSON，默认 false
 
         Returns:
-            搜索结果摘要
+            搜索结果摘要（标题、URL、片段）
         """
         logger.info(
             "agent_tool_call",
@@ -520,7 +527,7 @@ def register_agent_tools(
 
         tool_settings = cast(AgentToolSettings, ctx.deps.settings)
         base_url = tool_settings.mcwiki_base_url
-        search_limit = normalize_limit(limit, default=5)
+        search_limit = normalize_limit(limit, default=10)
         params = build_search_params(query, search_limit, namespaces, use_cache, pretty)
         url = build_mcwiki_url(base_url, "api/search")
 
@@ -535,7 +542,7 @@ def register_agent_tools(
                 error=str(e),
             )
             return _tool_failure(
-                f"搜索请求失败: {str(e)}",
+                f"搜索失败: API 服务不可用 ({e})",
                 error_kind="TRANSIENT",
                 retryable=True,
                 diagnostic_summary=str(e),
@@ -543,7 +550,10 @@ def register_agent_tools(
 
         if not payload.get("success"):
             error = payload.get("error", {})
-            message = error.get("message", "搜索失败")
+            if isinstance(error, dict):
+                message = error.get("message") or error.get("code") or "未知错误"
+            else:
+                message = error or "未知错误"
             return _tool_failure(
                 f"搜索失败: {message}",
                 error_kind="PERMANENT",
@@ -551,19 +561,21 @@ def register_agent_tools(
 
         results = payload.get("data", {}).get("results", [])
         if not results:
-            return _tool_success("未找到相关条目。")
+            return _tool_success(f"未找到与 '{query}' 相关的页面。")
 
-        lines = ["搜索结果："]
-        for index, item in enumerate(results, start=1):
+        lines = [f"搜索 '{query}' 的结果 ({len(results)} 条):\n"]
+        for item in results:
             title = item.get("title", "未知标题")
+            namespace = item.get("namespace", "")
             url_item = item.get("url", "")
-            snippet = item.get("snippet", "")
-            line = f"{index}. {title}"
+            snippet = str(item.get("snippet", "")).replace("\n", " ")[:150]
+            ns_part = f" ({namespace})" if namespace else ""
+            lines.append(f"- **{title}**{ns_part}")
             if url_item:
-                line += f" - {url_item}"
+                lines.append(f"  {url_item}")
             if snippet:
-                line += f"\n   摘要: {snippet}"
-            lines.append(line)
+                lines.append(f"  {snippet}")
+            lines.append("")
         return _tool_success("\n".join(lines))
 
     @chat_agent.tool
@@ -576,18 +588,28 @@ def register_agent_tools(
         pretty: bool = False,
         max_chars: int = 2000,
     ) -> str:
-        """
-        获取 Minecraft Wiki 页面内容。默认使用 wikitext（稳定、信息完整）；
-        仅在调用方显式指定时才使用 html/markdown/both。
+        """获取 Minecraft 中文 Wiki 页面的内容。
+
+        根据页面名称获取完整内容。
+
+        格式选择：
+        - wikitext（默认）：Wiki 原始标记，{{Template}} 完整保留，信息最全。
+          **非必要不要改 format，默认 wikitext 就是最好的。**
+        - html：清洗后的正文 HTML。仅当 wikitext 中某个模板确实无法理解时才使用。
+        - markdown / both：仅在调用方显式需要时传入。
+
+        wikitext 中遇到不认识的 {{Template}} 时，可用 mcwiki_search 传
+        namespaces=[10] 去模板命名空间搜索该模板文档。
 
         Args:
             ctx: 运行上下文
-            page_name: 页面名称
-            format: 输出格式，默认 wikitext；可选 html/markdown/both（需显式声明）
-            use_cache: 是否使用缓存
-            include_metadata: 是否包含元数据
-            pretty: 是否格式化 JSON
-            max_chars: 最大返回字符数
+            page_name: 页面名称，支持中文。例如 '钻石'、'工作台'、'命令'
+            format: 输出格式。默认 wikitext（优先，无需声明）；html 仅在 wikitext
+                模板确实无法理解时使用；markdown/both 需显式声明
+            use_cache: 是否使用缓存，默认 true
+            include_metadata: 是否包含元数据，默认 true
+            pretty: 是否格式化 JSON，默认 false
+            max_chars: 最大返回字符数，默认 2000
 
         Returns:
             页面内容摘要
@@ -627,7 +649,7 @@ def register_agent_tools(
                 error=str(e),
             )
             return _tool_failure(
-                f"页面请求失败: {str(e)}",
+                f"页面获取失败: API 服务不可用 ({e})",
                 error_kind="TRANSIENT",
                 retryable=True,
                 diagnostic_summary=str(e),
@@ -635,9 +657,18 @@ def register_agent_tools(
 
         if not payload.get("success"):
             error = payload.get("error", {})
-            message = error.get("message", "页面获取失败")
+            code = error.get("code", "") if isinstance(error, dict) else ""
+            if code == "PAGE_NOT_FOUND":
+                return _tool_failure(
+                    f"页面 '{page_name}' 不存在。可尝试使用 mcwiki_search 搜索正确的页面名称。",
+                    error_kind="PERMANENT",
+                )
+            if isinstance(error, dict):
+                message = error.get("message") or code or "未知错误"
+            else:
+                message = error or "未知错误"
             return _tool_failure(
-                f"页面获取失败: {message}",
+                f"获取页面失败: {message}",
                 error_kind="PERMANENT",
             )
 
@@ -671,10 +702,215 @@ def register_agent_tools(
         if len(text_content) > max_chars:
             text_content = text_content[:max_chars] + "..."
 
-        header = f"页面: {title}"
+        info_lines = [f"# {title}"]
         if url_item:
-            header += f" - {url_item}"
-        return _tool_success(f"{header}\n{text_content}")
+            info_lines.append(f"URL: {url_item}")
+
+        if include_metadata:
+            meta = page.get("meta", {})
+            info_lines.append(
+                f"格式: {requested_format}  |  字数: {meta.get('wordCount', 'N/A')}  "
+                f"|  段落: {meta.get('sectionCount', 'N/A')}"
+            )
+        else:
+            info_lines.append(f"格式: {requested_format}")
+
+        info_lines.extend(["", text_content])
+        return _tool_success("\n".join(info_lines))
+
+    @chat_agent.tool
+    async def mcwiki_check_page_exists(
+        ctx: RunContext[AgentDependencies],
+        page_name: str,
+    ) -> str:
+        """检查 Minecraft 中文 Wiki 页面是否存在。
+
+        在不确定页面名是否准确、又不想拉取全文时使用。
+        若不存在，可改用 mcwiki_search 搜索正确名称。
+
+        Args:
+            ctx: 运行上下文
+            page_name: 页面名称，支持中文
+
+        Returns:
+            存在性结果；存在时可能包含页面 ID、长度、最后修改、重定向信息
+        """
+        logger.info(
+            "agent_tool_call",
+            tool="mcwiki_check_page_exists",
+            page_name=page_name,
+            connection_id=str(ctx.deps.connection_id),
+            run_id=ctx.deps.run_id,
+        )
+
+        tool_settings = cast(AgentToolSettings, ctx.deps.settings)
+        url = build_page_exists_url(tool_settings.mcwiki_base_url, page_name)
+
+        try:
+            response = await ctx.deps.http_client.get(url)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as e:
+            logger.error(
+                "agent_tool_error",
+                tool="mcwiki_check_page_exists",
+                error=str(e),
+            )
+            return _tool_failure(
+                f"检查失败: API 服务不可用 ({e})",
+                error_kind="TRANSIENT",
+                retryable=True,
+                diagnostic_summary=str(e),
+            )
+
+        if not payload.get("success"):
+            error = payload.get("error", {})
+            if isinstance(error, dict):
+                message = error.get("message") or error.get("code") or "未知错误"
+            else:
+                message = error or "未知错误"
+            return _tool_failure(
+                f"检查失败: {message}",
+                error_kind="PERMANENT",
+            )
+
+        info = payload.get("data", {})
+        if info.get("exists"):
+            page_info = info.get("pageInfo", {}) or {}
+            lines = [f"页面 '{page_name}' 存在。"]
+            if page_info:
+                if page_info.get("pageid") is not None:
+                    lines.append(f"页面ID: {page_info.get('pageid')}")
+                if page_info.get("length") is not None:
+                    lines.append(f"长度: {page_info.get('length')} 字节")
+                if page_info.get("touched"):
+                    lines.append(f"最后修改: {page_info.get('touched')}")
+            if info.get("redirected"):
+                actual_title = page_info.get("title", page_name)
+                lines.append(f"重定向到: {actual_title}")
+            return _tool_success("\n".join(lines))
+        return _tool_success(f"页面 '{page_name}' 不存在。")
+
+    @chat_agent.tool
+    async def mcwiki_check_health(
+        ctx: RunContext[AgentDependencies],
+    ) -> str:
+        """检查 Minecraft Wiki API 服务健康状态。
+
+        在 Wiki 工具连续失败、怀疑上游不可用时使用。
+
+        Args:
+            ctx: 运行上下文
+
+        Returns:
+            服务状态、运行时间、环境与内存摘要
+        """
+        logger.info(
+            "agent_tool_call",
+            tool="mcwiki_check_health",
+            connection_id=str(ctx.deps.connection_id),
+            run_id=ctx.deps.run_id,
+        )
+
+        tool_settings = cast(AgentToolSettings, ctx.deps.settings)
+        url = build_health_url(tool_settings.mcwiki_base_url)
+
+        try:
+            response = await ctx.deps.http_client.get(url)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as e:
+            logger.error(
+                "agent_tool_error",
+                tool="mcwiki_check_health",
+                error=str(e),
+            )
+            return _tool_failure(
+                f"API 服务不可用: {e}",
+                error_kind="TRANSIENT",
+                retryable=True,
+                diagnostic_summary=str(e),
+            )
+
+        if not payload.get("status"):
+            return _tool_failure(
+                f"API 返回异常: {payload}",
+                error_kind="TRANSIENT",
+                retryable=True,
+            )
+
+        mem = payload.get("memory", {}) or {}
+        svc = payload.get("service", {}) or {}
+        uptime = payload.get("uptime", {}) or {}
+        lines = [
+            f"状态: {payload.get('status', 'unknown')}",
+            f"运行时间: {uptime.get('human', 'N/A')}",
+            f"环境: {svc.get('environment', 'N/A')}",
+            (
+                f"内存: {mem.get('used', '?')} / {mem.get('total', '?')} "
+                f"(系统 {mem.get('system', '?')})"
+            ),
+        ]
+        return _tool_success("\n".join(lines))
+
+    @chat_agent.tool
+    async def mcwiki_list_namespaces(
+        ctx: RunContext[AgentDependencies],
+    ) -> str:
+        """获取 Minecraft Wiki 的命名空间映射表。
+
+        返回所有可用命名空间的数字 ID 与名称。
+        结合 mcwiki_search 的 namespaces 参数使用，例如 namespaces=[10] 搜索模板文档。
+
+        Args:
+            ctx: 运行上下文
+
+        Returns:
+            命名空间 ID → 名称映射
+        """
+        logger.info(
+            "agent_tool_call",
+            tool="mcwiki_list_namespaces",
+            connection_id=str(ctx.deps.connection_id),
+            run_id=ctx.deps.run_id,
+        )
+
+        tool_settings = cast(AgentToolSettings, ctx.deps.settings)
+        url = build_namespaces_url(tool_settings.mcwiki_base_url)
+
+        try:
+            response = await ctx.deps.http_client.get(url)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as e:
+            logger.error(
+                "agent_tool_error",
+                tool="mcwiki_list_namespaces",
+                error=str(e),
+            )
+            return _tool_failure(
+                f"获取命名空间失败: {e}",
+                error_kind="TRANSIENT",
+                retryable=True,
+                diagnostic_summary=str(e),
+            )
+
+        if not payload.get("success"):
+            error = payload.get("error", {})
+            if isinstance(error, dict):
+                message = error.get("message") or error.get("code") or "未知错误"
+            else:
+                message = error or "未知错误"
+            return _tool_failure(
+                f"获取命名空间失败: {message}",
+                error_kind="PERMANENT",
+            )
+
+        namespaces = payload.get("data", {}).get("namespaces", {}) or {}
+        lines = ["命名空间映射表：\n"]
+        for key, value in namespaces.items():
+            lines.append(f"  {key} → {value}")
+        return _tool_success("\n".join(lines))
 
     @chat_agent.tool
     async def list_available_providers(

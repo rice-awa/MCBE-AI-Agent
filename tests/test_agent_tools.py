@@ -211,7 +211,10 @@ async def test_agent_tools_accept_narrow_runtime_settings() -> None:
 
     assert providers == "可用 Provider: deepseek, ollama"
     assert "Stone" in search
+    assert "stone" in search
     assert http_client.requests[0][0] == "https://wiki.example.test/api/search"
+    assert http_client.requests[0][1] is not None
+    assert http_client.requests[0][1]["limit"] == 10
 
 
 @pytest.mark.asyncio
