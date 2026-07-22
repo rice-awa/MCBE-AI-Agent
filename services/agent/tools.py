@@ -215,11 +215,13 @@ def register_agent_tools(
         commands: list[str],
     ) -> str:
         """
-        批量执行 Minecraft 命令，注意一定要遵循MCBE的语法
+        批量执行 Minecraft 命令，注意一定要遵循MCBE的语法。
+        每次最多 20 条命令，超出请拆分为多次调用。
+        一次 run 最多 16 次工具调用，请合理规划，避免超限被拒后反复重试。
 
         Args:
             ctx: 运行上下文
-            commands: 要执行的命令数组（不包括前导斜杠）
+            commands: 要执行的命令数组（不包括前导斜杠），最多 20 条
 
         Returns:
             每条命令的执行结果

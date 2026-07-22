@@ -808,7 +808,7 @@ class Settings(BaseSettings):
 
     # 每轮 run 预算（UsageLimits + wall-clock）
     request_limit: int = Field(default=8, ge=1)
-    tool_calls_limit: int = Field(default=8, ge=1)
+    tool_calls_limit: int = Field(default=16, ge=1)
     # None = 未显式配置；运行时可由模型 context window 派生
     input_tokens_limit: int | None = Field(default=None, ge=1)
     output_tokens_limit: int | None = Field(default=None, ge=1)
@@ -831,7 +831,7 @@ class Settings(BaseSettings):
     runtime_harness_audit_max_records: int = Field(default=5000, gt=0)
     # 工具策略 / 审批
     approval_ttl: float = Field(default=120.0, gt=0)
-    max_batch_commands: int = Field(default=10, ge=1)
+    max_batch_commands: int = Field(default=20, ge=1)
     hard_deny_tools: list[str] = Field(default_factory=list)
     hard_deny_command_roots: list[str] = Field(
         default_factory=lambda: ["op", "deop", "stop", "whitelist", "permission", "wsserver"]
