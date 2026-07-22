@@ -28,7 +28,12 @@ class ChatRequest(BaseMessage):
     delivery: Literal["tellraw", "scriptevent"] = "tellraw"
     conversation_id: str = DEFAULT_CONVERSATION_ID
     # 单次 run 身份，由入队侧或 Worker 生成；贯穿工具/完成事件。
+    # 迁移期 run_id 与 trace_id 相同，保留现有日志与幂等兼容。
     run_id: str | None = None
+    # 一次玩家意图的稳定身份；审批恢复/重试保持不变。
+    trace_id: str | None = None
+    # 单次执行 attempt；审批恢复或重试时生成新值。
+    attempt_id: str | None = None
     # 历史 revision，保留兼容 API；普通聊天写回会递增。
     conversation_generation: int = 0
     # 管理操作失效 epoch；clear/switch/new/restore/switch_model 等运行时状态变更会递增。
@@ -71,6 +76,10 @@ class StreamChunk(BaseMessage):
     tool_name: str | None = None
     tool_args: dict | None = None
     tool_result_preview: str | None = None
+    # 交付侧 correlation（不含消息正文）；Task 3 桥接会使用。
+    trace_id: str | None = None
+    attempt_id: str | None = None
+    conversation_id: str | None = None
 
 
 class SystemNotification(BaseMessage):

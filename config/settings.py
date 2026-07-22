@@ -849,6 +849,14 @@ class Settings(BaseSettings):
     # 避免把完整 prompt/completion 写入 trace。
     pydantic_ai_instrumentation: bool = False
 
+    # Agent Trace 审计平台（默认关闭；include_content 仅在 enabled 时生效）
+    agent_trace_enabled: bool = False
+    agent_trace_include_content: bool = False
+    agent_trace_path: str = "logs/agent_traces.jsonl"
+    agent_trace_max_records: int = Field(default=10000, ge=1)
+    agent_trace_api_host: str = "127.0.0.1"
+    agent_trace_api_port: int = Field(default=8787, ge=1, le=65535)
+
     # 队列配置
     queue_max_size: int = 100
     llm_worker_count: int = 2
@@ -922,6 +930,13 @@ class Settings(BaseSettings):
 
     # 流控嵌套配置（字节预算与分片延迟）
     flow_control: FlowControlConfig = Field(default_factory=FlowControlConfig)
+
+    @model_validator(mode="after")
+    def _normalize_agent_trace_content(self) -> "Settings":
+        """include_content 在 enabled=false 时无效，强制关闭。"""
+        if not self.agent_trace_enabled and self.agent_trace_include_content:
+            self.agent_trace_include_content = False
+        return self
 
     def get_provider_config(self, provider_name: str | None = None) -> LLMProviderConfig:
         """获取指定提供商的配置"""

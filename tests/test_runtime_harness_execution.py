@@ -599,3 +599,186 @@ async def test_multi_deferred_approvals_require_full_results_then_execute_only_a
     # 只执行被批准的那一次
     assert counter.get("run_minecraft_command") == 1
     assert not isinstance(second.output, DeferredToolRequests)
+
+
+@pytest.mark.asyncio
+async def test_harness_emits_tool_proposed_policy_and_execution(tmp_path):
+    """Harness call_tool writes tool.proposed / policy.decided / execution.*."""
+    import json
+    from pathlib import Path
+
+    from services.agent.trace import TraceContext, TraceRecorder, set_trace_recorder
+
+    path = tmp_path / "harness_trace.jsonl"
+    recorder = TraceRecorder(path=path, enabled=True, include_content=True, max_records=200)
+    await recorder.start()
+    set_trace_recorder(recorder)
+    try:
+        context = TraceContext(
+            trace_id="trace-h1",
+            run_id="trace-h1",
+            attempt_id="attempt-h1",
+            message_id="msg-h1",
+            connection_id="conn-1",
+            player_name="Steve",
+            conversation_id="conv-1",
+        )
+        deps = _Deps(
+            settings=_Settings(),
+            run_id="trace-h1",
+            conversation_id="conv-1",
+        )
+        # inject trace fields dynamically for offline harness
+        deps.trace_context = context  # type: ignore[attr-defined]
+        deps.trace_recorder = recorder  # type: ignore[attr-defined]
+        deps.auto_approve_tools = False
+
+        agent = _build_agent()
+        result = await agent.run(
+            "list providers please",
+            deps=deps,
+            model=TestModel(call_tools=["list_available_providers"]),
+        )
+        assert result.output
+
+        await recorder.stop()
+        events = [
+            json.loads(line)
+            for line in Path(path).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        names = [e["event_name"] for e in events]
+        assert "tool.proposed" in names
+        assert "policy.decided" in names
+        assert "tool.execution.started" in names
+        assert "tool.execution.completed" in names
+        proposed = next(e for e in events if e["event_name"] == "tool.proposed")
+        assert proposed["attributes"]["tool_name"] == "list_available_providers"
+        assert proposed.get("payload") is not None
+        completed = next(e for e in events if e["event_name"] == "tool.execution.completed")
+        assert completed["attributes"]["execution_status"] == "succeeded"
+    finally:
+        set_trace_recorder(None)
+
+
+@pytest.mark.asyncio
+async def test_harness_deny_emits_denied_execution_status(tmp_path):
+    import json
+    from pathlib import Path
+
+    from services.agent.trace import TraceContext, TraceRecorder, set_trace_recorder
+
+    path = tmp_path / "harness_deny.jsonl"
+    recorder = TraceRecorder(path=path, enabled=True, include_content=False, max_records=100)
+    await recorder.start()
+    set_trace_recorder(recorder)
+    try:
+        context = TraceContext(
+            trace_id="trace-deny",
+            run_id="trace-deny",
+            attempt_id="attempt-d",
+            message_id="m",
+            connection_id="c",
+            player_name="Steve",
+            conversation_id="conv",
+        )
+        settings = _Settings()
+        settings.hard_deny_tools = ["run_minecraft_command"]
+        deps = _Deps(settings=settings, run_id="trace-deny")
+        deps.trace_context = context  # type: ignore[attr-defined]
+        deps.trace_recorder = recorder  # type: ignore[attr-defined]
+
+        agent = _build_agent(policy_settings=settings)
+        # Force a tool call that will be denied by hard_deny
+        result = await agent.run(
+            "op someone",
+            deps=deps,
+            model=TestModel(call_tools=["run_minecraft_command"]),
+        )
+        # ToolDenied may surface as text/output depending on pydantic-ai
+        _ = result
+
+        await recorder.stop()
+        events = [
+            json.loads(line)
+            for line in Path(path).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        names = [e["event_name"] for e in events]
+        assert "tool.proposed" in names
+        assert "policy.decided" in names
+        denied = [
+            e
+            for e in events
+            if e["event_name"] in {"tool.execution.failed", "tool.execution.completed"}
+            and e.get("attributes", {}).get("execution_status") == "denied"
+        ]
+        assert denied, f"expected denied execution event, got {names}"
+        assert all("payload" not in e or e.get("payload") is None for e in events)
+        # Content-off: free-text policy reason must not appear in attributes
+        policy_events = [e for e in events if e["event_name"] == "policy.decided"]
+        assert policy_events
+        assert "reason" not in (policy_events[0].get("attributes") or {})
+    finally:
+        set_trace_recorder(None)
+
+
+@pytest.mark.asyncio
+async def test_harness_cancelled_emits_tool_execution_cancelled(tmp_path):
+    """asyncio.CancelledError during tool invoke emits tool.execution.cancelled."""
+    import json
+    from pathlib import Path
+
+    from services.agent.trace import TraceContext, TraceRecorder, set_trace_recorder
+
+    path = tmp_path / "harness_cancel.jsonl"
+    recorder = TraceRecorder(path=path, enabled=True, include_content=False, max_records=100)
+    await recorder.start()
+    set_trace_recorder(recorder)
+    try:
+        context = TraceContext(
+            trace_id="trace-cancel",
+            run_id="trace-cancel",
+            attempt_id="attempt-c",
+            message_id="m",
+            connection_id="c",
+            player_name="Steve",
+            conversation_id="conv",
+        )
+        deps = _Deps(settings=_Settings(), run_id="trace-cancel")
+        deps.trace_context = context  # type: ignore[attr-defined]
+        deps.trace_recorder = recorder  # type: ignore[attr-defined]
+
+        policy = PolicyEngine.from_settings(_Settings())
+        agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+            "test",
+            deps_type=_Deps,
+            output_type=[str, DeferredToolRequests],
+            capabilities=[HarnessCapability(policy=policy)],
+        )
+
+        @agent.tool
+        async def list_available_providers(ctx: RunContext[_Deps]) -> str:
+            raise asyncio.CancelledError()
+
+        with pytest.raises(asyncio.CancelledError):
+            await agent.run(
+                "list providers please",
+                deps=deps,
+                model=TestModel(call_tools=["list_available_providers"]),
+            )
+
+        await recorder.stop()
+        events = [
+            json.loads(line)
+            for line in Path(path).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        names = [e["event_name"] for e in events]
+        assert "tool.execution.started" in names
+        assert "tool.execution.cancelled" in names
+        cancelled = next(e for e in events if e["event_name"] == "tool.execution.cancelled")
+        assert cancelled["attributes"]["execution_status"] == "cancelled"
+        assert cancelled["attributes"]["tool_name"] == "list_available_providers"
+    finally:
+        set_trace_recorder(None)

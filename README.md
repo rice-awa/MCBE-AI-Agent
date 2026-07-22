@@ -300,6 +300,51 @@ python cli.py runtime-harness analyze --no-llm
 
 默认模式会使用当前 `providers.default` 对聚合统计生成 2-4 条中文改进建议。发送给 LLM 的内容只包含总量、失败率、平均耗时、风险分布、重点问题工具和规则建议；如果默认 Provider 不可用，CLI 会保留规则建议并显示回退原因。
 
+## Agent Trace 审计
+
+完整 Agent 运行追踪写入独立的 append-only JSONL journal（默认 `logs/agent_traces.jsonl`），与 Runtime Harness 工具摘要审计分离。
+
+### 启用
+
+在 `config.json` 的 `agent` 下配置：
+
+```json
+{
+  "agent": {
+    "agent_trace_enabled": true,
+    "agent_trace_include_content": false,
+    "agent_trace_path": "logs/agent_traces.jsonl",
+    "agent_trace_max_records": 10000,
+    "agent_trace_api_host": "127.0.0.1",
+    "agent_trace_api_port": 8787
+  }
+}
+```
+
+- `agent_trace_enabled`：是否记录 trace 事件（默认 `false`）。
+- `agent_trace_include_content`：是否持久化完整正文（默认 `false`，仅在 trace 开启时生效）；完整内容为 opt-in。
+- `agent_trace_path`：journal 路径。
+- `agent_trace_api_host` / `agent_trace_api_port`：本地只读 API 默认绑定。
+
+### 本地查询与只读 API
+
+```bash
+python cli.py trace serve
+# open http://127.0.0.1:8787
+python cli.py trace list --recent 20
+python cli.py trace list --status failed --player alex
+python cli.py trace show <trace_id>
+python cli.py trace show <trace_id> --json
+python cli.py trace health
+```
+
+- API 为**本地只读**（GET），不修改 journal。
+- 完整正文仅在 `agent_trace_include_content=true` 时写入；默认只有元数据与摘要字段。
+- WebSocket 原始报文日志（`enable_ws_raw_log`）与本 journal **相互独立**，不会互相替代。
+- 静态审计工作台：`web/trace/`（无构建步骤，由 `trace serve` 按仓库根路径托管，不依赖进程 CWD）。
+- journal 轮转会重写文件以保留最近 N 条记录（`agent_trace_max_records`），按设计面向本地/开发体量，不适合超大生产写入。
+- 离线验收夹具矩阵见 `tests/test_trace_integration.py`（no-tool / single-tool / approval / deny / failure / cancel / multiplayer / privacy）。
+
 ## Addon Bridge 桥接
 
 当前仓库已经接入一条可用的 Python <-> Addon <-> 游戏桥接链路，用于让 Agent 通过 Addon 获取更稳定的游戏内上下文，如玩家背包，实体信息等。打包好的 Addon 可在[release](https://github.com/rice-awa/MCBE-AI-Agent/release)获取

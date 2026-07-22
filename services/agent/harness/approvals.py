@@ -96,6 +96,50 @@ class PendingApprovalStore:
             self._items[key] = pending
         return pending
 
+    @staticmethod
+    def _emit_approval_trace(
+        pending: PendingApproval,
+        *,
+        event_name: str,
+        status: str = "info",
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        """Fail-soft approval lifecycle emit when correlation IDs are present."""
+        meta = pending.metadata if isinstance(pending.metadata, dict) else {}
+        trace_id = meta.get("trace_id") or pending.run_id
+        attempt_id = meta.get("attempt_id")
+        if not trace_id or not attempt_id:
+            return
+        try:
+            from services.agent.trace import TraceContext, get_trace_recorder
+
+            context = TraceContext(
+                trace_id=str(trace_id),
+                run_id=str(pending.run_id or trace_id),
+                attempt_id=str(attempt_id),
+                message_id=str(meta.get("message_id") or pending.approval_id),
+                connection_id=str(pending.connection_id),
+                player_name=str(pending.player_name),
+                conversation_id=str(pending.conversation_id or "default"),
+            )
+            attrs = {
+                "approval_id": pending.approval_id,
+                "batch_id": pending.batch_id,
+                "tool_name": pending.tool_name,
+                "tool_call_id": pending.tool_call_id,
+            }
+            if attributes:
+                attrs.update(attributes)
+            get_trace_recorder().emit(
+                event_name,
+                context,
+                status=status,  # type: ignore[arg-type]
+                tool_call_id=pending.tool_call_id,
+                attributes=attrs,
+            )
+        except Exception:
+            pass
+
     def get(
         self,
         connection_id: str,
@@ -264,6 +308,12 @@ class PendingApprovalStore:
                 return None, "该审批已处理", None
 
             pending.decision = bool(approved)
+            self._emit_approval_trace(
+                pending,
+                event_name="approval.decided",
+                status="accepted" if approved else "denied",
+                attributes={"approved": bool(approved)},
+            )
 
             siblings = self._siblings_unlocked(
                 connection_id=connection_id,
@@ -353,13 +403,26 @@ class PendingApprovalStore:
     def _purge_expired_unlocked(self, now: float | None = None) -> None:
         current = now if now is not None else time.time()
         expired_batches: set[tuple[str, str, str, str]] = set()
+        expired_items: list[PendingApproval] = []
         for key, item in self._items.items():
             if item.expires_at <= current:
                 expired_batches.add((key[0], key[1], key[2], item.batch_id))
+                expired_items.append(item)
         for connection_id, player_name, conversation_id, batch_id in expired_batches:
             self._pop_batch_unlocked(
                 connection_id=connection_id,
                 player_name=player_name,
                 conversation_id=conversation_id,
                 batch_id=batch_id,
+            )
+        # Emit once per expired item (metadata may carry trace correlation)
+        seen_ids: set[str] = set()
+        for item in expired_items:
+            if item.approval_id in seen_ids:
+                continue
+            seen_ids.add(item.approval_id)
+            self._emit_approval_trace(
+                item,
+                event_name="approval.expired",
+                status="expired",
             )

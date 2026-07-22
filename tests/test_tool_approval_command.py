@@ -303,3 +303,67 @@ def test_session_auto_approve_conversation_vs_forever() -> None:
 
     host.clear_auto_approve_tools("Steve", conversation_id="conv-a")
     assert host.should_auto_approve_tools("Steve", "conv-a") is False
+
+
+def test_approval_decision_and_expiry_emit_trace_events(tmp_path):
+    """PendingApprovalStore emits approval.decided / approval.expired when correlated."""
+    import asyncio
+    import json
+    from pathlib import Path
+
+    from services.agent.trace import TraceRecorder, set_trace_recorder
+
+    async def _run():
+        path = tmp_path / "approval_trace.jsonl"
+        recorder = TraceRecorder(path=path, enabled=True, include_content=False, max_records=100)
+        await recorder.start()
+        set_trace_recorder(recorder)
+        try:
+            store = PendingApprovalStore(default_ttl_seconds=0.01)
+            pending = _make_pending(approval_id="ap1", ttl=0.01)
+            pending.metadata = {
+                "trace_id": "trace-ap",
+                "attempt_id": "attempt-ap",
+                "message_id": "msg-ap",
+            }
+            store.put(pending)
+
+            # decision path
+            p, reason, batch = store.record_decision(
+                connection_id="conn-1",
+                player_name="Steve",
+                conversation_id="conv-1",
+                approval_id="ap1",
+                approved=True,
+            )
+            assert p is not None and reason is None
+            assert batch is not None
+
+            # expiry path
+            pending2 = _make_pending(approval_id="ap2", ttl=0.01, tool_call_id="tc2")
+            pending2.metadata = {
+                "trace_id": "trace-ap2",
+                "attempt_id": "attempt-ap2",
+                "message_id": "msg-ap2",
+            }
+            store.put(pending2)
+            time.sleep(0.02)
+            # trigger purge via get
+            assert store.get("conn-1", "Steve", "conv-1", "ap2") is None
+
+            await recorder.stop()
+            events = [
+                json.loads(line)
+                for line in Path(path).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            names = [e["event_name"] for e in events]
+            assert "approval.decided" in names
+            assert "approval.expired" in names
+            decided = next(e for e in events if e["event_name"] == "approval.decided")
+            assert decided["status"] == "accepted"
+            assert decided["attributes"]["approval_id"] == "ap1"
+        finally:
+            set_trace_recorder(None)
+
+    asyncio.run(_run())

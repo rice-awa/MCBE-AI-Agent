@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import suppress
 from typing import Any
 from uuid import UUID
@@ -20,6 +21,7 @@ from mcbe_ws_sdk.gateway.connection import ConnectionState
 from config.logging import get_logger
 from core.queue import MessageBroker
 from models.agent import MCColor, MCPrefix
+from core.session import DEFAULT_CONVERSATION_ID
 from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
 from models.messages import StreamChunk
 from models.messages import SystemNotification as HostSystemNotification
@@ -149,11 +151,19 @@ class BrokerResponseBridge:
 
     async def _stream_chunk(self, state: ConnectionState, chunk: StreamChunk) -> None:
         """Match legacy ConnectionManager._send_stream_chunk coloring/prefixes."""
+        start = time.perf_counter()
+        delivery_type = "scriptevent" if chunk.delivery == "scriptevent" else "tellraw"
+        target = chunk.target or chunk.player_name or "@a"
+        content_len = len(chunk.content or "")
+
+        # Early-return chunk types never leave the host — skip delivery.* so
+        # we do not orphan delivery.enqueued without started/completed.
+        if chunk.chunk_type == "thinking_end":
+            return
+
         if chunk.chunk_type == "thinking_start":
             message = f"{MCColor.GRAY}{MCPrefix.THINKING}思考中..."
             color = MCColor.GRAY
-        elif chunk.chunk_type == "thinking_end":
-            return
         elif chunk.chunk_type == "content":
             message = chunk.content
             color = MCColor.GREEN
@@ -176,21 +186,126 @@ class BrokerResponseBridge:
         if not message:
             return
 
+        self._emit_delivery(
+            "delivery.enqueued",
+            chunk,
+            status="info",
+            attributes={
+                "target": target,
+                "delivery_type": delivery_type,
+                "chunk_type": chunk.chunk_type,
+                "sequence": chunk.sequence,
+                "byte_count": content_len,
+                "chunk_count": 1,
+            },
+        )
+
         delivery = self._delivery(state)
         if delivery is None:
+            self._emit_delivery(
+                "delivery.failed",
+                chunk,
+                status="failed",
+                attributes={
+                    "target": target,
+                    "delivery_type": delivery_type,
+                    "chunk_type": chunk.chunk_type,
+                    "reason": "no_delivery",
+                    "byte_count": content_len,
+                    "chunk_count": 1,
+                },
+                duration_ms=int((time.perf_counter() - start) * 1000),
+            )
             return
 
-        if chunk.delivery == "scriptevent":
-            await delivery.send_scriptevent(message, source="stream_scriptevent")
-            return
-
-        target = chunk.target or chunk.player_name or "@a"
-        await delivery.send_tellraw(
-            message,
-            color=color,
-            source="stream_tellraw",
-            target=target,
+        self._emit_delivery(
+            "delivery.started",
+            chunk,
+            status="started",
+            attributes={
+                "target": target,
+                "delivery_type": delivery_type,
+                "chunk_type": chunk.chunk_type,
+                "byte_count": len(message),
+                "chunk_count": 1,
+            },
         )
+        try:
+            if chunk.delivery == "scriptevent":
+                await delivery.send_scriptevent(message, source="stream_scriptevent")
+            else:
+                await delivery.send_tellraw(
+                    message,
+                    color=color,
+                    source="stream_tellraw",
+                    target=target,
+                )
+            self._emit_delivery(
+                "delivery.completed",
+                chunk,
+                status="completed",
+                attributes={
+                    "target": target,
+                    "delivery_type": delivery_type,
+                    "chunk_type": chunk.chunk_type,
+                    "byte_count": len(message),
+                    "chunk_count": 1,
+                },
+                duration_ms=int((time.perf_counter() - start) * 1000),
+            )
+        except Exception as exc:
+            self._emit_delivery(
+                "delivery.failed",
+                chunk,
+                status="failed",
+                attributes={
+                    "target": target,
+                    "delivery_type": delivery_type,
+                    "chunk_type": chunk.chunk_type,
+                    "reason": type(exc).__name__,
+                    "byte_count": len(message),
+                    "chunk_count": 1,
+                },
+                duration_ms=int((time.perf_counter() - start) * 1000),
+            )
+            raise
+
+    def _emit_delivery(
+        self,
+        event_name: str,
+        chunk: StreamChunk,
+        *,
+        status: str = "info",
+        attributes: dict[str, Any] | None = None,
+        duration_ms: int | None = None,
+    ) -> None:
+        """Emit delivery.* events; never include chunk body or raw frames."""
+        trace_id = getattr(chunk, "trace_id", None)
+        attempt_id = getattr(chunk, "attempt_id", None)
+        if not trace_id or not attempt_id:
+            return
+        try:
+            from services.agent.trace import TraceContext, get_trace_recorder
+
+            conversation_id = getattr(chunk, "conversation_id", None) or DEFAULT_CONVERSATION_ID
+            context = TraceContext(
+                trace_id=str(trace_id),
+                run_id=str(trace_id),
+                attempt_id=str(attempt_id),
+                message_id=str(getattr(chunk, "id", "") or attempt_id),
+                connection_id=str(chunk.connection_id),
+                player_name=str(chunk.player_name or DEFAULT_PLAYER_DISPLAY_NAME),
+                conversation_id=str(conversation_id),
+            )
+            get_trace_recorder().emit(
+                event_name,
+                context,
+                status=status,  # type: ignore[arg-type]
+                duration_ms=duration_ms,
+                attributes=dict(attributes or {}),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("delivery_trace_emit_failed", event=event_name, error=str(exc))
 
     async def _system(
         self,

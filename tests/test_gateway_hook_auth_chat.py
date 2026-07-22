@@ -191,3 +191,80 @@ async def test_chat_submits_chat_request_without_blocking():
     assert req.player_name == "Steve"
     assert req.content == "你好"
     assert req.connection_id == cid
+
+
+@pytest.mark.asyncio
+async def test_chat_ingress_assigns_trace_id_before_enqueue():
+    settings = _settings(dev_mode=True)
+    broker = MessageBroker(max_size=10)
+    _hook, sessions, broker, handlers = _build_hook(settings=settings, broker=broker)
+    cid = uuid4()
+    sent: list[str] = []
+
+    async def send_payload(payload: str) -> None:
+        sent.append(payload)
+
+    state = ConnectionState(id=cid, send_payload=send_payload)
+    sessions.create(cid, authenticated=True)
+
+    await handlers.handle_chat(state, "hello", "tellraw", player_name="alex")
+    item = await asyncio.wait_for(broker.get_request(), timeout=1.0)
+    request = item.payload
+    assert request.trace_id == request.run_id
+    assert request.attempt_id
+    assert item.trace_context is not None
+    assert item.trace_context.trace_id == request.trace_id
+    assert item.trace_context.player_name == "alex"
+    assert item.enqueued_at_ns > 0
+
+
+@pytest.mark.asyncio
+async def test_approval_resume_keeps_trace_and_uses_new_attempt():
+    settings = _settings(dev_mode=True)
+    broker = MessageBroker(max_size=10)
+    _hook, sessions, broker, handlers = _build_hook(settings=settings, broker=broker)
+    cid = uuid4()
+    sent: list[str] = []
+
+    async def send_payload(payload: str) -> None:
+        sent.append(payload)
+
+    state = ConnectionState(id=cid, send_payload=send_payload)
+    sessions.create(cid, authenticated=True)
+
+    pending = SimpleNamespace(
+        run_id="trace-original",
+        use_context=True,
+        provider="deepseek",
+        delivery="tellraw",
+        broadcast_ai_chat=False,
+        batch_id="batch-1",
+        messages=[],
+        tool_name="run_minecraft_command",
+    )
+    completed_item = SimpleNamespace(
+        tool_call_id="tc1",
+        tool_name="run_minecraft_command",
+        decision=True,
+    )
+
+    await handlers._resume_from_completed_batch(
+        state,
+        completed_batch=[completed_item],
+        pending=pending,
+        owner="alex",
+        conversation_id="default",
+        player_name="alex",
+        source="tool_approve",
+    )
+    item = await asyncio.wait_for(broker.get_request(), timeout=1.0)
+    resumed = item.payload
+    assert resumed.trace_id == "trace-original"
+    assert resumed.run_id == "trace-original"
+    assert resumed.attempt_id
+    assert resumed.attempt_id != resumed.trace_id
+    assert resumed.attempt_id != "attempt-original"
+    assert item.trace_context is not None
+    assert item.trace_context.trace_id == "trace-original"
+    assert item.trace_context.attempt_id == resumed.attempt_id
+    assert item.trace_context.player_name == "alex"

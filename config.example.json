@@ -72,7 +72,13 @@
       "mcp_tool_allowlist": [],
       "tool_policy_version": "2026-07-21.1"
     },
-    "pydantic_ai_instrumentation": false
+    "pydantic_ai_instrumentation": false,
+    "agent_trace_enabled": false,
+    "agent_trace_include_content": false,
+    "agent_trace_path": "logs/agent_traces.jsonl",
+    "agent_trace_max_records": 10000,
+    "agent_trace_api_host": "127.0.0.1",
+    "agent_trace_api_port": 8787
   },
   "queue": {
     "max_size": 100,
