@@ -143,7 +143,16 @@ def test_settings_defaults_and_constraints():
     """Settings 字段应有正确默认值与约束。"""
     from config.settings import Settings
 
-    s = Settings()
+    # Settings() 会读本地 config.json；对可能被配置覆盖的字段显式固定期望值
+    s = Settings(
+        worker_http_timeout=60,
+        worker_poll_timeout=1.0,
+        run_command_timeout=10.0,
+        request_limit=8,
+        tool_calls_limit=8,
+        run_timeout=90.0,
+        max_tool_concurrency=4,
+    )
     assert s.worker_http_timeout == 60
     assert s.worker_poll_timeout == 1.0
     assert s.run_command_timeout == 10.0

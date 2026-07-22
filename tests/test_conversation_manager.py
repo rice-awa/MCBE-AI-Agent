@@ -105,7 +105,8 @@ class MockBroker:
 
 def test_conversation_manager_init():
     """测试 ConversationManager 初始化"""
-    settings = Settings()
+    # 显式传入轮数，避免被本地 config.json 覆盖
+    settings = Settings(max_history_turns=20)
     broker = MockBroker()
     manager = ConversationManager(broker, settings)
 

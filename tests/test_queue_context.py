@@ -944,8 +944,14 @@ def test_worker_sends_notification_when_auto_compression_runs(monkeypatch) -> No
             metadata={"is_complete": True, "all_messages": completed_messages},
         )
 
+    compress_calls = {"n": 0}
+
     async def _fake_check_and_compress(self, *args, **kwargs):
-        return True, "压缩完成(本地回退摘要): 5轮 -> 3轮"
+        # 请求前 / 响应后各会调用一次；仅首次触发压缩，避免重复通知
+        compress_calls["n"] += 1
+        if compress_calls["n"] == 1:
+            return True, "压缩完成(本地回退摘要): 5轮 -> 3轮"
+        return False, ""
 
     monkeypatch.setattr("services.agent.worker.stream_chat", _fake_stream_chat)
     monkeypatch.setattr("services.agent.core.get_agent_manager", lambda: _FakeManager())
@@ -970,6 +976,7 @@ def test_worker_sends_notification_when_auto_compression_runs(monkeypatch) -> No
         for item in list(response_queue._queue)
         if isinstance(item, SystemNotification)
     ]
+    assert compress_calls["n"] == 2
     assert len(notifications) == 1
     assert notifications[0].level == "info"
     assert "对话历史已自动压缩" in notifications[0].message

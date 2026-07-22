@@ -67,6 +67,7 @@ def _minecraft_config() -> SimpleNamespace:
         success_color="green",
         commands={},
         get_command_description=lambda _t: ("", ""),
+        ai_broadcast_default=True,
     )
 
 
