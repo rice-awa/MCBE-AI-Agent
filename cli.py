@@ -21,6 +21,24 @@ from services.auth.jwt_handler import JWTHandler
 logger = get_logger(__name__)
 
 
+async def _start_trace_recorder(settings: Any) -> None:
+    """Start process TraceRecorder from settings (no-op when disabled)."""
+    from services.agent.trace import get_trace_recorder
+
+    recorder = get_trace_recorder(settings)
+    await recorder.start()
+
+
+async def _stop_trace_recorder(settings: Any | None = None) -> None:
+    """Stop process TraceRecorder and flush remaining events (fail-soft)."""
+    from services.agent.trace import get_trace_recorder
+
+    try:
+        await get_trace_recorder(settings).stop()
+    except Exception as exc:  # noqa: BLE001 — shutdown must not fail hard
+        logger.warning("trace_recorder_stop_failed", error=str(exc))
+
+
 class Application:
     """MCBE AI Agent 应用"""
 
@@ -47,6 +65,9 @@ class Application:
             worker_count=self.settings.llm_worker_count,
             dev_mode=self.settings.dev_mode,
         )
+
+        # Trace journal writer must be running before workers accept traffic
+        await _start_trace_recorder(self.settings)
 
         agent_runtime = get_agent_runtime()
         mcp_connected = await agent_runtime.initialize(self.settings)
@@ -92,6 +113,9 @@ class Application:
 
         # 关闭 Agent runtime 维护的 MCP 和 Provider 资源
         await get_agent_runtime().shutdown()
+
+        # Flush remaining trace events after workers stop (no new emits)
+        await _stop_trace_recorder(self.settings)
 
         logger.info("application_stopped")
 
@@ -441,14 +465,15 @@ def trace_health():
     help="API 端口（默认 settings.agent_trace_api_port；0 表示系统分配）",
 )
 def trace_serve(host: str | None, port: int | None):
-    """启动本地只读 Trace API（及 web/trace 静态工作台）。"""
+    """启动本地只读 Trace API（及相对本仓库的 web/trace 静态工作台）。"""
     from services.agent.trace_api import TraceAPIServer
     from services.agent.trace_query import TraceQuery
 
     settings = get_settings()
     bind_host = host if host is not None else settings.agent_trace_api_host
     bind_port = port if port is not None else settings.agent_trace_api_port
-    static_dir = Path("web/trace")
+    # Resolve relative to this package/repo root, not process CWD
+    static_dir = Path(__file__).resolve().parent / "web" / "trace"
     query = TraceQuery(settings.agent_trace_path)
     server = TraceAPIServer(bind_host, bind_port, query, static_dir)
 
