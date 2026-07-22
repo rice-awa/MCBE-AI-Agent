@@ -45,10 +45,12 @@ from services.agent.block_ops.tools_impl import (
     apply_limits_to_payload,
     build_edit_payload,
     build_inspect_payload,
+    build_block_preflight_plan,
     edit_blocks_impl,
     inspect_block_impl,
     merge_canonical_from_preflight,
     run_block_preflight,
+    project_block_execute_args,
 )
 from services.agent.harness.execution import (
     HarnessCapability,
@@ -57,6 +59,7 @@ from services.agent.harness.execution import (
     hash_normalized_args,
     normalize_tool_args,
     reset_idempotency_store,
+    classify_tool_exception,
 )
 from services.agent.tool_results import ToolResult
 from services.agent.tools import iter_registered_tools, register_agent_tools
@@ -519,7 +522,7 @@ async def test_run_block_preflight_edit_canonicalizes() -> None:
     await ensure_block_capability(cid, bridge)
     deps = _Deps(connection_id=cid, addon_bridge=bridge)
     ctx = SimpleNamespace(deps=deps)
-    canonical, failure = await run_block_preflight(
+    plan, failure = await run_block_preflight(
         ctx,  # type: ignore[arg-type]
         "edit_blocks",
         {
@@ -531,9 +534,9 @@ async def test_run_block_preflight_edit_canonicalizes() -> None:
         },
     )
     assert failure is None
-    assert canonical is not None
-    assert canonical.get("phase") == "execute"
-    assert canonical.get("locked_targets")
+    assert plan is not None
+    assert plan.authorized_args.get("phase") == "execute"
+    assert plan.execute_args.get("locked_targets")
 
 
 @pytest.mark.asyncio
@@ -801,6 +804,17 @@ async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() 
     assert execute_args["to_pos"] == {"x": 4, "y": 64, "z": 3}
     assert "repairs_applied" not in execute_args
     assert "facing" not in execute_args
+    assert metadata["approval_metadata"] == {
+        "bounds": {
+            "min": {"x": 2, "y": 64, "z": 1},
+            "max": {"x": 4, "y": 64, "z": 3},
+        },
+        "repairs_applied": ["reversed_bounds"],
+        "facing": "south",
+        "player_origin": {"x": 100, "y": 64, "z": 100},
+        "before_samples": [{"type_id": "minecraft:air"}],
+        "future_preflight_evidence": {"source": "addon"},
+    }
 
     # Approval recovery must use the persisted strict execution projection,
     # not the in-process preflight cache or bridge-facing authorization args.
@@ -829,6 +843,48 @@ async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() 
     assert execute_calls[0]["locked_targets"] == locked_targets
 
 
+def test_block_preflight_plan_keeps_unknown_evidence_out_of_operation_args() -> None:
+    plan = build_block_preflight_plan(
+        "edit_blocks",
+        {
+            "type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute",
+            "dimension": "minecraft:overworld", "position": {"x": 1, "y": 64, "z": 1},
+        },
+        {
+            "locked_targets": [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}],
+            "repairs_applied": ["rounded"],
+            "future_evidence": {"version": 2},
+        },
+    )
+
+    assert plan.authorized_args["phase"] == "execute"
+    assert plan.execute_args["position"] == {"x": 1, "y": 64, "z": 1}
+    assert "future_evidence" not in plan.authorized_args
+    assert "future_evidence" not in plan.execute_args
+    assert plan.approval_metadata["future_evidence"] == {"version": 2}
+
+
+@pytest.mark.parametrize(
+    ("authorized_args", "message"),
+    [
+        ({"type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "position": {"x": 1}, "locked_targets": [{}], "phase": "preflight"}, "incomplete"),
+        ({"type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "position": {"x": 1}, "locked_targets": [], "phase": "execute"}, "incomplete"),
+        ({"type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "locked_targets": [{}], "phase": "execute"}, "place position"),
+        ({"type_id": "minecraft:stone", "mode": "batch", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "positions": [], "locked_targets": [{}], "phase": "execute"}, "non-empty batch"),
+        ({"type_id": "minecraft:stone", "mode": "fill", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "locked_targets": [{}], "phase": "execute"}, "fill bounds"),
+    ],
+)
+def test_corrupt_edit_approval_contract_is_rejected_before_bridge(
+    authorized_args: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        project_block_execute_args("edit_blocks", authorized_args)
+    result = classify_tool_exception(
+        ValueError(f"block preflight execution contract {message}"), tool_name="edit_blocks"
+    )
+    assert json.loads(result.output)["code"] == "INTERNAL_ERROR"
+
+
 @pytest.mark.asyncio
 async def test_harness_approved_edit_uses_preflight_cache() -> None:
     """After preflight cache is warm, approved call_tool executes once with locked args."""
@@ -854,18 +910,18 @@ async def test_harness_approved_edit_uses_preflight_cache() -> None:
     deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-pf-2")
     ctx = SimpleNamespace(deps=deps, tool_call_id="tc-1", tool_call_approved=False)
 
-    canonical, failure = await run_block_preflight(ctx, "edit_blocks", original_args)  # type: ignore[arg-type]
+    plan, failure = await run_block_preflight(ctx, "edit_blocks", original_args)  # type: ignore[arg-type]
     assert failure is None
-    assert canonical is not None
-    assert canonical.get("phase") == "execute"
-    assert canonical.get("locked_targets")
+    assert plan is not None
+    assert plan.authorized_args.get("phase") == "execute"
+    assert plan.authorized_args.get("locked_targets")
 
     original_hash = hash_normalized_args(normalize_tool_args(original_args))
     get_preflight_cache().put(
         run_id="run-pf-2",
         tool_call_id="tc-1",
         original_args_hash=original_hash,
-        canonical_args=canonical,
+        canonical_args=plan.authorized_args,
         connection_id=cid,
     )
 
@@ -891,11 +947,11 @@ async def test_harness_approved_edit_uses_preflight_cache() -> None:
     assert len(execute_calls) == 1
     assert execute_calls[0][1].get("locked_targets")
     # policy: edit requires approval unless approved
-    need = policy.decide("edit_blocks", normalize_tool_args(canonical), player_name="Steve")
+    need = policy.decide("edit_blocks", normalize_tool_args(plan.authorized_args), player_name="Steve")
     assert need.action == PolicyDecisionKind.REQUIRE_APPROVAL
     allow = policy.decide(
         "edit_blocks",
-        normalize_tool_args(canonical),
+        normalize_tool_args(plan.authorized_args),
         player_name="Steve",
         approved=True,
     )

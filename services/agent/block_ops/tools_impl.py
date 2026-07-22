@@ -66,6 +66,21 @@ def project_block_execute_args(tool_name: str, authorized_args: dict[str, Any]) 
     missing = [key for key in required if key not in projected]
     if missing or projected.get("phase") != "execute" or not projected.get("locked_targets"):
         raise ValueError("block preflight execution contract is incomplete")
+    if tool_name == "edit_blocks":
+        mode = projected["mode"]
+        if mode == "place" and not isinstance(projected.get("position"), dict):
+            raise ValueError("block preflight execution contract requires place position")
+        if mode == "batch" and not isinstance(projected.get("positions"), list):
+            raise ValueError("block preflight execution contract requires batch positions")
+        if mode == "batch" and not projected["positions"]:
+            raise ValueError("block preflight execution contract requires non-empty batch positions")
+        if mode == "fill" and (
+            not isinstance(projected.get("from_pos"), dict)
+            or not isinstance(projected.get("to_pos"), dict)
+        ):
+            raise ValueError("block preflight execution contract requires fill bounds")
+        if mode not in {"place", "batch", "fill"}:
+            raise ValueError("block preflight execution contract has invalid edit mode")
     return projected
 
 
@@ -485,11 +500,10 @@ async def run_block_preflight(
     ctx: RunContext[AgentDependencies],
     tool_name: str,
     tool_args: dict[str, Any],
-) -> tuple[dict[str, Any] | None, ToolResult | None]:
+) -> tuple[BlockPreflightPlan | dict[str, Any] | None, ToolResult | None]:
     """Run bridge preflight before harness policy.
 
-    Returns (canonical_args, failure). On success failure is None and
-    canonical_args is the approval/execution source of truth.
+    Returns (preflight_plan, failure). Absolute inspect may return direct args.
     """
     deps = ctx.deps
     unsupported = await _require_supported(ctx)
@@ -548,8 +562,7 @@ async def run_block_preflight(
             preflight_fields = {k: v for k, v in body.items() if k not in {"schema_version", "ok"}}
         else:
             preflight_fields = body if isinstance(body, dict) else {}
-        canonical = merge_canonical_from_preflight(tool_args, preflight_fields)
-        return canonical, None
+        return build_block_preflight_plan(tool_name, tool_args, preflight_fields), None
 
     if tool_name == "edit_blocks":
         mode = str(tool_args.get("mode") or "place")
@@ -612,8 +625,7 @@ async def run_block_preflight(
             preflight_fields = body
         else:
             preflight_fields = {}
-        canonical = merge_canonical_from_preflight(tool_args, preflight_fields)
-        return canonical, None
+        return build_block_preflight_plan(tool_name, tool_args, preflight_fields), None
 
     return dict(tool_args), None
 

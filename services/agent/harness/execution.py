@@ -501,6 +501,23 @@ class PolicyEngine:
 def classify_tool_exception(exc: BaseException, *, tool_name: str) -> ToolResult:
     text = str(exc) or exc.__class__.__name__
     lower = text.lower()
+    if tool_name in _BLOCK_OPS_TOOLS and "execution contract" in lower:
+        from services.agent.block_ops.schema import BlockErrorCode, build_error_response, dumps_payload
+
+        return ToolResult.failure(
+            dumps_payload(
+                build_error_response(
+                    BlockErrorCode.INTERNAL_ERROR,
+                    "方块工具内部参数处理失败；本次操作未发送到 Add-on",
+                    retryable=False,
+                    external_state_unknown=False,
+                    fallback_allowed=False,
+                )
+            ),
+            error_kind="INTERNAL",
+            retryable=False,
+            diagnostic_summary=text,
+        )
     if "timeout" in lower or "deadline" in lower:
         entry = get_tool_entry(tool_name)
         side_effect = bool(entry.may_have_external_side_effects) if entry is not None else True
@@ -573,9 +590,10 @@ class HarnessToolset(WrapperToolset[Any]):
         connection_id = str(getattr(deps, "connection_id", "") or "")
 
         # 0) Block tools: preflight / relative resolution BEFORE policy & approval.
-        # Canonical args become the source for approval summaries, hashes, audit, execute.
+        # Preflight plans separate authorization, execution projection, and evidence.
+        preflight_plan = None
         if name in _BLOCK_OPS_TOOLS:
-            preflight_failure, canonical_args = await self._preflight_block_tool(
+            preflight_failure, preflight_plan = await self._preflight_block_tool(
                 name=name,
                 tool_args=effective_args,
                 original_args_hash=original_args_hash,
@@ -595,8 +613,8 @@ class HarnessToolset(WrapperToolset[Any]):
                     result=preflight_failure,
                 )
                 return materialize_tool_result(preflight_failure)
-            if canonical_args is not None:
-                effective_args = canonical_args
+            if preflight_plan is not None:
+                effective_args = preflight_plan.authorized_args
 
         normalized = normalize_tool_args(effective_args)
         args_hash = hash_normalized_args(normalized)
@@ -672,9 +690,13 @@ class HarnessToolset(WrapperToolset[Any]):
                     "tool_name": name,
                     "normalized_args": normalized,
                     "args_hash": args_hash,
-                    "execute_args": execute_args,
+                    "execute_args": (
+                        preflight_plan.execute_args if preflight_plan is not None else execute_args
+                    ),
                     "execution_args_hash": hash_normalized_args(normalize_tool_args(execute_args)),
-                    "approval_metadata": {},
+                    "approval_metadata": (
+                        preflight_plan.approval_metadata if preflight_plan is not None else {}
+                    ),
                     "original_args_hash": original_args_hash,
                     "args_summary": summary,
                     "policy_version": decision.policy_version,
@@ -792,35 +814,39 @@ class HarnessToolset(WrapperToolset[Any]):
         run_id: str,
         tool_call_id: str,
         connection_id: str,
-    ) -> tuple[ToolResult | None, dict[str, Any] | None]:
-        """Run block-ops preflight; return (failure, canonical_args)."""
+    ) -> tuple[ToolResult | None, Any | None]:
+        """Run block-ops preflight; return (failure, separated plan)."""
         from services.agent.block_ops.preflight_cache import get_preflight_cache
-        from services.agent.block_ops.tools_impl import run_block_preflight
+        from services.agent.block_ops.tools_impl import BlockPreflightPlan, run_block_preflight
+
+        already_approved = bool(getattr(ctx, "tool_call_approved", False)) or bool(
+            getattr(getattr(ctx, "deps", None), "auto_approve_tools", False)
+        )
+        # Approved block calls are never allowed to fall back to cached/model
+        # arguments or a fresh preflight: the persisted override must validate.
+        if already_approved:
+            try:
+                execute_args = _python_tool_args(name, tool_args)
+            except ValueError as exc:
+                return classify_tool_exception(exc, tool_name=name), None
+            return None, BlockPreflightPlan(dict(tool_args), execute_args, {})
 
         # Reuse cached canonical args on approval recovery (same original hash).
         cache = get_preflight_cache()
         if run_id and tool_call_id:
             cached = cache.get(run_id, tool_call_id, original_args_hash)
             if cached is not None:
-                return None, dict(cached.canonical_args)
+                return None, BlockPreflightPlan(
+                    dict(cached.canonical_args),
+                    dict(cached.execute_args),
+                    dict(cached.approval_metadata),
+                )
             # Also accept lookup when tool_args already mark execute phase.
             if tool_args.get("phase") == "execute" and tool_args.get("locked_targets"):
-                return None, dict(tool_args)
-
-        already_approved = bool(getattr(ctx, "tool_call_approved", False)) or bool(
-            getattr(getattr(ctx, "deps", None), "auto_approve_tools", False)
-        )
-        # Approved block calls are never allowed to fall back to model args or a
-        # fresh preflight: the persisted override must already be executable.
-        if already_approved:
-            try:
-                _python_tool_args(name, tool_args)
-            except ValueError as exc:
-                return classify_tool_exception(exc, tool_name=name), None
-            return None, dict(tool_args)
+                return None, BlockPreflightPlan(dict(tool_args), _python_tool_args(name, tool_args), {})
 
         try:
-            canonical, failure = await run_block_preflight(ctx, name, tool_args)
+            plan_or_args, failure = await run_block_preflight(ctx, name, tool_args)
         except Exception as exc:
             classified = classify_tool_exception(exc, tool_name=name)
             return classified, None
@@ -828,20 +854,27 @@ class HarnessToolset(WrapperToolset[Any]):
         if failure is not None:
             return failure, None
 
-        if canonical is None:
-            return None, dict(tool_args)
+        if plan_or_args is None:
+            return None, BlockPreflightPlan(dict(tool_args), _python_tool_args(name, tool_args), {})
+
+        if isinstance(plan_or_args, BlockPreflightPlan):
+            plan = plan_or_args
+        else:
+            canonical = dict(plan_or_args)
+            plan = BlockPreflightPlan(canonical, _python_tool_args(name, canonical), {})
 
         if run_id and tool_call_id:
             cache.put(
                 run_id=run_id,
                 tool_call_id=tool_call_id,
                 original_args_hash=original_args_hash,
-                canonical_args=canonical,
-                execute_args=_python_tool_args(name, canonical),
-                preflight_payload=canonical,
+                canonical_args=plan.authorized_args,
+                execute_args=plan.execute_args,
+                approval_metadata=plan.approval_metadata,
+                preflight_payload=plan.approval_metadata,
                 connection_id=connection_id or None,
             )
-        return None, canonical
+        return None, plan
 
     def _audit(
         self,
