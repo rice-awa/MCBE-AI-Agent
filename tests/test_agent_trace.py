@@ -346,8 +346,22 @@ async def test_emit_never_raises_on_bad_status(tmp_path, context):
     path = tmp_path / "trace.jsonl"
     recorder = TraceRecorder(path=path, enabled=True, include_content=False)
     await recorder.start()
-    # Invalid status must not bubble to caller
+    # Invalid status must not bubble to caller; counted as dropped (contract fail)
     recorder.emit("trace.started", context, status="not-a-real-status")
+    assert recorder.dropped == 1
+    assert recorder.gap == 1
+    assert recorder.enqueued == 0
+    assert recorder.written == 0
+    assert not path.exists() or path.read_text(encoding="utf-8").strip() == ""
+
+    # Subsequent valid emit still works
+    recorder.emit("trace.started", context, status="started")
     await recorder.stop()
-    # Dropped as invalid or not written; either way no exception
-    assert recorder.dropped + recorder.write_failed + recorder.written + recorder.enqueued >= 0
+    assert recorder.enqueued == 1
+    assert recorder.written == 1
+    assert recorder.dropped == 1
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row["status"] == "started"
+    assert row["event_name"] == "trace.started"

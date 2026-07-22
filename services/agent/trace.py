@@ -355,7 +355,8 @@ class TraceRecorder:
                 await self._drain_remaining(queue)
                 break
             try:
-                self._append_line(str(item))
+                # Disk I/O off the event loop so agent paths stay responsive
+                await asyncio.to_thread(self._append_line, str(item))
                 self.written += 1
             except Exception as exc:  # noqa: BLE001
                 self.write_failed += 1
@@ -375,7 +376,7 @@ class TraceRecorder:
             if item is _STOP:
                 continue
             try:
-                self._append_line(str(item))
+                await asyncio.to_thread(self._append_line, str(item))
                 self.written += 1
             except Exception as exc:  # noqa: BLE001
                 self.write_failed += 1
@@ -383,7 +384,7 @@ class TraceRecorder:
                 logger.warning("trace_write_failed", error=str(exc), path=str(self.path))
 
     def _append_line(self, line: str) -> None:
-        """追加一行 JSON 并按 max_records 轮转（与 harness audit 语义类似）。"""
+        """追加一行 JSON 并按 max_records 轮转（同步；由 writer 经 to_thread 调用）。"""
         path = self.path
         path.parent.mkdir(parents=True, exist_ok=True)
         existing: list[str] = []
