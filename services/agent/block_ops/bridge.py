@@ -68,10 +68,9 @@ def map_addon_bridge_result(
     if ok is False:
         body: dict[str, Any]
         if isinstance(payload, dict):
-            code = payload.get("code") or default_error_code
-            body = _safe_addon_error_body(str(code))
+            body = _safe_addon_error_body(payload.get("code") or default_error_code)
         else:
-            body = _safe_addon_error_body(str(default_error_code))
+            body = _safe_addon_error_body(default_error_code)
 
         if failure_prefix:
             body["message"] = f"{failure_prefix}: {body['message']}"
@@ -134,15 +133,19 @@ def map_bridge_exception(
     )
 
 
-def _safe_addon_error_body(code: str) -> dict[str, Any]:
+def _safe_addon_error_body(code: Any) -> dict[str, Any]:
     """Return an external error envelope without mirroring bridge payload content."""
-    error_kind, retryable, external_unknown = _error_kind_for_code(code)
-    fallback_allowed = code == BlockErrorCode.ADDON_UNAVAILABLE
-    message = f"Addon 返回错误：{code}。"
+    try:
+        stable_code = BlockErrorCode(str(code))
+    except ValueError:
+        stable_code = BlockErrorCode.INTERNAL_ERROR
+    error_kind, retryable, external_unknown = _error_kind_for_code(stable_code)
+    fallback_allowed = stable_code == BlockErrorCode.ADDON_UNAVAILABLE
+    message = f"Addon 返回错误：{stable_code}。"
     if fallback_allowed:
         message += "可另行使用命令工具作为回退，但该命令仍需独立审批。"
     return build_error_response(
-        code,
+        stable_code,
         message,
         retryable=retryable,
         external_state_unknown=external_unknown,

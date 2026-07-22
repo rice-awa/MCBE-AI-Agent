@@ -297,6 +297,30 @@ def test_explicit_addon_errors_preserve_code_and_only_unavailable_allows_fallbac
         assert "独立审批" in body["message"]
 
 
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("token=bridge-secret", "safe"),
+        ("PROTECTED_BLOCK", "password=hunter2"),
+    ],
+)
+def test_addon_error_code_and_message_never_leak_untrusted_text(code: str, message: str) -> None:
+    result = map_addon_bridge_result(
+        {"ok": False, "payload": {"code": code, "message": message}}
+    )
+
+    body = json.loads(result.output)
+    assert "bridge-secret" not in result.output
+    assert "hunter2" not in result.output
+    assert "bridge-secret" not in (result.diagnostic_summary or "")
+    assert "hunter2" not in (result.diagnostic_summary or "")
+    if code == "PROTECTED_BLOCK":
+        assert body["code"] == "PROTECTED_BLOCK"
+    else:
+        assert body["code"] == "INTERNAL_ERROR"
+        assert body["fallback_allowed"] is False
+
+
 def test_limits_hard_clamp() -> None:
     settings = SimpleNamespace(
         addon=SimpleNamespace(
@@ -834,6 +858,59 @@ async def test_harness_preflight_exception_is_safe_projection_failure_and_is_log
         "external_state_unknown": False,
         "execution_stage": "projection",
     }
+
+
+@pytest.mark.asyncio
+async def test_harness_rejects_incomplete_non_deferred_execute_projection(monkeypatch) -> None:
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    )
+    register_agent_tools(agent)
+    captured: dict[str, Any] = {}
+
+    def capture(event: str, **fields: Any) -> None:
+        captured["event"] = event
+        captured.update(fields)
+
+    monkeypatch.setattr("services.agent.harness.execution.logger.error", capture)
+    calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return ModelResponse(parts=[TextPart(content="done")])
+        return ModelResponse(parts=[ToolCallPart(
+            tool_name="edit_blocks",
+            tool_call_id="tc-fast-projection",
+            args={
+                "type_id": "minecraft:stone", "mode": "place",
+                "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
+                "phase": "execute", "locked_targets": [{"x": 1, "y": 64, "z": 1}],
+            },
+        )])
+
+    result = await agent.run(
+        "edit",
+        model=FunctionModel(model_fn),
+        deps=_Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-fast-projection"),
+    )
+
+    assert "INTERNAL_ERROR" in str(result.all_messages())
+    assert not any(
+        name == "edit_blocks" and payload.get("phase") == "execute"
+        for name, payload in bridge.calls
+    )
+    assert captured["event"] == "tool_execution_failed"
+    assert captured["execution_stage"] == "projection"
+    assert captured["run_id"] == "run-fast-projection"
+    assert captured["tool_call_id"] == "tc-fast-projection"
 @pytest.mark.asyncio
 async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() -> None:
     locked_targets = [

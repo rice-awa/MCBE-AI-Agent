@@ -589,6 +589,21 @@ def log_tool_execution_failed(
     )
 
 
+def _projection_failure(ctx: Any, tool_name: str, exc: ValueError) -> ToolResult:
+    """Classify and log an invalid block execution projection once."""
+    classified = classify_tool_exception(
+        exc, tool_name=tool_name, execution_stage="projection"
+    )
+    log_tool_execution_failed(
+        tool_name=tool_name,
+        ctx=ctx,
+        result=classified,
+        execution_stage="projection",
+        error_type=exc.__class__.__name__,
+    )
+    return classified
+
+
 def materialize_tool_result(result: Any) -> Any:
     """将 ToolResult 转为模型可消费的文本，其它类型原样返回。"""
     if isinstance(result, ToolResult):
@@ -951,7 +966,11 @@ class HarnessToolset(WrapperToolset[Any]):
                 )
             # Also accept lookup when tool_args already mark execute phase.
             if tool_args.get("phase") == "execute" and tool_args.get("locked_targets"):
-                return None, BlockPreflightPlan(dict(tool_args), _python_tool_args(name, tool_args), {})
+                try:
+                    execute_args = _python_tool_args(name, tool_args)
+                except ValueError as exc:
+                    return _projection_failure(ctx, name, exc), None
+                return None, BlockPreflightPlan(dict(tool_args), execute_args, {})
 
         try:
             plan_or_args, failure = await run_block_preflight(ctx, name, tool_args)
@@ -972,13 +991,21 @@ class HarnessToolset(WrapperToolset[Any]):
             return failure, None
 
         if plan_or_args is None:
-            return None, BlockPreflightPlan(dict(tool_args), _python_tool_args(name, tool_args), {})
+            try:
+                execute_args = _python_tool_args(name, tool_args)
+            except ValueError as exc:
+                return _projection_failure(ctx, name, exc), None
+            return None, BlockPreflightPlan(dict(tool_args), execute_args, {})
 
         if isinstance(plan_or_args, BlockPreflightPlan):
             plan = plan_or_args
         else:
             canonical = dict(plan_or_args)
-            plan = BlockPreflightPlan(canonical, _python_tool_args(name, canonical), {})
+            try:
+                execute_args = _python_tool_args(name, canonical)
+            except ValueError as exc:
+                return _projection_failure(ctx, name, exc), None
+            plan = BlockPreflightPlan(canonical, execute_args, {})
 
         if run_id and tool_call_id:
             cache.put(

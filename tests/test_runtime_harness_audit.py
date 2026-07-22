@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 
 from config.settings import Settings
+from config.redaction import redact_exception
 from services.agent.harness.audit import (
     AuditWriter,
     build_audit_record,
@@ -409,6 +410,22 @@ def test_audit_exception_redacts_sensitive_values_but_keeps_correlation() -> Non
     assert "bridge-secret" not in tool_dumped
     assert "hunter2" not in tool_dumped
     assert "Bearer abcdef" not in tool_dumped
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        '{"nested":{"api_key":"json-secret","authorization":"Bearer json-bearer"}}',
+        "{'token': 'repr-secret', 'nested': {'password': 'repr-password'}}",
+    ],
+)
+def test_redact_exception_handles_structured_and_python_repr_secrets(detail: str) -> None:
+    redacted = redact_exception(RuntimeError(detail))
+
+    assert redacted is not None
+    assert "RuntimeError" in redacted
+    for secret in ("json-secret", "json-bearer", "repr-secret", "repr-password"):
+        assert secret not in redacted
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+import json
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -80,9 +81,29 @@ def redact_exception(exc: BaseException | str | None, max_length: int = DEFAULT_
     if exc is None:
         return None
     if isinstance(exc, BaseException):
-        text = f"{type(exc).__name__}: {exc}"
+        prefix = f"{type(exc).__name__}: "
+        raw_text = str(exc)
     else:
-        text = str(exc)
+        prefix = ""
+        raw_text = str(exc)
+    try:
+        parsed = json.loads(raw_text)
+    except (TypeError, ValueError):
+        text = prefix + raw_text
+    else:
+        text = prefix + json.dumps(
+            _truncate_value(parsed, max_length),
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        return truncate_for_log(text, max_length)
+    text = re.sub(
+        r"(?i)(['\"]?(?:token|password|passwd|secret|api[_-]?key|authorization)['\"]?\s*:\s*)"
+        r"(['\"])(?:bearer\s+)?[^'\"]*\2",
+        r"\1\2[REDACTED]\2",
+        text,
+    )
     text = re.sub(
         r"(?i)\b(token|password|passwd|secret|api[_-]?key|authorization)\s*[=:]\s*"
         r"(?:bearer\s+)?[^,\s)\]}]+",
