@@ -1100,11 +1100,12 @@ class CommandHandlers:
             or received_ids != expected_ids
             or len(received_ids) != len(completed_batch)
         )
-        expected_call_ids = {
-            call.tool_call_id
+        expected_calls = {
+            call.tool_call_id: call.tool_name
             for call in list(pending.requests.approvals) + list(pending.requests.calls)
         }
         seen_call_ids: set[str] = set()
+        seen_expected_call_ids: set[str] = set()
         for item in completed_batch:
             if (
                 item.connection_id != str(state.id)
@@ -1115,12 +1116,16 @@ class CommandHandlers:
                 or item.is_expired()
                 or item.decision is None
                 or not item.tool_call_id
-                or item.tool_call_id not in expected_call_ids
+                or item.tool_call_id != item.expected_tool_call_id
+                or item.expected_tool_call_id not in expected_calls
+                or expected_calls[item.expected_tool_call_id] != item.tool_name
                 or item.tool_call_id in seen_call_ids
+                or item.expected_tool_call_id in seen_expected_call_ids
             ):
                 invalid_batch = True
                 break
             seen_call_ids.add(item.tool_call_id)
+            seen_expected_call_ids.add(item.expected_tool_call_id)
 
         if invalid_batch:
             msg = self.protocol.create_error_message("审批批次校验失败，未恢复工具调用")

@@ -337,6 +337,11 @@ async def test_gateway_approval_resume_uses_override_only_for_block_tools() -> N
     }
     block.execute_args = dict(block.normalized_args)
     block.execution_args_hash = hash_normalized_args(normalize_tool_args(block.execute_args))
+    block.requests.approvals[0] = ToolCallPart(
+        tool_name="edit_blocks",
+        args=block.normalized_args,
+        tool_call_id="tc-block",
+    )
     regular = _make_pending(approval_id="r", tool_call_id="tc-regular")
     regular.connection_id = str(state.id)
     block.batch_id = regular.batch_id = "batch"
@@ -395,3 +400,53 @@ async def test_gateway_rejects_tampered_block_execution_hash_before_resume() -> 
 
     handler.broker.submit_request.assert_not_awaited()
     handler._send_player_reply.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_approval_rejects_swapped_original_tool_call_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实审批命令路径不得把同批记录换绑到另一条 deferred call。"""
+    store = PendingApprovalStore(default_ttl_seconds=120.0)
+    monkeypatch.setattr(
+        "services.agent.runtime.get_agent_runtime",
+        lambda: SimpleNamespace(get_pending_approval_store=lambda _settings: store),
+    )
+    handler = object.__new__(CommandHandlers)
+    handler.protocol = MagicMock()
+    handler.protocol.create_success_message.return_value = "ok"
+    handler.protocol.create_info_message.return_value = "info"
+    handler.protocol.create_error_message.return_value = "invalid"
+    handler._send_player_reply = AsyncMock()
+    handler.broker = MagicMock()
+    handler.settings = MagicMock()
+    handler.broker.get_active_conversation_id.return_value = "conv-1"
+    handler.broker.submit_request = AsyncMock()
+    session = SimpleNamespace(current_provider="test")
+    handler._require_host = lambda _state: SimpleNamespace(
+        get_player_session=lambda _owner: session,
+        should_auto_approve_tools=lambda *_args: False,
+    )
+    state = SimpleNamespace(id=uuid4(), _player_name="Steve")
+    now = time.time()
+    requests = DeferredToolRequests(
+        approvals=[
+            ToolCallPart(tool_name="run_minecraft_command", args={"command": "a"}, tool_call_id="tc-a"),
+            ToolCallPart(tool_name="run_minecraft_command", args={"command": "b"}, tool_call_id="tc-b"),
+        ]
+    )
+    first = _make_pending(approval_id="ap-a", tool_call_id="tc-b", batch_id="batch", sibling_ids=["ap-a", "ap-b"])
+    second = _make_pending(approval_id="ap-b", tool_call_id="tc-a", batch_id="batch", sibling_ids=["ap-a", "ap-b"])
+    for pending, expected_id in ((first, "tc-a"), (second, "tc-b")):
+        pending.connection_id = str(state.id)
+        pending.requests = requests
+        pending.expected_tool_call_id = expected_id
+        pending.created_at = now
+        pending.expires_at = now + 120
+        store.put(pending)
+
+    await handler.handle_tool_approval(state, "ap-a", approved=True, player_name="Steve")
+    await handler.handle_tool_approval(state, "ap-b", approved=True, player_name="Steve")
+
+    handler.broker.submit_request.assert_not_awaited()
+    assert handler._send_player_reply.await_count >= 3

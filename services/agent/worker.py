@@ -1175,6 +1175,7 @@ class AgentWorker:
                 conversation_id=request.conversation_id,
                 run_id=request.run_id or str(metadata.get("run_id") or ""),
                 tool_call_id=call.tool_call_id,
+                expected_tool_call_id=call.tool_call_id,
                 tool_name=call.tool_name,
                 normalized_args=normalized_args,
                 execute_args=execute_args,

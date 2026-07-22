@@ -969,6 +969,20 @@ async def test_place_and_batch_approval_resume_execute_only_frozen_targets(
     assert edit_payloads[-1]["locked_targets"] == locked_targets
     assert edit_payloads[-1]["dimension"] == locked_targets[0]["dimension"]
 
+    repeated = await agent.run(
+        message_history=first.all_messages(),
+        deferred_tool_results=DeferredToolResults(
+            approvals={approval.tool_call_id: ToolApproved(override_args=execute_args)}
+        ),
+        model=FunctionModel(model_fn),
+        deps=deps,
+    )
+    assert not isinstance(repeated.output, DeferredToolRequests)
+    repeated_payloads = [
+        payload for capability, payload in bridge.calls if capability == "edit_blocks"
+    ]
+    assert [payload["phase"] for payload in repeated_payloads] == ["preflight", "execute"]
+
 
 @pytest.mark.asyncio
 async def test_relative_inspect_executes_frozen_public_projection_only() -> None:

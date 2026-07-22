@@ -48,12 +48,17 @@ class PendingApproval:
     metadata: dict[str, Any] = field(default_factory=dict)
     execute_args: dict[str, Any] = field(default_factory=dict)
     execution_args_hash: str = ""
+    expected_tool_call_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.batch_id:
             self.batch_id = self.approval_id
         if not self.sibling_approval_ids:
             self.sibling_approval_ids = [self.approval_id]
+        # Keep compatibility with callers constructed before this field existed,
+        # while preserving the original deferred call identity thereafter.
+        if not self.expected_tool_call_id:
+            self.expected_tool_call_id = self.tool_call_id
 
     def is_expired(self, now: float | None = None) -> bool:
         return (now if now is not None else time.time()) >= self.expires_at
