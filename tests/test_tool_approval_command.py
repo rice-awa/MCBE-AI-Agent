@@ -22,6 +22,7 @@ from pydantic_ai.tools import DeferredToolRequests
 from config.settings import MinecraftConfig
 from mcbe_ws_sdk.command.registry import CommandRegistry
 from services.agent.harness.approvals import PendingApproval, PendingApprovalStore
+from services.agent.harness.execution import hash_normalized_args, normalize_tool_args
 from services.gateway.session_store import HostSessionStore
 from services.gateway.command_handlers import CommandHandlers
 
@@ -327,6 +328,7 @@ async def test_gateway_approval_resume_uses_override_only_for_block_tools() -> N
     )
     state = SimpleNamespace(id=uuid4())
     block = _make_pending(approval_id="b", tool_call_id="tc-block")
+    block.connection_id = str(state.id)
     block.tool_name = "edit_blocks"
     block.normalized_args = {
         "type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute",
@@ -334,7 +336,19 @@ async def test_gateway_approval_resume_uses_override_only_for_block_tools() -> N
         "locked_targets": [{"x": 1, "y": 64, "z": 1}], "phase": "execute",
     }
     block.execute_args = dict(block.normalized_args)
+    block.execution_args_hash = hash_normalized_args(normalize_tool_args(block.execute_args))
     regular = _make_pending(approval_id="r", tool_call_id="tc-regular")
+    regular.connection_id = str(state.id)
+    block.batch_id = regular.batch_id = "batch"
+    block.sibling_approval_ids = regular.sibling_approval_ids = ["b", "r"]
+    block.requests.approvals.append(
+        ToolCallPart(
+            tool_name="run_minecraft_command",
+            args={"command": "x"},
+            tool_call_id="tc-regular",
+        )
+    )
+    regular.requests = block.requests
     block.decision = regular.decision = True
 
     await handler._resume_from_completed_batch(
@@ -345,3 +359,39 @@ async def test_gateway_approval_resume_uses_override_only_for_block_tools() -> N
     payload = handler.broker.submit_request.await_args.args[1].deferred_tool_results["approvals"]
     assert payload["tc-block"] == {"kind": "tool-approved", "override_args": block.execute_args}
     assert payload["tc-regular"] is True
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_tampered_block_execution_hash_before_resume() -> None:
+    """已批准方块操作的执行投影哈希必须与审批记录一致。"""
+    handler = object.__new__(CommandHandlers)
+    handler.protocol = MagicMock()
+    handler.protocol.create_error_message.return_value = "invalid"
+    handler._send_player_reply = AsyncMock()
+    handler.broker = MagicMock()
+    handler.broker.submit_request = AsyncMock()
+    handler._require_host = lambda _state: SimpleNamespace(
+        get_player_session=lambda _owner: SimpleNamespace(current_provider="test"),
+        should_auto_approve_tools=lambda *_args: False,
+    )
+    state = SimpleNamespace(id=uuid4())
+    block = _make_pending(approval_id="b", tool_call_id="tc-block")
+    block.connection_id = str(state.id)
+    block.tool_name = "edit_blocks"
+    block.normalized_args = {
+        "type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld", "position": {"x": 1, "y": 64, "z": 1},
+        "locked_targets": [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}],
+        "phase": "execute",
+    }
+    block.execute_args = dict(block.normalized_args)
+    block.execution_args_hash = "tampered"
+    block.decision = True
+
+    await handler._resume_from_completed_batch(
+        state, completed_batch=[block], pending=block, owner="Steve",
+        conversation_id="conv-1", player_name="Steve", source="test",
+    )
+
+    handler.broker.submit_request.assert_not_awaited()
+    handler._send_player_reply.assert_awaited_once()

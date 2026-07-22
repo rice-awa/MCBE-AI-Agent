@@ -1088,6 +1088,47 @@ class CommandHandlers:
         source: str,
     ) -> None:
         host = self._require_host(state)
+        # The store validates these before popping a completed batch. Recheck at
+        # the gateway boundary because the following payload resumes a persisted
+        # model history and can trigger a world mutation.
+        from services.agent.harness.execution import hash_normalized_args, normalize_tool_args
+
+        expected_ids = set(pending.sibling_approval_ids)
+        received_ids = {item.approval_id for item in completed_batch}
+        invalid_batch = (
+            not completed_batch
+            or received_ids != expected_ids
+            or len(received_ids) != len(completed_batch)
+        )
+        expected_call_ids = {
+            call.tool_call_id
+            for call in list(pending.requests.approvals) + list(pending.requests.calls)
+        }
+        seen_call_ids: set[str] = set()
+        for item in completed_batch:
+            if (
+                item.connection_id != str(state.id)
+                or item.player_name != owner
+                or item.conversation_id != conversation_id
+                or item.batch_id != pending.batch_id
+                or item.run_id != pending.run_id
+                or item.is_expired()
+                or item.decision is None
+                or not item.tool_call_id
+                or item.tool_call_id not in expected_call_ids
+                or item.tool_call_id in seen_call_ids
+            ):
+                invalid_batch = True
+                break
+            seen_call_ids.add(item.tool_call_id)
+
+        if invalid_batch:
+            msg = self.protocol.create_error_message("审批批次校验失败，未恢复工具调用")
+            await self._send_player_reply(
+                state, msg, source=source, player_name=player_name
+            )
+            return
+
         approvals_payload: dict[str, Any] = {}
         for item in completed_batch:
             if item.decision is True:
@@ -1106,6 +1147,18 @@ class CommandHandlers:
                         return
                     if expected_execute_args != item.execute_args:
                         msg = self.protocol.create_error_message("方块工具审批参数不一致")
+                        await self._send_player_reply(
+                            state, msg, source=source, player_name=player_name
+                        )
+                        return
+                    actual_execute_hash = hash_normalized_args(
+                        normalize_tool_args(item.execute_args)
+                    )
+                    if (
+                        not item.execution_args_hash
+                        or item.execution_args_hash != actual_execute_hash
+                    ):
+                        msg = self.protocol.create_error_message("方块工具审批参数哈希不一致")
                         await self._send_player_reply(
                             state, msg, source=source, player_name=player_name
                         )

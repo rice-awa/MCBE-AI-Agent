@@ -844,6 +844,241 @@ async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "original_args", "locked_targets"),
+    [
+        (
+            "place",
+            {
+                "type_id": "minecraft:gold_block",
+                "mode": "place",
+                "coordinate_mode": "player_relative",
+                "position": {"forward": 2, "right": 1, "up": 0},
+            },
+            [{"dimension": "minecraft:overworld", "x": 42, "y": 70, "z": -8}],
+        ),
+        (
+            "batch",
+            {
+                "type_id": "minecraft:gold_block",
+                "mode": "batch",
+                "coordinate_mode": "absolute",
+                "dimension": "minecraft:the_nether",
+                "positions": [{"x": 3, "y": 65, "z": 4}, {"x": 5, "y": 65, "z": 4}],
+            },
+            [
+                {"dimension": "minecraft:the_nether", "x": 3, "y": 65, "z": 4},
+                {"dimension": "minecraft:the_nether", "x": 5, "y": 65, "z": 4},
+            ],
+        ),
+    ],
+)
+async def test_place_and_batch_approval_resume_execute_only_frozen_targets(
+    mode: str,
+    original_args: dict[str, Any],
+    locked_targets: list[dict[str, Any]],
+) -> None:
+    """真实 defer/resume 只执行批准时的绝对计划，预检缓存不是恢复依赖。"""
+    player_state = {"position": {"x": 40, "y": 70, "z": -10}, "facing": "north"}
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {
+                "ok": True,
+                "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}},
+            }
+        if capability == "edit_blocks" and payload.get("phase") == "preflight":
+            return {
+                "ok": True,
+                "payload": {
+                    "ok": True,
+                    "phase": "preflight",
+                    "mode": mode,
+                    "coordinate_mode": "absolute",
+                    "dimension": locked_targets[0]["dimension"],
+                    "position": {
+                        key: locked_targets[0][key] for key in ("x", "y", "z")
+                    },
+                    "positions": [
+                        {key: target[key] for key in ("x", "y", "z")}
+                        for target in locked_targets
+                    ],
+                    "locked_targets": locked_targets,
+                    "player_origin": player_state["position"],
+                    "facing": player_state["facing"],
+                },
+            }
+        if capability == "edit_blocks" and payload.get("phase") == "execute":
+            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": len(locked_targets)}}
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR", "message": "unexpected"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    )
+    register_agent_tools(agent)
+    model_calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 1:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="edit_blocks", tool_call_id=f"tc-{mode}", args=original_args,
+            )])
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id=f"run-{mode}")
+    first = await agent.run("edit", model=FunctionModel(model_fn), deps=deps)
+    assert isinstance(first.output, DeferredToolRequests)
+    approval = first.output.approvals[0]
+    execute_args = first.output.metadata[approval.tool_call_id]["execute_args"]
+    assert execute_args["locked_targets"] == locked_targets
+    assert execute_args["dimension"] == locked_targets[0]["dimension"]
+    if mode == "place":
+        assert execute_args["position"] == {"x": 42, "y": 70, "z": -8}
+    else:
+        assert execute_args["positions"] == [{"x": 3, "y": 65, "z": 4}, {"x": 5, "y": 65, "z": 4}]
+
+    # Simulate movement/turning while waiting. The execute request must never
+    # consult this state again, and cache eviction must not change the result.
+    player_state.update(position={"x": 900, "y": 10, "z": 900}, facing="south")
+    reset_preflight_cache()
+    second = await agent.run(
+        message_history=first.all_messages(),
+        deferred_tool_results=DeferredToolResults(
+            approvals={approval.tool_call_id: ToolApproved(override_args=execute_args)}
+        ),
+        model=FunctionModel(model_fn),
+        deps=deps,
+    )
+
+    assert not isinstance(second.output, DeferredToolRequests)
+    edit_payloads = [payload for capability, payload in bridge.calls if capability == "edit_blocks"]
+    tool_contents = [
+        str(getattr(part, "content", ""))
+        for message in second.all_messages()
+        for part in getattr(message, "parts", [])
+    ]
+    assert [payload["phase"] for payload in edit_payloads] == ["preflight", "execute"], tool_contents
+    assert edit_payloads[-1]["locked_targets"] == locked_targets
+    assert edit_payloads[-1]["dimension"] == locked_targets[0]["dimension"]
+
+
+@pytest.mark.asyncio
+async def test_relative_inspect_executes_frozen_public_projection_only() -> None:
+    """相对查询的展示元数据不能流入 inspect_block 的公开 Python 调用。"""
+    locked_targets = [{"dimension": "minecraft:overworld", "x": 12, "y": 68, "z": -4}]
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {
+                "ok": True,
+                "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}},
+            }
+        if capability == "inspect_block" and payload.get("phase") == "preflight":
+            return {
+                "ok": True,
+                "payload": {
+                    "ok": True,
+                    "phase": "preflight",
+                    "locked_targets": locked_targets,
+                    "dimension": "minecraft:overworld",
+                    "position": {"x": 12, "y": 68, "z": -4},
+                    "facing": "east",
+                    "player_origin": {"x": 10, "y": 68, "z": -4},
+                    "new_evidence": {"ignored": True},
+                },
+            }
+        if capability == "inspect_block" and payload.get("phase") == "execute":
+            return {"ok": True, "payload": {"ok": True, "phase": "execute", "block": {}}}
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR", "message": "unexpected"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent: Agent[_Deps, str] = Agent(
+        "test", deps_type=_Deps, output_type=str,
+        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    )
+    received_args: dict[str, Any] = {}
+
+    @agent.tool
+    async def inspect_block(
+        ctx: RunContext[_Deps],
+        coordinate_mode: str = "absolute",
+        dimension: str | None = None,
+        position: dict[str, Any] | None = None,
+        positions: list[dict[str, Any]] | None = None,
+        locked_targets: list[dict[str, Any]] | None = None,
+        phase: str | None = None,
+    ) -> str:
+        received_args.update({
+            "coordinate_mode": coordinate_mode, "dimension": dimension,
+            "position": position, "positions": positions,
+            "locked_targets": locked_targets, "phase": phase,
+        })
+        return str(await inspect_block_impl(
+            ctx, coordinate_mode=coordinate_mode, dimension=dimension,
+            position=position, positions=positions, locked_targets=locked_targets, phase=phase,
+        ))
+
+    calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="inspect_block", tool_call_id="tc-inspect-relative",
+                args={"coordinate_mode": "player_relative", "position": {"forward": 2, "right": 0, "up": 0}},
+            )])
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    result = await agent.run(
+        "inspect", model=FunctionModel(model_fn),
+        deps=_Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-inspect-relative"),
+    )
+
+    assert result.output == "done"
+    assert received_args == {
+        "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld",
+        "position": {"x": 12, "y": 68, "z": -4},
+        "positions": None,
+        "locked_targets": locked_targets,
+        "phase": "execute",
+    }
+    inspect_payloads = [payload for capability, payload in bridge.calls if capability == "inspect_block"]
+    assert [payload["phase"] for payload in inspect_payloads] == ["preflight", "execute"]
+    assert inspect_payloads[-1]["locked_targets"] == locked_targets
+
+
+def test_unknown_preflight_metadata_does_not_change_execute_projection_hash() -> None:
+    original = {
+        "type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld", "position": {"x": 1, "y": 64, "z": 1},
+    }
+    locked = [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}]
+    first = build_block_preflight_plan("edit_blocks", original, {"locked_targets": locked})
+    second = build_block_preflight_plan(
+        "edit_blocks", original,
+        {"locked_targets": locked, "future_metadata": {"facing": "north"}},
+    )
+
+    assert first.execute_args == second.execute_args
+    assert hash_normalized_args(normalize_tool_args(first.execute_args)) == hash_normalized_args(
+        normalize_tool_args(second.execute_args)
+    )
+    assert second.approval_metadata["future_metadata"] == {"facing": "north"}
+
+
+@pytest.mark.asyncio
 async def test_auto_approved_edit_preflights_then_executes_locked_operation() -> None:
     bridge = _FakeBridge()
     cid = str(uuid4())

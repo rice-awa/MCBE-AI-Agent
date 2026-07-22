@@ -476,6 +476,22 @@ def merge_canonical_from_preflight(
                 canonical["dimension"] = bounds["dimension"]
             canonical["coordinate_mode"] = "absolute"
 
+    # Preflight evidence can include both a representative position and a
+    # positions list. Public edit_blocks accepts exactly the target shape for
+    # its mode, so keep only the frozen shape that will be executed.
+    mode = canonical.get("mode") or original_args.get("mode") or "place"
+    if mode == "place":
+        canonical.pop("positions", None)
+        canonical.pop("from", None)
+        canonical.pop("to", None)
+    elif mode == "batch":
+        canonical.pop("position", None)
+        canonical.pop("from", None)
+        canonical.pop("to", None)
+    elif mode == "fill":
+        canonical.pop("position", None)
+        canonical.pop("positions", None)
+
     # Mark as ready for execute phase.
     canonical["phase"] = "execute"
     return canonical

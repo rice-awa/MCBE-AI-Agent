@@ -493,7 +493,7 @@ async def test_multi_deferred_approvals_require_full_results_then_execute_only_a
 
     step = {"n": 0}
 
-    def model_fn(messages, info):
+    async def model_fn(messages, info):
         step["n"] += 1
         if step["n"] == 1:
             return ModelResponse(
