@@ -447,6 +447,21 @@ def test_redact_exception_scrubs_all_structured_string_leaves(detail: str) -> No
         assert secret not in redacted
 
 
+def test_redact_exception_handles_hyphen_and_underscore_sensitive_key_aliases() -> None:
+    redacted = redact_exception(
+        RuntimeError(
+            "api-key=api-secret access-key=access-secret private-key=private-secret "
+            "x_api_key=x-api-secret set_cookie=cookie-secret"
+        )
+    )
+
+    assert redacted is not None
+    for secret in (
+        "api-secret", "access-secret", "private-secret", "x-api-secret", "cookie-secret",
+    ):
+        assert secret not in redacted
+
+
 @pytest.mark.asyncio
 async def test_shutdown_flush_persists_queued_records(tmp_path):
     audit_path = tmp_path / "runtime_harness_tools.jsonl"

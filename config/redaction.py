@@ -34,7 +34,8 @@ _SENSITIVE_KEYS = frozenset({
     "credential",
 })
 _SENSITIVE_KEY_PATTERN = "|".join(
-    re.escape(key).replace(r"\_", r"[-_]?") for key in _SENSITIVE_KEYS
+    r"[-_]?".join(re.escape(part) for part in key.replace("-", "_").split("_"))
+    for key in _SENSITIVE_KEYS
 )
 
 _SENSITIVE_QUERY_KEYS = frozenset(
