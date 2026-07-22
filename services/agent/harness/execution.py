@@ -819,12 +819,10 @@ class HarnessToolset(WrapperToolset[Any]):
         from services.agent.block_ops.preflight_cache import get_preflight_cache
         from services.agent.block_ops.tools_impl import BlockPreflightPlan, run_block_preflight
 
-        already_approved = bool(getattr(ctx, "tool_call_approved", False)) or bool(
-            getattr(getattr(ctx, "deps", None), "auto_approve_tools", False)
-        )
+        deferred_approved = bool(getattr(ctx, "tool_call_approved", False))
         # Approved block calls are never allowed to fall back to cached/model
         # arguments or a fresh preflight: the persisted override must validate.
-        if already_approved:
+        if deferred_approved:
             try:
                 execute_args = _python_tool_args(name, tool_args)
             except ValueError as exc:

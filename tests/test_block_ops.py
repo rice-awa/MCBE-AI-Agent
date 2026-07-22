@@ -843,6 +843,100 @@ async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() 
     assert execute_calls[0]["locked_targets"] == locked_targets
 
 
+@pytest.mark.asyncio
+async def test_auto_approved_edit_preflights_then_executes_locked_operation() -> None:
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    )
+    register_agent_tools(agent)
+    calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return ModelResponse(parts=[TextPart(content="done")])
+        return ModelResponse(parts=[ToolCallPart(
+            tool_name="edit_blocks", tool_call_id="tc-auto", args={
+                "type_id": "minecraft:stone", "mode": "place",
+                "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
+                "position": {"x": 9, "y": 64, "z": 9},
+            },
+        )])
+
+    result = await agent.run(
+        "place a block", model=FunctionModel(model_fn),
+        deps=_Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(),
+                   run_id="run-auto", auto_approve_tools=True),
+    )
+
+    assert not isinstance(result.output, DeferredToolRequests)
+    phases = [payload.get("phase") for name, payload in bridge.calls if name == "edit_blocks"]
+    assert phases == ["preflight", "execute"]
+    execute_payload = [payload for name, payload in bridge.calls if name == "edit_blocks"][-1]
+    assert execute_payload["locked_targets"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("args", "mutate"),
+    [
+        ({"type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "position": {"x": 1, "y": 64, "z": 1}}, lambda value: value.update(phase="preflight")),
+        ({"type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "position": {"x": 1, "y": 64, "z": 1}}, lambda value: value.update(locked_targets=[])),
+        ({"type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "position": {"x": 1, "y": 64, "z": 1}}, lambda value: value.pop("position")),
+        ({"type_id": "minecraft:stone", "mode": "batch", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "positions": [{"x": 1, "y": 64, "z": 1}]}, lambda value: value.pop("positions")),
+        ({"type_id": "minecraft:stone", "mode": "fill", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "from_pos": {"x": 1, "y": 64, "z": 1}, "to_pos": {"x": 2, "y": 64, "z": 1}}, lambda value: value.pop("to_pos")),
+    ],
+)
+async def test_corrupt_approved_override_never_executes_block_bridge(
+    args: dict[str, Any], mutate: Any
+) -> None:
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test", deps_type=_Deps, output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    )
+    register_agent_tools(agent)
+    calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return ModelResponse(parts=[TextPart(content="done")])
+        return ModelResponse(parts=[ToolCallPart(
+            tool_name="edit_blocks", tool_call_id="tc-corrupt", args=args,
+        )])
+
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-corrupt")
+    first = await agent.run("edit", model=FunctionModel(model_fn), deps=deps)
+    assert isinstance(first.output, DeferredToolRequests)
+    approval = first.output.approvals[0]
+    override_args = dict(first.output.metadata[approval.tool_call_id]["execute_args"])
+    mutate(override_args)
+    result = await agent.run(
+        message_history=first.all_messages(),
+        deferred_tool_results=DeferredToolResults(
+            approvals={approval.tool_call_id: ToolApproved(override_args=override_args)}
+        ),
+        model=FunctionModel(model_fn), deps=deps,
+    )
+
+    assert "INTERNAL_ERROR" in str(result.all_messages())
+    assert not any(
+        name == "edit_blocks" and payload.get("phase") == "execute"
+        for name, payload in bridge.calls
+    )
+
+
 def test_block_preflight_plan_keeps_unknown_evidence_out_of_operation_args() -> None:
     plan = build_block_preflight_plan(
         "edit_blocks",
