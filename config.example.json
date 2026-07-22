@@ -31,10 +31,10 @@
     }
   },
   "agent": {
-    "system_prompt": "你是一个MCBE助手，请始终保持积极友好的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown",
+    "system_prompt": "你是一个MCBE助手，请始终保持积极友好的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown，不要生成任何emoji",
     "enable_reasoning_output": true,
-    "max_history_turns": 20,
-    "agent_retries": 2,
+    "max_history_turns": 50,
+    "agent_retries": 3,
     "worker_http_timeout": 60,
     "worker_poll_timeout": 1.0,
     "run_command_timeout": 10.0,
@@ -54,7 +54,7 @@
     "output_tokens_limit": null,
     "total_tokens_limit": null,
     "run_timeout": 90.0,
-    "max_tool_concurrency": 4,
+    "max_tool_concurrency": 6,
     "context_output_reserve_tokens": 1024,
     "count_tokens_before_request": true,
     "runtime_harness": {
@@ -174,6 +174,7 @@
       }
     },
     "welcome_message_template": "-----------\n成功连接 MCBE AI Agent v{version}\n连接 ID: {connection_id}...\n当前模型: {provider}/{model}\n上下文: {context_status}\n-----------\n使用 \"{help_command}\" 查看可用命令",
+    "ai_broadcast_default": true,
     "context_enabled_text": "启用",
     "context_disabled_text": "关闭",
     "error_prefix": "❌ 错误: ",

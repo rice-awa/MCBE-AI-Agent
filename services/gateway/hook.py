@@ -79,6 +79,7 @@ class HostConnectionHook(NoOpHook):
         self.sessions.create(
             state.id,
             authenticated=self.settings.dev_mode,
+            ai_broadcast_all=self.settings.minecraft.ai_broadcast_default,
         )
         self.broker.register_connection(state.id)
         await self.bridge.start(state)

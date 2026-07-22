@@ -118,6 +118,31 @@ def test_agent_run_budget_defaults_when_absent(tmp_path, monkeypatch):
     assert settings.context_output_reserve_tokens == 1024
 
 
+def test_minecraft_ai_broadcast_default_loaded_from_json(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    write_json_config(
+        tmp_path,
+        {
+            "minecraft": {
+                "ai_broadcast_default": False,
+            }
+        },
+    )
+
+    settings = Settings()
+
+    assert settings.minecraft.ai_broadcast_default is False
+
+
+def test_minecraft_ai_broadcast_default_is_true_by_default(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    write_json_config(tmp_path, {"minecraft": {}})
+
+    settings = Settings()
+
+    assert settings.minecraft.ai_broadcast_default is True
+
+
 def test_agent_compression_settings_are_optional_in_runtime_config(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("SECRET_KEY", "test-secret")
@@ -137,6 +162,7 @@ def test_agent_compression_settings_are_optional_in_runtime_config(tmp_path, mon
     assert settings.compression_keep_recent_turns == 8
     assert settings.compression_summary_max_chars == 2000
     assert settings.compression_timeout == 30
+    assert settings.minecraft.ai_broadcast_default is True
 
 
 def test_agent_compression_settings_validate_ranges(tmp_path, monkeypatch):

@@ -144,6 +144,9 @@ class MinecraftConfig(BaseModel):
 -----------
 使用 "{help_command}" 查看可用命令"""
 
+    # 新连接默认是否开启 AI 全服广播（运行时仍可用 `AGENT 广播` 调整）
+    ai_broadcast_default: bool = True
+
     # 状态文本
     context_enabled_text: str = "启用"
     context_disabled_text: str = "关闭"
@@ -758,10 +761,10 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3"
 
     # Agent 配置
-    system_prompt: str = "请始终保持积极和专业的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown"
+    system_prompt: str = "请始终保持积极和专业的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown，不要生成任何emoji"
     enable_reasoning_output: bool = True
-    max_history_turns: int = 20
-    agent_retries: int = Field(default=2, ge=0)
+    max_history_turns: int = 50
+    agent_retries: int = Field(default=3, ge=0)
     worker_http_timeout: int = Field(default=60, ge=1)
     worker_poll_timeout: float = Field(default=1.0, gt=0)
     run_command_timeout: float = Field(default=10.0, gt=0)

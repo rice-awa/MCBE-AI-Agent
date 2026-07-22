@@ -501,9 +501,11 @@ AGENT 对话 list            # 查看当前连接内的对话
 AGENT 上下文 启用          # 启用携带当前对话历史
 AGENT 上下文 关闭          # 关闭携带历史但不清除对话
 AGENT 上下文 状态          # 查看上下文开关与当前对话状态
-AGENT 广播 状态           # 查看 AI 聊天广播策略
+AGENT 广播 状态           # 查看 AI 聊天广播策略（默认全服开启，见 config minecraft.ai_broadcast_default）
+AGENT 广播 全服 关闭      # 关闭 AI 全服广播
 AGENT 广播 全服 开启      # 开启 AI 全服广播
 AGENT 广播 玩家 <名> 开启 # 指定玩家开启广播
+AGENT 广播 关闭           # 关闭全服并清空指定玩家名单
 切换模型 openai          # 切换到 OpenAI
 切换模型 deepseek        # 切换回 DeepSeek
 帮助                     # 显示帮助信息

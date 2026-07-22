@@ -157,7 +157,7 @@ MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多
 - `storage.conversations_dir` / `storage.tokens_file`
 - `logging.level` / `logging.enable_file_logging` / `logging.log_dir` / `logging.files.*` / `logging.rotation_*`
 - `mcp.enabled` / `mcp.servers`
-- `minecraft.commands`
+- `minecraft.commands` / `minecraft.ai_broadcast_default`（新连接默认 AI 全服广播，默认 true）
 - `websocket.*`
 - `model_metadata.*`
 

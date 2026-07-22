@@ -64,6 +64,7 @@ class CommandHandlers:
             host = self.sessions.create(
                 state.id,
                 authenticated=self.dev_mode,
+                ai_broadcast_all=self.settings.minecraft.ai_broadcast_default,
             )
         return host
 
