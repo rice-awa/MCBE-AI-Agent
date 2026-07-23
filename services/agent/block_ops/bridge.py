@@ -158,14 +158,15 @@ def map_bridge_exception(
     if pre_mutation:
         body = build_error_response(
             BlockErrorCode.LIMIT_EXCEEDED,
-            (
-                "方块桥接出站帧超出 MCBE commandLine 字节预算，请求未发送；"
-                "请缩小体积/批次数后重试，勿用命令回退绕过审批。"
-            ),
+            "出站帧超出 MCBE commandLine 字节预算，请求未发送。",
             retryable=True,
             external_state_unknown=False,
             fallback_allowed=False,
             reason="command_line_budget",
+            hint=(
+                "减小 batch.positions 数量或 fill AABB；继续使用 batch/fill，"
+                "禁止拆成大量 place（禁止 place 风暴）；勿用命令绕过审批。"
+            ),
         )
         return ToolResult.failure(
             dumps_payload(body),

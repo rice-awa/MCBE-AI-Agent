@@ -16,7 +16,11 @@ from services.agent.block_ops.capability import (
     BlockCapabilityStatus,
     ensure_block_capability,
 )
-from services.agent.block_ops.config import get_block_tools_limits
+from services.agent.block_ops.config import (
+    DEFAULT_COMMAND_LINE_BYTE_BUDGET,
+    get_block_tools_limits,
+    get_command_line_byte_budget,
+)
 from services.agent.block_ops.preflight_cache import get_preflight_cache
 from services.agent.block_ops.schema import (
     BlockErrorCode,
@@ -30,6 +34,15 @@ logger = get_logger(__name__)
 BLOCK_TOOL_NAMES = frozenset({"inspect_block", "edit_blocks"})
 CoordinateMode = Literal["absolute", "player_relative"]
 EditMode = Literal["place", "batch", "fill"]
+
+# Stable request_id length matching production ``addon-{uuid4().hex}`` (38 chars).
+_BRIDGE_REQUEST_ID_PLACEHOLDER = f"addon-{'0' * 32}"
+_BRIDGE_REQ_PREFIX = "scriptevent mcbews:bridge_req "
+_COMMAND_LINE_BUDGET_HINT = (
+    "减小 batch.positions 数量或 fill AABB；继续使用 batch/fill，"
+    "禁止拆成大量 place（禁止 place 风暴）；勿用命令绕过审批。"
+)
+_COMMAND_LINE_BUDGET_MESSAGE = "出站帧超出 MCBE commandLine 字节预算，请求未发送。"
 
 
 @dataclass(frozen=True)
@@ -340,6 +353,136 @@ def _aabb_volume(from_pos: dict[str, Any], to_pos: dict[str, Any]) -> int | None
         return dx * dy * dz
     except (TypeError, ValueError):
         return None
+
+
+def estimate_bridge_command_line_bytes(
+    capability: str,
+    payload: dict[str, Any],
+    *,
+    request_id: str = _BRIDGE_REQUEST_ID_PLACEHOLDER,
+) -> int:
+    """Estimate MCBE ``commandLine`` UTF-8 bytes for a bridge capability request.
+
+    Mirrors SDK ``encode_bridge_request`` wire shape:
+    ``scriptevent mcbews:bridge_req`` + compact JSON
+    ``{v, request_id, capability, payload}`` (separators ``(",", ":")``).
+    """
+    wire = {
+        "v": 2,
+        "request_id": request_id,
+        "capability": capability,
+        "payload": payload,
+    }
+    body = json.dumps(wire, ensure_ascii=False, separators=(",", ":"))
+    return len((_BRIDGE_REQ_PREFIX + body).encode("utf-8"))
+
+
+def _suggested_max_discrete_for_budget(
+    capability: str,
+    payload: dict[str, Any],
+    *,
+    budget: int,
+) -> int | None:
+    """Largest ``positions`` count that still fits under budget, if applicable."""
+    positions = payload.get("positions")
+    if not isinstance(positions, list) or not positions:
+        return None
+    if estimate_bridge_command_line_bytes(capability, payload) < budget:
+        return None
+
+    lo, hi = 0, len(positions)
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        trial = dict(payload)
+        trial["positions"] = positions[:mid]
+        if estimate_bridge_command_line_bytes(capability, trial) < budget:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best if best > 0 else 0
+
+
+def command_line_budget_exceeded_result(
+    *,
+    estimated_bytes: int,
+    budget: int = DEFAULT_COMMAND_LINE_BYTE_BUDGET,
+    suggested_max_discrete: int | None = None,
+    matched_count: int | None = None,
+    volume: int | None = None,
+) -> ToolResult:
+    """Host-side LIMIT when the outbound bridge frame would exceed commandLine budget."""
+    fields: dict[str, Any] = {
+        "retryable": True,
+        "external_state_unknown": False,
+        "fallback_allowed": False,
+        "reason": "command_line_budget",
+        "hint": _COMMAND_LINE_BUDGET_HINT,
+        "estimated_bytes": estimated_bytes,
+        "budget": budget,
+    }
+    if suggested_max_discrete is not None:
+        fields["suggested_max_discrete"] = suggested_max_discrete
+    if matched_count is not None:
+        fields["matched_count"] = matched_count
+    if volume is not None:
+        fields["volume"] = volume
+    body = build_error_response(
+        BlockErrorCode.LIMIT_EXCEEDED,
+        _COMMAND_LINE_BUDGET_MESSAGE,
+        **fields,
+    )
+    return ToolResult.failure(
+        dumps_payload(body),
+        error_kind="INVALID_ARGUMENT",
+        retryable=True,
+        external_state_unknown=False,
+        diagnostic_summary=(
+            f"command_line_budget estimated={estimated_bytes} budget={budget}"
+        ),
+    )
+
+
+def check_bridge_command_line_budget(
+    capability: str,
+    payload: dict[str, Any],
+    *,
+    budget: int | None = None,
+    matched_count: int | None = None,
+    volume: int | None = None,
+) -> ToolResult | None:
+    """Return LIMIT ToolResult when estimated wire size is at/over budget; else None."""
+    limit = DEFAULT_COMMAND_LINE_BYTE_BUDGET if budget is None else int(budget)
+    estimated = estimate_bridge_command_line_bytes(capability, payload)
+    if estimated < limit:
+        return None
+    suggested = _suggested_max_discrete_for_budget(
+        capability, payload, budget=limit
+    )
+    # Prefer explicit matched_count; fall back to positions / locked length.
+    effective_matched = matched_count
+    if effective_matched is None:
+        positions = payload.get("positions")
+        if isinstance(positions, list):
+            effective_matched = len(positions)
+        else:
+            locked = payload.get("locked_targets")
+            if isinstance(locked, list):
+                effective_matched = len(locked)
+    effective_volume = volume
+    if effective_volume is None:
+        from_pos = payload.get("from")
+        to_pos = payload.get("to")
+        if isinstance(from_pos, dict) and isinstance(to_pos, dict):
+            effective_volume = _aabb_volume(from_pos, to_pos)
+    return command_line_budget_exceeded_result(
+        estimated_bytes=estimated,
+        budget=limit,
+        suggested_max_discrete=suggested,
+        matched_count=effective_matched,
+        volume=effective_volume,
+    )
 
 
 def compact_locked_targets_for_wire(
@@ -721,6 +864,21 @@ async def run_block_preflight(
             phase="preflight",
             limits=limits_payload,
         )
+        budget = get_command_line_byte_budget(deps.settings)
+        preflight_volume = (
+            _aabb_volume(from_pos, to_pos)
+            if isinstance(from_pos, dict) and isinstance(to_pos, dict)
+            else None
+        )
+        budget_fail = check_bridge_command_line_budget(
+            "edit_blocks",
+            payload,
+            budget=budget,
+            volume=preflight_volume,
+        )
+        if budget_fail is not None:
+            return None, budget_fail
+
         result = await call_block_capability(deps.addon_bridge, "edit_blocks", payload)
         if not result.is_success:
             return None, result
@@ -742,7 +900,49 @@ async def run_block_preflight(
             preflight_fields = body
         else:
             preflight_fields = {}
-        return build_block_preflight_plan(tool_name, tool_args, preflight_fields), None
+        plan = build_block_preflight_plan(tool_name, tool_args, preflight_fields)
+
+        # Reject before approval when the post-omit execute frame would still overflow.
+        exec_args = plan.execute_args
+        exec_from = exec_args.get("from_pos") or exec_args.get("from")
+        exec_to = exec_args.get("to_pos") or exec_args.get("to")
+        exec_payload = build_edit_payload(
+            mode=str(exec_args.get("mode") or mode),
+            coordinate_mode=str(exec_args.get("coordinate_mode") or coord_mode),
+            dimension=exec_args.get("dimension"),
+            position=exec_args.get("position") if isinstance(exec_args.get("position"), dict) else None,
+            positions=exec_args.get("positions") if isinstance(exec_args.get("positions"), list) else None,
+            from_pos=exec_from if isinstance(exec_from, dict) else None,
+            to_pos=exec_to if isinstance(exec_to, dict) else None,
+            type_id=str(exec_args.get("type_id") or tool_args.get("type_id") or ""),
+            states=exec_args.get("states"),
+            replace_any=bool(exec_args.get("replace_any", False)),
+            expected_previous=exec_args.get("expected_previous"),
+            player_name=deps.player_name,
+            phase="execute",
+            locked_targets=(
+                exec_args.get("locked_targets")
+                if isinstance(exec_args.get("locked_targets"), list)
+                else None
+            ),
+        )
+        locked = exec_args.get("locked_targets")
+        matched_count = len(locked) if isinstance(locked, list) else None
+        exec_volume = (
+            _aabb_volume(exec_from, exec_to)
+            if isinstance(exec_from, dict) and isinstance(exec_to, dict)
+            else preflight_volume
+        )
+        execute_budget_fail = check_bridge_command_line_budget(
+            "edit_blocks",
+            exec_payload,
+            budget=budget,
+            matched_count=matched_count,
+            volume=exec_volume,
+        )
+        if execute_budget_fail is not None:
+            return None, execute_budget_fail
+        return plan, None
 
     return dict(tool_args), None
 
@@ -880,6 +1080,7 @@ async def edit_blocks_impl(
         },
     )
     locked_on_wire = payload.get("locked_targets")
+    estimated_wire = estimate_bridge_command_line_bytes("edit_blocks", payload)
     logger.info(
         "edit_blocks_bridge_payload",
         connection_id=_connection_id(deps),
@@ -899,6 +1100,27 @@ async def edit_blocks_impl(
         payload_bytes=len(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         ),
+        estimated_command_line_bytes=estimated_wire,
         omitted_locked_targets="locked_targets" not in payload and bool(locked_targets),
     )
+    budget = get_command_line_byte_budget(deps.settings)
+    volume = (
+        _aabb_volume(from_pos, to_pos)
+        if isinstance(from_pos, dict) and isinstance(to_pos, dict)
+        else None
+    )
+    matched_count = (
+        len(locked_targets)
+        if isinstance(locked_targets, list)
+        else (len(positions) if isinstance(positions, list) else None)
+    )
+    budget_fail = check_bridge_command_line_budget(
+        "edit_blocks",
+        payload,
+        budget=budget,
+        matched_count=matched_count,
+        volume=volume,
+    )
+    if budget_fail is not None:
+        return budget_fail
     return await call_block_capability(deps.addon_bridge, "edit_blocks", payload)

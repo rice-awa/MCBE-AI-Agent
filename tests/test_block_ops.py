@@ -28,8 +28,10 @@ from services.agent.block_ops.capability import (
     reset_block_capability_cache,
 )
 from services.agent.block_ops.config import (
+    DEFAULT_COMMAND_LINE_BYTE_BUDGET,
     HARD_MAX_DISCRETE_POSITIONS,
     get_block_tools_limits,
+    get_command_line_byte_budget,
 )
 from services.agent.block_ops.preflight_cache import (
     get_preflight_cache,
@@ -46,7 +48,9 @@ from services.agent.block_ops.tools_impl import (
     build_edit_payload,
     build_inspect_payload,
     build_block_preflight_plan,
+    check_bridge_command_line_budget,
     edit_blocks_impl,
+    estimate_bridge_command_line_bytes,
     inspect_block_impl,
     merge_canonical_from_preflight,
     run_block_preflight,
@@ -266,8 +270,64 @@ def test_edit_bridge_frame_too_large_is_limit_not_unknown() -> None:
     assert body["code"] == "LIMIT_EXCEEDED"
     assert body["external_state_unknown"] is False
     assert body["retryable"] is True
+    assert body["fallback_allowed"] is False
+    assert body["reason"] == "command_line_budget"
     assert result.external_state_unknown is False
     assert "未发送" in body["message"] or "字节预算" in body["message"]
+    assert "place" in body.get("hint", "").lower() or "禁止" in body.get("hint", "")
+
+
+def test_estimate_bridge_command_line_bytes_matches_sdk_shape() -> None:
+    payload = {
+        "mode": "fill",
+        "coordinate_mode": "absolute",
+        "type_id": "minecraft:oak_planks",
+        "replace_any": False,
+        "player_name": "Steve",
+        "phase": "execute",
+        "dimension": "minecraft:overworld",
+        "from": {"x": -797, "y": 93, "z": 180},
+        "to": {"x": -793, "y": 93, "z": 184},
+    }
+    estimated = estimate_bridge_command_line_bytes("edit_blocks", payload)
+    wire = {
+        "v": 2,
+        "request_id": "addon-" + ("0" * 32),
+        "capability": "edit_blocks",
+        "payload": payload,
+    }
+    manual = "scriptevent mcbews:bridge_req " + json.dumps(
+        wire, ensure_ascii=False, separators=(",", ":")
+    )
+    assert estimated == len(manual.encode("utf-8"))
+    assert estimated < DEFAULT_COMMAND_LINE_BYTE_BUDGET
+
+
+def test_sparse_fill_execute_omit_estimated_under_budget() -> None:
+    locked = [
+        {"dimension": "minecraft:overworld", "x": -797 + i, "y": 93, "z": 180}
+        for i in range(6)
+    ]
+    payload = build_edit_payload(
+        mode="fill",
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        position=None,
+        positions=None,
+        from_pos={"x": -797, "y": 93, "z": 180},
+        to_pos={"x": -793, "y": 93, "z": 184},
+        type_id="minecraft:oak_planks",
+        states=None,
+        replace_any=False,
+        expected_previous=None,
+        player_name="tester",
+        phase="execute",
+        locked_targets=locked,
+    )
+    assert "locked_targets" not in payload
+    estimated = estimate_bridge_command_line_bytes("edit_blocks", payload)
+    assert estimated < DEFAULT_COMMAND_LINE_BYTE_BUDGET
+    assert check_bridge_command_line_budget("edit_blocks", payload) is None
 
 
 def test_build_edit_payload_omits_locked_targets_on_fill_execute() -> None:
@@ -937,6 +997,88 @@ async def test_edit_blocks_limit_exceeded() -> None:
     assert not result.is_success
     body = json.loads(result.output)
     assert body["code"] == "LIMIT_EXCEEDED"
+
+
+@pytest.mark.asyncio
+async def test_edit_blocks_oversized_batch_precheck_limit_without_bridge() -> None:
+    """Huge batch.positions → host commandLine budget LIMIT; bridge never called."""
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    capability_calls = list(bridge.calls)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+    # Under max_discrete_positions (256) but still blows the 461 B wire budget.
+    positions = [{"x": i, "y": 64, "z": 0} for i in range(20)]
+    result = await edit_blocks_impl(
+        ctx,  # type: ignore[arg-type]
+        mode="batch",
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        positions=positions,
+        type_id="minecraft:dirt",
+        phase="execute",
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "LIMIT_EXCEEDED"
+    assert body["reason"] == "command_line_budget"
+    assert body["retryable"] is True
+    assert body["fallback_allowed"] is False
+    assert body["external_state_unknown"] is False
+    assert "未发送" in body["message"]
+    assert "place" in body["hint"].lower() or "禁止" in body["hint"]
+    assert "suggested_max_discrete" in body
+    # Only capability probe; no edit_blocks request.
+    edit_calls = [c for c in bridge.calls if c[0] == "edit_blocks"]
+    assert edit_calls == []
+    assert len(bridge.calls) == len(capability_calls)
+
+
+@pytest.mark.asyncio
+async def test_run_block_preflight_rejects_oversized_batch_before_bridge() -> None:
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+    positions = [{"x": i, "y": 64, "z": 0} for i in range(20)]
+    plan, failure = await run_block_preflight(
+        ctx,  # type: ignore[arg-type]
+        "edit_blocks",
+        {
+            "mode": "batch",
+            "coordinate_mode": "absolute",
+            "dimension": "minecraft:overworld",
+            "positions": positions,
+            "type_id": "minecraft:dirt",
+        },
+    )
+    assert plan is None
+    assert failure is not None
+    body = json.loads(failure.output)
+    assert body["code"] == "LIMIT_EXCEEDED"
+    assert body["reason"] == "command_line_budget"
+    assert "hint" in body
+    assert any(k in body["hint"] for k in ("place", "batch", "fill"))
+    assert not any(c[0] == "edit_blocks" for c in bridge.calls)
+
+
+def test_get_command_line_byte_budget_reads_flow_control() -> None:
+    assert get_command_line_byte_budget(None) == DEFAULT_COMMAND_LINE_BYTE_BUDGET
+    assert get_command_line_byte_budget(SimpleNamespace()) == DEFAULT_COMMAND_LINE_BYTE_BUDGET
+    assert (
+        get_command_line_byte_budget(
+            SimpleNamespace(flow_control=SimpleNamespace(command_line_byte_budget=400))
+        )
+        == 400
+    )
+    assert (
+        get_command_line_byte_budget(
+            SimpleNamespace(flow_control={"command_line_byte_budget": 500})
+        )
+        == 500
+    )
 
 
 @pytest.mark.asyncio

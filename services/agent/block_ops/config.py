@@ -13,6 +13,8 @@ HARD_MAX_CELLS_PER_TICK = 512
 DEFAULT_MAX_DISCRETE_POSITIONS = 256
 DEFAULT_MAX_FILL_VOLUME = 4096
 DEFAULT_CELLS_PER_TICK = 128
+# MCBE commandLine hard budget (empirically ~461 B); mirrors Settings.flow_control.
+DEFAULT_COMMAND_LINE_BYTE_BUDGET = 461
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,26 @@ class BlockToolsLimits:
 
 def _clamp(value: int, *, minimum: int, hard_max: int) -> int:
     return max(minimum, min(int(value), hard_max))
+
+
+def get_command_line_byte_budget(settings: Any | None = None) -> int:
+    """Read MCBE commandLine byte budget from settings.flow_control (default 461)."""
+    if settings is None:
+        return DEFAULT_COMMAND_LINE_BYTE_BUDGET
+    flow = getattr(settings, "flow_control", None)
+    if flow is None:
+        return DEFAULT_COMMAND_LINE_BYTE_BUDGET
+    if isinstance(flow, dict):
+        raw = flow.get("command_line_byte_budget", DEFAULT_COMMAND_LINE_BYTE_BUDGET)
+    else:
+        raw = getattr(flow, "command_line_byte_budget", DEFAULT_COMMAND_LINE_BYTE_BUDGET)
+    try:
+        budget = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_COMMAND_LINE_BYTE_BUDGET
+    if budget <= 0:
+        return DEFAULT_COMMAND_LINE_BYTE_BUDGET
+    return budget
 
 
 def get_block_tools_limits(settings: Any | None = None) -> BlockToolsLimits:
