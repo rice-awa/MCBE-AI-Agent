@@ -355,6 +355,58 @@ def _aabb_volume(from_pos: dict[str, Any], to_pos: dict[str, Any]) -> int | None
         return None
 
 
+def _request_fill_aabb(
+    args: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Extract fill corner pair from request args (from/to or from_pos/to_pos)."""
+    from_pos = args.get("from") if isinstance(args.get("from"), dict) else None
+    to_pos = args.get("to") if isinstance(args.get("to"), dict) else None
+    if from_pos is None and isinstance(args.get("from_pos"), dict):
+        from_pos = args["from_pos"]
+    if to_pos is None and isinstance(args.get("to_pos"), dict):
+        to_pos = args["to_pos"]
+    if (
+        isinstance(from_pos, dict)
+        and isinstance(to_pos, dict)
+        and all(k in from_pos for k in ("x", "y", "z"))
+        and all(k in to_pos for k in ("x", "y", "z"))
+    ):
+        return from_pos, to_pos
+    return None, None
+
+
+def _normalize_aabb_corners(
+    from_pos: dict[str, Any],
+    to_pos: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return min/max ordered corners for stable fill authorization."""
+    try:
+        xs = sorted((int(from_pos["x"]), int(to_pos["x"])))
+        ys = sorted((int(from_pos["y"]), int(to_pos["y"])))
+        zs = sorted((int(from_pos["z"]), int(to_pos["z"])))
+        return (
+            {"x": xs[0], "y": ys[0], "z": zs[0]},
+            {"x": xs[1], "y": ys[1], "z": zs[1]},
+        )
+    except (KeyError, TypeError, ValueError):
+        return from_pos, to_pos
+
+
+def _locked_targets_aabb(
+    locked: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Fallback AABB from sparse locked cell list (min/max only)."""
+    xs = [int(t["x"]) for t in locked if isinstance(t, dict) and "x" in t]
+    ys = [int(t["y"]) for t in locked if isinstance(t, dict) and "y" in t]
+    zs = [int(t["z"]) for t in locked if isinstance(t, dict) and "z" in t]
+    if not xs or not ys or not zs:
+        return None, None
+    return (
+        {"x": min(xs), "y": min(ys), "z": min(zs)},
+        {"x": max(xs), "y": max(ys), "z": max(zs)},
+    )
+
+
 def estimate_bridge_command_line_bytes(
     capability: str,
     payload: dict[str, Any],
@@ -636,7 +688,12 @@ def merge_canonical_from_preflight(
     original_args: dict[str, Any],
     preflight_payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build approval/execution canonical args from preflight response payload."""
+    """Build approval/execution canonical args from preflight response payload.
+
+    For fill, authorized ``from``/``to`` keep the **request AABB** (or full
+    preflight bounds) and are never shrunk to sparse ``locked_targets`` min/max.
+    ``locked_targets`` is still stored in full for audit and idempotency.
+    """
     canonical = dict(original_args)
     if not isinstance(preflight_payload, dict):
         return canonical
@@ -689,32 +746,12 @@ def merge_canonical_from_preflight(
             canonical["coordinate_mode"] = "absolute"
             if locked and isinstance(locked[0], dict) and "dimension" in locked[0]:
                 canonical["dimension"] = locked[0]["dimension"]
-        elif (original_args.get("mode") or "") == "fill" and len(locked) >= 2:
-            first, last = locked[0], locked[-1]
-            if isinstance(first, dict) and isinstance(last, dict):
-                xs = [int(t["x"]) for t in locked if isinstance(t, dict) and "x" in t]
-                ys = [int(t["y"]) for t in locked if isinstance(t, dict) and "y" in t]
-                zs = [int(t["z"]) for t in locked if isinstance(t, dict) and "z" in t]
-                if xs and ys and zs:
-                    canonical["from"] = {"x": min(xs), "y": min(ys), "z": min(zs)}
-                    canonical["to"] = {"x": max(xs), "y": max(ys), "z": max(zs)}
-                    canonical["coordinate_mode"] = "absolute"
-                    if "dimension" in first:
-                        canonical["dimension"] = first["dimension"]
-        elif "bounds" in preflight_payload and isinstance(preflight_payload["bounds"], dict):
-            bounds = preflight_payload["bounds"]
-            if "min" in bounds and "max" in bounds:
-                canonical["from"] = bounds["min"]
-                canonical["to"] = bounds["max"]
-                canonical["coordinate_mode"] = "absolute"
-
-    if "bounds" in preflight_payload and isinstance(preflight_payload["bounds"], dict):
-        bounds = preflight_payload["bounds"]
-        if "min" in bounds and "max" in bounds:
-            canonical["from"] = bounds["min"]
-            canonical["to"] = bounds["max"]
-            if "dimension" in bounds:
-                canonical["dimension"] = bounds["dimension"]
+        elif (original_args.get("mode") or "") == "fill":
+            # Do not shrink fill AABB from sparse locked min/max here.
+            # Dimension / absolute mode still freeze from locked evidence.
+            first = locked[0] if isinstance(locked[0], dict) else None
+            if isinstance(first, dict) and "dimension" in first:
+                canonical["dimension"] = first["dimension"]
             canonical["coordinate_mode"] = "absolute"
 
     # Preflight evidence can include both a representative position and a
@@ -732,13 +769,61 @@ def merge_canonical_from_preflight(
     elif mode == "fill":
         canonical.pop("position", None)
         canonical.pop("positions", None)
-        if "from" not in canonical and isinstance(original_args.get("from_pos"), dict):
-            canonical["from"] = original_args["from_pos"]
-        if "to" not in canonical and isinstance(original_args.get("to_pos"), dict):
-            canonical["to"] = original_args["to_pos"]
+        # Authorized AABB priority (never shrink request volume to sparse locked):
+        # 1) original request corners (from/to or from_pos/to_pos), normalized
+        # 2) preflight bounds (full query volume when present)
+        # 3) preflight from/to if present
+        # 4) locked min/max only as last resort
+        request_from, request_to = _request_fill_aabb(original_args)
+        if request_from is not None and request_to is not None:
+            nfrom, nto = _normalize_aabb_corners(request_from, request_to)
+            canonical["from"] = nfrom
+            canonical["to"] = nto
+        else:
+            filled = False
+            bounds = preflight_payload.get("bounds")
+            if isinstance(bounds, dict) and "min" in bounds and "max" in bounds:
+                bmin, bmax = bounds["min"], bounds["max"]
+                if isinstance(bmin, dict) and isinstance(bmax, dict):
+                    canonical["from"] = bmin
+                    canonical["to"] = bmax
+                    if "dimension" in bounds:
+                        canonical["dimension"] = bounds["dimension"]
+                    filled = True
+            if not filled:
+                p_from = preflight_payload.get("from")
+                p_to = preflight_payload.get("to")
+                if isinstance(p_from, dict) and isinstance(p_to, dict):
+                    nfrom, nto = _normalize_aabb_corners(p_from, p_to)
+                    canonical["from"] = nfrom
+                    canonical["to"] = nto
+                    filled = True
+            if not filled and isinstance(locked, list) and locked:
+                lfrom, lto = _locked_targets_aabb(locked)
+                if lfrom is not None and lto is not None:
+                    canonical["from"] = lfrom
+                    canonical["to"] = lto
+        if isinstance(locked, list) and locked:
+            canonical["coordinate_mode"] = "absolute"
+        elif "coordinate_mode" not in canonical:
+            canonical["coordinate_mode"] = (
+                original_args.get("coordinate_mode") or "absolute"
+            )
         # 授权和审计使用桥协议字段名；Python 签名别名只存在于严格执行投影。
         canonical.pop("from_pos", None)
         canonical.pop("to_pos", None)
+    else:
+        # Non-fill may still surface preflight bounds for inspect-like payloads.
+        if "bounds" in preflight_payload and isinstance(preflight_payload["bounds"], dict):
+            bounds = preflight_payload["bounds"]
+            if "min" in bounds and "max" in bounds:
+                if "from" not in canonical:
+                    canonical["from"] = bounds["min"]
+                if "to" not in canonical:
+                    canonical["to"] = bounds["max"]
+                if "dimension" in bounds:
+                    canonical["dimension"] = bounds["dimension"]
+                canonical["coordinate_mode"] = "absolute"
 
     # Mark as ready for execute phase.
     canonical["phase"] = "execute"

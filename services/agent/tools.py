@@ -1142,9 +1142,8 @@ def register_agent_tools(
             dimension: 维度 ID（absolute 必填）
             position: 单个坐标 {x,y,z} 或相对 {forward,right,up}
             positions: 多个坐标列表（与 position 互斥）
-            locked_targets: 审批前预检锁定的绝对目标（内部/恢复用）
-            phase: preflight|execute（内部；通常由 harness 注入）
         """
+        # locked_targets / phase: harness recovery only; stripped from model schema.
         from services.agent.block_ops.tools_impl import inspect_block_impl
 
         return await inspect_block_impl(
@@ -1180,8 +1179,8 @@ def register_agent_tools(
         默认仅替换空气；replace_any 或 expected_previous 授权覆写（二者互斥）。
         删除请显式放置 minecraft:air 并授权覆写。高风险，需玩家审批。
 
-        fill 模式使用 from_pos / to_pos 作为两个角点（桥协议字段为 from / to；
-        harness 预检后会自动映射）。
+        fill 模式使用 from / to 两个角点（工具参数名 from_pos / to_pos，
+        与 catalog 的 from/to 同义；harness 与预检会自动映射）。
 
         Args:
             ctx: 运行上下文
@@ -1191,14 +1190,13 @@ def register_agent_tools(
             dimension: 维度 ID（absolute 必填）
             position: place 单点
             positions: batch 多点
-            from_pos: fill 角点 A
-            to_pos: fill 角点 B
+            from_pos: fill 角点 A（对应 from）
+            to_pos: fill 角点 B（对应 to）
             states: 可选 block states
             replace_any: 是否允许覆写普通非空气方块
             expected_previous: 条件写入 {type_id, states?}
-            locked_targets: 预检锁定目标（内部/恢复用）
-            phase: preflight|execute（内部）
         """
+        # locked_targets / phase: harness recovery only; stripped from model schema.
         from services.agent.block_ops.tools_impl import edit_blocks_impl
 
         return await edit_blocks_impl(

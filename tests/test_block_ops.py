@@ -1048,6 +1048,209 @@ def test_fill_canonical_args_exclude_python_bound_aliases_from_authorization_has
     assert plan.execute_args["to_pos"] == plan.authorized_args["to"]
 
 
+def test_merge_canonical_fill_sparse_locked_keeps_request_aabb() -> None:
+    """Sparse locked cells must not shrink authorized fill from/to."""
+    original = {
+        "mode": "fill",
+        "type_id": "minecraft:oak_planks",
+        "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld",
+        "from_pos": {"x": -797, "y": 93, "z": 180},
+        "to_pos": {"x": -793, "y": 93, "z": 184},
+    }
+    # 6 air cells along z=180 only — sparse relative to 5×1×5 volume.
+    locked_targets = [
+        {"dimension": "minecraft:overworld", "x": x, "y": 93, "z": 180}
+        for x in range(-797, -791)
+    ]
+    preflight = {
+        "mode": "fill",
+        "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld",
+        # Addon may report matched-only bounds; must not override request AABB.
+        "bounds": {
+            "min": {"x": -797, "y": 93, "z": 180},
+            "max": {"x": -792, "y": 93, "z": 180},
+        },
+        "locked_targets": locked_targets,
+        "matched_count": len(locked_targets),
+    }
+
+    canonical = merge_canonical_from_preflight(original, preflight)
+    assert canonical["phase"] == "execute"
+    assert canonical["from"] == {"x": -797, "y": 93, "z": 180}
+    assert canonical["to"] == {"x": -793, "y": 93, "z": 184}
+    assert canonical["locked_targets"] == locked_targets
+    assert "from_pos" not in canonical
+    assert "to_pos" not in canonical
+
+    plan = build_block_preflight_plan("edit_blocks", original, preflight)
+    assert plan.authorized_args["from"] == {"x": -797, "y": 93, "z": 180}
+    assert plan.authorized_args["to"] == {"x": -793, "y": 93, "z": 184}
+    assert plan.execute_args["from_pos"] == plan.authorized_args["from"]
+    assert plan.execute_args["to_pos"] == plan.authorized_args["to"]
+    assert plan.execute_args["locked_targets"] == locked_targets
+
+    # Success path: authorized_bounds derived from post-merge execute corners
+    # must report original volume 25, not locked-shrunk volume.
+    authorized_bounds = {
+        "from": plan.execute_args["from_pos"],
+        "to": plan.execute_args["to_pos"],
+        "volume": 25,
+    }
+    fat_payload = {
+        "ok": True,
+        "mode": "fill",
+        "type_id": "minecraft:oak_planks",
+        "changed_count": 6,
+        "skipped": 19,
+        "volume": 6,
+        "from": {"x": -797, "y": 93, "z": 180},
+        "to": {"x": -792, "y": 93, "z": 180},
+        "before_samples": [{"type_id": "minecraft:air"}] * 6,
+    }
+    projected = project_block_result_for_model(
+        fat_payload, mode="fill", authorized_bounds=authorized_bounds
+    )
+    assert projected["from"] == {"x": -797, "y": 93, "z": 180}
+    assert projected["to"] == {"x": -793, "y": 93, "z": 184}
+    assert projected["volume"] == 25
+    assert "before_samples" not in projected
+
+
+def test_merge_canonical_fill_accepts_from_to_request_keys() -> None:
+    """Original from/to (catalog names) also preserve authorized AABB."""
+    original = {
+        "mode": "fill",
+        "type_id": "minecraft:stone",
+        "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld",
+        "from": {"x": 0, "y": 64, "z": 0},
+        "to": {"x": 4, "y": 64, "z": 4},
+    }
+    locked = [
+        {"dimension": "minecraft:overworld", "x": 0, "y": 64, "z": 0},
+        {"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 0},
+    ]
+    canonical = merge_canonical_from_preflight(
+        original,
+        {
+            "locked_targets": locked,
+            "bounds": {
+                "min": {"x": 0, "y": 64, "z": 0},
+                "max": {"x": 1, "y": 64, "z": 0},
+            },
+        },
+    )
+    assert canonical["from"] == {"x": 0, "y": 64, "z": 0}
+    assert canonical["to"] == {"x": 4, "y": 64, "z": 4}
+    assert len(canonical["locked_targets"]) == 2
+
+
+def test_strip_block_internal_tool_schema_hides_locked_and_phase() -> None:
+    from services.agent.harness.execution import strip_block_internal_tool_schema
+    from pydantic_ai.tools import ToolDefinition
+
+    raw = ToolDefinition(
+        name="edit_blocks",
+        description="edit",
+        parameters_json_schema={
+            "type": "object",
+            "properties": {
+                "type_id": {"type": "string"},
+                "mode": {"type": "string"},
+                "from_pos": {"type": "object"},
+                "to_pos": {"type": "object"},
+                "locked_targets": {"type": "array"},
+                "phase": {"type": "string"},
+            },
+            "required": ["type_id", "locked_targets"],
+        },
+    )
+    stripped = strip_block_internal_tool_schema(raw)
+    props = stripped.parameters_json_schema["properties"]
+    assert "locked_targets" not in props
+    assert "phase" not in props
+    assert "type_id" in props
+    assert "from_pos" in props
+    assert "locked_targets" not in stripped.parameters_json_schema.get("required", [])
+
+    inspect_raw = ToolDefinition(
+        name="inspect_block",
+        parameters_json_schema={
+            "type": "object",
+            "properties": {
+                "position": {"type": "object"},
+                "locked_targets": {"type": "array"},
+                "phase": {"type": "string"},
+            },
+        },
+    )
+    inspect_stripped = strip_block_internal_tool_schema(inspect_raw)
+    assert "locked_targets" not in inspect_stripped.parameters_json_schema["properties"]
+    assert "phase" not in inspect_stripped.parameters_json_schema["properties"]
+
+    other = ToolDefinition(
+        name="run_minecraft_command",
+        parameters_json_schema={
+            "type": "object",
+            "properties": {"command": {"type": "string"}, "phase": {"type": "string"}},
+        },
+    )
+    assert strip_block_internal_tool_schema(other) is other
+
+
+@pytest.mark.asyncio
+async def test_harness_prepare_tools_strips_block_internal_params() -> None:
+    from pydantic_ai.tools import ToolDefinition
+
+    cap = HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))
+    cid = "schema-strip-1"
+    get_block_capability_cache().set(
+        cid,
+        BlockCapabilityRecord(
+            status=BlockCapabilityStatus.SUPPORTED,
+            probed_at=time.time(),
+        ),
+    )
+
+    class _Ctx:
+        deps = SimpleNamespace(connection_id=cid, addon_bridge=None, settings=_Settings())
+
+    tool_defs = [
+        ToolDefinition(
+            name="edit_blocks",
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "type_id": {"type": "string"},
+                    "locked_targets": {"type": "array"},
+                    "phase": {"type": "string"},
+                },
+            },
+        ),
+        ToolDefinition(
+            name="inspect_block",
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "position": {"type": "object"},
+                    "locked_targets": {"type": "array"},
+                    "phase": {"type": "string"},
+                },
+            },
+        ),
+    ]
+    prepared = await cap.prepare_tools(_Ctx(), tool_defs)  # type: ignore[arg-type]
+    by_name = {td.name: td for td in prepared}
+    assert "edit_blocks" in by_name
+    assert "inspect_block" in by_name
+    for name in ("edit_blocks", "inspect_block"):
+        props = by_name[name].parameters_json_schema.get("properties") or {}
+        assert "locked_targets" not in props
+        assert "phase" not in props
+
+
 def test_policy_edit_blocks_requires_approval_inspect_allows() -> None:
     engine = PolicyEngine.from_settings(_Settings())
     allow = engine.decide(

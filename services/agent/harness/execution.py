@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -1324,7 +1324,10 @@ class HarnessCapability(AbstractCapability[Any]):
                     str(connection_id),
                     getattr(deps, "addon_bridge", None),
                 )
-        return [td for td in tool_defs if self.policy.is_tool_exposed(td.name, ctx=ctx)]
+        exposed = [td for td in tool_defs if self.policy.is_tool_exposed(td.name, ctx=ctx)]
+        # Hide harness-only recovery fields from the model-facing schema.
+        # Approval resume / override_args still inject locked_targets + phase=execute.
+        return [strip_block_internal_tool_schema(td) for td in exposed]
 
 
 def build_harness_capability(settings: Any | None = None) -> HarnessCapability:
@@ -1333,6 +1336,45 @@ def build_harness_capability(settings: Any | None = None) -> HarnessCapability:
 
 def _duration_ms(start: float) -> int:
     return max(0, round((time.perf_counter() - start) * 1000))
+
+
+# Model-facing tool schema must not advertise recovery-only fields.
+_BLOCK_INTERNAL_SCHEMA_KEYS = frozenset({"locked_targets", "phase"})
+
+
+def strip_block_internal_tool_schema(tool_def: ToolDefinition) -> ToolDefinition:
+    """Remove locked_targets/phase from public ToolDefinition parameters.
+
+    Function implementations and harness recovery still accept these kwargs;
+    only the schema shown to the model is stripped.
+    """
+    if tool_def.name not in _BLOCK_OPS_TOOLS:
+        return tool_def
+    schema = tool_def.parameters_json_schema
+    if not isinstance(schema, dict):
+        return tool_def
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return tool_def
+    if not _BLOCK_INTERNAL_SCHEMA_KEYS.intersection(properties):
+        return tool_def
+
+    new_properties = {
+        key: value
+        for key, value in properties.items()
+        if key not in _BLOCK_INTERNAL_SCHEMA_KEYS
+    }
+    new_schema = dict(schema)
+    new_schema["properties"] = new_properties
+    required = schema.get("required")
+    if isinstance(required, list):
+        new_schema["required"] = [
+            item for item in required if item not in _BLOCK_INTERNAL_SCHEMA_KEYS
+        ]
+    return replace(
+        tool_def,
+        parameters_json_schema=new_schema,  # type: ignore[arg-type]
+    )
 
 
 def _python_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
