@@ -282,12 +282,16 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         "edit_blocks",
         ToolIntent.CHANGE_WORLD,
         ToolRisk.HIGH,
-        "放置、批量放置或填充方块时使用；默认仅替换空气，需要覆写时显式 authorize。",
+        "放置、批量放置或填充方块时使用；平台/地板/墙优先一次 fill 或少量 batch；"
+        "默认仅替换空气，需要覆写非空地面时 replace_any=true 并再审批。",
         "不要用于查询；可表达的方块写入不要改用 setblock/fill 命令。"
-        "Add-on 不可用时才可另行审批命令工具。",
+        "禁止对连续区域 place×N；Add-on 不可用时才可另行审批命令工具。",
         "mode=place|batch|fill；coordinate_mode=absolute|player_relative；"
         "place 用 position，batch 用 positions，fill 用 from/to；"
-        "type_id 必填；states 可选；replace_any 与 expected_previous 互斥。",
+        "type_id 必填；states 可选；replace_any 与 expected_previous 互斥；"
+        "LIMIT_EXCEEDED 时减小 positions 或 fill 体积，仍用 batch/fill，不要 place 风暴；"
+        "PRECONDITION_FAILED 且 actual 非空气时不要对同一格无 replace 重试；"
+        "单轮建造避免无意义并行 place，优先扩大/收紧 AABB 或 batch。",
         preview=ParameterPreviewPolicy(
             include=(
                 "mode",

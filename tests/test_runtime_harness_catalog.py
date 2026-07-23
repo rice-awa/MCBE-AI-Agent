@@ -56,3 +56,21 @@ def test_group_tools_by_intent_keeps_catalog_entries() -> None:
 
     assert set(grouped) == set(ToolIntent)
     assert grouped_names == REGISTERED_AGENT_TOOL_NAMES
+
+
+def test_edit_blocks_catalog_contains_recovery_guidance() -> None:
+    entry = get_tool_catalog()["edit_blocks"]
+    text = " ".join(
+        (
+            entry.when_to_use,
+            entry.when_not_to_use,
+            entry.parameter_constraints,
+        )
+    )
+    assert "fill" in text
+    assert "batch" in text
+    assert "LIMIT_EXCEEDED" in text
+    assert "replace_any" in text
+    assert "PRECONDITION_FAILED" in text
+    assert "place" in text
+    assert any(k in text for k in ("风暴", "place×N", "place×", "并行 place"))

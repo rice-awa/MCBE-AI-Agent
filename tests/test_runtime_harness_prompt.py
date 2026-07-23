@@ -14,6 +14,12 @@ def test_runtime_harness_prompt_renders_decision_tree_and_cards() -> None:
     assert "方块操作优先策略" in prompt
     assert "inspect_block" in prompt
     assert "edit_blocks" in prompt
+    # Recovery guidance for edit_blocks failures / place-storm prevention.
+    assert "LIMIT_EXCEEDED" in prompt
+    assert "place" in prompt and ("风暴" in prompt or "place×N" in prompt or "place×" in prompt)
+    assert "replace_any" in prompt
+    assert "PRECONDITION_FAILED" in prompt
+    assert "batch" in prompt and "fill" in prompt
 
 
 def test_runtime_harness_tool_cards_do_not_duplicate_when_not_to_use_prefix() -> None:

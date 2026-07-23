@@ -1135,6 +1135,8 @@ def register_agent_tools(
 
         优先使用本工具查询方块，不要用 setblock/fill 命令试探。
         absolute 模式必须提供 dimension；player_relative 使用当前事件玩家脚部原点。
+        建造前可用本工具确认目标是否为空气；若 actual 非空气且后续写入
+        未设 replace_any，不要对同一格无授权重试 place。
 
         Args:
             ctx: 运行上下文
@@ -1176,8 +1178,16 @@ def register_agent_tools(
         """写入方块：place 单格 / batch 离散批量 / fill 区域填充。
 
         默认可表达的方块写入必须使用本工具，不要手写 setblock/fill。
-        默认仅替换空气；replace_any 或 expected_previous 授权覆写（二者互斥）。
-        删除请显式放置 minecraft:air 并授权覆写。高风险，需玩家审批。
+        平台/地板/墙：优先一次 fill 或少量 batch，禁止对连续区域 place×N。
+        默认仅替换空气；要铺满非空地面必须 replace_any=true（高风险再审批）。
+        replace_any 与 expected_previous 互斥。删除请显式放置 minecraft:air 并授权覆写。
+        高风险，需玩家审批。
+
+        恢复策略：
+        - 若返回 LIMIT_EXCEEDED：减小 positions 数量或 fill 体积，仍用 batch/fill，
+          不要 place 风暴。
+        - 若 PRECONDITION_FAILED 且 actual 非空气：不要对同一格无 replace 重试。
+        - 单轮建造避免无意义并行 place；优先扩大/收紧 AABB 或 batch。
 
         fill 模式使用 from / to 两个角点（工具参数名 from_pos / to_pos，
         与 catalog 的 from/to 同义；harness 与预检会自动映射）。

@@ -21,7 +21,12 @@ _INTENT_GUIDANCE: dict[ToolIntent, str] = {
 _BLOCK_TOOL_PRIORITY = (
     "方块操作优先策略："
     "查询方块用 inspect_block；放置/批量/填充用 edit_blocks（mode=place|batch|fill）。"
-    "默认仅替换空气；删除方块请显式放置 minecraft:air 并授权覆写。"
+    "平台/地板/墙：优先一次 fill 或少量 batch，禁止对连续区域 place×N。"
+    "默认仅替换空气；要铺满非空地面必须 replace_any=true（高风险再审批）。"
+    "删除方块请显式放置 minecraft:air 并授权覆写。"
+    "若返回 LIMIT_EXCEEDED：减小 positions 数量或 fill 体积，仍用 batch/fill，不要 place 风暴。"
+    "若 PRECONDITION_FAILED 且 actual 非空气：不要对同一格无 replace 重试。"
+    "单轮建造避免无意义并行 place；优先扩大/收紧 AABB 或 batch。"
     "专用工具可用时禁止改用 setblock/fill 作为捷径。"
     "仅当 Add-on 不支持或专用工具返回 ADDON_UNAVAILABLE 时，"
     "才可另行调用 run_minecraft_command（仍走命令审批）。"
