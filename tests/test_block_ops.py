@@ -51,6 +51,7 @@ from services.agent.block_ops.tools_impl import (
     merge_canonical_from_preflight,
     run_block_preflight,
     project_block_execute_args,
+    should_omit_locked_targets_on_wire,
 )
 from services.agent.harness.execution import (
     HarnessCapability,
@@ -308,6 +309,196 @@ def test_build_edit_payload_omits_locked_targets_on_fill_execute() -> None:
     )
     command_line = f"scriptevent mcbews:bridge_req {wire}"
     assert len(command_line.encode("utf-8")) <= 461
+
+
+def test_build_edit_payload_omits_locked_targets_on_sparse_fill_execute() -> None:
+    """Sparse absolute fill (matched << volume) must omit locked_targets on execute wire."""
+    # volume = 5*1*5 = 25; only 6 air cells matched
+    locked = [
+        {"dimension": "minecraft:overworld", "x": 3, "y": -60, "z": -9},
+        {"dimension": "minecraft:overworld", "x": 4, "y": -60, "z": -8},
+        {"dimension": "minecraft:overworld", "x": 5, "y": -60, "z": -7},
+        {"dimension": "minecraft:overworld", "x": 6, "y": -60, "z": -6},
+        {"dimension": "minecraft:overworld", "x": 7, "y": -60, "z": -5},
+        {"dimension": "minecraft:overworld", "x": 3, "y": -60, "z": -5},
+    ]
+    assert len(locked) == 6
+    payload = build_edit_payload(
+        mode="fill",
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        position=None,
+        positions=None,
+        from_pos={"x": 3, "y": -60, "z": -9},
+        to_pos={"x": 7, "y": -60, "z": -5},
+        type_id="minecraft:oak_planks",
+        states=None,
+        replace_any=False,
+        expected_previous=None,
+        player_name="fantong7038",
+        phase="execute",
+        locked_targets=locked,
+        limits={"max_discrete_positions": 4096, "max_fill_volume": 4096, "cells_per_tick": 128},
+    )
+    assert "locked_targets" not in payload
+    assert "max_fill_volume" not in payload
+    assert payload["from"] == {"x": 3, "y": -60, "z": -9}
+    assert payload["to"] == {"x": 7, "y": -60, "z": -5}
+
+
+def test_build_edit_payload_omits_locked_targets_on_sparse_fill_subtile() -> None:
+    """Sparse sub-tile with 4 locked cells still omits on absolute fill execute."""
+    locked = [
+        {"dimension": "minecraft:overworld", "x": 10, "y": 64, "z": 0},
+        {"dimension": "minecraft:overworld", "x": 11, "y": 64, "z": 0},
+        {"dimension": "minecraft:overworld", "x": 10, "y": 64, "z": 1},
+        {"dimension": "minecraft:overworld", "x": 11, "y": 64, "z": 1},
+    ]
+    # AABB volume 3*1*3=9 > 4 locked
+    payload = build_edit_payload(
+        mode="fill",
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        position=None,
+        positions=None,
+        from_pos={"x": 10, "y": 64, "z": 0},
+        to_pos={"x": 12, "y": 64, "z": 2},
+        type_id="minecraft:stone",
+        states=None,
+        replace_any=False,
+        expected_previous=None,
+        player_name="tester",
+        phase="execute",
+        locked_targets=locked,
+    )
+    assert "locked_targets" not in payload
+    assert should_omit_locked_targets_on_wire(
+        mode="fill",
+        phase="execute",
+        from_pos={"x": 10, "y": 64, "z": 0},
+        to_pos={"x": 12, "y": 64, "z": 2},
+        position=None,
+        positions=None,
+        locked_targets=locked,
+        coordinate_mode="absolute",
+    )
+
+
+def test_build_edit_payload_omits_locked_targets_on_absolute_place_execute() -> None:
+    locked = [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}]
+    payload = build_edit_payload(
+        mode="place",
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        position={"x": 1, "y": 64, "z": 1},
+        positions=None,
+        from_pos=None,
+        to_pos=None,
+        type_id="minecraft:stone",
+        states=None,
+        replace_any=False,
+        expected_previous=None,
+        player_name="tester",
+        phase="execute",
+        locked_targets=locked,
+    )
+    assert "locked_targets" not in payload
+    assert payload["position"] == {"x": 1, "y": 64, "z": 1}
+
+
+def test_build_edit_payload_omits_locked_targets_on_absolute_batch_execute() -> None:
+    positions = [
+        {"x": 1, "y": 64, "z": 1},
+        {"x": 2, "y": 64, "z": 1},
+        {"x": 3, "y": 64, "z": 1},
+    ]
+    locked = [
+        {"dimension": "minecraft:overworld", **p} for p in positions
+    ]
+    payload = build_edit_payload(
+        mode="batch",
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        position=None,
+        positions=positions,
+        from_pos=None,
+        to_pos=None,
+        type_id="minecraft:dirt",
+        states=None,
+        replace_any=False,
+        expected_previous=None,
+        player_name="tester",
+        phase="execute",
+        locked_targets=locked,
+    )
+    assert "locked_targets" not in payload
+    assert payload["positions"] == positions
+
+
+def test_should_not_omit_locked_targets_on_preflight_or_player_relative() -> None:
+    locked = [
+        {"dimension": "minecraft:overworld", "x": 3, "y": -60, "z": -9},
+        {"dimension": "minecraft:overworld", "x": 4, "y": -60, "z": -8},
+    ]
+    from_pos = {"x": 3, "y": -60, "z": -9}
+    to_pos = {"x": 7, "y": -60, "z": -5}
+
+    assert not should_omit_locked_targets_on_wire(
+        mode="fill",
+        phase="preflight",
+        from_pos=from_pos,
+        to_pos=to_pos,
+        position=None,
+        positions=None,
+        locked_targets=locked,
+        coordinate_mode="absolute",
+    )
+    assert not should_omit_locked_targets_on_wire(
+        mode="fill",
+        phase="execute",
+        from_pos=from_pos,
+        to_pos=to_pos,
+        position=None,
+        positions=None,
+        locked_targets=locked,
+        coordinate_mode="player_relative",
+    )
+
+    preflight_payload = build_edit_payload(
+        mode="fill",
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        position=None,
+        positions=None,
+        from_pos=from_pos,
+        to_pos=to_pos,
+        type_id="minecraft:oak_planks",
+        states=None,
+        replace_any=False,
+        expected_previous=None,
+        player_name="tester",
+        phase="preflight",
+        locked_targets=locked,
+    )
+    assert "locked_targets" in preflight_payload
+
+    relative_payload = build_edit_payload(
+        mode="fill",
+        coordinate_mode="player_relative",
+        dimension="minecraft:overworld",
+        position=None,
+        positions=None,
+        from_pos=from_pos,
+        to_pos=to_pos,
+        type_id="minecraft:oak_planks",
+        states=None,
+        replace_any=False,
+        expected_previous=None,
+        player_name="tester",
+        phase="execute",
+        locked_targets=locked,
+    )
+    assert "locked_targets" in relative_payload
 
 
 def test_invalid_bridge_response_does_not_leak_raw_payload() -> None:

@@ -377,29 +377,24 @@ def should_omit_locked_targets_on_wire(
     locked_targets: list[dict[str, Any]] | None,
     coordinate_mode: str,
 ) -> bool:
-    """True when absolute geometry already freezes the target set without the cell list.
+    """True when absolute execute geometry freezes targets without replaying cells.
 
-    MCBE ``commandLine`` hard budget is ~461 bytes. A 5×1×5 fill with full
-    ``locked_targets`` is ~1.8 KB and never leaves the host — the bridge then
-    times out and surfaces a useless STATE_UNKNOWN. For continuous fill AABBs
-    and absolute place/batch shapes, from/to or position(s) already freeze the
-    plan; omit the cell list on the wire.
+    MCBE ``commandLine`` hard budget is ~461 bytes. Even sparse fill locked lists
+    blow that budget and never leave the host (bridge timeout → STATE_UNKNOWN).
+    On absolute execute, place/batch/fill geometry (position / positions /
+    from+to) is authoritative; omit ``locked_targets`` on the wire. Audit and
+    approval records may still hold the full list.
     """
     if phase != "execute" or coordinate_mode != "absolute":
         return False
-    if not locked_targets:
-        return True
     if mode == "fill" and isinstance(from_pos, dict) and isinstance(to_pos, dict):
-        volume = _aabb_volume(from_pos, to_pos)
-        # Sparse fills (matched < volume) still need the cell list.
-        if volume is None:
-            return False
-        return len(locked_targets) >= volume
+        return True
     if mode == "place" and isinstance(position, dict):
         return True
     if mode == "batch" and isinstance(positions, list) and positions:
-        return len(positions) >= len(locked_targets)
-    return False
+        return True
+    # No complete absolute geometry — only omit if there is nothing to send.
+    return not locked_targets
 
 
 def build_inspect_payload(
