@@ -466,6 +466,54 @@ async def test_gateway_rejects_tampered_block_execution_hash_before_resume() -> 
     handler._send_player_reply.assert_awaited_once()
 
 
+def test_expired_block_approval_is_not_resumable() -> None:
+    """过期方块审批不得从 store 取出并静默用原始参数重新预检执行。"""
+    store = PendingApprovalStore(default_ttl_seconds=0.01)
+    block = _make_pending(approval_id="b", tool_call_id="tc-block", ttl=0.01)
+    block.tool_name = "edit_blocks"
+    block.normalized_args = {
+        "type_id": "minecraft:stone",
+        "mode": "place",
+        "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld",
+        "position": {"x": 1, "y": 64, "z": 1},
+        "locked_targets": [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}],
+        "phase": "execute",
+    }
+    block.execute_args = {
+        "type_id": "minecraft:stone",
+        "mode": "place",
+        "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld",
+        "position": {"x": 1, "y": 64, "z": 1},
+        "locked_targets": [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}],
+        "phase": "execute",
+    }
+    block.execution_args_hash = hash_normalized_args(normalize_tool_args(block.execute_args))
+    store.put(block)
+
+    time.sleep(0.02)
+    found, reason = store.get_for_owner(
+        connection_id="conn-1",
+        player_name="Steve",
+        conversation_id="conv-1",
+        approval_id="b",
+    )
+    assert found is None
+    assert reason is not None
+
+    decided, decide_reason, completed = store.record_decision(
+        connection_id="conn-1",
+        player_name="Steve",
+        conversation_id="conv-1",
+        approval_id="b",
+        approved=True,
+    )
+    assert decided is None
+    assert completed is None
+    assert decide_reason is not None
+
+
 @pytest.mark.asyncio
 async def test_handle_tool_approval_rejects_swapped_original_tool_call_ids(
     monkeypatch: pytest.MonkeyPatch,

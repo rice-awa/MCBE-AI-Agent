@@ -15,7 +15,7 @@ from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
-from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 
 from config.settings import Settings
 from services.agent.block_ops.bridge import map_addon_bridge_result, map_bridge_exception
@@ -2116,6 +2116,70 @@ async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() 
 
 
 @pytest.mark.asyncio
+async def test_denied_edit_blocks_approval_never_sends_execute() -> None:
+    """玩家拒绝后恢复不得产生 phase=execute bridge 请求。"""
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    )
+    register_agent_tools(agent)
+    calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return ModelResponse(parts=[TextPart(content="denied")])
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="edit_blocks",
+                    tool_call_id="tc-deny-fill",
+                    args={
+                        "type_id": "minecraft:stone",
+                        "mode": "fill",
+                        "coordinate_mode": "absolute",
+                        "dimension": "minecraft:overworld",
+                        "from_pos": {"x": 1, "y": 64, "z": 1},
+                        "to_pos": {"x": 2, "y": 64, "z": 2},
+                    },
+                )
+            ]
+        )
+
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-deny")
+    first = await agent.run("fill", model=FunctionModel(model_fn), deps=deps)
+    assert isinstance(first.output, DeferredToolRequests)
+    approval = first.output.approvals[0]
+
+    second = await agent.run(
+        message_history=first.all_messages(),
+        deferred_tool_results=DeferredToolResults(
+            approvals={
+                approval.tool_call_id: ToolDenied(message="玩家拒绝了工具调用 edit_blocks"),
+            }
+        ),
+        model=FunctionModel(model_fn),
+        deps=deps,
+    )
+
+    assert not isinstance(second.output, DeferredToolRequests)
+    assert not any(
+        name == "edit_blocks" and payload.get("phase") == "execute"
+        for name, payload in bridge.calls
+    )
+    assert any(
+        name == "edit_blocks" and payload.get("phase") == "preflight"
+        for name, payload in bridge.calls
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("mode", "original_args", "locked_targets"),
     [
@@ -2593,6 +2657,61 @@ def test_block_preflight_plan_keeps_unknown_evidence_out_of_operation_args() -> 
     assert "future_evidence" not in plan.authorized_args
     assert "future_evidence" not in plan.execute_args
     assert plan.approval_metadata["future_evidence"] == {"version": 2}
+
+
+def test_project_block_execute_args_is_subset_of_public_tool_signatures() -> None:
+    """严格执行投影的 key 必须是公开 Python 工具签名的子集（不含 ctx）。"""
+    agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
+    register_agent_tools(agent)
+    tools = iter_registered_tools(agent)  # type: ignore[arg-type]
+
+    def public_fields(tool_name: str) -> set[str]:
+        tool = tools[tool_name]
+        schema = tool.function_schema.json_schema
+        return set(schema.get("properties") or {})
+
+    edit_sig = public_fields("edit_blocks")
+    inspect_sig = public_fields("inspect_block")
+
+    edit_plan = build_block_preflight_plan(
+        "edit_blocks",
+        {
+            "type_id": "minecraft:stone",
+            "mode": "fill",
+            "coordinate_mode": "absolute",
+            "dimension": "minecraft:overworld",
+            "from_pos": {"x": 4, "y": 64, "z": 3},
+            "to_pos": {"x": 2, "y": 64, "z": 1},
+            "states": {"lit": False},
+            "replace_any": True,
+        },
+        {
+            "locked_targets": [{"dimension": "minecraft:overworld", "x": 2, "y": 64, "z": 1}],
+            "from": {"x": 2, "y": 64, "z": 1},
+            "to": {"x": 4, "y": 64, "z": 3},
+            "repairs_applied": ["reversed_bounds"],
+            "facing": "south",
+        },
+    )
+    assert set(edit_plan.execute_args) <= edit_sig
+    assert "from" not in edit_plan.execute_args
+    assert "to" not in edit_plan.execute_args
+    assert "repairs_applied" not in edit_plan.execute_args
+
+    inspect_plan = build_block_preflight_plan(
+        "inspect_block",
+        {"coordinate_mode": "player_relative", "position": {"forward": 1}},
+        {
+            "locked_targets": [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}],
+            "dimension": "minecraft:overworld",
+            "position": {"x": 1, "y": 64, "z": 1},
+            "facing": "east",
+            "player_origin": {"x": 0, "y": 64, "z": 0},
+        },
+    )
+    assert set(inspect_plan.execute_args) <= inspect_sig
+    assert "facing" not in inspect_plan.execute_args
+    assert "player_origin" not in inspect_plan.execute_args
 
 
 @pytest.mark.parametrize(

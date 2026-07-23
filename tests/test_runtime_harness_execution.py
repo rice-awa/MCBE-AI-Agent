@@ -271,6 +271,9 @@ def test_inspect_invocation_failure_redacts_model_log_and_audit(monkeypatch) -> 
     assert captured["tool_call_id"] == "tc-inspect"
     assert captured["player_name"] == "Alex"
     assert captured["execution_stage"] == "invocation"
+    # Main log and tool audit must correlate by the same ids.
+    assert audit["run_id"] == captured["run_id"]
+    assert audit["tool_call_id"] == captured["tool_call_id"]
 
 
 def test_policy_only_configured_destructive_command_roots_require_approval() -> None:

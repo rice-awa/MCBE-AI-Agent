@@ -515,36 +515,26 @@ def classify_tool_exception(
         "projection" if "execution contract" in lower else "invocation"
     )
     if tool_name in _BLOCK_OPS_TOOLS and stage == "projection":
-        from services.agent.block_ops.schema import BlockErrorCode, build_error_response, dumps_payload
+        from services.agent.block_ops.schema import (
+            build_internal_error_response,
+            dumps_payload,
+        )
 
         return ToolResult.failure(
-            dumps_payload(
-                build_error_response(
-                    BlockErrorCode.INTERNAL_ERROR,
-                    "方块工具内部参数处理失败；本次操作未发送到 Add-on",
-                    retryable=False,
-                    external_state_unknown=False,
-                    fallback_allowed=False,
-                )
-            ),
+            dumps_payload(build_internal_error_response()),
             error_kind="INTERNAL",
             retryable=False,
             diagnostic_summary=diagnostic_summary,
             error_type=exc.__class__.__name__,
         )
     if tool_name == "edit_blocks" and stage == "invocation":
-        from services.agent.block_ops.schema import BlockErrorCode, build_error_response, dumps_payload
+        from services.agent.block_ops.schema import (
+            build_state_unknown_response,
+            dumps_payload,
+        )
 
         return ToolResult.failure(
-            dumps_payload(
-                build_error_response(
-                    BlockErrorCode.STATE_UNKNOWN,
-                    "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。",
-                    retryable=False,
-                    external_state_unknown=True,
-                    fallback_allowed=False,
-                )
-            ),
+            dumps_payload(build_state_unknown_response()),
             error_kind="PERMANENT",
             retryable=False,
             external_state_unknown=True,

@@ -50,6 +50,36 @@ def build_error_response(
     return body
 
 
+def build_internal_error_response(
+    message: str = "方块工具内部参数处理失败；本次操作未发送到 Add-on",
+    **fields: Any,
+) -> dict[str, Any]:
+    """Stable envelope for host-side projection failures (never reached Add-on)."""
+    return build_error_response(
+        BlockErrorCode.INTERNAL_ERROR,
+        message,
+        retryable=False,
+        external_state_unknown=False,
+        fallback_allowed=False,
+        **fields,
+    )
+
+
+def build_state_unknown_response(
+    message: str = "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。",
+    **fields: Any,
+) -> dict[str, Any]:
+    """Stable envelope for unclassified world-mutating failures after invocation starts."""
+    return build_error_response(
+        BlockErrorCode.STATE_UNKNOWN,
+        message,
+        retryable=False,
+        external_state_unknown=True,
+        fallback_allowed=False,
+        **fields,
+    )
+
+
 def dumps_success(**fields: Any) -> str:
     return json.dumps(build_success_response(**fields), ensure_ascii=False)
 

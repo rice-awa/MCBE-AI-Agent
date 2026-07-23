@@ -1617,6 +1617,33 @@ class AgentWorker:
         preassigned_ids = [store.generate_approval_id() for _ in pending_calls]
         sibling_ids = list(preassigned_ids)
 
+        # Fail closed before any store write: block tools need projected execute_args.
+        for call in pending_calls:
+            if call.tool_name not in {"inspect_block", "edit_blocks"}:
+                continue
+            meta = deferred.metadata.get(call.tool_call_id, {}) if deferred.metadata else {}
+            execute_args = meta.get("execute_args") if isinstance(meta, dict) else None
+            if not isinstance(execute_args, dict) or not execute_args:
+                logger.error(
+                    "block_approval_missing_execute_args",
+                    tool_name=call.tool_name,
+                    tool_call_id=call.tool_call_id,
+                    run_id=request.run_id,
+                    player_name=player_name,
+                )
+                await self._send_error_chunk(
+                    connection_id,
+                    request.player_name,
+                    "方块工具审批参数契约无效，未进入审批队列",
+                    sequence,
+                    target=stream_target,
+                    error_kind="INTERNAL",
+                    run_id=request.run_id,
+                    trace_id=request.trace_id or request.run_id,
+                    attempt_id=request.attempt_id,
+                )
+                return
+
         for approval_id, call in zip(preassigned_ids, pending_calls):
             meta = deferred.metadata.get(call.tool_call_id, {}) if deferred.metadata else {}
             normalized_args = meta.get("normalized_args")
@@ -1625,7 +1652,9 @@ class AgentWorker:
                 normalized_args = args
             args_hash = str(meta.get("args_hash") or "")
             execute_args = meta.get("execute_args")
-            if not isinstance(execute_args, dict):
+            if call.tool_name not in {"inspect_block", "edit_blocks"} and not isinstance(
+                execute_args, dict
+            ):
                 execute_args = normalized_args
             execution_args_hash = str(meta.get("execution_args_hash") or "")
             args_summary = str(

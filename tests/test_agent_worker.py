@@ -70,6 +70,86 @@ def test_worker_coerces_block_tool_approval_override_args() -> None:
 
 
 @pytest.mark.asyncio
+async def test_worker_rejects_block_approval_without_execute_args() -> None:
+    """方块工具不得用 normalized_args 回退填充 execute_args 进入审批队列。"""
+    from pydantic_ai.messages import ToolCallPart
+    from pydantic_ai.tools import DeferredToolRequests
+
+    from services.agent.harness.approvals import PendingApprovalStore
+
+    broker = MagicMock()
+    broker.send_response = AsyncMock()
+    worker = AgentWorker(broker, _make_settings())
+    store = PendingApprovalStore(default_ttl_seconds=120.0)
+    connection_id = uuid4()
+    request = ChatRequest(
+        id=uuid4(),
+        connection_id=connection_id,
+        player_name="Steve",
+        conversation_id="conv-1",
+        content="edit",
+        run_id="run-missing-exec",
+    )
+    deferred = DeferredToolRequests(
+        approvals=[
+            ToolCallPart(
+                tool_name="edit_blocks",
+                tool_call_id="tc-fill",
+                args={
+                    "type_id": "minecraft:stone",
+                    "mode": "place",
+                    "coordinate_mode": "absolute",
+                    "dimension": "minecraft:overworld",
+                    "position": {"x": 1, "y": 64, "z": 1},
+                    "repairs_applied": ["should-not-reach-python"],
+                },
+            )
+        ],
+        metadata={
+            "tc-fill": {
+                "normalized_args": {
+                    "type_id": "minecraft:stone",
+                    "mode": "place",
+                    "coordinate_mode": "absolute",
+                    "dimension": "minecraft:overworld",
+                    "position": {"x": 1, "y": 64, "z": 1},
+                    "repairs_applied": ["should-not-reach-python"],
+                    "phase": "execute",
+                },
+                # deliberately omit execute_args
+                "args_hash": "h",
+                "args_summary": "place stone",
+            }
+        },
+    )
+    event = SimpleNamespace(
+        metadata={
+            "deferred_requests": deferred,
+            "all_messages": [],
+            "run_id": "run-missing-exec",
+        }
+    )
+
+    with patch(
+        "services.agent.worker.get_agent_runtime",
+        return_value=SimpleNamespace(get_pending_approval_store=lambda _settings: store),
+    ):
+        await worker._handle_approval_required(
+            request=request,
+            connection_id=connection_id,
+            event=event,
+            sequence=1,
+            stream_target="Steve",
+        )
+
+    assert len(store) == 0
+    broker.send_response.assert_awaited()
+    chunk = broker.send_response.await_args.args[1]
+    assert chunk.chunk_type == "error"
+    assert "契约无效" in chunk.content
+
+
+@pytest.mark.asyncio
 async def test_start_passes_http_timeout_to_httpx_client():
     """start() 应将 settings.worker_http_timeout 传给 httpx.AsyncClient。"""
     settings = _make_settings(worker_http_timeout=42)
