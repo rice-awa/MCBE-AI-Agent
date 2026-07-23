@@ -7,7 +7,7 @@ import time
 from uuid import UUID, uuid4
 
 import httpx
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ThinkingPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ThinkingPart
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 
 from core.queue import MessageBroker
@@ -795,19 +795,57 @@ class AgentWorker:
                     error_kind = (
                         event.metadata.get("error_kind") if event.metadata else None
                     ) or "INTERNAL"
+                    diagnostic_summary = (
+                        event.metadata.get("diagnostic_summary")
+                        if event.metadata
+                        else None
+                    )
                     logger.error(
                         "chat_response_error",
                         worker_id=self.worker_id,
                         connection_id=str(connection_id),
                         run_id=run_id,
                         error_kind=error_kind,
-                        diagnostic_summary=(
-                            event.metadata.get("diagnostic_summary")
-                            if event.metadata
-                            else None
-                        ),
+                        diagnostic_summary=diagnostic_summary,
                         response_length=len(response_text),
+                        salvaged=bool(
+                            event.metadata and event.metadata.get("all_messages")
+                        ),
                     )
+
+                    # mid-run 失败：尽量落盘已产生的工具/模型消息 + 错误说明，
+                    # 避免下轮 LLM 完全不知道本轮做了什么 / 为何中断。
+                    if (
+                        request.use_context
+                        and event.metadata
+                        and isinstance(event.metadata.get("all_messages"), list)
+                        and self.broker.get_response_queue(connection_id) is not None
+                    ):
+                        await self._persist_partial_run_history(
+                            connection_id=connection_id,
+                            request=request,
+                            all_messages=event.metadata["all_messages"],
+                            player_error_text=event.content or "",
+                            conversation_invalidation_epoch=conversation_invalidation_epoch,
+                        )
+
+                    if (
+                        not terminal_emitted
+                        and resolved_context is not None
+                        and event.metadata
+                    ):
+                        new_messages = event.metadata.get("new_messages_serialized")
+                        if not isinstance(new_messages, list):
+                            new_messages = event.metadata.get("new_messages")
+                        usage = event.metadata.get("usage")
+                        usage_dict = usage if isinstance(usage, dict) else None
+                        self._record_model_pairs_from_messages(
+                            resolved_context,
+                            new_messages if isinstance(new_messages, list) else None,
+                            usage=usage_dict,
+                            provider=provider_name,
+                        )
+
                     # 错误事件需要发送到游戏（玩家只看稳定类别文案）
                     chunk = StreamChunk(
                         connection_id=connection_id,
@@ -828,10 +866,10 @@ class AgentWorker:
                             status="failed",
                             attributes={
                                 "error_kind": error_kind,
-                                "diagnostic_summary": (
-                                    (event.metadata or {}).get("diagnostic_summary")
-                                    if event.metadata
-                                    else None
+                                "diagnostic_summary": diagnostic_summary,
+                                "salvage_partial_run": bool(
+                                    event.metadata
+                                    and event.metadata.get("salvage_partial_run")
                                 ),
                             },
                         )
@@ -1067,6 +1105,117 @@ class AgentWorker:
                 for part in getattr(message, "parts", [])
             )
         )
+
+    async def _persist_partial_run_history(
+        self,
+        *,
+        connection_id: UUID,
+        request: ChatRequest,
+        all_messages: list[ModelMessage],
+        player_error_text: str,
+        conversation_invalidation_epoch: int | None,
+    ) -> None:
+        """mid-run 失败时落盘已产生消息 + 错误说明，供下轮 LLM 继续。"""
+        if not all_messages:
+            return
+
+        history = list(all_messages)
+        note = (player_error_text or "").strip()
+        if note:
+            # 避免与已有尾部 assistant 文本重复
+            last = history[-1] if history else None
+            last_text = ""
+            if isinstance(last, ModelResponse):
+                for part in getattr(last, "parts", []) or []:
+                    if getattr(part, "part_kind", None) == "text":
+                        last_text += str(getattr(part, "content", "") or "")
+            if note not in last_text:
+                history.append(
+                    ModelResponse(
+                        parts=[
+                            TextPart(
+                                content=(
+                                    f"[系统] 本轮执行中断：{note}"
+                                    " 已完成的工具结果见上文；请基于现状继续或向玩家说明。"
+                                )
+                            )
+                        ]
+                    )
+                )
+
+        trimmed_history = self._trim_history(history, self.settings.max_history_turns)
+        trimmed_history, cleared_count = self._strip_reasoning_content(trimmed_history)
+        try:
+            history_updated = self.broker.set_conversation_history(
+                connection_id,
+                request.player_name,
+                trimmed_history,
+                request.conversation_id,
+                expected_invalidation_epoch=conversation_invalidation_epoch,
+            )
+        except TypeError:
+            # 旧 broker 签名兼容
+            history_updated = self.broker.set_conversation_history(
+                connection_id,
+                request.player_name,
+                trimmed_history,
+                request.conversation_id,
+            )
+
+        if history_updated:
+            logger.info(
+                "chat_partial_history_persisted",
+                worker_id=self.worker_id,
+                connection_id=str(connection_id),
+                player=request.player_name,
+                conversation_id=request.conversation_id,
+                history_message_count=len(trimmed_history),
+                cleared_reasoning_content_count=cleared_count,
+            )
+            # 失败路径也做一次压缩检查（与成功路径一致），避免超大 partial 历史
+            try:
+                from core.conversation import get_conversation_manager
+
+                conv_manager = get_conversation_manager(self.broker, self.settings)
+                provider_name = request.provider or self.settings.default_provider
+                compressed, msg = await conv_manager.check_and_compress(
+                    connection_id,
+                    request.player_name,
+                    force=False,
+                    conversation_id=request.conversation_id,
+                    provider_name=provider_name,
+                )
+                if compressed:
+                    await self.broker.send_response(
+                        connection_id,
+                        SystemNotification(
+                            connection_id=connection_id,
+                            level="info",
+                            message=f"对话历史已自动压缩，{msg}",
+                            player_name=request.player_name,
+                        ),
+                    )
+                    logger.info(
+                        "auto_compression_triggered_after_partial",
+                        worker_id=self.worker_id,
+                        connection_id=str(connection_id),
+                        player=request.player_name,
+                        message=msg,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "partial_history_compress_failed",
+                    error=str(exc),
+                    connection_id=str(connection_id),
+                )
+        else:
+            logger.info(
+                "chat_partial_history_stale_write_skipped",
+                worker_id=self.worker_id,
+                connection_id=str(connection_id),
+                player=request.player_name,
+                conversation_id=request.conversation_id,
+            )
 
     @staticmethod
     def _trim_history(
