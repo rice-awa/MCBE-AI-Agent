@@ -48,7 +48,7 @@
     "mcwiki_base_url": "https://mcwiki.rice-awa.top",
     "dedup_external_messages": true,
     "tool_response_verbose": false,
-    "request_limit": 8,
+    "request_limit": 50,
     "tool_calls_limit": 50,
     "input_tokens_limit": null,
     "output_tokens_limit": null,
