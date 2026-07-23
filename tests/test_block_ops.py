@@ -27,6 +27,7 @@ from services.agent.block_ops.capability import (
     get_block_capability_cache,
     reset_block_capability_cache,
 )
+from services.agent.block_ops.project import project_block_result_for_model
 from services.agent.block_ops.config import (
     DEFAULT_COMMAND_LINE_BYTE_BUDGET,
     HARD_MAX_DISCRETE_POSITIONS,
@@ -636,6 +637,224 @@ def test_addon_error_code_and_message_never_leak_untrusted_text(code: str, messa
     else:
         assert body["code"] == "INTERNAL_ERROR"
         assert body["fallback_allowed"] is False
+
+
+def test_precondition_failed_projects_actual_target_and_hint() -> None:
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "PRECONDITION_FAILED",
+                "message": "target is not air",
+                "target": {
+                    "x": -797,
+                    "y": 93,
+                    "z": 182,
+                    "dimension": "minecraft:overworld",
+                },
+                "actual": {
+                    "type_id": "minecraft:gravel",
+                    "states": {"some": "state"},
+                    "password": "hunter2",
+                },
+                "stack": "Traceback password=hunter2",
+            },
+        }
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "PRECONDITION_FAILED"
+    assert body["actual_type_id"] == "minecraft:gravel"
+    assert body["target"] == {"x": -797, "y": 93, "z": 182}
+    assert "dimension" not in body["target"]
+    assert "hint" in body
+    assert "replace_any" in body["hint"]
+    assert body["fallback_allowed"] is False
+    assert body["retryable"] is False
+    assert "非空气" in body["message"] or "空气" in body["message"]
+    assert "hunter2" not in result.output
+    assert "Traceback" not in result.output
+    assert "states" not in body
+
+
+def test_precondition_changed_projects_decision_fields() -> None:
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "PRECONDITION_CHANGED",
+                "message": "block changed since preflight",
+                "target": {"x": 1, "y": 64, "z": 2},
+                "actual": {"type_id": "minecraft:stone"},
+            },
+        }
+    )
+    body = json.loads(result.output)
+    assert body["code"] == "PRECONDITION_CHANGED"
+    assert body["actual_type_id"] == "minecraft:stone"
+    assert body["target"] == {"x": 1, "y": 64, "z": 2}
+    assert body["hint"]
+    assert body["fallback_allowed"] is False
+
+
+def test_limit_exceeded_addon_error_includes_place_ban_hint() -> None:
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "LIMIT_EXCEEDED",
+                "message": "too many cells",
+                "matched_count": 6,
+                "volume": 25,
+                "suggested_max_discrete": 3,
+            },
+        }
+    )
+    body = json.loads(result.output)
+    assert body["code"] == "LIMIT_EXCEEDED"
+    assert body["retryable"] is True
+    assert body["fallback_allowed"] is False
+    assert body["external_state_unknown"] is False
+    assert "place" in body["hint"].lower() or "禁止" in body["hint"]
+    assert body["matched_count"] == 6
+    assert body["volume"] == 25
+    assert body["suggested_max_discrete"] == 3
+
+
+def test_map_ok_true_non_block_payload_keeps_full_dump() -> None:
+    """Legacy / non-block capabilities keep full payload for backward compatibility."""
+    result = map_addon_bridge_result({"ok": True, "payload": {"players": [{"name": "Steve"}]}})
+    assert result.is_success
+    body = json.loads(result.output)
+    assert body == {"players": [{"name": "Steve"}]}
+
+
+def test_place_success_model_projection_is_slim() -> None:
+    fat_payload = {
+        "schema_version": "1",
+        "ok": True,
+        "phase": "execute",
+        "mode": "place",
+        "dimension": "minecraft:overworld",
+        "type_id": "minecraft:stone",
+        "changed": True,
+        "position": {"x": -793, "y": 94, "z": 185, "dimension": "minecraft:overworld"},
+        "targets": [
+            {
+                "x": -793,
+                "y": 94,
+                "z": 185,
+                "dimension": "minecraft:overworld",
+                "type_id": "minecraft:stone",
+            }
+        ],
+        "before": {
+            "type_id": "minecraft:air",
+            "states": {},
+            "x": -793,
+            "y": 94,
+            "z": 185,
+            "dimension": "minecraft:overworld",
+            "extra_a": 1,
+            "extra_b": 2,
+            "extra_c": 3,
+        },
+        "after": {
+            "type_id": "minecraft:stone",
+            "states": {},
+            "x": -793,
+            "y": 94,
+            "z": 185,
+            "dimension": "minecraft:overworld",
+        },
+        "states": {},
+        "repairs_applied": [],
+        "verification": {"checked": True, "details": ["a"] * 20},
+        "rollback": {"attempted": False},
+    }
+    projected = project_block_result_for_model(fat_payload, mode="place")
+    text = json.dumps(projected, ensure_ascii=False)
+    assert len(text) <= 250
+    assert projected["ok"] is True
+    assert projected["mode"] == "place"
+    assert projected["changed"] is True
+    assert projected["at"] == {"x": -793, "y": 94, "z": 185}
+    assert projected["type_id"] == "minecraft:stone"
+    assert projected["was"] == "minecraft:air"
+    assert "before" not in projected
+    assert "after" not in projected
+    assert "targets" not in projected
+    assert "verification" not in projected
+    assert "phase" not in projected
+
+    mapped = map_addon_bridge_result(
+        {"ok": True, "payload": fat_payload},
+        project_for_model=True,
+        mode="place",
+    )
+    assert mapped.is_success
+    assert len(mapped.output) <= 250
+    assert "before" not in mapped.output
+    assert "verification" not in mapped.output
+
+
+def test_fill_success_model_projection_uses_authorized_aabb() -> None:
+    fat_payload = {
+        "schema_version": "1",
+        "ok": True,
+        "phase": "execute",
+        "mode": "fill",
+        "type_id": "minecraft:oak_planks",
+        "changed_count": 6,
+        "skipped": 19,
+        "volume": 2,  # locked-shrunk (wrong for model)
+        "from": {"x": -797, "y": 93, "z": 180},
+        "to": {"x": -796, "y": 93, "z": 180},
+        "previous_type_counts": {
+            "minecraft:air": 6,
+            "minecraft:grass_path": 12,
+            "minecraft:stone": 4,
+            "minecraft:gravel": 3,
+        },
+        "before_samples": [{"type_id": "minecraft:air", "x": 0, "y": 0, "z": 0}] * 10,
+        "targets": [{"x": i, "y": 93, "z": 180} for i in range(6)],
+        "verification": {"ok": True, "cells": list(range(25))},
+        "rollback": {"needed": False},
+    }
+    authorized = {
+        "from": {"x": -797, "y": 93, "z": 180},
+        "to": {"x": -793, "y": 93, "z": 184},
+        "volume": 25,
+    }
+    projected = project_block_result_for_model(
+        fat_payload, mode="fill", authorized_bounds=authorized
+    )
+    assert projected["ok"] is True
+    assert projected["mode"] == "fill"
+    assert projected["changed_count"] == 6
+    assert projected["skipped"] == 19
+    assert projected["volume"] == 25
+    assert projected["from"] == {"x": -797, "y": 93, "z": 180}
+    assert projected["to"] == {"x": -793, "y": 93, "z": 184}
+    assert projected["type_id"] == "minecraft:oak_planks"
+    assert projected["previous_type_counts"]["minecraft:air"] == 6
+    assert "before_samples" not in projected
+    assert "targets" not in projected
+    assert "verification" not in projected
+    assert "rollback" not in projected
+    assert "phase" not in projected
+
+    mapped = map_addon_bridge_result(
+        {"ok": True, "payload": fat_payload},
+        project_for_model=True,
+        mode="fill",
+        authorized_bounds=authorized,
+    )
+    body = json.loads(mapped.output)
+    assert "before_samples" not in body
+    assert body["volume"] == 25
+    assert body["from"]["z"] == 180
+    assert body["to"]["z"] == 184
 
 
 def test_limits_hard_clamp() -> None:

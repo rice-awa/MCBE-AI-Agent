@@ -5,6 +5,7 @@ from services.agent.block_ops.bridge import (
     map_addon_bridge_result,
     map_bridge_exception,
 )
+from services.agent.block_ops.project import project_block_result_for_model
 from services.agent.block_ops.capability import (
     BlockCapabilityCache,
     BlockCapabilityRecord,
@@ -81,6 +82,7 @@ __all__ = [
     "map_bridge_exception",
     "merge_canonical_from_preflight",
     "project_block_execute_args",
+    "project_block_result_for_model",
     "reset_block_capability_cache",
     "reset_preflight_cache",
     "run_block_preflight",

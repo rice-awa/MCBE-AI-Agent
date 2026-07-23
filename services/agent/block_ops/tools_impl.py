@@ -1123,4 +1123,16 @@ async def edit_blocks_impl(
     )
     if budget_fail is not None:
         return budget_fail
-    return await call_block_capability(deps.addon_bridge, "edit_blocks", payload)
+    authorized_bounds: dict[str, Any] | None = None
+    if mode == "fill" and isinstance(from_pos, dict) and isinstance(to_pos, dict):
+        authorized_bounds = {"from": from_pos, "to": to_pos}
+        vol = _aabb_volume(from_pos, to_pos)
+        if vol is not None:
+            authorized_bounds["volume"] = vol
+    return await call_block_capability(
+        deps.addon_bridge,
+        "edit_blocks",
+        payload,
+        mode=mode,
+        authorized_bounds=authorized_bounds,
+    )
