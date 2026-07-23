@@ -30,6 +30,7 @@ from services.agent.block_ops.capability import (
 from services.agent.block_ops.project import project_block_result_for_model
 from services.agent.block_ops.config import (
     DEFAULT_COMMAND_LINE_BYTE_BUDGET,
+    DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE,
     HARD_MAX_DISCRETE_POSITIONS,
     get_block_tools_limits,
     get_command_line_byte_budget,
@@ -53,6 +54,7 @@ from services.agent.block_ops.tools_impl import (
     edit_blocks_impl,
     estimate_bridge_command_line_bytes,
     inspect_block_impl,
+    locked_targets_wire_limit_exceeded,
     merge_canonical_from_preflight,
     run_block_preflight,
     project_block_execute_args,
@@ -864,6 +866,7 @@ def test_limits_hard_clamp() -> None:
                 max_discrete_positions=99999,
                 max_fill_volume=99999,
                 cells_per_tick=99999,
+                max_locked_targets_on_wire=99999,
             )
         )
     )
@@ -871,6 +874,87 @@ def test_limits_hard_clamp() -> None:
     assert limits.max_discrete_positions == HARD_MAX_DISCRETE_POSITIONS
     assert limits.max_fill_volume == 16384
     assert limits.cells_per_tick == 512
+    assert limits.max_locked_targets_on_wire == 1024
+
+
+def test_max_locked_targets_on_wire_default_zero_and_readable() -> None:
+    assert DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE == 0
+    assert get_block_tools_limits(None).max_locked_targets_on_wire == 0
+    assert (
+        get_block_tools_limits(
+            SimpleNamespace(addon=SimpleNamespace(block_tools={}))
+        ).max_locked_targets_on_wire
+        == 0
+    )
+    assert (
+        get_block_tools_limits(
+            SimpleNamespace(
+                addon=SimpleNamespace(
+                    block_tools={"max_locked_targets_on_wire": 8}
+                )
+            )
+        ).max_locked_targets_on_wire
+        == 8
+    )
+    # Explicit 0 must not be treated as missing.
+    assert (
+        get_block_tools_limits(
+            SimpleNamespace(
+                addon=SimpleNamespace(
+                    block_tools={"max_locked_targets_on_wire": 0}
+                )
+            )
+        ).max_locked_targets_on_wire
+        == 0
+    )
+
+
+def test_locked_targets_wire_limit_exceeded_only_when_cap_positive() -> None:
+    cells = [{"x": i, "y": 64, "z": 0} for i in range(5)]
+    assert locked_targets_wire_limit_exceeded(cells, max_locked_targets_on_wire=0) is None
+    assert locked_targets_wire_limit_exceeded(cells, max_locked_targets_on_wire=5) is None
+    fail = locked_targets_wire_limit_exceeded(cells, max_locked_targets_on_wire=2)
+    assert fail is not None
+    body = json.loads(fail.output)
+    assert body["code"] == "LIMIT_EXCEEDED"
+    assert body["reason"] == "max_locked_targets_on_wire"
+    assert body["suggested_max_discrete"] == 2
+    assert body["matched_count"] == 5
+    assert any(k in body.get("hint", "") for k in ("place", "batch", "fill"))
+
+
+def test_absolute_execute_still_omits_when_max_locked_wire_zero() -> None:
+    """Default max_locked_targets_on_wire=0 must not force shipping locked list."""
+    locked = [{"x": i, "y": 64, "z": 0} for i in range(6)]
+    payload = build_edit_payload(
+        mode="fill",
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        position=None,
+        positions=None,
+        from_pos={"x": 0, "y": 64, "z": 0},
+        to_pos={"x": 4, "y": 64, "z": 4},
+        type_id="minecraft:oak_planks",
+        states=None,
+        replace_any=False,
+        expected_previous=None,
+        player_name="Steve",
+        phase="execute",
+        locked_targets=locked,
+        max_locked_targets_on_wire=0,
+    )
+    assert "locked_targets" not in payload
+    assert should_omit_locked_targets_on_wire(
+        mode="fill",
+        phase="execute",
+        from_pos={"x": 0, "y": 64, "z": 0},
+        to_pos={"x": 4, "y": 64, "z": 4},
+        position=None,
+        positions=None,
+        locked_targets=locked,
+        coordinate_mode="absolute",
+        max_locked_targets_on_wire=0,
+    )
 
 
 def test_bridge_payload_limits_are_top_level_addon_fields() -> None:

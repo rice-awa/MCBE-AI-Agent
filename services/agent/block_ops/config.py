@@ -9,10 +9,14 @@ from typing import Any
 HARD_MAX_DISCRETE_POSITIONS = 1024
 HARD_MAX_FILL_VOLUME = 16384
 HARD_MAX_CELLS_PER_TICK = 512
+HARD_MAX_LOCKED_TARGETS_ON_WIRE = 1024
 
 DEFAULT_MAX_DISCRETE_POSITIONS = 256
 DEFAULT_MAX_FILL_VOLUME = 4096
 DEFAULT_CELLS_PER_TICK = 128
+# 0 = absolute execute prefers omit locked_targets on the wire (see should_omit_*).
+# When >0 and a non-omitted path must ship locked cells, enforce this cap.
+DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE = 0
 # MCBE commandLine hard budget (empirically ~461 B); mirrors Settings.flow_control.
 DEFAULT_COMMAND_LINE_BYTE_BUDGET = 461
 
@@ -22,6 +26,7 @@ class BlockToolsLimits:
     max_discrete_positions: int = DEFAULT_MAX_DISCRETE_POSITIONS
     max_fill_volume: int = DEFAULT_MAX_FILL_VOLUME
     cells_per_tick: int = DEFAULT_CELLS_PER_TICK
+    max_locked_targets_on_wire: int = DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE
 
 
 def _clamp(value: int, *, minimum: int, hard_max: int) -> int:
@@ -60,6 +65,7 @@ def get_block_tools_limits(settings: Any | None = None) -> BlockToolsLimits:
     max_positions = DEFAULT_MAX_DISCRETE_POSITIONS
     max_fill = DEFAULT_MAX_FILL_VOLUME
     cells = DEFAULT_CELLS_PER_TICK
+    max_locked_on_wire = DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE
 
     if block_tools is not None:
         if isinstance(block_tools, dict):
@@ -68,12 +74,28 @@ def get_block_tools_limits(settings: Any | None = None) -> BlockToolsLimits:
             )
             max_fill = int(block_tools.get("max_fill_volume", max_fill) or max_fill)
             cells = int(block_tools.get("cells_per_tick", cells) or cells)
+            raw_locked = block_tools.get(
+                "max_locked_targets_on_wire", max_locked_on_wire
+            )
+            # Preserve explicit 0 (omit preference); only fall back when missing/None.
+            if raw_locked is None:
+                max_locked_on_wire = DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE
+            else:
+                max_locked_on_wire = int(raw_locked)
         else:
             max_positions = int(
-                getattr(block_tools, "max_discrete_positions", max_positions) or max_positions
+                getattr(block_tools, "max_discrete_positions", max_positions)
+                or max_positions
             )
             max_fill = int(getattr(block_tools, "max_fill_volume", max_fill) or max_fill)
             cells = int(getattr(block_tools, "cells_per_tick", cells) or cells)
+            raw_locked = getattr(
+                block_tools, "max_locked_targets_on_wire", max_locked_on_wire
+            )
+            if raw_locked is None:
+                max_locked_on_wire = DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE
+            else:
+                max_locked_on_wire = int(raw_locked)
 
     return BlockToolsLimits(
         max_discrete_positions=_clamp(
@@ -81,4 +103,8 @@ def get_block_tools_limits(settings: Any | None = None) -> BlockToolsLimits:
         ),
         max_fill_volume=_clamp(max_fill, minimum=1, hard_max=HARD_MAX_FILL_VOLUME),
         cells_per_tick=_clamp(cells, minimum=1, hard_max=HARD_MAX_CELLS_PER_TICK),
+        # 0 is intentional (absolute omit preference); clamp only the upper bound.
+        max_locked_targets_on_wire=max(
+            0, min(int(max_locked_on_wire), HARD_MAX_LOCKED_TARGETS_ON_WIRE)
+        ),
     )

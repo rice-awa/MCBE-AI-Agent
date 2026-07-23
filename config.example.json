@@ -205,7 +205,8 @@
     "block_tools": {
       "max_discrete_positions": 256,
       "max_fill_volume": 4096,
-      "cells_per_tick": 128
+      "cells_per_tick": 128,
+      "max_locked_targets_on_wire": 0
     }
   },
   "logging": {

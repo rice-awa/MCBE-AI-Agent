@@ -571,6 +571,7 @@ def should_omit_locked_targets_on_wire(
     positions: list[dict[str, Any]] | None,
     locked_targets: list[dict[str, Any]] | None,
     coordinate_mode: str,
+    max_locked_targets_on_wire: int | None = None,
 ) -> bool:
     """True when absolute execute geometry freezes targets without replaying cells.
 
@@ -579,7 +580,12 @@ def should_omit_locked_targets_on_wire(
     On absolute execute, place/batch/fill geometry (position / positions /
     from+to) is authoritative; omit ``locked_targets`` on the wire. Audit and
     approval records may still hold the full list.
+
+    ``max_locked_targets_on_wire`` default 0 means absolute execute always prefers
+    omit when geometry is complete (does not force shipping locked cells). Values
+    ``>0`` only cap the list on non-omit paths (see ``build_edit_payload``).
     """
+    del max_locked_targets_on_wire  # policy knob reserved for non-omit cap path
     if phase != "execute" or coordinate_mode != "absolute":
         return False
     if mode == "fill" and isinstance(from_pos, dict) and isinstance(to_pos, dict):
@@ -590,6 +596,46 @@ def should_omit_locked_targets_on_wire(
         return True
     # No complete absolute geometry — only omit if there is nothing to send.
     return not locked_targets
+
+
+def locked_targets_wire_limit_exceeded(
+    locked_targets: list[dict[str, Any]] | None,
+    *,
+    max_locked_targets_on_wire: int,
+) -> ToolResult | None:
+    """When a non-omit path must ship locked cells and the list exceeds the cap.
+
+    ``max_locked_targets_on_wire=0`` means “prefer omit on absolute” and does not
+    enforce a positive cap; only values ``>0`` trigger LIMIT on ship paths.
+    """
+    if max_locked_targets_on_wire <= 0 or not locked_targets:
+        return None
+    if len(locked_targets) <= max_locked_targets_on_wire:
+        return None
+    body = build_error_response(
+        BlockErrorCode.LIMIT_EXCEEDED,
+        (
+            f"locked_targets 数量 {len(locked_targets)} 超过 "
+            f"max_locked_targets_on_wire={max_locked_targets_on_wire}，请求未发送。"
+        ),
+        retryable=True,
+        external_state_unknown=False,
+        fallback_allowed=False,
+        reason="max_locked_targets_on_wire",
+        hint=_COMMAND_LINE_BUDGET_HINT,
+        suggested_max_discrete=max_locked_targets_on_wire,
+        matched_count=len(locked_targets),
+    )
+    return ToolResult.failure(
+        dumps_payload(body),
+        error_kind="INVALID_ARGUMENT",
+        retryable=True,
+        external_state_unknown=False,
+        diagnostic_summary=(
+            f"max_locked_targets_on_wire matched={len(locked_targets)} "
+            f"cap={max_locked_targets_on_wire}"
+        ),
+    )
 
 
 def build_inspect_payload(
@@ -638,6 +684,7 @@ def build_edit_payload(
     phase: str,
     locked_targets: list[dict[str, Any]] | None = None,
     limits: dict[str, int] | None = None,
+    max_locked_targets_on_wire: int | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "mode": mode,
@@ -662,6 +709,13 @@ def build_edit_payload(
     if expected_previous is not None:
         payload["expected_previous"] = expected_previous
 
+    wire_cap = 0 if max_locked_targets_on_wire is None else int(max_locked_targets_on_wire)
+    if limits is not None and "max_locked_targets_on_wire" in limits and max_locked_targets_on_wire is None:
+        try:
+            wire_cap = int(limits["max_locked_targets_on_wire"])
+        except (TypeError, ValueError, KeyError):
+            wire_cap = 0
+
     omit_locked = should_omit_locked_targets_on_wire(
         mode=mode,
         phase=phase,
@@ -671,8 +725,11 @@ def build_edit_payload(
         positions=positions if isinstance(positions, list) else None,
         locked_targets=locked_targets if isinstance(locked_targets, list) else None,
         coordinate_mode=coordinate_mode,
+        max_locked_targets_on_wire=wire_cap,
     )
     if locked_targets is not None and not omit_locked:
+        # Cap is enforced by locked_targets_wire_limit_exceeded at send/preflight;
+        # default wire_cap=0 never forces shipping on absolute (omit above).
         payload["locked_targets"] = compact_locked_targets_for_wire(
             locked_targets,
             dimension=dimension,
@@ -864,6 +921,7 @@ async def run_block_preflight(
         "max_discrete_positions": limits.max_discrete_positions,
         "max_fill_volume": limits.max_fill_volume,
         "cells_per_tick": limits.cells_per_tick,
+        "max_locked_targets_on_wire": limits.max_locked_targets_on_wire,
     }
 
     # If already canonical with locked_targets from a prior approval recovery, skip re-preflight.
@@ -948,6 +1006,7 @@ async def run_block_preflight(
             player_name=deps.player_name,
             phase="preflight",
             limits=limits_payload,
+            max_locked_targets_on_wire=limits.max_locked_targets_on_wire,
         )
         budget = get_command_line_byte_budget(deps.settings)
         preflight_volume = (
@@ -991,6 +1050,11 @@ async def run_block_preflight(
         exec_args = plan.execute_args
         exec_from = exec_args.get("from_pos") or exec_args.get("from")
         exec_to = exec_args.get("to_pos") or exec_args.get("to")
+        locked_for_exec = (
+            exec_args.get("locked_targets")
+            if isinstance(exec_args.get("locked_targets"), list)
+            else None
+        )
         exec_payload = build_edit_payload(
             mode=str(exec_args.get("mode") or mode),
             coordinate_mode=str(exec_args.get("coordinate_mode") or coord_mode),
@@ -1005,12 +1069,19 @@ async def run_block_preflight(
             expected_previous=exec_args.get("expected_previous"),
             player_name=deps.player_name,
             phase="execute",
-            locked_targets=(
-                exec_args.get("locked_targets")
-                if isinstance(exec_args.get("locked_targets"), list)
-                else None
-            ),
+            locked_targets=locked_for_exec,
+            max_locked_targets_on_wire=limits.max_locked_targets_on_wire,
         )
+        # Cap only when wire still ships locked_targets (non-omit path).
+        if "locked_targets" in exec_payload:
+            wire_cap_fail = locked_targets_wire_limit_exceeded(
+                exec_payload.get("locked_targets")
+                if isinstance(exec_payload.get("locked_targets"), list)
+                else locked_for_exec,
+                max_locked_targets_on_wire=limits.max_locked_targets_on_wire,
+            )
+            if wire_cap_fail is not None:
+                return None, wire_cap_fail
         locked = exec_args.get("locked_targets")
         matched_count = len(locked) if isinstance(locked, list) else None
         exec_volume = (
@@ -1162,8 +1233,19 @@ async def edit_blocks_impl(
             "max_discrete_positions": limits.max_discrete_positions,
             "max_fill_volume": limits.max_fill_volume,
             "cells_per_tick": limits.cells_per_tick,
+            "max_locked_targets_on_wire": limits.max_locked_targets_on_wire,
         },
+        max_locked_targets_on_wire=limits.max_locked_targets_on_wire,
     )
+    if "locked_targets" in payload:
+        wire_cap_fail = locked_targets_wire_limit_exceeded(
+            payload.get("locked_targets")
+            if isinstance(payload.get("locked_targets"), list)
+            else locked_targets,
+            max_locked_targets_on_wire=limits.max_locked_targets_on_wire,
+        )
+        if wire_cap_fail is not None:
+            return wire_cap_fail
     locked_on_wire = payload.get("locked_targets")
     estimated_wire = estimate_bridge_command_line_bytes("edit_blocks", payload)
     logger.info(
