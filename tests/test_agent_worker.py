@@ -296,7 +296,137 @@ async def test_usage_limit_exceeded_does_not_continue_tools(monkeypatch):
     assert broker.send_response.await_count >= 1
     sent = broker.send_response.await_args_list[-1].args[1]
     assert getattr(sent, "chunk_type", None) == "error"
-    assert "预算" in sent.content or "错误" in sent.content
+    assert "预算" in sent.content or "错误" in sent.content or "上限" in sent.content
+
+
+@pytest.mark.asyncio
+async def test_error_event_persists_partial_run_history(monkeypatch):
+    """mid-run 失败时应落盘已产生的 all_messages + 错误说明，供下轮 LLM 使用。"""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        ToolCallPart,
+        ToolReturnPart,
+        UserPromptPart,
+    )
+
+    from models.agent import StreamEvent
+
+    settings = _make_settings()
+    settings.compression_enabled = False
+    broker = MagicMock()
+    broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+    broker.get_conversation_history = MagicMock(return_value=[])
+    broker.set_conversation_history = MagicMock(return_value=True)
+    broker.send_response = AsyncMock(return_value=True)
+    broker.get_response_queue = MagicMock(return_value=object())
+    broker.mark_conversation_title_generating = MagicMock(return_value=False)
+    worker = AgentWorker(broker, settings)
+
+    partial_messages = [
+        ModelRequest(parts=[UserPromptPart(content="在这里放火把")]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="edit_blocks",
+                    args={"mode": "place", "type_id": "minecraft:torch"},
+                    tool_call_id="tc-1",
+                )
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="edit_blocks",
+                    content='{"ok": true}',
+                    tool_call_id="tc-1",
+                )
+            ]
+        ),
+    ]
+
+    async def fake_stream_chat(*_args, **_kwargs):
+        yield StreamEvent(
+            event_type="tool_call",
+            content="edit_blocks",
+            sequence=0,
+            metadata={
+                "tool_name": "edit_blocks",
+                "tool_call_id": "tc-1",
+                "args": {"mode": "place"},
+            },
+        )
+        yield StreamEvent(
+            event_type="tool_result",
+            content='{"ok": true}',
+            sequence=1,
+            metadata={"tool_name": "edit_blocks", "tool_call_id": "tc-1"},
+        )
+        yield StreamEvent(
+            event_type="error",
+            content=(
+                "本轮累计输入 token 已达配置上限（多步工具会把每次请求的输入相加），"
+                "请缩短问题、清空或压缩上下文，或拆成更小的步骤后重试。"
+            ),
+            sequence=2,
+            metadata={
+                "error_kind": "DENIED",
+                "diagnostic_summary": (
+                    "Exceeded the input_tokens_limit of 126976 (input_tokens=128035)"
+                ),
+                "all_messages": partial_messages,
+                "new_messages": partial_messages,
+                "new_messages_serialized": [
+                    {"kind": "request", "parts": []},
+                    {"kind": "response", "parts": []},
+                ],
+                "salvage_partial_run": True,
+                "run_id": "run-partial",
+            },
+        )
+
+    monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+    monkeypatch.setattr(
+        "services.agent.providers.ProviderRegistry.get_model",
+        lambda _config: object(),
+    )
+    monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+
+    connection_id = uuid4()
+    await worker._process_request_locked(
+        ChatRequest(
+            connection_id=connection_id,
+            content="在这里放火把",
+            player_name="Alex",
+            run_id="run-partial",
+            use_context=True,
+        ),
+        connection_id,
+    )
+
+    assert broker.set_conversation_history.called
+    args = broker.set_conversation_history.call_args
+    saved_history = args.args[2]
+    assert len(saved_history) >= len(partial_messages)
+    # 末尾应有中断说明，供下轮 LLM 看见
+    last = saved_history[-1]
+    assert isinstance(last, ModelResponse)
+    last_text = "".join(
+        str(getattr(p, "content", "") or "")
+        for p in last.parts
+        if getattr(p, "part_kind", None) == "text"
+    )
+    assert "中断" in last_text or "上限" in last_text
+
+    # 玩家仍收到 error chunk
+    error_chunks = [
+        c.args[1]
+        for c in broker.send_response.await_args_list
+        if getattr(c.args[1], "chunk_type", None) == "error"
+    ]
+    assert error_chunks
+    assert "上限" in error_chunks[-1].content or "累计" in error_chunks[-1].content
 
 
 @pytest.mark.asyncio

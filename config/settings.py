@@ -809,7 +809,10 @@ class Settings(BaseSettings):
     # 每轮 run 预算（UsageLimits + wall-clock）
     request_limit: int = Field(default=8, ge=1)
     tool_calls_limit: int = Field(default=16, ge=1)
-    # None = 未显式配置；运行时可由模型 context window 派生
+    # None = 不设 run 级 token 硬上限。
+    # 注意：PydanticAI 的 input/total tokens 是整轮累计（多步工具会相加），
+    # 不能用 context_window 自动派生，否则会在多轮工具循环中误杀。
+    # 单次请求窗口保护由 ContextBuilder history_processor 负责。
     input_tokens_limit: int | None = Field(default=None, ge=1)
     output_tokens_limit: int | None = Field(default=None, ge=1)
     total_tokens_limit: int | None = Field(default=None, ge=1)
@@ -820,6 +823,7 @@ class Settings(BaseSettings):
     # 仅当当前 provider 的 Model 实现了 count_tokens 时才会真正开启
     # （目前 anthropic；OpenAIChatModel / OllamaModel / FunctionModel / TestModel 不支持）。
     # deepseek/openai/ollama 会在 build_usage_limits 中自动关闭，避免 NotImplementedError。
+    # 且仅在显式配置了 input/total_tokens_limit 时有实际约束作用。
     count_tokens_before_request: bool = True
 
     # 运行时 Harness 配置

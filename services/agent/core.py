@@ -98,44 +98,24 @@ def provider_supports_count_tokens(provider_name: str | None) -> bool:
 def build_usage_limits(settings: Any, provider_name: str | None = None) -> UsageLimits:
     """从 Settings 构建 PydanticAI UsageLimits。
 
-    ContextBuilder 负责正常历史退化；在模型支持时 `count_tokens_before_request`
-    作为最终硬边界，阻止估算误差导致的超窗请求。
-    若 context_window 元数据缺失，不回退到无限预算。
+    重要：PydanticAI 的 ``input_tokens`` / ``total_tokens`` 是**整轮 agent run 的累计值**
+    （每次模型请求的 usage 相加），不是单次 prompt 的窗口占用。
 
-    注意：OpenAI / DeepSeek / Ollama 的 Model 未实现 count_tokens；
-    即便 settings 开启也会自动关闭，避免 NotImplementedError 打断对话。
+    因此：
+    - **单次请求**的上下文窗口保护由 ``ContextBuilder`` history_processor 负责；
+    - ``input_tokens_limit`` / ``total_tokens_limit`` 仅在用户**显式配置**时作为
+      run 级预算硬上限传入；**不要**用 ``context_window`` 自动派生，否则多步
+      工具循环会在累计输入达到窗口大小时被误杀（即便每一步都未超窗）。
+    - ``request_limit`` / ``tool_calls_limit`` 仍始终生效，用于限制本轮步数。
+    - 模型支持时 ``count_tokens_before_request`` 可与显式 token 上限配合；
+      OpenAI / DeepSeek / Ollama 的 Model 未实现 count_tokens，会自动关闭。
     """
     request_limit = int(getattr(settings, "request_limit", 8) or 8)
     tool_calls_limit = int(getattr(settings, "tool_calls_limit", 8) or 8)
+    # 仅透传显式配置；None 表示不设 run 级 token 硬上限（由 ContextBuilder 管窗口）
     input_tokens_limit = getattr(settings, "input_tokens_limit", None)
     output_tokens_limit = getattr(settings, "output_tokens_limit", None)
     total_tokens_limit = getattr(settings, "total_tokens_limit", None)
-    reserve = int(getattr(settings, "context_output_reserve_tokens", 1024) or 0)
-
-    context_window = None
-    get_provider_config = getattr(settings, "get_provider_config", None)
-    if callable(get_provider_config):
-        try:
-            provider_config = get_provider_config(provider_name)
-            context_window = getattr(provider_config, "context_window", None)
-        except Exception:
-            context_window = None
-
-    # 未显式配置 input/total 时，尝试从模型 context_window 派生
-    if input_tokens_limit is None or total_tokens_limit is None:
-        if context_window is not None and context_window > reserve:
-            derived = int(context_window) - reserve
-            if input_tokens_limit is None:
-                input_tokens_limit = derived
-            if total_tokens_limit is None:
-                total_tokens_limit = int(context_window)
-
-    # 元数据缺失且未显式配置时：使用保守硬上限，避免无限预算
-    if context_window is None:
-        if input_tokens_limit is None:
-            input_tokens_limit = max(1024, 8192 - reserve)
-        if total_tokens_limit is None:
-            total_tokens_limit = 8192
 
     want_count_tokens = bool(getattr(settings, "count_tokens_before_request", True))
     supports_count_tokens = provider_supports_count_tokens(provider_name)
@@ -157,6 +137,35 @@ def build_usage_limits(settings: Any, provider_name: str | None = None) -> Usage
     )
 
 
+def format_usage_limit_player_message(exc: UsageLimitExceeded) -> str:
+    """把 UsageLimitExceeded 拆成可操作的玩家文案（区分 request/tool/token）。"""
+    msg = str(exc)
+    lower = msg.lower()
+    if "tool_calls_limit" in lower:
+        return (
+            "本轮工具调用次数已达上限，请缩短任务、拆成多条指令，"
+            "或稍后再试。"
+        )
+    if "request_limit" in lower:
+        return (
+            "本轮模型请求步数已达上限（多轮工具循环过长），请缩短任务"
+            "或拆成多条指令后重试。"
+        )
+    if "output_tokens_limit" in lower:
+        return "本轮模型输出过长已达上限，请缩短问题或分步提问。"
+    if "total_tokens_limit" in lower:
+        return (
+            "本轮累计 token 已达配置上限（含多步工具循环），"
+            "请缩短问题、清空上下文，或拆成更小的步骤后重试。"
+        )
+    if "input_tokens_limit" in lower:
+        return (
+            "本轮累计输入 token 已达配置上限（多步工具会把每次请求的输入相加），"
+            "请缩短问题、清空或压缩上下文，或拆成更小的步骤后重试。"
+        )
+    return "已达到本轮请求预算上限，请缩短问题、拆成多步，或稍后再试。"
+
+
 def get_run_timeout(settings: Any) -> float:
     return float(getattr(settings, "run_timeout", 90.0) or 90.0)
 
@@ -172,7 +181,7 @@ def classify_run_exception(exc: BaseException) -> tuple[ErrorKind, str, str]:
     if isinstance(exc, asyncio.TimeoutError):
         return "TRANSIENT", player_facing_error("TRANSIENT"), "run_timeout"
     if isinstance(exc, UsageLimitExceeded):
-        return "DENIED", "已达到本轮请求预算上限，请缩短问题或稍后再试。", str(exc)
+        return "DENIED", format_usage_limit_player_message(exc), str(exc)
 
     # 懒导入避免 core ↔ context 循环依赖
     from services.agent.context import ContextOversizedError
@@ -186,6 +195,69 @@ def classify_run_exception(exc: BaseException) -> tuple[ErrorKind, str, str]:
     if "timeout" in lower or "deadline exceeded" in lower:
         return "TRANSIENT", player_facing_error("TRANSIENT"), detail
     return "INTERNAL", player_facing_error("INTERNAL"), detail
+
+
+def _salvage_messages_from_run(run: Any) -> tuple[list[ModelMessage], list[ModelMessage], Any | None]:
+    """从未正常结束的 AgentRun 尽量提取 all/new messages 与 usage。"""
+    all_messages: list[ModelMessage] = []
+    new_messages: list[ModelMessage] = []
+    usage: Any | None = None
+    if run is None:
+        return all_messages, new_messages, usage
+    try:
+        raw_all = run.all_messages() if callable(getattr(run, "all_messages", None)) else None
+        if isinstance(raw_all, list):
+            all_messages = list(raw_all)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        raw_new = run.new_messages() if callable(getattr(run, "new_messages", None)) else None
+        if isinstance(raw_new, list):
+            new_messages = list(raw_new)
+        elif all_messages:
+            new_messages = list(all_messages)
+    except Exception:  # noqa: BLE001
+        if all_messages:
+            new_messages = list(all_messages)
+    try:
+        usage_attr = getattr(run, "usage", None)
+        usage = usage_attr() if callable(usage_attr) else usage_attr
+    except Exception:  # noqa: BLE001
+        usage = None
+    return all_messages, new_messages, usage
+
+
+def _build_error_event(
+    ctx: "_HandlerContext",
+    deps: AgentDependencies,
+    *,
+    error_kind: ErrorKind,
+    player_msg: str,
+    diagnostic: str,
+) -> StreamEvent:
+    """构造 error StreamEvent；若已 salvage 到部分消息则一并放入 metadata。"""
+    metadata: dict[str, Any] = {
+        "error_kind": error_kind,
+        "diagnostic_summary": diagnostic,
+        "run_id": deps.run_id,
+        "conversation_id": deps.conversation_id,
+        "player_name": deps.player_name,
+    }
+    if ctx.all_messages:
+        metadata["all_messages"] = ctx.all_messages
+        metadata["new_messages"] = ctx.new_messages
+        metadata["new_messages_serialized"] = serialize_model_messages(ctx.new_messages)
+        metadata["tool_events"] = ctx.tool_events or _extract_tool_events_from_messages(
+            ctx.new_messages
+        )
+        metadata["usage"] = ctx.serialized_usage
+        metadata["salvage_partial_run"] = True
+    return StreamEvent(
+        event_type="error",
+        content=player_msg,
+        sequence=ctx.sequence,
+        metadata=metadata,
+    )
 
 
 def _is_generator_exit_cleanup_error(exc: BaseException) -> bool:
@@ -942,6 +1014,8 @@ async def stream_response_handler(
     # pydantic-ai 的 iter 清理会变成 RuntimeError("coroutine ignored GeneratorExit")，
     # 进而拖垮 worker。
     approval_event: StreamEvent | None = None
+    # 持有 run 引用，异常时 salvage 已产生的消息（UsageLimitExceeded 等中断路径）
+    active_run: Any | None = None
 
     try:
         async with asyncio.timeout(run_timeout):
@@ -958,6 +1032,7 @@ async def stream_response_handler(
                 prompt,
                 **run_kwargs,
             ) as run:
+                active_run = run
                 async for node in run:
                     # 处理用户提示节点
                     if Agent.is_user_prompt_node(node):
@@ -1196,25 +1271,43 @@ async def stream_response_handler(
                 error_kind = "TRANSIENT"
                 player_msg = player_facing_error("TRANSIENT")
 
+            # 中断前 salvage 已产生的工具/模型消息，供 worker 落历史与 trace
+            if not ctx.all_messages and active_run is not None:
+                salvaged_all, salvaged_new, salvaged_usage = _salvage_messages_from_run(
+                    active_run
+                )
+                if salvaged_all:
+                    ctx.all_messages = salvaged_all
+                    ctx.new_messages = salvaged_new or salvaged_all
+                    ctx.serialized_usage = _serialize_usage(salvaged_usage)
+                    if not ctx.tool_events:
+                        ctx.tool_events = _extract_tool_events_from_messages(
+                            ctx.new_messages
+                        )
+                    logger.info(
+                        "stream_partial_run_salvaged",
+                        connection_id=str(deps.connection_id),
+                        run_id=deps.run_id,
+                        all_messages=len(ctx.all_messages),
+                        new_messages=len(ctx.new_messages),
+                        error_kind=error_kind,
+                    )
+
             logger.error(
                 "stream_response_handler_error",
                 error=diagnostic,
                 error_kind=error_kind,
                 connection_id=str(deps.connection_id),
                 run_id=deps.run_id,
+                salvaged_messages=len(ctx.all_messages),
                 exc_info=True,  # 保留完整堆栈
             )
-            yield StreamEvent(
-                event_type="error",
-                content=player_msg,
-                sequence=ctx.sequence,
-                metadata={
-                    "error_kind": error_kind,
-                    "diagnostic_summary": diagnostic,
-                    "run_id": deps.run_id,
-                    "conversation_id": deps.conversation_id,
-                    "player_name": deps.player_name,
-                },
+            yield _build_error_event(
+                ctx,
+                deps,
+                error_kind=error_kind,
+                player_msg=player_msg,
+                diagnostic=diagnostic,
             )
             return
 
@@ -1330,19 +1423,15 @@ async def non_stream_response_handler(
             error_kind=error_kind,
             connection_id=str(deps.connection_id),
             run_id=deps.run_id,
+            salvaged_messages=len(ctx.all_messages),
             exc_info=True,
         )
-        yield StreamEvent(
-            event_type="error",
-            content=player_msg,
-            sequence=ctx.sequence,
-            metadata={
-                "error_kind": error_kind,
-                "diagnostic_summary": diagnostic,
-                "run_id": deps.run_id,
-                "conversation_id": deps.conversation_id,
-                "player_name": deps.player_name,
-            },
+        yield _build_error_event(
+            ctx,
+            deps,
+            error_kind=error_kind,
+            player_msg=player_msg,
+            diagnostic=diagnostic,
         )
 
 
@@ -1453,15 +1542,10 @@ async def stream_chat(
             run_id=deps.run_id,
             exc_info=True,
         )
-        yield StreamEvent(
-            event_type="error",
-            content=player_msg,
-            sequence=ctx.sequence,
-            metadata={
-                "error_kind": error_kind,
-                "diagnostic_summary": diagnostic,
-                "run_id": deps.run_id,
-                "conversation_id": deps.conversation_id,
-                "player_name": deps.player_name,
-            },
+        yield _build_error_event(
+            ctx,
+            deps,
+            error_kind=error_kind,
+            player_msg=player_msg,
+            diagnostic=diagnostic,
         )
