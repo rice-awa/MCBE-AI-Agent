@@ -91,6 +91,40 @@ MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多
 
 避免盲目实现，确保代码符合框架/库的最佳实践。
 
+## Development Workflow (Git)
+
+完整协作约定见 `AGENTS.md`。在本仓库写代码时必须遵守：
+
+### 分支模型
+
+```
+feature/* / fix/* / ...  →  dev  →  master
+```
+
+1. **新功能与 bug 修复必须新建分支**，禁止在 `master` 或 `dev` 上直接开发与提交。
+2. 功能 / 修复分支从最新 **`dev`** 拉出：`git fetch origin && git checkout -b <type>/<name> origin/dev`。
+3. 完成后先合入 **`dev`**（PR 或获准后的 merge），自测与评审在 `dev` 上完成。
+4. 仅从已验证的 **`dev` 合回 `master`**；禁止 feature/fix 分支跳过 `dev` 直合 `master`。
+5. 热修复若从 `master` 拉出，修复后仍先合 `dev`，再由 `dev` 合回 `master`。
+
+### 分支命名
+
+格式：`<type>/<short-kebab-desc>`（英文小写 kebab-case，一看即知意图）
+
+| type | 用途 | 示例 |
+|------|------|------|
+| `feature/` 或 `feat/` | 新功能 | `feature/ddui-chat-panel` |
+| `fix/` | bug 修复 | `fix/pydantic-ai-1.0-import` |
+| `refactor/` | 重构 | `refactor/agent-conversation` |
+| `chore/` | 杂项 / 依赖 | `chore/update-vitest` |
+| `docs/` | 文档 | `docs/addon-bridge-protocol` |
+| `test/` | 测试 | `test/agent-worker-isolation` |
+
+- 一个分支一个主题；避免 `tmp`、`wip`、`fix-1`、纯中文路径名。
+- 临时 worktree 可用 `worktree-<topic>`，合入前用正式 type 命名或在 PR 中写清主题。
+- 提交信息遵循 Conventional Commits（如 `fix(agent): ...`、`feat(chat): ...`）。
+- 推送 / 开 PR 时目标分支默认是 **`dev`**，不是 `master`。
+
 ## Key Files
 
 | File | Purpose |
