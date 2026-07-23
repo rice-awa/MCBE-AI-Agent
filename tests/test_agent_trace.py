@@ -14,6 +14,7 @@ from services.agent.trace import (
     TraceContext,
     TraceEvent,
     TraceRecorder,
+    _PAYLOAD_ALLOWED_KEYS,
     get_trace_recorder,
     serialize_trace_payload,
     set_trace_recorder,
@@ -437,7 +438,114 @@ def test_get_trace_recorder_reads_settings(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_record_tool_call_payload_only_tool_args(tmp_path, context):
+    """New writes keep only tool_args — no parameters mirror key."""
+    path = tmp_path / "trace.jsonl"
+    recorder = TraceRecorder(path=path, enabled=True, include_content=True, max_records=100)
+    await recorder.start()
+    recorder.record_tool_call(
+        context,
+        tool_name="run_command",
+        tool_call_id="tc-1",
+        tool_args={"command": "say hi"},
+    )
+    # parameters keyword is an input alias only
+    recorder.record_tool_call(
+        context,
+        tool_name="other",
+        parameters={"x": 1},
+        tool_args={"y": 2},  # parameters wins when not None
+    )
+    await recorder.stop()
+
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert set(events[0]["payload"].keys()) == {"tool_args"}
+    assert events[0]["payload"]["tool_args"] == {"command": "say hi"}
+    assert "parameters" not in events[0]["payload"]
+    assert set(events[1]["payload"].keys()) == {"tool_args"}
+    assert events[1]["payload"]["tool_args"] == {"x": 1}
+
+
+@pytest.mark.asyncio
+async def test_record_tool_result_payload_only_tool_result(tmp_path, context):
+    """New writes keep only tool_result — no result mirror key."""
+    path = tmp_path / "trace.jsonl"
+    recorder = TraceRecorder(path=path, enabled=True, include_content=True, max_records=100)
+    await recorder.start()
+    recorder.record_tool_result(
+        context,
+        tool_name="run_command",
+        tool_call_id="tc-1",
+        result={"ok": True, "output": "done"},
+        status="succeeded",
+    )
+    await recorder.stop()
+
+    event = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert set(event["payload"].keys()) == {"tool_result"}
+    assert event["payload"]["tool_result"] == {"ok": True, "output": "done"}
+    assert "result" not in event["payload"]
+
+
+@pytest.mark.asyncio
+async def test_record_final_response_payload_only_final_response(tmp_path, context):
+    """New writes keep only final_response — no content mirror key."""
+    path = tmp_path / "trace.jsonl"
+    recorder = TraceRecorder(path=path, enabled=True, include_content=True, max_records=100)
+    await recorder.start()
+    recorder.record_final_response(context, content="hello player")
+    await recorder.stop()
+
+    event = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert set(event["payload"].keys()) == {"final_response"}
+    assert event["payload"]["final_response"] == "hello player"
+    assert "content" not in event["payload"]
+
+
+def test_payload_allowed_keys_keeps_legacy_mirror_names():
+    """Read-side allowlist retains old mirror keys for journal compatibility."""
+    assert "parameters" in _PAYLOAD_ALLOWED_KEYS
+    assert "result" in _PAYLOAD_ALLOWED_KEYS
+    assert "content" in _PAYLOAD_ALLOWED_KEYS
+    assert "tool_args" in _PAYLOAD_ALLOWED_KEYS
+    assert "tool_result" in _PAYLOAD_ALLOWED_KEYS
+    assert "final_response" in _PAYLOAD_ALLOWED_KEYS
+
+
+@pytest.mark.asyncio
+async def test_record_model_messages_extracts_model_name_from_response(tmp_path, context):
+    """When model_name arg is omitted, lift it from a response-kind message into attributes."""
+    path = tmp_path / "trace.jsonl"
+    recorder = TraceRecorder(path=path, enabled=True, include_content=True, max_records=100)
+    await recorder.start()
+    recorder.record_model_messages(
+        context,
+        messages=[
+            {"kind": "request", "parts": [{"part_kind": "user-prompt", "content": "hi"}]},
+            {
+                "kind": "response",
+                "model_name": "deepseek-v4-flash",
+                "parts": [{"part_kind": "text", "content": "hello"}],
+                "finish_reason": "stop",
+            },
+        ],
+        provider="deepseek",
+        finish_reason="stop",
+    )
+    await recorder.stop()
+
+    event = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert event["attributes"]["model_name"] == "deepseek-v4-flash"
+    # model_name must not appear at payload top-level
+    assert "model_name" not in event["payload"]
+    assert set(event["payload"].keys()) == {"messages"}
+    # And messages structure is preserved with model_name inside the response dict
+    assert event["payload"]["messages"][1]["model_name"] == "deepseek-v4-flash"
+
+
+@pytest.mark.asyncio
 async def test_emit_never_raises_on_bad_status(tmp_path, context):
+
     path = tmp_path / "trace.jsonl"
     recorder = TraceRecorder(path=path, enabled=True, include_content=False)
     await recorder.start()
