@@ -246,7 +246,21 @@ export async function handleFill(
   let cells: AbsolutePosition[];
 
   if (payload.locked_targets && payload.locked_targets.length > 0) {
-    dimension = payload.locked_targets[0].dimension;
+    // Host may omit per-cell dimension when it matches top-level (commandLine budget).
+    const firstDim = payload.locked_targets.find(
+      (t) => typeof t.dimension === "string" && t.dimension,
+    )?.dimension;
+    const topDim =
+      typeof payload.dimension === "string" && payload.dimension
+        ? payload.dimension
+        : undefined;
+    dimension = firstDim ?? topDim ?? "";
+    if (!dimension) {
+      return fail(
+        "INVALID_ARGUMENT",
+        "locked_targets require dimension (per-cell or top-level)",
+      );
+    }
     cells = payload.locked_targets.map((t) => ({
       x: Math.floor(t.x),
       y: Math.floor(t.y),

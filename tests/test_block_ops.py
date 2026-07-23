@@ -231,21 +231,83 @@ def test_edit_bridge_exception_is_unknown_and_does_not_leak_transport_detail() -
     )
 
     body = json.loads(result.output)
-    assert body == {
-        "schema_version": "1",
-        "ok": False,
-        "code": "STATE_UNKNOWN",
-        "message": "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。",
-        "retryable": False,
-        "external_state_unknown": True,
-        "fallback_allowed": False,
-    }
+    assert body["schema_version"] == "1"
+    assert body["ok"] is False
+    assert body["code"] == "STATE_UNKNOWN"
+    assert body["retryable"] is False
+    assert body["external_state_unknown"] is True
+    assert body["fallback_allowed"] is False
+    assert "外部状态未知" in body["message"]
+    assert "请勿自动重试" in body["message"]
+    # Diagnostic is surfaced in the model-facing message for operators, but redacted.
+    assert "TimeoutError" in body["message"]
+    assert "bridge-secret" not in body["message"]
     assert result.error_type == "TimeoutError"
     assert result.diagnostic_summary == "TimeoutError: token=[REDACTED] timed out"
     assert "bridge-secret" not in result.diagnostic_summary
     assert "bridge-secret" not in result.output
     assert result.retryable is False
     assert result.external_state_unknown is True
+
+
+def test_edit_bridge_frame_too_large_is_limit_not_unknown() -> None:
+    """commandLine budget failures never left the host — not STATE_UNKNOWN."""
+
+    class FrameTooLargeError(Exception):
+        pass
+
+    result = map_bridge_exception(
+        FrameTooLargeError("raw command too long in bytes (1864 > 461); cannot be safely chunked"),
+        tool_name="edit_blocks",
+    )
+    body = json.loads(result.output)
+    assert body["ok"] is False
+    assert body["code"] == "LIMIT_EXCEEDED"
+    assert body["external_state_unknown"] is False
+    assert body["retryable"] is True
+    assert result.external_state_unknown is False
+    assert "未发送" in body["message"] or "字节预算" in body["message"]
+
+
+def test_build_edit_payload_omits_locked_targets_on_fill_execute() -> None:
+    locked = [
+        {"dimension": "minecraft:overworld", "x": x, "y": -60, "z": z}
+        for x in range(3, 8)
+        for z in range(-9, -4)
+    ]
+    payload = build_edit_payload(
+        mode="fill",
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        position=None,
+        positions=None,
+        from_pos={"x": 3, "y": -60, "z": -9},
+        to_pos={"x": 7, "y": -60, "z": -5},
+        type_id="minecraft:oak_planks",
+        states=None,
+        replace_any=False,
+        expected_previous=None,
+        player_name="fantong7038",
+        phase="execute",
+        locked_targets=locked,
+        limits={"max_discrete_positions": 4096, "max_fill_volume": 4096, "cells_per_tick": 128},
+    )
+    assert "locked_targets" not in payload
+    assert "max_fill_volume" not in payload  # limits omitted on execute
+    assert payload["from"] == {"x": 3, "y": -60, "z": -9}
+    assert payload["to"] == {"x": 7, "y": -60, "z": -5}
+    wire = json.dumps(
+        {
+            "v": 2,
+            "request_id": "addon-" + "a" * 32,
+            "capability": "edit_blocks",
+            "payload": payload,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    command_line = f"scriptevent mcbews:bridge_req {wire}"
+    assert len(command_line.encode("utf-8")) <= 461
 
 
 def test_invalid_bridge_response_does_not_leak_raw_payload() -> None:
@@ -1192,7 +1254,10 @@ async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() 
     assert len(execute_calls) == 1
     assert execute_calls[0]["from"] == {"x": 2, "y": 64, "z": 1}
     assert execute_calls[0]["to"] == {"x": 4, "y": 64, "z": 3}
-    assert execute_calls[0]["locked_targets"] == locked_targets
+    # Continuous fill AABB is frozen by from/to; locked_targets are omitted on the
+    # wire to stay under the MCBE commandLine budget (still present in execute_args).
+    assert "locked_targets" not in execute_calls[0]
+    assert execute_args["locked_targets"] == locked_targets
 
     repeated = await agent.run(
         message_history=first.all_messages(),
@@ -1334,8 +1399,17 @@ async def test_place_and_batch_approval_resume_execute_only_frozen_targets(
         for part in getattr(message, "parts", [])
     ]
     assert [payload["phase"] for payload in edit_payloads] == ["preflight", "execute"], tool_contents
-    assert edit_payloads[-1]["locked_targets"] == locked_targets
+    # Absolute place/batch geometry freezes targets; locked_targets may be omitted
+    # on the wire. The approval execute_args still retain them for idempotency.
     assert edit_payloads[-1]["dimension"] == locked_targets[0]["dimension"]
+    if mode == "place":
+        assert edit_payloads[-1]["position"] == {"x": 42, "y": 70, "z": -8}
+    else:
+        assert edit_payloads[-1]["positions"] == [
+            {"x": 3, "y": 65, "z": 4},
+            {"x": 5, "y": 65, "z": 4},
+        ]
+    assert execute_args["locked_targets"] == locked_targets
 
     repeated = await agent.run(
         message_history=first.all_messages(),
@@ -1497,7 +1571,9 @@ async def test_auto_approved_edit_preflights_then_executes_locked_operation() ->
     phases = [payload.get("phase") for name, payload in bridge.calls if name == "edit_blocks"]
     assert phases == ["preflight", "execute"]
     execute_payload = [payload for name, payload in bridge.calls if name == "edit_blocks"][-1]
-    assert execute_payload["locked_targets"]
+    assert execute_payload.get("phase") == "execute"
+    # place with absolute position freezes the target without shipping locked_targets.
+    assert execute_payload.get("position") == {"x": 9, "y": 64, "z": 9}
 
 
 @pytest.mark.asyncio
@@ -1761,7 +1837,12 @@ async def test_harness_approved_edit_uses_preflight_cache() -> None:
         c for c in bridge.calls if c[0] == "edit_blocks" and c[1].get("phase") == "execute"
     ]
     assert len(execute_calls) == 1
-    assert execute_calls[0][1].get("locked_targets")
+    wire = execute_calls[0][1]
+    # Absolute place freezes the target via position; locked_targets may be
+    # omitted from the wire payload while remaining in the approval plan.
+    assert wire.get("phase") == "execute"
+    assert wire.get("position") == exec_args.get("position")
+    assert recovered.canonical_args.get("locked_targets")
     # policy: edit requires approval unless approved
     need = policy.decide("edit_blocks", normalize_tool_args(plan.authorized_args), player_name="Steve")
     assert need.action == PolicyDecisionKind.REQUIRE_APPROVAL

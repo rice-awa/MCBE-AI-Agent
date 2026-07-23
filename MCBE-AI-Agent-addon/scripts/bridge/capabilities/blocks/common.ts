@@ -295,10 +295,22 @@ export function resolveEditTargets(
   player_origin?: AbsolutePosition;
   player_name?: string;
 }> {
-  // After approval, locked_targets may be provided
+  // After approval, locked_targets may be provided. Host may omit per-cell
+  // dimension when it matches the top-level dimension (commandLine budget).
   if (payload.locked_targets && payload.locked_targets.length > 0) {
+    const fallbackDimension =
+      typeof payload.dimension === "string" && payload.dimension
+        ? payload.dimension
+        : payload.locked_targets.find((t) => typeof t.dimension === "string")?.dimension;
+    if (!fallbackDimension) {
+      return fail(
+        "INVALID_ARGUMENT",
+        "locked_targets require dimension (per-cell or top-level)",
+      );
+    }
     const targets = payload.locked_targets.map((t) => ({
-      dimension: t.dimension,
+      dimension:
+        typeof t.dimension === "string" && t.dimension ? t.dimension : fallbackDimension,
       x: Math.floor(t.x),
       y: Math.floor(t.y),
       z: Math.floor(t.z),

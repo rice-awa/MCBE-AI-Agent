@@ -117,14 +117,26 @@ class WsCommandRunner:
             ) from exc
 
     async def run_as_text(self, state: ConnectionState, command: str) -> str:
-        """Run a command and return the legacy agent-facing result string."""
+        """Run a command and return the legacy agent-facing result string.
+
+        Protocol / size errors (FrameTooLargeError) are re-raised so callers can
+        fail-fast; only game-side failures are stringified.
+        """
         if state.send_payload is None:
             return "命令执行失败: WebSocket 未连接"
         try:
             response = await self.run_raw(state, command)
             return format_command_response(response)
         except Exception as exc:
-            return f"命令执行失败: {exc}"
+            # Preserve structured class name for host mapping (FrameTooLarge etc.).
+            logger.warning(
+                "ws_command_run_failed",
+                connection_id=str(state.id),
+                error_type=type(exc).__name__,
+                error=str(exc),
+                command_line_bytes=len(str(command).encode("utf-8")),
+            )
+            raise
 
     def resolve(self, state: ConnectionState, response: MinecraftCommandResponse) -> bool:
         """Complete a pending future if this response is tracked. Returns True if handled."""

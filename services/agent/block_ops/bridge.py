@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Protocol
 
+from config.logging import get_logger
 from config.redaction import redact_exception
 from services.agent.block_ops.schema import (
     BlockErrorCode,
@@ -13,10 +14,47 @@ from services.agent.block_ops.schema import (
 )
 from services.agent.tool_results import ToolResult
 
+logger = get_logger(__name__)
+
 
 class _BridgeClient(Protocol):
     async def request(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
         ...
+
+
+def _is_pre_mutation_transport_error(exc: BaseException) -> bool:
+    """True when the failure happened before any world mutation could start.
+
+    These must NOT be mapped to STATE_UNKNOWN: the host never successfully
+    delivered (or never successfully started waiting for) a bridge request that
+    could have written blocks.
+    """
+    name = type(exc).__name__
+    text = str(exc)
+    # FrameTooLargeError from SDK flow control — command never left the host.
+    if name in {"FrameTooLargeError", "BridgeLimitError", "ProtocolError"}:
+        return True
+    if "FrameTooLarge" in name or "raw command too long" in text:
+        return True
+    if "commandLine" in text and ("too long" in text or "budget" in text or ">" in text):
+        return True
+    # Explicit host-side send failures that never reached the game.
+    markers = (
+        "命令执行失败: FrameTooLarge",
+        "命令执行失败: raw command too long",
+        "BridgeOutboundError",
+        "bridge outbound failed before send",
+        "bridge request never left host",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _is_bridge_timeout(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    text = str(exc)
+    if name in {"BridgeTimeoutError", "TimeoutError", "asyncio.TimeoutError"}:
+        return True
+    return "Bridge request timed out" in text or "bridge_request_timeout" in text
 
 
 def map_addon_bridge_result(
@@ -103,10 +141,57 @@ def map_bridge_exception(
     """Map bridge transport exceptions to ToolResult.failure."""
     diagnostic_summary = redact_exception(exc) or exc.__class__.__name__
     error_type = exc.__class__.__name__
+    pre_mutation = _is_pre_mutation_transport_error(exc)
+    is_timeout = _is_bridge_timeout(exc)
+
+    logger.warning(
+        "block_bridge_exception",
+        tool_name=tool_name,
+        error_type=error_type,
+        diagnostic_summary=diagnostic_summary,
+        pre_mutation=pre_mutation,
+        is_timeout=is_timeout,
+    )
+
+    # Payload never left the host (e.g. commandLine over 461 B). Safe to retry
+    # after shrinking the plan; world state is known-unchanged by this call.
+    if pre_mutation:
+        body = build_error_response(
+            BlockErrorCode.LIMIT_EXCEEDED,
+            (
+                "方块桥接出站帧超出 MCBE commandLine 字节预算，请求未发送；"
+                "请缩小体积/批次数后重试，勿用命令回退绕过审批。"
+            ),
+            retryable=True,
+            external_state_unknown=False,
+            fallback_allowed=False,
+            reason="command_line_budget",
+        )
+        return ToolResult.failure(
+            dumps_payload(body),
+            error_kind="INVALID_ARGUMENT",
+            retryable=True,
+            external_state_unknown=False,
+            diagnostic_summary=diagnostic_summary,
+            error_type=error_type,
+        )
+
     if tool_name == "edit_blocks":
+        # Timeout after a successful outbound means the addon may have written —
+        # keep STATE_UNKNOWN + no-auto-retry contract.
+        if is_timeout:
+            message = (
+                "方块修改桥接超时；外部状态未知，请勿自动重试或回退命令。"
+                f" 诊断: {diagnostic_summary}"
+            )
+        else:
+            message = (
+                "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。"
+                f" 诊断: {diagnostic_summary}"
+            )
         body = build_error_response(
             BlockErrorCode.STATE_UNKNOWN,
-            "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。",
+            message,
             retryable=False,
             external_state_unknown=True,
             fallback_allowed=False,

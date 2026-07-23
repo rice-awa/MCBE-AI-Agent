@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -326,6 +327,81 @@ def apply_limits_to_payload(payload: dict[str, Any], limits: dict[str, int] | No
     return payload
 
 
+def _aabb_volume(from_pos: dict[str, Any], to_pos: dict[str, Any]) -> int | None:
+    """Return inclusive AABB cell count, or None when coords are not integers."""
+    try:
+        if not all(k in from_pos for k in ("x", "y", "z")):
+            return None
+        if not all(k in to_pos for k in ("x", "y", "z")):
+            return None
+        dx = abs(int(to_pos["x"]) - int(from_pos["x"])) + 1
+        dy = abs(int(to_pos["y"]) - int(from_pos["y"])) + 1
+        dz = abs(int(to_pos["z"]) - int(from_pos["z"])) + 1
+        return dx * dy * dz
+    except (TypeError, ValueError):
+        return None
+
+
+def compact_locked_targets_for_wire(
+    locked_targets: list[dict[str, Any]] | None,
+    *,
+    dimension: str | None,
+) -> list[dict[str, Any]] | None:
+    """Drop per-cell dimension when it matches the top-level dimension (saves commandLine budget)."""
+    if not locked_targets:
+        return locked_targets
+    out: list[dict[str, Any]] = []
+    for item in locked_targets:
+        if not isinstance(item, dict):
+            continue
+        cell: dict[str, Any] = {
+            "x": item.get("x"),
+            "y": item.get("y"),
+            "z": item.get("z"),
+        }
+        cell_dim = item.get("dimension")
+        if cell_dim is not None and (dimension is None or cell_dim != dimension):
+            cell["dimension"] = cell_dim
+        out.append(cell)
+    return out
+
+
+def should_omit_locked_targets_on_wire(
+    *,
+    mode: str,
+    phase: str,
+    from_pos: dict[str, Any] | None,
+    to_pos: dict[str, Any] | None,
+    position: dict[str, Any] | None,
+    positions: list[dict[str, Any]] | None,
+    locked_targets: list[dict[str, Any]] | None,
+    coordinate_mode: str,
+) -> bool:
+    """True when absolute geometry already freezes the target set without the cell list.
+
+    MCBE ``commandLine`` hard budget is ~461 bytes. A 5×1×5 fill with full
+    ``locked_targets`` is ~1.8 KB and never leaves the host — the bridge then
+    times out and surfaces a useless STATE_UNKNOWN. For continuous fill AABBs
+    and absolute place/batch shapes, from/to or position(s) already freeze the
+    plan; omit the cell list on the wire.
+    """
+    if phase != "execute" or coordinate_mode != "absolute":
+        return False
+    if not locked_targets:
+        return True
+    if mode == "fill" and isinstance(from_pos, dict) and isinstance(to_pos, dict):
+        volume = _aabb_volume(from_pos, to_pos)
+        # Sparse fills (matched < volume) still need the cell list.
+        if volume is None:
+            return False
+        return len(locked_targets) >= volume
+    if mode == "place" and isinstance(position, dict):
+        return True
+    if mode == "batch" and isinstance(positions, list) and positions:
+        return len(positions) >= len(locked_targets)
+    return False
+
+
 def build_inspect_payload(
     *,
     coordinate_mode: str,
@@ -395,9 +471,26 @@ def build_edit_payload(
         payload["states"] = states
     if expected_previous is not None:
         payload["expected_previous"] = expected_previous
-    if locked_targets is not None:
-        payload["locked_targets"] = locked_targets
-    apply_limits_to_payload(payload, limits)
+
+    omit_locked = should_omit_locked_targets_on_wire(
+        mode=mode,
+        phase=phase,
+        from_pos=from_pos if isinstance(from_pos, dict) else None,
+        to_pos=to_pos if isinstance(to_pos, dict) else None,
+        position=position if isinstance(position, dict) else None,
+        positions=positions if isinstance(positions, list) else None,
+        locked_targets=locked_targets if isinstance(locked_targets, list) else None,
+        coordinate_mode=coordinate_mode,
+    )
+    if locked_targets is not None and not omit_locked:
+        payload["locked_targets"] = compact_locked_targets_for_wire(
+            locked_targets,
+            dimension=dimension,
+        )
+    # Limits only affect preflight enumeration / host checks. Omitting them on
+    # execute saves critical commandLine bytes under the 461 B MCBE budget.
+    if phase != "execute":
+        apply_limits_to_payload(payload, limits)
     return payload
 
 
@@ -583,8 +676,6 @@ async def run_block_preflight(
         if not result.is_success:
             return None, result
         try:
-            import json
-
             body = json.loads(result.output)
         except Exception:
             return dict(tool_args), None
@@ -639,8 +730,6 @@ async def run_block_preflight(
         if not result.is_success:
             return None, result
         try:
-            import json
-
             body = json.loads(result.output)
         except Exception:
             return None, ToolResult.failure(
@@ -773,6 +862,7 @@ async def edit_blocks_impl(
         # Best-effort: callers via harness pass locked_targets in args.
         pass
 
+    exec_phase = phase or "execute"
     payload = build_edit_payload(
         mode=mode,
         coordinate_mode=coordinate_mode,
@@ -786,12 +876,34 @@ async def edit_blocks_impl(
         replace_any=replace_any,
         expected_previous=expected_previous,
         player_name=deps.player_name,
-        phase=phase or "execute",
+        phase=exec_phase,
         locked_targets=locked_targets,
         limits={
             "max_discrete_positions": limits.max_discrete_positions,
             "max_fill_volume": limits.max_fill_volume,
             "cells_per_tick": limits.cells_per_tick,
         },
+    )
+    locked_on_wire = payload.get("locked_targets")
+    logger.info(
+        "edit_blocks_bridge_payload",
+        connection_id=_connection_id(deps),
+        run_id=deps.run_id,
+        player_name=deps.player_name,
+        mode=mode,
+        phase=exec_phase,
+        type_id=type_id,
+        coordinate_mode=coordinate_mode,
+        dimension=dimension,
+        locked_targets_input=len(locked_targets) if isinstance(locked_targets, list) else 0,
+        locked_targets_on_wire=len(locked_on_wire) if isinstance(locked_on_wire, list) else 0,
+        has_from=from_pos is not None,
+        has_to=to_pos is not None,
+        has_position=position is not None,
+        positions_count=len(positions) if isinstance(positions, list) else 0,
+        payload_bytes=len(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ),
+        omitted_locked_targets="locked_targets" not in payload and bool(locked_targets),
     )
     return await call_block_capability(deps.addon_bridge, "edit_blocks", payload)

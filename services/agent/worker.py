@@ -1307,7 +1307,8 @@ class AgentWorker:
         or hosts without addon tooling). Runtime ``cli.py serve`` always injects
         the shared service from ``HostGatewayServer``.
 
-        Addon 层仍消费字符串结果；从 CommandResult 映射。
+        Addon 层仍消费字符串结果；从 CommandResult 映射。发送侧失败（帧过大等）
+        必须抛出，避免 SDK 侧空等 bridge timeout 并被误映射为 STATE_UNKNOWN。
         """
         if self._addon is None:
             return None
@@ -1316,9 +1317,28 @@ class AgentWorker:
             result = await self._create_command_callback(connection_id)(command)
             if result.is_success:
                 return result.output
+
+            diagnostic = result.diagnostic_summary or result.output or result.status
+            # Pre-mutation host failures: raise so map_bridge_exception can classify
+            # as LIMIT_EXCEEDED instead of waiting for a bridge response that never
+            # comes (and then reporting STATE_UNKNOWN).
+            text = result.output or ""
+            if result.status == "failed" and (
+                "raw command too long" in text
+                or "FrameTooLarge" in text
+                or ("commandLine" in text and "too long" in text)
+                or "bridge request never left host" in text
+            ):
+                raise RuntimeError(
+                    f"bridge request never left host: {diagnostic}"
+                ) from None
             if result.status == "connection_unavailable":
-                return f"命令执行失败: {result.output}"
+                raise ConnectionError(
+                    f"bridge outbound failed before send: {diagnostic}"
+                ) from None
             if result.status == "timeout_unknown":
+                # WS commandResponse timeout is distinct from bridge RESP timeout;
+                # still unknown because the game may have accepted the scriptevent.
                 return f"命令执行超时: {result.output}"
             return f"命令执行失败: {result.output}"
 
