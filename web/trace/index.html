@@ -42,6 +42,15 @@
         >
           刷新
         </button>
+        <button
+          type="button"
+          class="btn btn--danger btn--ghost"
+          id="btn-clear-journal"
+          title="清空整个 journal（不可恢复）"
+          aria-label="清空全部"
+        >
+          清空全部
+        </button>
       </div>
     </header>
 
@@ -121,8 +130,30 @@
         <header class="panel__header">
           <div class="panel__heading-row">
             <h2 id="timeline-heading" class="panel__title">事件时间线</h2>
-            <p class="panel__hint" id="timeline-subtitle">选择左侧 trace</p>
+            <div class="panel__header-actions">
+              <button
+                type="button"
+                class="btn btn--ghost"
+                id="btn-export-trace"
+                title="导出当前 trace 完整 JSON"
+                aria-label="导出 JSON"
+                hidden
+              >
+                导出 JSON
+              </button>
+              <button
+                type="button"
+                class="btn btn--danger"
+                id="btn-delete-trace"
+                title="从 journal 删除本条 trace"
+                aria-label="删除本条"
+                hidden
+              >
+                删除本条
+              </button>
+            </div>
           </div>
+          <p class="panel__hint" id="timeline-subtitle">选择左侧 trace</p>
           <div class="panel__meta" id="timeline-summary" hidden></div>
         </header>
 

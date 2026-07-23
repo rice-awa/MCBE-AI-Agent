@@ -1,6 +1,7 @@
 /**
  * Agent Trace Audit Workbench
  * Consumes GET /api/config, /api/health, /api/traces, /api/traces/{id}
+ * Mutations: DELETE /api/traces/{id}, DELETE /api/traces
  * No sample data; journal content inserted via textContent only.
  */
 (function () {
@@ -15,6 +16,7 @@
     healthSummary: $("health-summary"),
     malformedBadge: $("malformed-badge"),
     btnRefresh: $("btn-refresh"),
+    btnClearJournal: $("btn-clear-journal"),
     filterForm: $("filter-form"),
     filterStatus: $("filter-status"),
     filterPlayer: $("filter-player"),
@@ -37,6 +39,8 @@
     timelineErrorText: $("timeline-error-text"),
     btnRetryDetail: $("btn-retry-detail"),
     timeline: $("timeline"),
+    btnExportTrace: $("btn-export-trace"),
+    btnDeleteTrace: $("btn-delete-trace"),
     inspectorSubtitle: $("inspector-subtitle"),
     inspectorEmpty: $("inspector-empty"),
     inspectorContent: $("inspector-content"),
@@ -117,6 +121,12 @@
     }, 2200);
   }
 
+  function setTraceActionsVisible(visible) {
+    const show = Boolean(visible);
+    if (els.btnExportTrace) els.btnExportTrace.hidden = !show;
+    if (els.btnDeleteTrace) els.btnDeleteTrace.hidden = !show;
+  }
+
   // —— Formatters ——
 
   function formatTs(value) {
@@ -175,6 +185,40 @@
     }
   }
 
+  function stringifyContent(value) {
+    if (value == null) return "";
+    if (typeof value === "string") return value;
+    return prettyJson(value);
+  }
+
+  /** Pretty-print tool args when they arrive as a JSON string. */
+  function formatToolArgs(args) {
+    if (args == null) return "";
+    if (typeof args === "string") {
+      const trimmed = args.trim();
+      if (
+        (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+        (trimmed.startsWith("[") && trimmed.endsWith("]"))
+      ) {
+        try {
+          return prettyJson(JSON.parse(trimmed));
+        } catch {
+          return args;
+        }
+      }
+      return args;
+    }
+    return prettyJson(args);
+  }
+
+  function partContentText(part) {
+    if (!part || typeof part !== "object") return "";
+    const c = part.content;
+    if (c == null) return "";
+    if (typeof c === "string") return c;
+    return prettyJson(c);
+  }
+
   // —— Fetch ——
 
   async function fetchJson(url, controller) {
@@ -197,6 +241,45 @@
       throw err;
     }
     return res.json();
+  }
+
+  /**
+   * JSON-body mutation helper (DELETE / POST-like).
+   * @param {string} url
+   * @param {{method?: string, body?: object, controller?: AbortController}} opts
+   */
+  async function fetchMutation(url, { method = "DELETE", body, controller } = {}) {
+    const res = await fetch(url, {
+      method,
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: controller ? controller.signal : undefined,
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      let detail = "";
+      try {
+        const parsed = await res.json();
+        detail =
+          parsed && (parsed.error || parsed.message)
+            ? String(parsed.error || parsed.message)
+            : "";
+      } catch {
+        /* ignore */
+      }
+      const err = new Error(detail || `HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    // Some 2xx may be empty
+    const ct = res.headers.get("content-type") || "";
+    if (ct.includes("application/json")) {
+      return res.json();
+    }
+    return null;
   }
 
   // —— Config / health ——
@@ -367,6 +450,7 @@
     state.selectedTraceId = traceId || null;
     state.selectedEventId = null;
     state.detail = null;
+    setTraceActionsVisible(false);
     writeUrlState({ replace: !push });
     markListSelection();
     if (!traceId) {
@@ -386,6 +470,7 @@
     text(els.timelineSubtitle, "选择左侧 trace");
     els.timelineSummary.hidden = true;
     clearChildren(els.timelineSummary);
+    setTraceActionsVisible(false);
   }
 
   async function loadDetail(traceId) {
@@ -399,6 +484,7 @@
     els.timelineLoading.hidden = false;
     setTimelineBusy(true);
     text(els.timelineSubtitle, traceId);
+    setTraceActionsVisible(false);
     showInspectorEmpty();
 
     try {
@@ -406,6 +492,7 @@
       if (controller.signal.aborted) return;
       state.detail = data;
       renderDetail(data);
+      setTraceActionsVisible(true);
     } catch (err) {
       if (err.name === "AbortError") return;
       els.timelineLoading.hidden = true;
@@ -418,6 +505,7 @@
           : `加载详情失败：${err.message || err}`;
       text(els.timelineErrorText, msg);
       els.timelineSummary.hidden = true;
+      setTraceActionsVisible(false);
     } finally {
       if (state.detailAbort === controller) {
         setTimelineBusy(false);
@@ -426,9 +514,43 @@
     }
   }
 
+  function modelAggregateByEventId(detail) {
+    const map = new Map();
+    const models = Array.isArray(detail && detail.models) ? detail.models : [];
+    for (const m of models) {
+      if (m && m.event_id) map.set(m.event_id, m);
+    }
+    return map;
+  }
+
+  function modelTimelineBit(event, modelAgg) {
+    // Prefer models[] aggregate: 「user_preview」→ tool_names
+    if (modelAgg) {
+      const userPrev = modelAgg.user_preview;
+      const tools = Array.isArray(modelAgg.tool_names) ? modelAgg.tool_names : null;
+      if (userPrev || (tools && tools.length)) {
+        const left = userPrev ? `「${userPrev}」` : "";
+        const right = tools && tools.length ? tools.join(", ") : "";
+        if (left && right) return `${left}→ ${right}`;
+        if (left) return left;
+        if (right) return `→ ${right}`;
+      }
+    }
+    // Fallback: provider / model bits from attributes or aggregate
+    const provider =
+      (modelAgg && modelAgg.provider) || attrOf(event, "provider");
+    const modelName =
+      (modelAgg && modelAgg.model_name) || attrOf(event, "model_name");
+    if (provider || modelName) {
+      return [provider, modelName].filter(Boolean).join("/");
+    }
+    return null;
+  }
+
   function renderDetail(data) {
     const summary = data.summary || {};
     const events = Array.isArray(data.events) ? data.events : [];
+    const modelMap = modelAggregateByEventId(data);
 
     text(
       els.timelineSubtitle,
@@ -491,32 +613,39 @@
       top.appendChild(el("span", "timeline__name", event.event_name || "(unnamed)"));
       top.appendChild(el("span", "timeline__status", event.status || "—"));
 
-      const detail = el("div", "timeline__detail");
+      const detailLine = el("div", "timeline__detail");
       const rel = relativeMs(startTs, event.timestamp);
       const bits = [];
       if (event.sequence != null) bits.push(`#${event.sequence}`);
       if (rel != null) bits.push(`+${formatDuration(rel)}`);
       if (event.duration_ms != null) bits.push(`dur ${formatDuration(event.duration_ms)}`);
 
+      const name = String(event.event_name || "");
       const toolName = attrOf(event, "tool_name");
-      const provider = attrOf(event, "provider");
-      const modelName = attrOf(event, "model_name");
       const decision = attrOf(event, "decision");
       const attemptId = event.attempt_id;
 
-      if (toolName) bits.push(`tool:${toolName}`);
-      if (provider || modelName) {
-        bits.push([provider, modelName].filter(Boolean).join("/"));
+      if (name.startsWith("model.")) {
+        const agg = event.event_id ? modelMap.get(event.event_id) : null;
+        const modelBit = modelTimelineBit(event, agg);
+        if (modelBit) bits.push(modelBit);
+      } else {
+        if (toolName) bits.push(`tool:${toolName}`);
+        const provider = attrOf(event, "provider");
+        const modelName = attrOf(event, "model_name");
+        if (provider || modelName) {
+          bits.push([provider, modelName].filter(Boolean).join("/"));
+        }
       }
       if (decision) bits.push(`decision:${decision}`);
       if (attemptId) bits.push(`attempt:${shortId(attemptId)}`);
 
       for (const b of bits) {
-        detail.appendChild(el("span", null, b));
+        detailLine.appendChild(el("span", null, b));
       }
 
       body.appendChild(top);
-      body.appendChild(detail);
+      body.appendChild(detailLine);
       item.appendChild(dot);
       item.appendChild(body);
 
@@ -626,6 +755,185 @@
     parent.appendChild(section);
   }
 
+  function addCollapsiblePre(parent, title, content, { open = false, copyLabel } = {}) {
+    const details = el("details", "inspector__details");
+    if (open) details.open = true;
+    const summary = el("summary");
+    summary.appendChild(el("span", null, title));
+    if (copyLabel) {
+      const btn = el("button", "btn btn--ghost btn--icon", copyLabel);
+      btn.type = "button";
+      btn.title = `复制 ${title}`;
+      btn.setAttribute("aria-label", `复制 ${title}`);
+      btn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        copyText(content);
+      });
+      summary.appendChild(btn);
+    }
+    details.appendChild(summary);
+    const body = el("div", "inspector__details-body");
+    const pre = el("pre");
+    text(pre, content);
+    body.appendChild(pre);
+    details.appendChild(body);
+    parent.appendChild(details);
+  }
+
+  function dialogueCard(roleClass, roleLabel, bodyText, { muted = false } = {}) {
+    const card = el("div", `dialogue__card dialogue__card--${roleClass}`);
+    card.appendChild(el("div", "dialogue__role", roleLabel));
+    const body = el("div", muted ? "dialogue__body dialogue__body--muted" : "dialogue__body");
+    text(body, bodyText);
+    card.appendChild(body);
+    return card;
+  }
+
+  function toolCallCard(part) {
+    const card = el("div", "dialogue__card dialogue__card--tool");
+    card.appendChild(el("div", "dialogue__role", "Tool call"));
+    const name = part.tool_name || "(unnamed tool)";
+    card.appendChild(el("div", "dialogue__tool-name", name));
+    const argsPre = el("pre", "dialogue__tool-args");
+    text(argsPre, formatToolArgs(part.args));
+    card.appendChild(argsPre);
+    return card;
+  }
+
+  function toolReturnCard(part) {
+    const card = el("div", "dialogue__card dialogue__card--return");
+    card.appendChild(el("div", "dialogue__role", "Tool return"));
+    const name = part.tool_name || "(unnamed tool)";
+    card.appendChild(el("div", "dialogue__tool-name", name));
+    const contentPre = el("pre", "dialogue__tool-content");
+    text(contentPre, stringifyContent(part.content != null ? part.content : part));
+    card.appendChild(contentPre);
+    return card;
+  }
+
+  /**
+   * Render dialogue cards from payload.messages pair.
+   * messages = [request, response?]
+   */
+  function renderDialogue(parent, messages, event, detail) {
+    const section = el("section", "inspector__section");
+    const header = el("div", "inspector__section-header");
+    header.appendChild(el("h3", "inspector__section-title", "对话"));
+    section.appendChild(header);
+
+    const dialogue = el("div", "dialogue");
+
+    // Collect parts across the pair
+    const allParts = [];
+    for (const msg of messages) {
+      if (!msg || typeof msg !== "object") continue;
+      const parts = Array.isArray(msg.parts) ? msg.parts : [];
+      for (const p of parts) {
+        if (p && typeof p === "object") allParts.push(p);
+      }
+    }
+
+    // 玩家: merge user-prompt parts
+    const userTexts = allParts
+      .filter((p) => p.part_kind === "user-prompt")
+      .map(partContentText)
+      .filter((t) => t !== "");
+    if (userTexts.length) {
+      dialogue.appendChild(dialogueCard("player", "玩家", userTexts.join("\n\n")));
+    }
+
+    // 模型: text parts from response (or all text parts if structure unclear)
+    const textParts = allParts.filter((p) => p.part_kind === "text");
+    const toolCalls = allParts.filter((p) => p.part_kind === "tool-call");
+    const toolReturns = allParts.filter((p) => p.part_kind === "tool-return");
+
+    const assistantTexts = textParts.map(partContentText).filter((t) => t !== "");
+    if (assistantTexts.length) {
+      dialogue.appendChild(dialogueCard("assistant", "模型", assistantTexts.join("\n\n")));
+    } else if (toolCalls.length) {
+      dialogue.appendChild(
+        dialogueCard("assistant", "模型", "(无文本，仅 tool-call)", { muted: true })
+      );
+    }
+
+    for (const tc of toolCalls) {
+      dialogue.appendChild(toolCallCard(tc));
+    }
+
+    // Tool returns: request-side tool-return parts (multi-round follow-ups)
+    if (toolReturns.length) {
+      for (const tr of toolReturns) {
+        dialogue.appendChild(toolReturnCard(tr));
+      }
+    }
+
+    if (!dialogue.childNodes.length) {
+      dialogue.appendChild(
+        dialogueCard("assistant", "对话", "(messages 中无可展示的 parts)", { muted: true })
+      );
+    }
+
+    section.appendChild(dialogue);
+    parent.appendChild(section);
+
+    // Usage / finish_reason / provider / model_name from attributes (fallback payload/response)
+    const attrs =
+      event.attributes && typeof event.attributes === "object" ? event.attributes : {};
+    const payload = event.payload && typeof event.payload === "object" ? event.payload : {};
+    const responseMsg =
+      messages.find((m) => m && (m.kind === "response" || m.role === "assistant")) ||
+      (messages.length > 1 ? messages[1] : null) ||
+      {};
+
+    const models = Array.isArray(detail.models) ? detail.models : [];
+    const modelAgg = models.find((m) => m.event_id && m.event_id === event.event_id) || {};
+
+    const usage =
+      attrs.usage != null
+        ? attrs.usage
+        : modelAgg.usage != null
+          ? modelAgg.usage
+          : payload.usage != null
+            ? payload.usage
+            : responseMsg.usage != null
+              ? responseMsg.usage
+              : null;
+    const finishReason =
+      attrs.finish_reason != null
+        ? attrs.finish_reason
+        : modelAgg.finish_reason != null
+          ? modelAgg.finish_reason
+          : payload.finish_reason != null
+            ? payload.finish_reason
+            : responseMsg.finish_reason != null
+              ? responseMsg.finish_reason
+              : undefined;
+    const provider =
+      attrs.provider != null
+        ? attrs.provider
+        : modelAgg.provider != null
+          ? modelAgg.provider
+          : payload.provider;
+    const modelName =
+      attrs.model_name != null
+        ? attrs.model_name
+        : modelAgg.model_name != null
+          ? modelAgg.model_name
+          : payload.model_name;
+
+    const metaPairs = [
+      ["provider", provider],
+      ["model_name", modelName],
+      ["finish_reason", finishReason],
+      ["usage", usage],
+    ];
+    const hasMeta = metaPairs.some(([, v]) => v !== undefined && v !== null);
+    if (hasMeta) {
+      addKvSection(parent, "模型元数据", metaPairs);
+    }
+  }
+
   function renderInspector(event, detail) {
     els.inspectorEmpty.hidden = true;
     els.inspectorContent.hidden = false;
@@ -659,62 +967,97 @@
       addKvSection(els.inspectorContent, "Attributes", attrPairs);
     }
 
-    // Usage: prefer payload (content mode), fall back to attributes (metadata mode).
-    const usageVal =
-      event.payload && event.payload.usage != null
-        ? event.payload.usage
-        : attrs && attrs.usage != null
-          ? attrs.usage
-          : null;
-    if (usageVal != null) {
-      addPreSection(els.inspectorContent, "Usage", prettyJson(usageVal), {
+    const hasPayload = Object.prototype.hasOwnProperty.call(event, "payload") && event.payload != null;
+    const isModelCompleted =
+      event.event_name === "model.request.completed" &&
+      hasPayload &&
+      typeof event.payload === "object" &&
+      Array.isArray(event.payload.messages);
+
+    if (isModelCompleted) {
+      // Structured dialogue first — do NOT dump whole messages as primary view
+      renderDialogue(els.inspectorContent, event.payload.messages, event, detail);
+      // Collapsible raw messages + raw event
+      addCollapsiblePre(
+        els.inspectorContent,
+        "Raw messages JSON",
+        prettyJson(event.payload.messages),
+        { copyLabel: "复制" }
+      );
+      addCollapsiblePre(els.inspectorContent, "Raw event JSON", prettyJson(event), {
         copyLabel: "复制",
       });
+      appendRelated(els.inspectorContent, event, detail);
+      return;
     }
 
-    // Payload: only when present (content-gated on server)
-    if (Object.prototype.hasOwnProperty.call(event, "payload") && event.payload != null) {
-      const payloadText =
-        typeof event.payload === "string" ? event.payload : prettyJson(event.payload);
-      addPreSection(els.inspectorContent, "Payload", payloadText, { copyLabel: "复制" });
-
-      // Highlight common content keys for readability
+    // Non-model events: structured content → collapsible raw payload → collapsible raw event
+    if (hasPayload) {
       if (typeof event.payload === "object") {
         const p = event.payload;
+
+        // Usage: prefer attributes, then payload
+        const usageVal =
+          attrs && attrs.usage != null
+            ? attrs.usage
+            : p.usage != null
+              ? p.usage
+              : null;
+        if (usageVal != null) {
+          addPreSection(els.inspectorContent, "Usage", prettyJson(usageVal), {
+            copyLabel: "复制",
+          });
+        }
+
         if (p.user_message != null) {
           addPreSection(els.inspectorContent, "User message", stringifyContent(p.user_message), {
             copyLabel: "复制",
           });
         }
-        if (p.messages != null) {
+
+        // Tool: one args + one result (compat old keys)
+        const toolArgs = p.tool_args != null ? p.tool_args : p.parameters;
+        if (toolArgs != null) {
+          addPreSection(els.inspectorContent, "Tool args", prettyJson(toolArgs), {
+            copyLabel: "复制",
+          });
+        }
+        const toolResult = p.tool_result != null ? p.tool_result : p.result;
+        if (toolResult != null) {
+          addPreSection(els.inspectorContent, "Tool result", stringifyContent(toolResult), {
+            copyLabel: "复制",
+          });
+        }
+
+        // Final: final_response ?? content (also accept legacy `response`)
+        const finalText =
+          p.final_response != null
+            ? p.final_response
+            : p.content != null
+              ? p.content
+              : p.response != null
+                ? p.response
+                : null;
+        if (finalText != null) {
+          addPreSection(els.inspectorContent, "Final response", stringifyContent(finalText), {
+            copyLabel: "复制",
+          });
+        }
+
+        // If messages present but not model.request.completed, still show structured dump
+        if (p.messages != null && event.event_name !== "model.request.completed") {
           addPreSection(els.inspectorContent, "LLM messages", prettyJson(p.messages), {
             copyLabel: "复制",
           });
         }
-        if (p.tool_args != null || p.parameters != null) {
-          addPreSection(
-            els.inspectorContent,
-            "Tool args",
-            prettyJson(p.tool_args != null ? p.tool_args : p.parameters),
-            { copyLabel: "复制" }
-          );
-        }
-        if (p.tool_result != null || p.result != null) {
-          addPreSection(
-            els.inspectorContent,
-            "Tool result",
-            stringifyContent(p.tool_result != null ? p.tool_result : p.result),
-            { copyLabel: "复制" }
-          );
-        }
-        if (p.final_response != null || p.response != null) {
-          addPreSection(
-            els.inspectorContent,
-            "Final response",
-            stringifyContent(p.final_response != null ? p.final_response : p.response),
-            { copyLabel: "复制" }
-          );
-        }
+
+        // Collapsible raw payload (avoid same-screen dump as primary)
+        addCollapsiblePre(els.inspectorContent, "Raw payload JSON", prettyJson(p), {
+          copyLabel: "复制",
+        });
+      } else {
+        const payloadText = String(event.payload);
+        addPreSection(els.inspectorContent, "Payload", payloadText, { copyLabel: "复制" });
       }
     } else {
       const note = el("p", "inspector__note inspector__note--warn");
@@ -734,16 +1077,10 @@
     // Related aggregates for context
     appendRelated(els.inspectorContent, event, detail);
 
-    // Full event JSON
-    addPreSection(els.inspectorContent, "Raw event JSON", prettyJson(event), {
+    // Collapsible full event JSON
+    addCollapsiblePre(els.inspectorContent, "Raw event JSON", prettyJson(event), {
       copyLabel: "复制",
     });
-  }
-
-  function stringifyContent(value) {
-    if (value == null) return "";
-    if (typeof value === "string") return value;
-    return prettyJson(value);
   }
 
   function appendRelated(parent, event, detail) {
@@ -761,13 +1098,16 @@
           ["duration_ms", match.duration_ms],
         ];
         addKvSection(parent, "Tool 聚合", pairs);
-        if (match.tool_args != null) {
-          addPreSection(parent, "Tool args (聚合)", prettyJson(match.tool_args), {
+        // One args + one result (prefer tool_args/tool_result, fallback parameters/result)
+        const args = match.tool_args != null ? match.tool_args : match.parameters;
+        if (args != null) {
+          addPreSection(parent, "Tool args (聚合)", prettyJson(args), {
             copyLabel: "复制",
           });
         }
-        if (match.tool_result != null) {
-          addPreSection(parent, "Tool result (聚合)", stringifyContent(match.tool_result), {
+        const result = match.tool_result != null ? match.tool_result : match.result;
+        if (result != null) {
+          addPreSection(parent, "Tool result (聚合)", stringifyContent(result), {
             copyLabel: "复制",
           });
         }
@@ -794,6 +1134,9 @@
           ["model_name", m.model_name],
           ["finish_reason", m.finish_reason],
           ["duration_ms", m.duration_ms],
+          ["user_preview", m.user_preview],
+          ["assistant_preview", m.assistant_preview],
+          ["tool_names", m.tool_names],
         ]);
       }
     }
@@ -835,6 +1178,88 @@
     }
   }
 
+  // —— Mutations: delete / clear / export ——
+
+  async function onDeleteTrace() {
+    const id = state.selectedTraceId;
+    if (!id || !state.detail) return;
+    const ok = window.confirm(
+      `确定删除 trace ${id}？此操作从 journal 移除该 trace 的所有事件，不可恢复。`
+    );
+    if (!ok) return; // cancel: no network request
+    try {
+      const result = await fetchMutation(`/api/traces/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        body: { confirm: true },
+      });
+      const n = result && result.removed_events != null ? result.removed_events : null;
+      showToast(n != null ? `已删除（${n} 条事件）` : "已删除");
+      state.selectedTraceId = null;
+      state.selectedEventId = null;
+      state.detail = null;
+      setTraceActionsVisible(false);
+      writeUrlState({ replace: true });
+      showTimelineEmpty();
+      showInspectorEmpty();
+      await Promise.all([loadList(), loadConfigAndHealth()]);
+    } catch (err) {
+      showToast(`删除失败：${err.message || err}`);
+    }
+  }
+
+  async function onClearJournal() {
+    const path =
+      (state.config && (state.config.journal_path || state.config.agent_trace_path)) ||
+      (els.journalPath && els.journalPath.textContent) ||
+      "—";
+    const ok = window.confirm(`确定清空 journal？\n${path}\n此操作不可恢复。`);
+    if (!ok) return; // cancel: no network request
+    try {
+      await fetchMutation("/api/traces", {
+        method: "DELETE",
+        body: { confirm: "CLEAR_ALL" },
+      });
+      showToast("已清空 journal");
+      state.selectedTraceId = null;
+      state.selectedEventId = null;
+      state.detail = null;
+      setTraceActionsVisible(false);
+      writeUrlState({ replace: true });
+      showTimelineEmpty();
+      showInspectorEmpty();
+      await Promise.all([loadList(), loadConfigAndHealth()]);
+    } catch (err) {
+      showToast(`清空失败：${err.message || err}`);
+    }
+  }
+
+  function onExportTrace() {
+    if (!state.detail) {
+      showToast("无详情可导出");
+      return;
+    }
+    const id =
+      (state.detail.summary && state.detail.summary.trace_id) ||
+      state.selectedTraceId ||
+      "unknown";
+    try {
+      const json = JSON.stringify(state.detail, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `trace-${id}.json`;
+      a.rel = "noopener";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      showToast("已开始下载");
+    } catch (err) {
+      showToast(`导出失败：${err.message || err}`);
+    }
+  }
+
   // —— Events wiring ——
 
   function onFilterSubmit(ev) {
@@ -848,6 +1273,7 @@
   }
 
   function onClearFilters() {
+    // Unchanged: only clears filter form state, never touches journal
     state.status = "";
     state.player = "";
     state.limit = 50;
@@ -873,6 +1299,7 @@
   function init() {
     readUrlState();
     syncFiltersToForm();
+    setTraceActionsVisible(false);
 
     els.filterForm.addEventListener("submit", onFilterSubmit);
     els.btnClearFilters.addEventListener("click", onClearFilters);
@@ -881,6 +1308,15 @@
       loadList();
       if (state.selectedTraceId) loadDetail(state.selectedTraceId);
     });
+    if (els.btnClearJournal) {
+      els.btnClearJournal.addEventListener("click", onClearJournal);
+    }
+    if (els.btnDeleteTrace) {
+      els.btnDeleteTrace.addEventListener("click", onDeleteTrace);
+    }
+    if (els.btnExportTrace) {
+      els.btnExportTrace.addEventListener("click", onExportTrace);
+    }
     els.btnRetryList.addEventListener("click", () => loadList());
     els.btnRetryDetail.addEventListener("click", () => {
       if (state.selectedTraceId) loadDetail(state.selectedTraceId);

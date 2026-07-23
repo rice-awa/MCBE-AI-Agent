@@ -418,6 +418,17 @@ class TraceRecorder:
             attrs.setdefault("provider", provider)
         if model_name is not None:
             attrs.setdefault("model_name", model_name)
+        elif messages:
+            # Prefer explicit arg; otherwise lift model_name from a response-kind dict.
+            for msg in messages:
+                if not isinstance(msg, Mapping):
+                    continue
+                if msg.get("kind") != "response":
+                    continue
+                extracted = msg.get("model_name")
+                if extracted is not None:
+                    attrs.setdefault("model_name", extracted)
+                    break
         if finish_reason is not None:
             attrs.setdefault("finish_reason", finish_reason)
         if usage is not None:
@@ -456,7 +467,9 @@ class TraceRecorder:
         args = parameters if parameters is not None else tool_args
         payload: dict[str, Any] | None = None
         if args is not None:
-            payload = {"tool_args": args, "parameters": args}
+            # Write only the canonical key; keep `parameters` as input alias and
+            # in _PAYLOAD_ALLOWED_KEYS for reading old journals.
+            payload = {"tool_args": args}
         self.emit(
             event_name,
             context,
@@ -500,7 +513,8 @@ class TraceRecorder:
             attrs.setdefault("tool_call_id", tool_call_id)
         payload: dict[str, Any] | None = None
         if result is not None:
-            payload = {"tool_result": result, "result": result}
+            # Write only the canonical key; keep `result` in allowlist for old journals.
+            payload = {"tool_result": result}
         self.emit(
             event_name,
             context,
@@ -534,8 +548,8 @@ class TraceRecorder:
     ) -> None:
         """记录终态与用户可见最终答复（正文仅 content 门控）。"""
         attrs = dict(attributes or {})
+        # Write only the canonical key; keep `content` in allowlist for old journals.
         payload = {
-            "content": content,
             "final_response": content,
         }
         self.emit(

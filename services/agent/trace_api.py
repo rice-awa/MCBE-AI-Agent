@@ -1,6 +1,7 @@
-"""Read-only local HTTP API over agent trace journal (stdlib only).
+"""Local HTTP API over agent trace journal (stdlib only).
 
-Uses ``ThreadingHTTPServer`` + GET-only handler. Serves JSON under ``/api/*``
+Uses ``ThreadingHTTPServer`` with GET for reads and DELETE for local journal
+mutations (delete one trace / clear journal). Serves JSON under ``/api/*``
 and optional static files from ``static_dir`` (``/`` and ``/assets/*``).
 Path traversal is rejected. Responses use UTF-8 JSON and ``Cache-Control: no-store``.
 """
@@ -17,13 +18,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from services.agent.trace_query import TraceQuery
 
+_MAX_BODY_BYTES = 64 * 1024
+
 
 def _json_bytes(payload: Any) -> bytes:
     return json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
 
 
 class TraceAPIServer:
-    """Loopback-friendly read-only trace API + static file server."""
+    """Loopback-friendly trace API + static file server (GET + local DELETE)."""
 
     def __init__(
         self,
@@ -105,10 +108,116 @@ class TraceAPIServer:
                 self._method_not_allowed()
 
             def do_DELETE(self) -> None:  # noqa: N802
-                self._method_not_allowed()
+                parsed = urlparse(self.path)
+                path = unquote(parsed.path or "/")
+
+                if path == "/api/traces":
+                    self._handle_clear_journal()
+                    return
+                if path.startswith("/api/traces/"):
+                    trace_id = path[len("/api/traces/") :].strip("/")
+                    if not trace_id or "/" in trace_id or ".." in trace_id:
+                        self._send_json(404, {"error": "not_found"})
+                        return
+                    self._handle_delete_trace(trace_id)
+                    return
+
+                self._send_json(404, {"error": "not_found"})
 
             def do_PATCH(self) -> None:  # noqa: N802
                 self._method_not_allowed()
+
+            def _read_json_body(self) -> tuple[Any | None, dict[str, Any] | None]:
+                """Return (parsed_body, error_payload). error_payload set on 400 cases."""
+                length_raw = self.headers.get("Content-Length") or "0"
+                try:
+                    length = int(length_raw)
+                except (TypeError, ValueError):
+                    length = 0
+                if length < 0:
+                    length = 0
+                if length > _MAX_BODY_BYTES:
+                    return None, {"error": "confirm_required"}
+                raw = self.rfile.read(length) if length else b""
+                if not raw or not raw.strip():
+                    return None, {"error": "confirm_required"}
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+                    return None, {"error": "confirm_required"}
+                if not isinstance(body, dict):
+                    return None, {"error": "confirm_required"}
+                return body, None
+
+            def _handle_delete_trace(self, trace_id: str) -> None:
+                body, err = self._read_json_body()
+                if err is not None:
+                    self._send_json(400, err)
+                    return
+                assert body is not None
+                if body.get("confirm") is not True:
+                    self._send_json(400, {"error": "confirm_required"})
+                    return
+
+                existing = server_self.query.get_trace(trace_id)
+                if existing is None:
+                    self._send_json(404, {"error": "not_found", "trace_id": trace_id})
+                    return
+
+                try:
+                    removed = server_self.query.delete_trace(trace_id)
+                except OSError as exc:
+                    self._send_json(
+                        500,
+                        {"error": "write_failed", "message": str(exc)},
+                    )
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json(
+                        500,
+                        {"error": "write_failed", "message": str(exc)},
+                    )
+                    return
+
+                if removed == 0:
+                    self._send_json(404, {"error": "not_found", "trace_id": trace_id})
+                    return
+
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "removed_events": removed,
+                        "trace_id": trace_id,
+                    },
+                )
+
+            def _handle_clear_journal(self) -> None:
+                body, err = self._read_json_body()
+                if err is not None:
+                    self._send_json(400, err)
+                    return
+                assert body is not None
+                if body.get("confirm") != "CLEAR_ALL":
+                    self._send_json(400, {"error": "confirm_required"})
+                    return
+
+                try:
+                    server_self.query.clear_journal()
+                except OSError as exc:
+                    self._send_json(
+                        500,
+                        {"error": "write_failed", "message": str(exc)},
+                    )
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json(
+                        500,
+                        {"error": "write_failed", "message": str(exc)},
+                    )
+                    return
+
+                self._send_json(200, {"ok": True, "cleared": True})
 
             def _method_not_allowed(self) -> None:
                 body = _json_bytes({"error": "method_not_allowed"})
@@ -116,7 +225,7 @@ class TraceAPIServer:
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
-                self.send_header("Allow", "GET")
+                self.send_header("Allow", "GET, DELETE")
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -203,7 +312,9 @@ class TraceAPIServer:
             "agent_trace_path": path,
             "agent_trace_api_host": api_host,
             "agent_trace_api_port": api_port,
-            "read_only": True,
+            "read_only": False,
+            "mutations_enabled": True,
+            "mutations": ["delete_trace", "clear_journal"],
             "journal_path": str(self.query.path),
         }
 
