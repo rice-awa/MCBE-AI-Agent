@@ -49,7 +49,7 @@
     "dedup_external_messages": true,
     "tool_response_verbose": false,
     "request_limit": 8,
-    "tool_calls_limit": 16,
+    "tool_calls_limit": 40,
     "input_tokens_limit": null,
     "output_tokens_limit": null,
     "total_tokens_limit": null,
