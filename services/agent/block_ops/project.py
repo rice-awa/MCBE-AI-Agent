@@ -2,11 +2,34 @@
 
 Audit / logger paths may retain full addon payloads; ToolResult.ok for the model
 uses only decision fields (place / batch / fill).
+
+Success projection filters air replacements so the model only sees non-air
+``was`` / ``previous_type_counts`` as overwrite signals.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+
+def _normalize_type_id(type_id: str) -> str:
+    """Normalize a typeId for air comparison (strip, lower, drop namespace)."""
+    text = type_id.strip().lower()
+    if ":" in text:
+        return text.rsplit(":", 1)[-1]
+    return text
+
+
+def is_air(type_id: Any) -> bool:
+    """Strict air check: only bare ``air`` after normalize (not cave_air/void_air)."""
+    if not isinstance(type_id, str) or not type_id:
+        return False
+    return _normalize_type_id(type_id) == "air"
+
+
+def _filter_non_air_counts(counts: dict[str, Any]) -> dict[str, Any]:
+    """Drop air keys from previous_type_counts; preserve original key strings."""
+    return {key: value for key, value in counts.items() if not is_air(key)}
 
 
 def _xyz(value: Any) -> dict[str, Any] | None:
@@ -103,7 +126,8 @@ def _project_place(payload: dict[str, Any]) -> dict[str, Any]:
     if type_id is not None:
         out["type_id"] = type_id
     was = _place_was(payload)
-    if was is not None:
+    # Only report non-air replacements as overwrite signal for the model.
+    if was is not None and not is_air(was):
         out["was"] = was
     states = payload.get("states")
     if isinstance(states, dict) and states:
@@ -128,7 +152,9 @@ def _project_batch(payload: dict[str, Any]) -> dict[str, Any]:
         out["type_id"] = type_id
     counts = payload.get("previous_type_counts")
     if isinstance(counts, dict) and counts:
-        out["previous_type_counts"] = counts
+        filtered = _filter_non_air_counts(counts)
+        if filtered:
+            out["previous_type_counts"] = filtered
     return out
 
 
@@ -149,7 +175,9 @@ def _project_fill(
         out["type_id"] = type_id
     counts = payload.get("previous_type_counts")
     if isinstance(counts, dict) and counts:
-        out["previous_type_counts"] = counts
+        filtered = _filter_non_air_counts(counts)
+        if filtered:
+            out["previous_type_counts"] = filtered
 
     from_pos: dict[str, Any] | None = None
     to_pos: dict[str, Any] | None = None

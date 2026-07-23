@@ -20,6 +20,21 @@ def test_runtime_harness_prompt_renders_decision_tree_and_cards() -> None:
     assert "replace_any" in prompt
     assert "PRECONDITION_FAILED" in prompt
     assert "batch" in prompt and "fill" in prompt
+    # Success result semantics (was air filter) live in system prompt.
+    assert "was" in prompt or "previous_type_counts" in prompt
+    assert "原为空气" in prompt or "非空气" in prompt
+
+
+def test_edit_blocks_catalog_constraints_omit_recovery_codes() -> None:
+    """Recovery (LIMIT/PRECONDITION) is system-only; catalog stays slim."""
+    from services.agent.harness.catalog import get_tool_entry
+
+    entry = get_tool_entry("edit_blocks")
+    assert entry is not None
+    constraints = entry.parameter_constraints
+    assert "LIMIT_EXCEEDED" not in constraints
+    assert "PRECONDITION_FAILED" not in constraints
+    assert "非空气" in constraints or "was" in constraints
 
 
 def test_runtime_harness_tool_cards_do_not_duplicate_when_not_to_use_prefix() -> None:

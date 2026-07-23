@@ -782,7 +782,8 @@ def test_place_success_model_projection_is_slim() -> None:
     assert projected["changed"] is True
     assert projected["at"] == {"x": -793, "y": 94, "z": 185}
     assert projected["type_id"] == "minecraft:stone"
-    assert projected["was"] == "minecraft:air"
+    # Air replacements are omitted so was only signals non-air overwrites.
+    assert "was" not in projected
     assert "before" not in projected
     assert "after" not in projected
     assert "targets" not in projected
@@ -798,6 +799,55 @@ def test_place_success_model_projection_is_slim() -> None:
     assert len(mapped.output) <= 250
     assert "before" not in mapped.output
     assert "verification" not in mapped.output
+    assert "was" not in mapped.output
+
+
+def test_place_success_model_projection_reports_non_air_was() -> None:
+    projected = project_block_result_for_model(
+        {
+            "ok": True,
+            "mode": "place",
+            "changed": True,
+            "type_id": "minecraft:stone",
+            "position": {"x": 0, "y": 64, "z": 0},
+            "before": {"type_id": "minecraft:dirt", "x": 0, "y": 64, "z": 0},
+            "after": {"type_id": "minecraft:stone", "x": 0, "y": 64, "z": 0},
+        },
+        mode="place",
+    )
+    assert projected["was"] == "minecraft:dirt"
+    assert projected["type_id"] == "minecraft:stone"
+
+
+def test_place_success_model_projection_omits_was_for_air_aliases() -> None:
+    for air_id in ("minecraft:air", "Air", "air"):
+        projected = project_block_result_for_model(
+            {
+                "ok": True,
+                "mode": "place",
+                "changed": True,
+                "type_id": "minecraft:stone",
+                "was": air_id,
+                "position": {"x": 1, "y": 2, "z": 3},
+            },
+            mode="place",
+        )
+        assert "was" not in projected, air_id
+
+
+def test_place_success_model_projection_keeps_cave_air_as_was() -> None:
+    projected = project_block_result_for_model(
+        {
+            "ok": True,
+            "mode": "place",
+            "changed": True,
+            "type_id": "minecraft:stone",
+            "was": "minecraft:cave_air",
+            "position": {"x": 1, "y": 2, "z": 3},
+        },
+        mode="place",
+    )
+    assert projected["was"] == "minecraft:cave_air"
 
 
 def test_fill_success_model_projection_uses_authorized_aabb() -> None:
@@ -839,7 +889,11 @@ def test_fill_success_model_projection_uses_authorized_aabb() -> None:
     assert projected["from"] == {"x": -797, "y": 93, "z": 180}
     assert projected["to"] == {"x": -793, "y": 93, "z": 184}
     assert projected["type_id"] == "minecraft:oak_planks"
-    assert projected["previous_type_counts"]["minecraft:air"] == 6
+    # Air keys stripped; non-air overwrite signal remains.
+    assert "minecraft:air" not in projected["previous_type_counts"]
+    assert projected["previous_type_counts"]["minecraft:grass_path"] == 12
+    assert projected["previous_type_counts"]["minecraft:stone"] == 4
+    assert projected["previous_type_counts"]["minecraft:gravel"] == 3
     assert "before_samples" not in projected
     assert "targets" not in projected
     assert "verification" not in projected
@@ -857,6 +911,40 @@ def test_fill_success_model_projection_uses_authorized_aabb() -> None:
     assert body["volume"] == 25
     assert body["from"]["z"] == 180
     assert body["to"]["z"] == 184
+    assert "minecraft:air" not in body["previous_type_counts"]
+
+
+def test_fill_success_model_projection_omits_air_only_counts() -> None:
+    projected = project_block_result_for_model(
+        {
+            "ok": True,
+            "mode": "fill",
+            "changed_count": 6,
+            "type_id": "minecraft:oak_planks",
+            "previous_type_counts": {"minecraft:air": 6, "Air": 1},
+            "from": {"x": 0, "y": 0, "z": 0},
+            "to": {"x": 1, "y": 0, "z": 2},
+        },
+        mode="fill",
+    )
+    assert "previous_type_counts" not in projected
+
+
+def test_batch_success_model_projection_filters_air_counts() -> None:
+    projected = project_block_result_for_model(
+        {
+            "ok": True,
+            "mode": "batch",
+            "changed_count": 4,
+            "type_id": "minecraft:stone",
+            "previous_type_counts": {
+                "minecraft:air": 3,
+                "minecraft:dirt": 1,
+            },
+        },
+        mode="batch",
+    )
+    assert projected["previous_type_counts"] == {"minecraft:dirt": 1}
 
 
 def test_limits_hard_clamp() -> None:

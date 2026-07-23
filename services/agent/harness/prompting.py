@@ -19,17 +19,19 @@ _INTENT_GUIDANCE: dict[ToolIntent, str] = {
 
 
 _BLOCK_TOOL_PRIORITY = (
-    "方块操作优先策略："
-    "查询方块用 inspect_block；放置/批量/填充用 edit_blocks（mode=place|batch|fill）。"
-    "平台/地板/墙：优先一次 fill 或少量 batch，禁止对连续区域 place×N。"
-    "默认仅替换空气；要铺满非空地面必须 replace_any=true（高风险再审批）。"
-    "删除方块请显式放置 minecraft:air 并授权覆写。"
-    "若返回 LIMIT_EXCEEDED：减小 positions 数量或 fill 体积，仍用 batch/fill，不要 place 风暴。"
-    "若 PRECONDITION_FAILED 且 actual 非空气：不要对同一格无 replace 重试。"
-    "单轮建造避免无意义并行 place；优先扩大/收紧 AABB 或 batch。"
-    "专用工具可用时禁止改用 setblock/fill 作为捷径。"
-    "仅当 Add-on 不支持或专用工具返回 ADDON_UNAVAILABLE 时，"
-    "才可另行调用 run_minecraft_command（仍走命令审批）。"
+    "方块操作优先策略：\n"
+    "- 查询用 inspect_block；写入用 edit_blocks（mode=place|batch|fill）。\n"
+    "- 平台/地板/墙：优先一次 fill 或少量 batch；禁止对连续区域 place×N。\n"
+    "- 默认仅替换空气；覆写非空须 replace_any=true（高风险再审批）。\n"
+    "- 删除：放置 minecraft:air 并授权覆写。\n"
+    "- 成功结果：was / previous_type_counts 仅含被替换的非空气方块；"
+    "无 was / 无 previous_type_counts = 原为空气（正常）。"
+    "若出现非预期非空 was，应向玩家说明或改 plan / 对齐 replace_any 意图。\n"
+    "- LIMIT_EXCEEDED：减小 positions 数量或 fill 体积，仍用 batch/fill；禁止 place 风暴。\n"
+    "- PRECONDITION_FAILED 且 actual 非空气：跳过该格，或 replace_any=true 再审批；"
+    "勿无授权对同一格重试。\n"
+    "- 专用工具可用时禁止改用 setblock/fill；"
+    "仅当返回 ADDON_UNAVAILABLE 才可另行审批 run_minecraft_command。"
 )
 
 
