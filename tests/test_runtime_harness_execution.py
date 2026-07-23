@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -15,15 +16,19 @@ from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCall
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults
 
 from services.agent.harness.approvals import PendingApproval, PendingApprovalStore
+from services.agent.harness.audit import build_audit_record
 from services.agent.harness.execution import (
     HarnessCapability,
     PolicyDecisionKind,
     PolicyEngine,
+    classify_tool_exception,
     get_idempotency_store,
     hash_normalized_args,
+    log_tool_execution_failed,
     normalize_tool_args,
     reset_idempotency_store,
 )
+from services.agent.block_ops.bridge import map_bridge_exception
 from services.agent.tool_results import ToolResult
 
 
@@ -98,6 +103,174 @@ def test_policy_low_risk_allows_and_hard_deny_blocks() -> None:
     )
     assert deny.action == PolicyDecisionKind.DENY
     assert "op" in deny.reason
+
+
+def test_edit_invocation_exception_returns_unknown_state_without_exception_detail() -> None:
+    result = classify_tool_exception(
+        RuntimeError("edit_blocks_impl leaked token=bridge-secret"),
+        tool_name="edit_blocks",
+        execution_stage="invocation",
+    )
+
+    assert json.loads(result.output) == {
+        "schema_version": "1",
+        "ok": False,
+        "code": "STATE_UNKNOWN",
+        "message": "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。",
+        "retryable": False,
+        "external_state_unknown": True,
+        "fallback_allowed": False,
+    }
+    assert result.retryable is False
+    assert result.external_state_unknown is True
+    assert "RuntimeError" not in result.output
+    assert "bridge-secret" not in result.output
+
+
+def test_projection_failure_keeps_redacted_internal_diagnostic() -> None:
+    result = classify_tool_exception(
+        ValueError("block preflight execution contract token=bridge-secret"),
+        tool_name="edit_blocks",
+        execution_stage="projection",
+    )
+
+    assert json.loads(result.output)["code"] == "INTERNAL_ERROR"
+    assert result.error_type == "ValueError"
+    assert result.diagnostic_summary == "ValueError: block preflight execution contract token=[REDACTED]"
+    assert "bridge-secret" not in result.output
+    assert "bridge-secret" not in result.diagnostic_summary
+
+
+def test_block_projection_failure_is_safe_and_definitely_not_sent() -> None:
+    result = classify_tool_exception(
+        ValueError("block preflight execution contract token=bridge-secret"),
+        tool_name="edit_blocks",
+        execution_stage="projection",
+    )
+
+    assert json.loads(result.output) == {
+        "schema_version": "1",
+        "ok": False,
+        "code": "INTERNAL_ERROR",
+        "message": "方块工具内部参数处理失败；本次操作未发送到 Add-on",
+        "retryable": False,
+        "external_state_unknown": False,
+        "fallback_allowed": False,
+    }
+    assert "bridge-secret" not in result.output
+
+
+def test_block_failure_log_is_correlated_and_omits_exception_text(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def capture(event: str, **fields: Any) -> None:
+        captured["event"] = event
+        captured.update(fields)
+
+    monkeypatch.setattr("services.agent.harness.execution.logger.error", capture)
+    ctx = type(
+        "Context",
+        (), {"deps": _Deps(run_id="run-log", player_name="Alex"), "tool_call_id": "tc-log"},
+    )()
+    result = classify_tool_exception(
+        RuntimeError("token=bridge-secret"),
+        tool_name="edit_blocks",
+        execution_stage="invocation",
+    )
+
+    log_tool_execution_failed(
+        tool_name="edit_blocks",
+        ctx=ctx,
+        result=result,
+        execution_stage="invocation",
+        error_type="RuntimeError",
+    )
+
+    assert captured["event"] == "tool_execution_failed"
+    assert captured["tool_name"] == "edit_blocks"
+    assert captured["run_id"] == "run-log"
+    assert captured["tool_call_id"] == "tc-log"
+    assert captured["connection_id_short"] == str(ctx.deps.connection_id)[-8:]
+    assert captured["player_name"] == "Alex"
+    assert captured["error_kind"] == "PERMANENT"
+    assert captured["error_type"] == "RuntimeError"
+    assert captured["diagnostic_summary"].startswith("RuntimeError")
+    assert captured["external_state_unknown"] is True
+    assert captured["execution_stage"] == "invocation"
+    assert "bridge-secret" not in json.dumps(captured)
+
+
+def test_mapped_bridge_failure_log_uses_original_exception_type(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def capture(event: str, **fields: Any) -> None:
+        captured["event"] = event
+        captured.update(fields)
+
+    monkeypatch.setattr("services.agent.harness.execution.logger.error", capture)
+    ctx = type(
+        "Context",
+        (), {"deps": _Deps(run_id="run-bridge", player_name="Alex"), "tool_call_id": "tc-bridge"},
+    )()
+    result = map_bridge_exception(
+        TimeoutError("token=bridge-secret timed out"), tool_name="edit_blocks"
+    )
+
+    log_tool_execution_failed(
+        tool_name="edit_blocks",
+        ctx=ctx,
+        result=result,
+        execution_stage="invocation",
+    )
+
+    assert captured["error_type"] == "TimeoutError"
+    assert captured["diagnostic_summary"] == "TimeoutError: token=[REDACTED] timed out"
+    assert "bridge-secret" not in json.dumps(captured)
+
+
+def test_inspect_invocation_failure_redacts_model_log_and_audit(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def capture(event: str, **fields: Any) -> None:
+        captured["event"] = event
+        captured.update(fields)
+
+    monkeypatch.setattr("services.agent.harness.execution.logger.error", capture)
+    ctx = type(
+        "Context",
+        (), {"deps": _Deps(run_id="run-inspect", player_name="Alex"), "tool_call_id": "tc-inspect"},
+    )()
+    result = classify_tool_exception(
+        RuntimeError('{"detail":"Bearer inspect-bearer","token":"inspect-secret"}'),
+        tool_name="inspect_block",
+        execution_stage="invocation",
+    )
+    log_tool_execution_failed(
+        tool_name="inspect_block",
+        ctx=ctx,
+        result=result,
+        execution_stage="invocation",
+        error_type="RuntimeError",
+    )
+    audit = build_audit_record(
+        tool_name="inspect_block",
+        parameters={},
+        ctx=ctx,
+        status="failure",
+        duration_ms=1,
+        result=result,
+    )
+
+    assert "inspect-secret" not in result.output
+    assert "inspect-bearer" not in result.output
+    assert "inspect-secret" not in json.dumps(captured)
+    assert "inspect-bearer" not in json.dumps(captured)
+    assert "inspect-secret" not in json.dumps(audit)
+    assert "inspect-bearer" not in json.dumps(audit)
+    assert captured["run_id"] == "run-inspect"
+    assert captured["tool_call_id"] == "tc-inspect"
+    assert captured["player_name"] == "Alex"
+    assert captured["execution_stage"] == "invocation"
 
 
 def test_policy_only_configured_destructive_command_roots_require_approval() -> None:
@@ -493,7 +666,7 @@ async def test_multi_deferred_approvals_require_full_results_then_execute_only_a
 
     step = {"n": 0}
 
-    def model_fn(messages, info):
+    async def model_fn(messages, info):
         step["n"] += 1
         if step["n"] == 1:
             return ModelResponse(

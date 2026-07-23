@@ -265,6 +265,50 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         preview=ParameterPreviewPolicy(include=("command",)),
         may_have_external_side_effects=True,
     ),
+    "inspect_block": _entry(
+        "inspect_block",
+        ToolIntent.QUERY_WORLD,
+        ToolRisk.LOW,
+        "查询单个或多个方块的 type ID、states、含水/空气/液体标记时使用；优先于 list/query 类命令。",
+        "不要用于修改方块；不要在专用工具可用时改用 setblock/fill 试探世界状态。",
+        "coordinate_mode 为 absolute 或 player_relative；absolute 必须提供 dimension；"
+        "提供 position 或 positions（互斥）；positions 不超过配置上限。",
+        preview=ParameterPreviewPolicy(
+            include=("coordinate_mode", "dimension", "position", "positions")
+        ),
+        may_have_external_side_effects=False,
+    ),
+    "edit_blocks": _entry(
+        "edit_blocks",
+        ToolIntent.CHANGE_WORLD,
+        ToolRisk.HIGH,
+        "放置、批量放置或填充方块时使用；平台/地板/墙优先一次 fill 或少量 batch；"
+        "默认仅替换空气，需要覆写非空地面时 replace_any=true 并再审批。",
+        "不要用于查询；可表达的方块写入不要改用 setblock/fill 命令。"
+        "禁止对连续区域 place×N；Add-on 不可用时才可另行审批命令工具。",
+        "mode=place|batch|fill；coordinate_mode=absolute|player_relative；"
+        "place 用 position，batch 用 positions，fill 用 from/to；"
+        "type_id 必填；states 可选；replace_any 与 expected_previous 互斥；"
+        "LIMIT_EXCEEDED 时减小 positions 或 fill 体积，仍用 batch/fill，不要 place 风暴；"
+        "PRECONDITION_FAILED 且 actual 非空气时不要对同一格无 replace 重试；"
+        "单轮建造避免无意义并行 place，优先扩大/收紧 AABB 或 batch。",
+        preview=ParameterPreviewPolicy(
+            include=(
+                "mode",
+                "coordinate_mode",
+                "dimension",
+                "type_id",
+                "position",
+                "positions",
+                "from",
+                "to",
+                "replace_any",
+                "expected_previous",
+                "states",
+            )
+        ),
+        may_have_external_side_effects=True,
+    ),
 }
 
 

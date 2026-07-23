@@ -302,13 +302,25 @@ class BrokerResponseBridge:
     async def _run_command(self, state: ConnectionState, item: dict[str, Any]) -> None:
         future = item.get("result_future")
         command = item.get("command") or ""
+        command_line_bytes = len(str(command).encode("utf-8"))
         try:
             text = await self._ws_commands.run_as_text(state, command)
             if future is not None and not future.done():
                 future.set_result(text)
         except Exception as exc:
+            # Surface FrameTooLargeError (and similar) with class name so the
+            # addon client can fail-fast instead of waiting for a bridge RESP.
+            error_text = f"命令执行失败: {type(exc).__name__}: {exc}"
+            logger.warning(
+                "broker_bridge_run_command_failed",
+                connection_id=str(state.id),
+                error_type=type(exc).__name__,
+                error=str(exc),
+                command_line_bytes=command_line_bytes,
+                command_prefix=str(command)[:48],
+            )
             if future is not None and not future.done():
-                future.set_result(f"命令执行失败: {exc}")
+                future.set_result(error_text)
 
     async def _ai_sync(self, state: ConnectionState, response: dict[str, Any]) -> None:
         player_name = response.get("player_name", DEFAULT_PLAYER_DISPLAY_NAME)

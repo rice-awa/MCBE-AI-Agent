@@ -961,6 +961,11 @@ def register_agent_tools(
         target: str = "@a",
     ) -> str:
         """通过 addon 桥接获取玩家快照。"""
+        from services.agent.block_ops.bridge import (
+            map_addon_bridge_result,
+            map_bridge_exception,
+        )
+
         if ctx.deps.addon_bridge is None:
             return _tool_failure("Addon 桥接不可用", error_kind="TRANSIENT", retryable=True)
 
@@ -969,15 +974,10 @@ def register_agent_tools(
                 "get_player_snapshot",
                 {"target": target},
             )
-            return _tool_success(json.dumps(result.get("payload", result), ensure_ascii=False))
+            return map_addon_bridge_result(result)
         except Exception as e:
             logger.error("agent_tool_error", tool="get_player_snapshot", error=str(e))
-            return _tool_failure(
-                f"获取玩家快照失败: {str(e)}",
-                error_kind="TRANSIENT",
-                retryable=True,
-                diagnostic_summary=str(e),
-            )
+            return map_bridge_exception(e, tool_name="get_player_snapshot")
 
     @chat_agent.tool
     async def get_look_block(
@@ -1049,6 +1049,11 @@ def register_agent_tools(
         target: str = "@a",
     ) -> str:
         """通过 addon 桥接获取背包快照。"""
+        from services.agent.block_ops.bridge import (
+            map_addon_bridge_result,
+            map_bridge_exception,
+        )
+
         if ctx.deps.addon_bridge is None:
             return _tool_failure("Addon 桥接不可用", error_kind="TRANSIENT", retryable=True)
 
@@ -1057,15 +1062,10 @@ def register_agent_tools(
                 "get_inventory_snapshot",
                 {"target": target},
             )
-            return _tool_success(json.dumps(result.get("payload", result), ensure_ascii=False))
+            return map_addon_bridge_result(result)
         except Exception as e:
             logger.error("agent_tool_error", tool="get_inventory_snapshot", error=str(e))
-            return _tool_failure(
-                f"获取背包快照失败: {str(e)}",
-                error_kind="TRANSIENT",
-                retryable=True,
-                diagnostic_summary=str(e),
-            )
+            return map_bridge_exception(e, tool_name="get_inventory_snapshot")
 
     @chat_agent.tool
     async def find_entities(
@@ -1075,6 +1075,11 @@ def register_agent_tools(
         target: str = "@s",
     ) -> str:
         """通过 addon 桥接查询实体快照。"""
+        from services.agent.block_ops.bridge import (
+            map_addon_bridge_result,
+            map_bridge_exception,
+        )
+
         if ctx.deps.addon_bridge is None:
             return _tool_failure("Addon 桥接不可用", error_kind="TRANSIENT", retryable=True)
 
@@ -1087,15 +1092,10 @@ def register_agent_tools(
                     "target": target,
                 },
             )
-            return _tool_success(json.dumps(result.get("payload", result), ensure_ascii=False))
+            return map_addon_bridge_result(result)
         except Exception as e:
             logger.error("agent_tool_error", tool="find_entities", error=str(e))
-            return _tool_failure(
-                f"查询实体失败: {str(e)}",
-                error_kind="TRANSIENT",
-                retryable=True,
-                diagnostic_summary=str(e),
-            )
+            return map_bridge_exception(e, tool_name="find_entities")
 
     @chat_agent.tool
     async def run_world_command(
@@ -1103,6 +1103,11 @@ def register_agent_tools(
         command: str,
     ) -> str:
         """通过 addon 桥接受控执行世界命令。(仅当run_minecraft_command工具无法使用才用)"""
+        from services.agent.block_ops.bridge import (
+            map_addon_bridge_result,
+            map_bridge_exception,
+        )
+
         if ctx.deps.addon_bridge is None:
             return _tool_failure("Addon 桥接不可用", error_kind="TRANSIENT", retryable=True)
 
@@ -1111,15 +1116,115 @@ def register_agent_tools(
                 "run_world_command",
                 {"command": command},
             )
-            return _tool_success(json.dumps(result.get("payload", result), ensure_ascii=False))
+            return map_addon_bridge_result(result)
         except Exception as e:
             logger.error("agent_tool_error", tool="run_world_command", error=str(e))
-            return _tool_failure(
-                f"执行世界命令失败: {str(e)}",
-                error_kind="TRANSIENT",
-                retryable=True,
-                diagnostic_summary=str(e),
-            )
+            return map_bridge_exception(e, tool_name="run_world_command")
+
+    @chat_agent.tool
+    async def inspect_block(
+        ctx: RunContext[AgentDependencies],
+        coordinate_mode: str = "absolute",
+        dimension: str | None = None,
+        position: dict[str, Any] | None = None,
+        positions: list[dict[str, Any]] | None = None,
+        locked_targets: list[dict[str, Any]] | None = None,
+        phase: str | None = None,
+    ) -> str:
+        """查询单个或多个方块快照（type ID、states、含水/空气/液体）。
+
+        优先使用本工具查询方块，不要用 setblock/fill 命令试探。
+        absolute 模式必须提供 dimension；player_relative 使用当前事件玩家脚部原点。
+        建造前可用本工具确认目标是否为空气；若 actual 非空气且后续写入
+        未设 replace_any，不要对同一格无授权重试 place。
+
+        Args:
+            ctx: 运行上下文
+            coordinate_mode: absolute 或 player_relative
+            dimension: 维度 ID（absolute 必填）
+            position: 单个坐标 {x,y,z} 或相对 {forward,right,up}
+            positions: 多个坐标列表（与 position 互斥）
+        """
+        # locked_targets / phase: harness recovery only; stripped from model schema.
+        from services.agent.block_ops.tools_impl import inspect_block_impl
+
+        return await inspect_block_impl(
+            ctx,
+            coordinate_mode=coordinate_mode,  # type: ignore[arg-type]
+            dimension=dimension,
+            position=position,
+            positions=positions,
+            locked_targets=locked_targets,
+            phase=phase,
+        )
+
+    @chat_agent.tool
+    async def edit_blocks(
+        ctx: RunContext[AgentDependencies],
+        type_id: str,
+        mode: str = "place",
+        coordinate_mode: str = "absolute",
+        dimension: str | None = None,
+        position: dict[str, Any] | None = None,
+        positions: list[dict[str, Any]] | None = None,
+        from_pos: dict[str, Any] | None = None,
+        to_pos: dict[str, Any] | None = None,
+        states: dict[str, Any] | None = None,
+        replace_any: bool = False,
+        expected_previous: dict[str, Any] | None = None,
+        locked_targets: list[dict[str, Any]] | None = None,
+        phase: str | None = None,
+    ) -> str:
+        """写入方块：place 单格 / batch 离散批量 / fill 区域填充。
+
+        默认可表达的方块写入必须使用本工具，不要手写 setblock/fill。
+        平台/地板/墙：优先一次 fill 或少量 batch，禁止对连续区域 place×N。
+        默认仅替换空气；要铺满非空地面必须 replace_any=true（高风险再审批）。
+        replace_any 与 expected_previous 互斥。删除请显式放置 minecraft:air 并授权覆写。
+        高风险，需玩家审批。
+
+        恢复策略：
+        - 若返回 LIMIT_EXCEEDED：减小 positions 数量或 fill 体积，仍用 batch/fill，
+          不要 place 风暴。
+        - 若 PRECONDITION_FAILED 且 actual 非空气：不要对同一格无 replace 重试。
+        - 单轮建造避免无意义并行 place；优先扩大/收紧 AABB 或 batch。
+
+        fill 模式使用 from / to 两个角点（工具参数名 from_pos / to_pos，
+        与 catalog 的 from/to 同义；harness 与预检会自动映射）。
+
+        Args:
+            ctx: 运行上下文
+            type_id: 目标方块 ID
+            mode: place | batch | fill
+            coordinate_mode: absolute 或 player_relative
+            dimension: 维度 ID（absolute 必填）
+            position: place 单点
+            positions: batch 多点
+            from_pos: fill 角点 A（对应 from）
+            to_pos: fill 角点 B（对应 to）
+            states: 可选 block states
+            replace_any: 是否允许覆写普通非空气方块
+            expected_previous: 条件写入 {type_id, states?}
+        """
+        # locked_targets / phase: harness recovery only; stripped from model schema.
+        from services.agent.block_ops.tools_impl import edit_blocks_impl
+
+        return await edit_blocks_impl(
+            ctx,
+            mode=mode,  # type: ignore[arg-type]
+            coordinate_mode=coordinate_mode,  # type: ignore[arg-type]
+            dimension=dimension,
+            position=position,
+            positions=positions,
+            from_pos=from_pos,
+            to_pos=to_pos,
+            type_id=type_id,
+            states=states,
+            replace_any=replace_any,
+            expected_previous=expected_previous,
+            locked_targets=locked_targets,
+            phase=phase,
+        )
 
     if _runtime_harness_schema_enabled(settings):
         _enhance_registered_tool_descriptions(chat_agent)

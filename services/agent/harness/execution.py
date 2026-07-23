@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -20,6 +20,7 @@ from pydantic_ai.toolsets.wrapper import WrapperToolset
 from pydantic_ai.tools import ToolDefinition
 
 from config.logging import get_logger
+from config.redaction import redact_exception
 from services.agent.harness.audit import (
     audit_enabled,
     build_audit_record,
@@ -35,6 +36,8 @@ from services.agent.harness.catalog import (
 from services.agent.tool_results import ToolResult
 
 logger = get_logger(__name__)
+
+_BLOCK_OPS_TOOLS: frozenset[str] = frozenset({"inspect_block", "edit_blocks"})
 
 DEFAULT_HARD_DENY_COMMAND_ROOTS: frozenset[str] = frozenset(
     {"op", "deop", "stop", "whitelist", "permission", "wsserver"}
@@ -384,10 +387,35 @@ class PolicyEngine:
             metadata={"risk": str(risk)},
         )
 
-    def is_tool_exposed(self, tool_name: str) -> bool:
+    def is_tool_exposed(self, tool_name: str, *, ctx: Any | None = None) -> bool:
+        if tool_name in _BLOCK_OPS_TOOLS:
+            return self._is_block_tool_exposed(tool_name, ctx)
         if tool_name in list_tool_names():
             return True
         return tool_name in self.mcp_tool_allowlist
+
+    def _is_block_tool_exposed(self, tool_name: str, ctx: Any | None) -> bool:
+        """Only expose dedicated block tools when connection capability is SUPPORTED."""
+        if tool_name not in list_tool_names():
+            return False
+        if ctx is None:
+            return False
+        deps = getattr(ctx, "deps", None)
+        if deps is None:
+            return False
+        connection_id = getattr(deps, "connection_id", None)
+        if connection_id is None:
+            return False
+        from services.agent.block_ops.capability import (
+            BlockCapabilityStatus,
+            get_block_capability_cache,
+        )
+
+        record = get_block_capability_cache().get(str(connection_id))
+        if record is None:
+            # Lazy sync view: hide until async probe completes via prepare_tools/get_tools.
+            return False
+        return record.status == BlockCapabilityStatus.SUPPORTED
 
     @staticmethod
     def _find_command_root(
@@ -473,9 +501,56 @@ class PolicyEngine:
         return bool(player_name) and target_text == player_name
 
 
-def classify_tool_exception(exc: BaseException, *, tool_name: str) -> ToolResult:
+def classify_tool_exception(
+    exc: BaseException,
+    *,
+    tool_name: str,
+    execution_stage: Literal["projection", "invocation"] | None = None,
+) -> ToolResult:
+    """Map tool-boundary exceptions without exposing implementation details."""
     text = str(exc) or exc.__class__.__name__
+    diagnostic_summary = redact_exception(exc) or exc.__class__.__name__
     lower = text.lower()
+    stage = execution_stage or (
+        "projection" if "execution contract" in lower else "invocation"
+    )
+    if tool_name in _BLOCK_OPS_TOOLS and stage == "projection":
+        from services.agent.block_ops.schema import BlockErrorCode, build_error_response, dumps_payload
+
+        return ToolResult.failure(
+            dumps_payload(
+                build_error_response(
+                    BlockErrorCode.INTERNAL_ERROR,
+                    "方块工具内部参数处理失败；本次操作未发送到 Add-on",
+                    retryable=False,
+                    external_state_unknown=False,
+                    fallback_allowed=False,
+                )
+            ),
+            error_kind="INTERNAL",
+            retryable=False,
+            diagnostic_summary=diagnostic_summary,
+            error_type=exc.__class__.__name__,
+        )
+    if tool_name == "edit_blocks" and stage == "invocation":
+        from services.agent.block_ops.schema import BlockErrorCode, build_error_response, dumps_payload
+
+        return ToolResult.failure(
+            dumps_payload(
+                build_error_response(
+                    BlockErrorCode.STATE_UNKNOWN,
+                    "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。",
+                    retryable=False,
+                    external_state_unknown=True,
+                    fallback_allowed=False,
+                )
+            ),
+            error_kind="PERMANENT",
+            retryable=False,
+            external_state_unknown=True,
+            diagnostic_summary=diagnostic_summary,
+            error_type=exc.__class__.__name__,
+        )
     if "timeout" in lower or "deadline" in lower:
         entry = get_tool_entry(tool_name)
         side_effect = bool(entry.may_have_external_side_effects) if entry is not None else True
@@ -484,14 +559,57 @@ def classify_tool_exception(exc: BaseException, *, tool_name: str) -> ToolResult
             error_kind="TRANSIENT",
             retryable=not side_effect and (entry is not None and entry.risk == ToolRisk.LOW),
             external_state_unknown=side_effect,
-            diagnostic_summary=text,
+            diagnostic_summary=diagnostic_summary,
+            error_type=exc.__class__.__name__,
         )
     return ToolResult.failure(
         f"工具执行失败: {tool_name}",
         error_kind="INTERNAL",
         retryable=False,
-        diagnostic_summary=text,
+        diagnostic_summary=diagnostic_summary,
+        error_type=exc.__class__.__name__,
     )
+
+
+def log_tool_execution_failed(
+    *,
+    tool_name: str,
+    ctx: Any,
+    result: ToolResult,
+    execution_stage: Literal["projection", "invocation"],
+    error_type: str | None = None,
+) -> None:
+    """Emit a correlation-safe failure event for tool boundary failures."""
+    deps = getattr(ctx, "deps", None)
+    connection_id = str(getattr(deps, "connection_id", "") or "")
+    logger.error(
+        "tool_execution_failed",
+        tool_name=tool_name,
+        run_id=getattr(deps, "run_id", None) or getattr(ctx, "run_id", None) or "",
+        tool_call_id=getattr(ctx, "tool_call_id", None) or "",
+        connection_id_short=connection_id[-8:] if connection_id else "",
+        player_name=getattr(deps, "player_name", None),
+        error_kind=result.error_kind,
+        error_type=result.error_type or error_type or type(result).__name__,
+        diagnostic_summary=result.diagnostic_summary or "tool execution failed",
+        external_state_unknown=result.external_state_unknown,
+        execution_stage=execution_stage,
+    )
+
+
+def _projection_failure(ctx: Any, tool_name: str, exc: BaseException) -> ToolResult:
+    """Classify and log an invalid block execution projection once."""
+    classified = classify_tool_exception(
+        exc, tool_name=tool_name, execution_stage="projection"
+    )
+    log_tool_execution_failed(
+        tool_name=tool_name,
+        ctx=ctx,
+        result=classified,
+        execution_stage="projection",
+        error_type=exc.__class__.__name__,
+    )
+    return classified
 
 
 def materialize_tool_result(result: Any) -> Any:
@@ -520,11 +638,12 @@ class HarnessToolset(WrapperToolset[Any]):
     idempotency: IdempotencyStore = field(default_factory=get_idempotency_store)
 
     async def get_tools(self, ctx: RunContext[Any]) -> dict[str, ToolsetTool[Any]]:
+        await self._ensure_block_capability(ctx)
         tools = await self.wrapped.get_tools(ctx)
         return {
             name: tool
             for name, tool in tools.items()
-            if self.policy.is_tool_exposed(name)
+            if self.policy.is_tool_exposed(name, ctx=ctx)
         }
 
     async def call_tool(
@@ -535,8 +654,9 @@ class HarnessToolset(WrapperToolset[Any]):
         tool: ToolsetTool[Any],
     ) -> Any:
         start = time.perf_counter()
-        normalized = normalize_tool_args(tool_args)
-        args_hash = hash_normalized_args(normalized)
+        effective_args = dict(tool_args or {})
+        original_normalized = normalize_tool_args(effective_args)
+        original_args_hash = hash_normalized_args(original_normalized)
         deps = getattr(ctx, "deps", None)
         player_name = getattr(deps, "player_name", None)
         run_id = getattr(deps, "run_id", None) or getattr(ctx, "run_id", None) or ""
@@ -545,6 +665,7 @@ class HarnessToolset(WrapperToolset[Any]):
         entry = get_tool_entry(name)
         trace_context = getattr(deps, "trace_context", None)
         trace_recorder = getattr(deps, "trace_recorder", None)
+        connection_id = str(getattr(deps, "connection_id", "") or "")
 
         # tool.proposed at the boundary (fail-soft)
         self._trace_tool_proposed(
@@ -552,12 +673,59 @@ class HarnessToolset(WrapperToolset[Any]):
             trace_context,
             tool_name=name,
             tool_call_id=str(tool_call_id) if tool_call_id else None,
-            tool_args=normalized,
+            tool_args=original_normalized,
         )
 
-        # 1) 幂等命中
+        # 0) Block tools: preflight / relative resolution BEFORE policy & approval.
+        # Preflight plans separate authorization, execution projection, and evidence.
+        preflight_plan = None
+        if name in _BLOCK_OPS_TOOLS:
+            preflight_failure, preflight_plan = await self._preflight_block_tool(
+                name=name,
+                tool_args=effective_args,
+                original_args_hash=original_args_hash,
+                ctx=ctx,
+                run_id=str(run_id),
+                tool_call_id=str(tool_call_id),
+                connection_id=connection_id,
+            )
+            if preflight_failure is not None:
+                self._audit(
+                    settings=settings,
+                    tool_name=name,
+                    parameters=original_normalized,
+                    ctx=ctx,
+                    status="failure",
+                    duration_ms=_duration_ms(start),
+                    result=preflight_failure,
+                )
+                return materialize_tool_result(preflight_failure)
+            if preflight_plan is not None:
+                effective_args = preflight_plan.authorized_args
+
+        normalized = normalize_tool_args(effective_args)
+        args_hash = hash_normalized_args(normalized)
+        execute_args = (
+            dict(preflight_plan.execute_args) if preflight_plan is not None else None
+        )
+        idempotency_args_hash = (
+            hash_normalized_args(normalize_tool_args(execute_args))
+            if name in _BLOCK_OPS_TOOLS and execute_args is not None
+            else args_hash
+        )
+
+        # 1) 方块工具只按实际执行投影幂等；非方块工具保持原参数哈希兼容。
         if run_id and tool_call_id:
-            cached = self.idempotency.get(str(run_id), str(tool_call_id), args_hash)
+            cached = self.idempotency.get(
+                str(run_id), str(tool_call_id), idempotency_args_hash
+            )
+            if name not in _BLOCK_OPS_TOOLS:
+                for legacy_hash in (args_hash, original_args_hash):
+                    if cached is not None or legacy_hash == idempotency_args_hash:
+                        continue
+                    cached = self.idempotency.get(
+                        str(run_id), str(tool_call_id), legacy_hash
+                    )
             if cached is not None:
                 logger.info(
                     "tool_idempotent_hit",
@@ -635,7 +803,37 @@ class HarnessToolset(WrapperToolset[Any]):
             return ToolDenied(message=decision.reason)
 
         if decision.action == PolicyDecisionKind.REQUIRE_APPROVAL:
+            try:
+                execute_args = execute_args or _python_tool_args(name, effective_args)
+            except (TypeError, ValueError, KeyError) as exc:
+                classified = classify_tool_exception(
+                    exc, tool_name=name, execution_stage="projection"
+                )
+                log_tool_execution_failed(
+                    tool_name=name,
+                    ctx=ctx,
+                    result=classified,
+                    execution_stage="projection",
+                    error_type=exc.__class__.__name__,
+                )
+                self._audit(
+                    settings=settings, tool_name=name, parameters=normalized, ctx=ctx,
+                    status="failure", duration_ms=_duration_ms(start), result=classified,
+                )
+                return materialize_tool_result(classified)
             summary = summarize_args_for_player(name, normalized)
+            self._audit(
+                settings=settings,
+                tool_name=name,
+                parameters=normalized,
+                authorized_args=normalized,
+                approval_evidence=(
+                    preflight_plan.approval_metadata if preflight_plan is not None else {}
+                ),
+                ctx=ctx,
+                status="approval_required",
+                duration_ms=_duration_ms(start),
+            )
             # 审批挂起：记 not_executed，真正 approval.requested 由 Worker 写
             not_exec_attrs: dict[str, Any] = {
                 "policy_action": str(decision.action),
@@ -659,6 +857,14 @@ class HarnessToolset(WrapperToolset[Any]):
                     "tool_name": name,
                     "normalized_args": normalized,
                     "args_hash": args_hash,
+                    "execute_args": (
+                        preflight_plan.execute_args if preflight_plan is not None else execute_args
+                    ),
+                    "execution_args_hash": idempotency_args_hash,
+                    "approval_metadata": (
+                        preflight_plan.approval_metadata if preflight_plan is not None else {}
+                    ),
+                    "original_args_hash": original_args_hash,
                     "args_summary": summary,
                     "policy_version": decision.policy_version,
                     "reason": decision.reason,
@@ -669,7 +875,7 @@ class HarnessToolset(WrapperToolset[Any]):
                 }
             )
 
-        # 3) 执行
+        # 3) 执行（使用 canonical args；映射 fill 的 from/to → from_pos/to_pos）
         self._trace_tool_started(
             trace_recorder,
             trace_context,
@@ -677,7 +883,25 @@ class HarnessToolset(WrapperToolset[Any]):
             tool_call_id=str(tool_call_id) if tool_call_id else None,
         )
         try:
-            raw_result = await super().call_tool(name, tool_args, ctx, tool)
+            execute_args = execute_args or _python_tool_args(name, effective_args)
+        except (TypeError, ValueError, KeyError) as exc:
+            classified = classify_tool_exception(
+                exc, tool_name=name, execution_stage="projection"
+            )
+            log_tool_execution_failed(
+                tool_name=name,
+                ctx=ctx,
+                result=classified,
+                execution_stage="projection",
+                error_type=exc.__class__.__name__,
+            )
+            self._audit(
+                settings=settings, tool_name=name, parameters=normalized, ctx=ctx,
+                status="failure", duration_ms=_duration_ms(start), result=classified,
+            )
+            return materialize_tool_result(classified)
+        try:
+            raw_result = await super().call_tool(name, execute_args, ctx, tool)
         except ApprovalRequired:
             raise
         except asyncio.CancelledError:
@@ -695,7 +919,16 @@ class HarnessToolset(WrapperToolset[Any]):
             )
             raise
         except Exception as exc:
-            classified = classify_tool_exception(exc, tool_name=name)
+            classified = classify_tool_exception(
+                exc, tool_name=name, execution_stage="invocation"
+            )
+            log_tool_execution_failed(
+                tool_name=name,
+                ctx=ctx,
+                result=classified,
+                execution_stage="invocation",
+                error_type=exc.__class__.__name__,
+            )
             self._audit(
                 settings=settings,
                 tool_name=name,
@@ -727,12 +960,20 @@ class HarnessToolset(WrapperToolset[Any]):
         if isinstance(raw_result, ToolResult):
             success = raw_result.is_success
             external_unknown = raw_result.external_state_unknown
+            if not raw_result.is_success and name in _BLOCK_OPS_TOOLS:
+                log_tool_execution_failed(
+                    tool_name=name,
+                    ctx=ctx,
+                    result=raw_result,
+                    execution_stage="invocation",
+                    error_type=raw_result.error_type,
+                )
             # 状态未知的副作用：不写入可重放成功缓存之外的自动重试语义
             if raw_result.is_success and run_id and tool_call_id:
                 self.idempotency.put(
                     str(run_id),
                     str(tool_call_id),
-                    args_hash,
+                    idempotency_args_hash,
                     raw_result,
                     external_state_unknown=False,
                 )
@@ -750,7 +991,7 @@ class HarnessToolset(WrapperToolset[Any]):
                 self.idempotency.put(
                     str(run_id),
                     str(tool_call_id),
-                    args_hash,
+                    idempotency_args_hash,
                     result_for_model,
                     external_state_unknown=False,
                 )
@@ -902,6 +1143,121 @@ class HarnessToolset(WrapperToolset[Any]):
         except Exception as exc:  # noqa: BLE001
             logger.debug("trace_tool_result_failed", error=str(exc))
 
+    async def _ensure_block_capability(self, ctx: RunContext[Any]) -> None:
+        deps = getattr(ctx, "deps", None)
+        if deps is None:
+            return
+        connection_id = getattr(deps, "connection_id", None)
+        if connection_id is None:
+            return
+        from services.agent.block_ops.capability import ensure_block_capability
+
+        await ensure_block_capability(
+            str(connection_id),
+            getattr(deps, "addon_bridge", None),
+        )
+
+    async def _preflight_block_tool(
+        self,
+        *,
+        name: str,
+        tool_args: dict[str, Any],
+        original_args_hash: str,
+        ctx: RunContext[Any],
+        run_id: str,
+        tool_call_id: str,
+        connection_id: str,
+    ) -> tuple[ToolResult | None, Any | None]:
+        """Run block-ops preflight; return (failure, separated plan)."""
+        from services.agent.block_ops.preflight_cache import get_preflight_cache
+        from services.agent.block_ops.tools_impl import BlockPreflightPlan, run_block_preflight
+
+        deferred_approved = bool(getattr(ctx, "tool_call_approved", False))
+        # Approved block calls are never allowed to fall back to cached/model
+        # arguments or a fresh preflight: the persisted override must validate.
+        if deferred_approved:
+            try:
+                execute_args = _python_tool_args(name, tool_args)
+            except (TypeError, ValueError, KeyError) as exc:
+                classified = classify_tool_exception(
+                    exc, tool_name=name, execution_stage="projection"
+                )
+                log_tool_execution_failed(
+                    tool_name=name,
+                    ctx=ctx,
+                    result=classified,
+                    execution_stage="projection",
+                    error_type=exc.__class__.__name__,
+                )
+                return classified, None
+            return None, BlockPreflightPlan(dict(tool_args), execute_args, {})
+
+        # Reuse cached canonical args on approval recovery (same original hash).
+        cache = get_preflight_cache()
+        if run_id and tool_call_id:
+            cached = cache.get(run_id, tool_call_id, original_args_hash)
+            if cached is not None:
+                return None, BlockPreflightPlan(
+                    dict(cached.canonical_args),
+                    dict(cached.execute_args),
+                    dict(cached.approval_metadata),
+                )
+            # Also accept lookup when tool_args already mark execute phase.
+            if tool_args.get("phase") == "execute" and tool_args.get("locked_targets"):
+                try:
+                    execute_args = _python_tool_args(name, tool_args)
+                except (TypeError, ValueError, KeyError) as exc:
+                    return _projection_failure(ctx, name, exc), None
+                return None, BlockPreflightPlan(dict(tool_args), execute_args, {})
+
+        try:
+            plan_or_args, failure = await run_block_preflight(ctx, name, tool_args)
+        except Exception as exc:
+            classified = classify_tool_exception(
+                exc, tool_name=name, execution_stage="projection"
+            )
+            log_tool_execution_failed(
+                tool_name=name,
+                ctx=ctx,
+                result=classified,
+                execution_stage="projection",
+                error_type=exc.__class__.__name__,
+            )
+            return classified, None
+
+        if failure is not None:
+            return failure, None
+
+        if plan_or_args is None:
+            try:
+                execute_args = _python_tool_args(name, tool_args)
+            except (TypeError, ValueError, KeyError) as exc:
+                return _projection_failure(ctx, name, exc), None
+            return None, BlockPreflightPlan(dict(tool_args), execute_args, {})
+
+        if isinstance(plan_or_args, BlockPreflightPlan):
+            plan = plan_or_args
+        else:
+            canonical = dict(plan_or_args)
+            try:
+                execute_args = _python_tool_args(name, canonical)
+            except (TypeError, ValueError, KeyError) as exc:
+                return _projection_failure(ctx, name, exc), None
+            plan = BlockPreflightPlan(canonical, execute_args, {})
+
+        if run_id and tool_call_id:
+            cache.put(
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+                original_args_hash=original_args_hash,
+                canonical_args=plan.authorized_args,
+                execute_args=plan.execute_args,
+                approval_metadata=plan.approval_metadata,
+                preflight_payload=plan.approval_metadata,
+                connection_id=connection_id or None,
+            )
+        return None, plan
+
     def _audit(
         self,
         *,
@@ -913,6 +1269,8 @@ class HarnessToolset(WrapperToolset[Any]):
         duration_ms: int,
         result: Any = None,
         exception: BaseException | None = None,
+        authorized_args: dict[str, Any] | None = None,
+        approval_evidence: dict[str, Any] | None = None,
     ) -> None:
         effective = settings or getattr(getattr(ctx, "deps", None), "settings", None)
         if not audit_enabled(effective):
@@ -931,6 +1289,8 @@ class HarnessToolset(WrapperToolset[Any]):
                 entry.policy_version if entry is not None else self.policy.policy_version
             ),
             run_id=getattr(getattr(ctx, "deps", None), "run_id", None),
+            authorized_args=authorized_args,
+            approval_evidence=approval_evidence,
         )
         path = getattr(effective, "runtime_harness_audit_path", "logs/runtime_harness_tools.jsonl")
         max_records = getattr(effective, "runtime_harness_audit_max_records", 5000)
@@ -953,7 +1313,21 @@ class HarnessCapability(AbstractCapability[Any]):
         ctx: RunContext[Any],
         tool_defs: list[ToolDefinition],
     ) -> list[ToolDefinition]:
-        return [td for td in tool_defs if self.policy.is_tool_exposed(td.name)]
+        # Probe capability once so block tools can be filtered correctly.
+        deps = getattr(ctx, "deps", None)
+        if deps is not None:
+            connection_id = getattr(deps, "connection_id", None)
+            if connection_id is not None:
+                from services.agent.block_ops.capability import ensure_block_capability
+
+                await ensure_block_capability(
+                    str(connection_id),
+                    getattr(deps, "addon_bridge", None),
+                )
+        exposed = [td for td in tool_defs if self.policy.is_tool_exposed(td.name, ctx=ctx)]
+        # Hide harness-only recovery fields from the model-facing schema.
+        # Approval resume / override_args still inject locked_targets + phase=execute.
+        return [strip_block_internal_tool_schema(td) for td in exposed]
 
 
 def build_harness_capability(settings: Any | None = None) -> HarnessCapability:
@@ -962,3 +1336,56 @@ def build_harness_capability(settings: Any | None = None) -> HarnessCapability:
 
 def _duration_ms(start: float) -> int:
     return max(0, round((time.perf_counter() - start) * 1000))
+
+
+# Model-facing tool schema must not advertise recovery-only fields.
+_BLOCK_INTERNAL_SCHEMA_KEYS = frozenset({"locked_targets", "phase"})
+
+
+def strip_block_internal_tool_schema(tool_def: ToolDefinition) -> ToolDefinition:
+    """Remove locked_targets/phase from public ToolDefinition parameters.
+
+    Function implementations and harness recovery still accept these kwargs;
+    only the schema shown to the model is stripped.
+    """
+    if tool_def.name not in _BLOCK_OPS_TOOLS:
+        return tool_def
+    schema = tool_def.parameters_json_schema
+    if not isinstance(schema, dict):
+        return tool_def
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return tool_def
+    if not _BLOCK_INTERNAL_SCHEMA_KEYS.intersection(properties):
+        return tool_def
+
+    new_properties = {
+        key: value
+        for key, value in properties.items()
+        if key not in _BLOCK_INTERNAL_SCHEMA_KEYS
+    }
+    new_schema = dict(schema)
+    new_schema["properties"] = new_properties
+    required = schema.get("required")
+    if isinstance(required, list):
+        new_schema["required"] = [
+            item for item in required if item not in _BLOCK_INTERNAL_SCHEMA_KEYS
+        ]
+    return replace(
+        tool_def,
+        parameters_json_schema=new_schema,  # type: ignore[arg-type]
+    )
+
+
+def _python_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Build Python call args through the block operation signature whitelist."""
+    if tool_name not in _BLOCK_OPS_TOOLS:
+        return dict(args or {})
+    if tool_name == "inspect_block" and args.get("phase") != "execute":
+        return {
+            key: value for key, value in dict(args or {}).items()
+            if key in {"coordinate_mode", "dimension", "position", "positions", "locked_targets", "phase"}
+        }
+    from services.agent.block_ops.tools_impl import project_block_execute_args
+
+    return project_block_execute_args(tool_name, dict(args or {}))
