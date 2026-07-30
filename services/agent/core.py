@@ -1,5 +1,7 @@
 """PydanticAI Agent 核心定义"""
 
+from __future__ import annotations
+
 import asyncio
 import re
 from collections.abc import AsyncIterator, Iterator
