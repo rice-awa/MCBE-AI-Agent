@@ -15,13 +15,14 @@ from config.logging import get_logger
 from config.settings import Settings
 from core.queue import MessageBroker, normalize_conversation_id
 from core.session import DEFAULT_CONVERSATION_ID
-from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
+from models.constants import DEFAULT_PLAYER_DISPLAY_NAME, DEFAULT_PLAYER_KEY
 from models.messages import ChatRequest
 from services.auth.jwt_handler import JWTHandler
 from services.gateway.session_store import HostConnectionSession, HostSessionStore
 from services.gateway.ws_command_runner import WsCommandRunner
 from mcbe_ws_sdk import MinecraftProtocolHandler
 from mcbe_ws_sdk.gateway.handler import TellrawMessage
+from services.agent.trace import TraceContext, get_trace_recorder
 
 logger = get_logger(__name__)
 
@@ -64,6 +65,7 @@ class CommandHandlers:
             host = self.sessions.create(
                 state.id,
                 authenticated=self.dev_mode,
+                ai_broadcast_all=self.settings.minecraft.ai_broadcast_default,
             )
         return host
 
@@ -112,6 +114,9 @@ class CommandHandlers:
         sender = player_name or state._player_name
         session = host.get_player_session(sender)
         resolved_conversation = conversation_id or DEFAULT_CONVERSATION_ID
+        # 一次玩家意图：trace_id == run_id（迁移期）；首次 attempt 新生成。
+        trace_id = str(uuid4())
+        attempt_id = str(uuid4())
         return ChatRequest(
             connection_id=state.id,
             content=content,
@@ -123,7 +128,89 @@ class CommandHandlers:
             auto_approve_tools=host.should_auto_approve_tools(
                 sender, resolved_conversation
             ),
+            run_id=trace_id,
+            trace_id=trace_id,
+            attempt_id=attempt_id,
         )
+
+    def _trace_context_for_request(self, chat_req: ChatRequest) -> TraceContext | None:
+        """从已填充 correlation 的 ChatRequest 构建 TraceContext。"""
+        trace_id = chat_req.trace_id or chat_req.run_id
+        attempt_id = chat_req.attempt_id
+        if not trace_id or not attempt_id:
+            return None
+        return TraceContext(
+            trace_id=trace_id,
+            run_id=chat_req.run_id or trace_id,
+            attempt_id=attempt_id,
+            message_id=str(chat_req.id),
+            connection_id=str(chat_req.connection_id),
+            player_name=chat_req.player_name or DEFAULT_PLAYER_KEY,
+            conversation_id=chat_req.conversation_id or DEFAULT_CONVERSATION_ID,
+        )
+
+    def _emit_request_rejected(
+        self,
+        *,
+        state: ConnectionState,
+        player_name: str | None,
+        reason: str,
+        chat_req: ChatRequest | None = None,
+        command_type: str | None = None,
+    ) -> None:
+        """Emit request.rejected with metadata only (no message content)."""
+        try:
+            recorder = get_trace_recorder()
+            if chat_req is not None:
+                context = self._trace_context_for_request(chat_req)
+            else:
+                # Auth rejection 等无 ChatRequest 路径：生成 ephemeral correlation。
+                ephemeral_id = str(uuid4())
+                context = TraceContext(
+                    trace_id=ephemeral_id,
+                    run_id=ephemeral_id,
+                    attempt_id=str(uuid4()),
+                    message_id="",
+                    connection_id=str(state.id),
+                    player_name=player_name or DEFAULT_PLAYER_KEY,
+                    conversation_id=DEFAULT_CONVERSATION_ID,
+                )
+            if context is None:
+                return
+            attributes: dict[str, Any] = {"reason": reason}
+            if command_type is not None:
+                attributes["command_type"] = command_type
+            if chat_req is not None and chat_req.delivery:
+                attributes["delivery"] = chat_req.delivery
+            recorder.emit(
+                "request.rejected",
+                context,
+                status="rejected",
+                attributes=attributes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("trace_emit_failed", event="request.rejected", error=str(exc))
+
+    def _emit_trace_events(
+        self,
+        chat_req: ChatRequest,
+        *events: tuple[str, str, dict[str, Any]],
+    ) -> None:
+        """Emit one or more trace events; never raises into the chat path."""
+        try:
+            context = self._trace_context_for_request(chat_req)
+            if context is None:
+                return
+            recorder = get_trace_recorder()
+            for event_name, status, attributes in events:
+                recorder.emit(
+                    event_name,
+                    context,
+                    status=status,
+                    attributes=attributes,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("trace_emit_failed", error=str(exc))
 
     # -- routing -------------------------------------------------------------------
 
@@ -145,6 +232,12 @@ class CommandHandlers:
             await self._send_player_reply(
                 state, error_msg, source="auth", player_name=player_name
             )
+            self._emit_request_rejected(
+                state=state,
+                player_name=player_name,
+                reason="auth_required",
+                command_type=cmd_type,
+            )
             return
 
         command_handlers = {
@@ -153,6 +246,9 @@ class CommandHandlers:
                 state, content, delivery="scriptevent", player_name=player_name
             ),
             "context": lambda: self.handle_context(
+                state, content, player_name=player_name
+            ),
+            "continuous_mode": lambda: self.handle_continuous_mode(
                 state, content, player_name=player_name
             ),
             "conversation": lambda: self.handle_conversation(
@@ -311,7 +407,23 @@ class CommandHandlers:
                 player=player_name,
                 content_length=len(content),
             )
+            attributes = {
+                "delivery": chat_req.delivery,
+                "use_context": chat_req.use_context,
+                "provider": chat_req.provider,
+            }
+            self._emit_trace_events(
+                chat_req,
+                ("trace.started", "started", attributes),
+                ("request.accepted", "accepted", attributes),
+            )
         except asyncio.QueueFull:
+            self._emit_request_rejected(
+                state=state,
+                player_name=player_name,
+                reason="queue_full",
+                chat_req=chat_req,
+            )
             msg = self.protocol.create_error_message("服务器繁忙，请稍后重试")
             await self._send_player_reply(
                 state, msg, source="chat", player_name=player_name
@@ -337,6 +449,12 @@ class CommandHandlers:
             error_msg = self.protocol.create_error_message("请先登录")
             await self._send_player_reply(
                 state, error_msg, source="auth", player_name=player_name
+            )
+            self._emit_request_rejected(
+                state=state,
+                player_name=player_name,
+                reason="auth_required",
+                command_type="ui_chat",
             )
             return
 
@@ -433,6 +551,29 @@ class CommandHandlers:
 
         await self._send_player_reply(
             state, msg, source="context", player_name=player_name
+        )
+
+    async def handle_continuous_mode(
+        self, state: ConnectionState, option: str, player_name: str | None = None
+    ) -> None:
+        host = self._require_host(state)
+        session = host.get_player_session(player_name)
+
+        action = option.strip().lower() if option.strip() else "状态"
+        if action in ("开启", "启用", "on", "enable", "开"):
+            session.continuous_mode = True
+            msg = self.protocol.create_success_message(
+                "连续AI聊天模式已开启，您可以直接发送消息与AI对话"
+            )
+        elif action in ("关闭", "off", "disable", "关"):
+            session.continuous_mode = False
+            msg = self.protocol.create_info_message("连续AI聊天模式已关闭")
+        else:
+            status = "开启" if session.continuous_mode else "关闭"
+            msg = self.protocol.create_info_message(f"连续AI聊天模式: {status}")
+
+        await self._send_player_reply(
+            state, msg, source="continuous_mode", player_name=player_name
         )
 
     async def handle_conversation(
@@ -1111,6 +1252,9 @@ class CommandHandlers:
             state.id, owner, conversation_id
         )
         session = host.get_player_session(owner)
+        # 审批恢复：保留原始 trace/run_id（ingress 时二者相等），生成新 attempt_id。
+        original_trace_id = pending.run_id
+        resume_attempt_id = str(uuid4())
         chat_req = ChatRequest(
             connection_id=state.id,
             content="",
@@ -1125,12 +1269,36 @@ class CommandHandlers:
             auto_approve_tools=host.should_auto_approve_tools(
                 owner, conversation_id
             ),
-            run_id=pending.run_id,
+            run_id=original_trace_id,
+            trace_id=original_trace_id,
+            attempt_id=resume_attempt_id,
             resume_approval_id=pending.batch_id,
             deferred_tool_results={"approvals": approvals_payload},
             resume_message_history=pending.messages,
         )
-        await self.broker.submit_request(state.id, chat_req, priority=0)
+        try:
+            await self.broker.submit_request(state.id, chat_req, priority=0)
+            attributes = {
+                "delivery": chat_req.delivery,
+                "resume": True,
+                "batch_id": pending.batch_id,
+            }
+            self._emit_trace_events(
+                chat_req,
+                ("request.accepted", "accepted", attributes),
+                ("request.resumed", "resumed", attributes),
+            )
+        except asyncio.QueueFull:
+            self._emit_request_rejected(
+                state=state,
+                player_name=player_name,
+                reason="queue_full",
+                chat_req=chat_req,
+            )
+            msg = self.protocol.create_error_message("服务器繁忙，请稍后重试")
+            await self._send_player_reply(
+                state, msg, source=source, player_name=player_name
+            )
 
     async def handle_run_command(
         self,

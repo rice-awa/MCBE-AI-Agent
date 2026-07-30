@@ -1,4 +1,7 @@
 from services.agent.mcwiki import (
+    build_health_url,
+    build_namespaces_url,
+    build_page_exists_url,
     build_page_url,
     build_search_params,
     normalize_limit,
@@ -24,3 +27,14 @@ def test_build_search_params() -> None:
 def test_build_page_url_encodes() -> None:
     url = build_page_url("https://mcwiki.rice-awa.top", "钻石")
     assert url == "https://mcwiki.rice-awa.top/api/page/%E9%92%BB%E7%9F%B3"
+
+
+def test_build_page_exists_url_encodes() -> None:
+    url = build_page_exists_url("https://mcwiki.rice-awa.top", "钻石")
+    assert url == "https://mcwiki.rice-awa.top/api/page/%E9%92%BB%E7%9F%B3/exists"
+
+
+def test_build_health_and_namespaces_urls() -> None:
+    base = "https://mcwiki.rice-awa.top"
+    assert build_health_url(base) == "https://mcwiki.rice-awa.top/health"
+    assert build_namespaces_url(base) == "https://mcwiki.rice-awa.top/api/search/namespaces"

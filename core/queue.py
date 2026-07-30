@@ -1,8 +1,9 @@
 """消息队列 - 实现 WS 和 Agent 之间的异步解耦"""
 
 import asyncio
+import time
 from dataclasses import dataclass, field
-from typing import Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 from uuid import UUID
 
 from pydantic_ai.messages import ModelMessage
@@ -19,6 +20,9 @@ from core.session import (
     make_session_lock_key,
     normalize_conversation_id,
 )
+
+if TYPE_CHECKING:
+    from services.agent.trace import TraceContext
 
 __all__ = [
     "DEFAULT_CONVERSATION_ID",
@@ -45,6 +49,9 @@ class QueueItem(Generic[T]):
     connection_id: UUID = field(compare=False)
     payload: T = field(compare=False)
     sequence: int = field(default=0, compare=True)  # 同优先级时的顺序
+    # 入站 trace 上下文；无 correlation 字段时保持 None（向后兼容）
+    trace_context: "TraceContext | None" = field(default=None, compare=False)
+    enqueued_at_ns: int = field(default=0, compare=False)
 
 
 class MessageBroker:
@@ -91,11 +98,14 @@ class MessageBroker:
             self._sequence += 1
             sequence = self._sequence
 
+        trace_context = self._trace_context_from_payload(connection_id, payload)
         item = QueueItem(
             priority=priority,
             connection_id=connection_id,
             payload=payload,
             sequence=sequence,
+            trace_context=trace_context,
+            enqueued_at_ns=time.time_ns(),
         )
 
         try:
@@ -113,6 +123,34 @@ class MessageBroker:
                 queue_size=self._request_queue.qsize(),
             )
             raise
+
+    @staticmethod
+    def _trace_context_from_payload(
+        connection_id: UUID,
+        payload: Any,
+    ) -> "TraceContext | None":
+        """从 ChatRequest 的 correlation 字段构建 TraceContext；缺失则返回 None。"""
+        from models.messages import ChatRequest
+        from services.agent.trace import TraceContext
+
+        if not isinstance(payload, ChatRequest):
+            return None
+
+        trace_id = payload.trace_id or payload.run_id
+        attempt_id = payload.attempt_id
+        if not trace_id or not attempt_id:
+            return None
+
+        run_id = payload.run_id or trace_id
+        return TraceContext(
+            trace_id=trace_id,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            message_id=str(payload.id),
+            connection_id=str(connection_id),
+            player_name=payload.player_name or DEFAULT_PLAYER_KEY,
+            conversation_id=payload.conversation_id or DEFAULT_CONVERSATION_ID,
+        )
 
     async def get_request(self) -> QueueItem:
         """

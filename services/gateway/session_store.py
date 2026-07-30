@@ -14,6 +14,7 @@ class PlayerSession:
 
     player_name: str
     context_enabled: bool = True
+    continuous_mode: bool = False
     current_provider: str | None = None
     current_template: str = "default"
     custom_variables: dict[str, str] = field(default_factory=dict)
@@ -27,7 +28,8 @@ class HostConnectionSession:
 
     connection_id: UUID
     authenticated: bool = False
-    ai_broadcast_all: bool = False
+    # Seeded from Settings.minecraft.ai_broadcast_default on connect (default on).
+    ai_broadcast_all: bool = True
     ai_broadcast_players: set[str] = field(default_factory=set)
     # `AGENT 同意 永远`：本连接下该玩家所有对话自动批准（切换对话仍生效）。
     auto_approve_tools_players: set[str] = field(default_factory=set)
@@ -114,6 +116,7 @@ class HostSessionStore:
         connection_id: UUID,
         *,
         authenticated: bool = False,
+        ai_broadcast_all: bool = True,
     ) -> HostConnectionSession:
         existing = self._sessions.get(connection_id)
         if existing is not None:
@@ -121,6 +124,7 @@ class HostSessionStore:
         session = HostConnectionSession(
             connection_id=connection_id,
             authenticated=authenticated,
+            ai_broadcast_all=ai_broadcast_all,
         )
         self._sessions[connection_id] = session
         return session

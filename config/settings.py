@@ -57,6 +57,12 @@ class MinecraftConfig(BaseModel):
             "description": "管理对话",
             "usage": "<new/switch/clear/status/list/save/restore>"
         },
+        "AGENT 连续模式": {
+            "type": "continuous_mode",
+            "aliases": ["AGENT 连续", "AGENT continuous", "AGENT auto"],
+            "description": "开启/关闭连续AI聊天模式（无需前缀自动触发AI）",
+            "usage": "<开启|关闭|状态>"
+        },
         "AGENT 上下文": {
             "type": "context",
             "aliases": ["AGENT context", "AI 上下文", "AI context"],
@@ -125,6 +131,7 @@ class MinecraftConfig(BaseModel):
         "chat_script": ("使用脚本事件发送", "<内容>"),
         "conversation": ("管理对话", "<new/switch/clear/status/list/save/restore>"),
         "context": ("管理上下文开关", "<启用/关闭/状态>"),
+        "continuous_mode": ("开启/关闭连续AI聊天模式", "<开启|关闭|状态>"),
         "mcp": ("MCP 服务器管理", "<list/status/reload>"),
         "ai_broadcast": ("控制多人 AI 聊天广播", "<状态/关闭/全服 开启|关闭/玩家 <玩家名> 开启|关闭>"),
         "tool_approve": ("同意高风险工具调用", "[approval_id|对话|永远]"),
@@ -143,6 +150,9 @@ class MinecraftConfig(BaseModel):
 上下文: {context_status}
 -----------
 使用 "{help_command}" 查看可用命令"""
+
+    # 新连接默认是否开启 AI 全服广播（运行时仍可用 `AGENT 广播` 调整）
+    ai_broadcast_default: bool = True
 
     # 状态文本
     context_enabled_text: str = "启用"
@@ -758,10 +768,10 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3"
 
     # Agent 配置
-    system_prompt: str = "请始终保持积极和专业的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown"
+    system_prompt: str = "请始终保持积极和专业的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown，不要生成任何emoji"
     enable_reasoning_output: bool = True
-    max_history_turns: int = 20
-    agent_retries: int = Field(default=2, ge=0)
+    max_history_turns: int = 50
+    agent_retries: int = Field(default=3, ge=0)
     worker_http_timeout: int = Field(default=60, ge=1)
     worker_poll_timeout: float = Field(default=1.0, gt=0)
     run_command_timeout: float = Field(default=10.0, gt=0)
@@ -798,8 +808,11 @@ class Settings(BaseSettings):
 
     # 每轮 run 预算（UsageLimits + wall-clock）
     request_limit: int = Field(default=8, ge=1)
-    tool_calls_limit: int = Field(default=8, ge=1)
-    # None = 未显式配置；运行时可由模型 context window 派生
+    tool_calls_limit: int = Field(default=16, ge=1)
+    # None = 不设 run 级 token 硬上限。
+    # 注意：PydanticAI 的 input/total tokens 是整轮累计（多步工具会相加），
+    # 不能用 context_window 自动派生，否则会在多轮工具循环中误杀。
+    # 单次请求窗口保护由 ContextBuilder history_processor 负责。
     input_tokens_limit: int | None = Field(default=None, ge=1)
     output_tokens_limit: int | None = Field(default=None, ge=1)
     total_tokens_limit: int | None = Field(default=None, ge=1)
@@ -810,6 +823,7 @@ class Settings(BaseSettings):
     # 仅当当前 provider 的 Model 实现了 count_tokens 时才会真正开启
     # （目前 anthropic；OpenAIChatModel / OllamaModel / FunctionModel / TestModel 不支持）。
     # deepseek/openai/ollama 会在 build_usage_limits 中自动关闭，避免 NotImplementedError。
+    # 且仅在显式配置了 input/total_tokens_limit 时有实际约束作用。
     count_tokens_before_request: bool = True
 
     # 运行时 Harness 配置
@@ -821,7 +835,7 @@ class Settings(BaseSettings):
     runtime_harness_audit_max_records: int = Field(default=5000, gt=0)
     # 工具策略 / 审批
     approval_ttl: float = Field(default=120.0, gt=0)
-    max_batch_commands: int = Field(default=10, ge=1)
+    max_batch_commands: int = Field(default=20, ge=1)
     hard_deny_tools: list[str] = Field(default_factory=list)
     hard_deny_command_roots: list[str] = Field(
         default_factory=lambda: ["op", "deop", "stop", "whitelist", "permission", "wsserver"]
@@ -845,6 +859,14 @@ class Settings(BaseSettings):
     # 关闭时仍依赖 structlog 的 run_id 因果链。开启时 include_content=False，
     # 避免把完整 prompt/completion 写入 trace。
     pydantic_ai_instrumentation: bool = False
+
+    # Agent Trace 审计平台（默认关闭；include_content 仅在 enabled 时生效）
+    agent_trace_enabled: bool = False
+    agent_trace_include_content: bool = False
+    agent_trace_path: str = "logs/agent_traces.jsonl"
+    agent_trace_max_records: int = Field(default=10000, ge=1)
+    agent_trace_api_host: str = "127.0.0.1"
+    agent_trace_api_port: int = Field(default=8787, ge=1, le=65535)
 
     # 队列配置
     queue_max_size: int = 100
@@ -919,6 +941,13 @@ class Settings(BaseSettings):
 
     # 流控嵌套配置（字节预算与分片延迟）
     flow_control: FlowControlConfig = Field(default_factory=FlowControlConfig)
+
+    @model_validator(mode="after")
+    def _normalize_agent_trace_content(self) -> "Settings":
+        """include_content 在 enabled=false 时无效，强制关闭。"""
+        if not self.agent_trace_enabled and self.agent_trace_include_content:
+            self.agent_trace_include_content = False
+        return self
 
     def get_provider_config(self, provider_name: str | None = None) -> LLMProviderConfig:
         """获取指定提供商的配置"""

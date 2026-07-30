@@ -32,3 +32,17 @@ def test_auto_approve_tools_scopes():
     host.enable_auto_approve_tools_forever("Alice")
     assert host.should_auto_approve_tools("Alice", "c2") is True
     assert host.should_auto_approve_tools("Bob", "c2") is False
+
+
+def test_create_defaults_ai_broadcast_all_on():
+    store = HostSessionStore()
+    host = store.create(uuid4())
+    assert host.ai_broadcast_all is True
+    assert host.should_broadcast_ai_chat("Alice") is True
+
+
+def test_create_respects_ai_broadcast_all_override():
+    store = HostSessionStore()
+    host = store.create(uuid4(), ai_broadcast_all=False)
+    assert host.ai_broadcast_all is False
+    assert host.should_broadcast_ai_chat("Alice") is False

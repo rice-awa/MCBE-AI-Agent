@@ -17,11 +17,13 @@ async function loadCapabilityHandlers(): Promise<Record<string, BridgeCapability
     inventorySnapshotModule,
     findEntitiesModule,
     worldCommandModule,
+    lookBlockModule,
   ] = await Promise.all([
     import("./capabilities/getPlayerSnapshot"),
     import("./capabilities/getInventorySnapshot"),
     import("./capabilities/findEntities"),
     import("./capabilities/runWorldCommand"),
+    import("./capabilities/getLookBlock"),
   ]);
 
   return {
@@ -36,6 +38,15 @@ async function loadCapabilityHandlers(): Promise<Record<string, BridgeCapability
       ),
     run_world_command: (_event, payload) =>
       worldCommandModule.handleRunWorldCommand(payload as { command?: string }),
+    get_look_block: (_event, payload) =>
+      lookBlockModule.handleGetLookBlock(
+        payload as {
+          target?: string;
+          max_distance?: number;
+          include_liquid_blocks?: boolean;
+          include_passable_blocks?: boolean;
+        },
+      ),
   };
 }
 

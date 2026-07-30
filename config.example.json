@@ -31,10 +31,10 @@
     }
   },
   "agent": {
-    "system_prompt": "你是一个MCBE助手，请始终保持积极友好的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown",
+    "system_prompt": "你是一个MCBE助手，请始终保持积极友好的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown，不要生成任何emoji",
     "enable_reasoning_output": true,
-    "max_history_turns": 20,
-    "agent_retries": 2,
+    "max_history_turns": 50,
+    "agent_retries": 3,
     "worker_http_timeout": 60,
     "worker_poll_timeout": 1.0,
     "run_command_timeout": 10.0,
@@ -48,13 +48,13 @@
     "mcwiki_base_url": "https://mcwiki.rice-awa.top",
     "dedup_external_messages": true,
     "tool_response_verbose": false,
-    "request_limit": 8,
-    "tool_calls_limit": 8,
+    "request_limit": 50,
+    "tool_calls_limit": 50,
     "input_tokens_limit": null,
     "output_tokens_limit": null,
     "total_tokens_limit": null,
     "run_timeout": 90.0,
-    "max_tool_concurrency": 4,
+    "max_tool_concurrency": 6,
     "context_output_reserve_tokens": 1024,
     "count_tokens_before_request": true,
     "runtime_harness": {
@@ -65,14 +65,20 @@
       "audit_path": "logs/runtime_harness_tools.jsonl",
       "audit_max_records": 5000,
       "approval_ttl": 120.0,
-      "max_batch_commands": 10,
+      "max_batch_commands": 20,
       "hard_deny_tools": [],
       "hard_deny_command_roots": ["op", "deop", "stop", "whitelist", "permission", "wsserver"],
       "approval_command_roots": ["clear", "clone", "damage", "fill", "kill", "replaceitem", "setblock", "structure", "summon"],
       "mcp_tool_allowlist": [],
       "tool_policy_version": "2026-07-21.1"
     },
-    "pydantic_ai_instrumentation": false
+    "pydantic_ai_instrumentation": false,
+    "agent_trace_enabled": false,
+    "agent_trace_include_content": false,
+    "agent_trace_path": "logs/agent_traces.jsonl",
+    "agent_trace_max_records": 10000,
+    "agent_trace_api_host": "127.0.0.1",
+    "agent_trace_api_port": 8787
   },
   "queue": {
     "max_size": 100,
@@ -174,6 +180,7 @@
       }
     },
     "welcome_message_template": "-----------\n成功连接 MCBE AI Agent v{version}\n连接 ID: {connection_id}...\n当前模型: {provider}/{model}\n上下文: {context_status}\n-----------\n使用 \"{help_command}\" 查看可用命令",
+    "ai_broadcast_default": true,
     "context_enabled_text": "启用",
     "context_disabled_text": "关闭",
     "error_prefix": "❌ 错误: ",

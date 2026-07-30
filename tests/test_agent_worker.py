@@ -143,7 +143,16 @@ def test_settings_defaults_and_constraints():
     """Settings 字段应有正确默认值与约束。"""
     from config.settings import Settings
 
-    s = Settings()
+    # Settings() 会读本地 config.json；对可能被配置覆盖的字段显式固定期望值
+    s = Settings(
+        worker_http_timeout=60,
+        worker_poll_timeout=1.0,
+        run_command_timeout=10.0,
+        request_limit=8,
+        tool_calls_limit=8,
+        run_timeout=90.0,
+        max_tool_concurrency=4,
+    )
     assert s.worker_http_timeout == 60
     assert s.worker_poll_timeout == 1.0
     assert s.run_command_timeout == 10.0
@@ -287,4 +296,597 @@ async def test_usage_limit_exceeded_does_not_continue_tools(monkeypatch):
     assert broker.send_response.await_count >= 1
     sent = broker.send_response.await_args_list[-1].args[1]
     assert getattr(sent, "chunk_type", None) == "error"
-    assert "预算" in sent.content or "错误" in sent.content
+    assert "预算" in sent.content or "错误" in sent.content or "上限" in sent.content
+
+
+@pytest.mark.asyncio
+async def test_error_event_persists_partial_run_history(monkeypatch):
+    """mid-run 失败时应落盘已产生的 all_messages + 错误说明，供下轮 LLM 使用。"""
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        ToolCallPart,
+        ToolReturnPart,
+        UserPromptPart,
+    )
+
+    from models.agent import StreamEvent
+
+    settings = _make_settings()
+    settings.compression_enabled = False
+    broker = MagicMock()
+    broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+    broker.get_conversation_history = MagicMock(return_value=[])
+    broker.set_conversation_history = MagicMock(return_value=True)
+    broker.send_response = AsyncMock(return_value=True)
+    broker.get_response_queue = MagicMock(return_value=object())
+    broker.mark_conversation_title_generating = MagicMock(return_value=False)
+    worker = AgentWorker(broker, settings)
+
+    partial_messages = [
+        ModelRequest(parts=[UserPromptPart(content="在这里放火把")]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="edit_blocks",
+                    args={"mode": "place", "type_id": "minecraft:torch"},
+                    tool_call_id="tc-1",
+                )
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="edit_blocks",
+                    content='{"ok": true}',
+                    tool_call_id="tc-1",
+                )
+            ]
+        ),
+    ]
+
+    async def fake_stream_chat(*_args, **_kwargs):
+        yield StreamEvent(
+            event_type="tool_call",
+            content="edit_blocks",
+            sequence=0,
+            metadata={
+                "tool_name": "edit_blocks",
+                "tool_call_id": "tc-1",
+                "args": {"mode": "place"},
+            },
+        )
+        yield StreamEvent(
+            event_type="tool_result",
+            content='{"ok": true}',
+            sequence=1,
+            metadata={"tool_name": "edit_blocks", "tool_call_id": "tc-1"},
+        )
+        yield StreamEvent(
+            event_type="error",
+            content=(
+                "本轮累计输入 token 已达配置上限（多步工具会把每次请求的输入相加），"
+                "请缩短问题、清空或压缩上下文，或拆成更小的步骤后重试。"
+            ),
+            sequence=2,
+            metadata={
+                "error_kind": "DENIED",
+                "diagnostic_summary": (
+                    "Exceeded the input_tokens_limit of 126976 (input_tokens=128035)"
+                ),
+                "all_messages": partial_messages,
+                "new_messages": partial_messages,
+                "new_messages_serialized": [
+                    {"kind": "request", "parts": []},
+                    {"kind": "response", "parts": []},
+                ],
+                "salvage_partial_run": True,
+                "run_id": "run-partial",
+            },
+        )
+
+    monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+    monkeypatch.setattr(
+        "services.agent.providers.ProviderRegistry.get_model",
+        lambda _config: object(),
+    )
+    monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+
+    connection_id = uuid4()
+    await worker._process_request_locked(
+        ChatRequest(
+            connection_id=connection_id,
+            content="在这里放火把",
+            player_name="Alex",
+            run_id="run-partial",
+            use_context=True,
+        ),
+        connection_id,
+    )
+
+    assert broker.set_conversation_history.called
+    args = broker.set_conversation_history.call_args
+    saved_history = args.args[2]
+    assert len(saved_history) >= len(partial_messages)
+    # 末尾应有中断说明，供下轮 LLM 看见
+    last = saved_history[-1]
+    assert isinstance(last, ModelResponse)
+    last_text = "".join(
+        str(getattr(p, "content", "") or "")
+        for p in last.parts
+        if getattr(p, "part_kind", None) == "text"
+    )
+    assert "中断" in last_text or "上限" in last_text
+
+    # 玩家仍收到 error chunk
+    error_chunks = [
+        c.args[1]
+        for c in broker.send_response.await_args_list
+        if getattr(c.args[1], "chunk_type", None) == "error"
+    ]
+    assert error_chunks
+    assert "上限" in error_chunks[-1].content or "累计" in error_chunks[-1].content
+
+
+@pytest.mark.asyncio
+async def test_stream_chunks_carry_trace_correlation(monkeypatch):
+    """StreamChunk 构造应带上 request 的 trace_id / attempt_id。"""
+    from services.agent.core import StreamEvent
+
+    settings = _make_settings()
+    broker = MagicMock()
+    broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+    broker.get_conversation_history = MagicMock(return_value=[])
+    broker.send_response = AsyncMock(return_value=True)
+    broker.get_response_queue = MagicMock(return_value=object())
+    worker = AgentWorker(broker, settings)
+
+    async def fake_stream_chat(*_args, **_kwargs):
+        yield StreamEvent(
+            event_type="content",
+            content="hello",
+            sequence=0,
+            metadata=None,
+        )
+        yield StreamEvent(
+            event_type="content",
+            content="",
+            sequence=1,
+            metadata={
+                "is_complete": True,
+                "all_messages": [],
+                "usage": None,
+                "tool_events": [],
+            },
+        )
+
+    monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+    monkeypatch.setattr(
+        "services.agent.providers.ProviderRegistry.get_model",
+        lambda _config: object(),
+    )
+    monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+
+    connection_id = uuid4()
+    await worker._process_request_locked(
+        ChatRequest(
+            connection_id=connection_id,
+            content="hi",
+            player_name="Alex",
+            run_id="trace-abc",
+            trace_id="trace-abc",
+            attempt_id="attempt-xyz",
+        ),
+        connection_id,
+    )
+
+    chunks = [
+        call.args[1]
+        for call in broker.send_response.await_args_list
+        if getattr(call.args[1], "type", None) == "stream_chunk"
+        or getattr(call.args[1], "chunk_type", None)
+    ]
+    assert chunks, "expected at least one StreamChunk"
+    for chunk in chunks:
+        assert chunk.trace_id == "trace-abc"
+        assert chunk.attempt_id == "attempt-xyz"
+        assert chunk.conversation_id is not None
+
+
+async def _flush_trace(recorder) -> list[dict]:
+    """Stop writer and return parsed journal lines for the active path."""
+    await recorder.stop()
+    path = recorder.path
+    if not path.exists():
+        return []
+    import json
+
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+@pytest.mark.asyncio
+async def test_single_tool_trace_contains_model_tool_model_and_final_response(
+    tmp_path, monkeypatch
+):
+    """Worker terminal path records model pairs + final response when content enabled."""
+    from services.agent.core import StreamEvent
+    from services.agent.trace import TraceRecorder, set_trace_recorder
+
+    settings = _make_settings()
+    path = tmp_path / "worker_trace.jsonl"
+    recorder = TraceRecorder(
+        path=path, enabled=True, include_content=True, max_records=500
+    )
+    await recorder.start()
+    set_trace_recorder(recorder)
+    try:
+        broker = MagicMock()
+        broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+        broker.get_conversation_history = MagicMock(return_value=[])
+        broker.set_conversation_history = MagicMock(return_value=True)
+        broker.get_response_queue = MagicMock(return_value=object())
+        broker.send_response = AsyncMock(return_value=True)
+        broker.mark_conversation_title_generating = MagicMock(return_value=False)
+        worker = AgentWorker(broker, settings)
+
+        final_text = "钻石剑在箱子里"
+        new_messages = [
+            {
+                "kind": "request",
+                "parts": [{"part_kind": "user-prompt", "content": "查一下钻石剑"}],
+            },
+            {
+                "kind": "response",
+                "parts": [
+                    {
+                        "part_kind": "tool-call",
+                        "tool_name": "find_entities",
+                        "tool_call_id": "tc1",
+                        "args": {"entity_type": "item"},
+                    }
+                ],
+                "finish_reason": "tool_calls",
+            },
+            {
+                "kind": "request",
+                "parts": [
+                    {
+                        "part_kind": "tool-return",
+                        "tool_name": "find_entities",
+                        "tool_call_id": "tc1",
+                        "content": "found 1",
+                    }
+                ],
+            },
+            {
+                "kind": "response",
+                "parts": [{"part_kind": "text", "content": final_text}],
+                "finish_reason": "stop",
+            },
+        ]
+
+        async def fake_stream_chat(*_args, **_kwargs):
+            yield StreamEvent(
+                event_type="content",
+                content=final_text,
+                sequence=0,
+                metadata=None,
+            )
+            yield StreamEvent(
+                event_type="content",
+                content="",
+                sequence=1,
+                metadata={
+                    "is_complete": True,
+                    "all_messages": [],
+                    "new_messages": new_messages,
+                    "new_messages_serialized": new_messages,
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                    "tool_events": [{"tool_name": "find_entities"}],
+                },
+            )
+
+        monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+        monkeypatch.setattr(
+            "services.agent.providers.ProviderRegistry.get_model",
+            lambda _config: object(),
+        )
+        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+
+        connection_id = uuid4()
+        await worker._process_request_locked(
+            ChatRequest(
+                connection_id=connection_id,
+                content="查一下钻石剑",
+                player_name="Alex",
+                run_id="trace-tool-1",
+                trace_id="trace-tool-1",
+                attempt_id="attempt-1",
+            ),
+            connection_id,
+        )
+
+        events = await _flush_trace(recorder)
+        names = [e["event_name"] for e in events]
+        assert "queue.dequeued" in names
+        assert "agent.attempt.started" in names
+        assert names.index("model.request.completed") < names.index("trace.completed")
+        assert sum(name == "model.request.completed" for name in names) == 2
+        completed = [e for e in events if e["event_name"] == "trace.completed"]
+        assert len(completed) == 1
+        assert completed[0]["payload"]["content"] == final_text
+    finally:
+        set_trace_recorder(None)
+
+
+@pytest.mark.asyncio
+async def test_content_disabled_keeps_metadata_but_omits_messages_and_results(
+    tmp_path, monkeypatch
+):
+    """include_content=False keeps lifecycle events but drops payload bodies."""
+    from services.agent.core import StreamEvent
+    from services.agent.trace import TraceRecorder, set_trace_recorder
+
+    settings = _make_settings()
+    path = tmp_path / "worker_trace_meta.jsonl"
+    recorder = TraceRecorder(
+        path=path, enabled=True, include_content=False, max_records=500
+    )
+    await recorder.start()
+    set_trace_recorder(recorder)
+    try:
+        broker = MagicMock()
+        broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+        broker.get_conversation_history = MagicMock(return_value=[])
+        broker.set_conversation_history = MagicMock(return_value=True)
+        broker.get_response_queue = MagicMock(return_value=object())
+        broker.send_response = AsyncMock(return_value=True)
+        broker.mark_conversation_title_generating = MagicMock(return_value=False)
+        worker = AgentWorker(broker, settings)
+
+        new_messages = [
+            {"kind": "request", "parts": [{"part_kind": "user-prompt", "content": "secret prompt"}]},
+            {
+                "kind": "response",
+                "parts": [{"part_kind": "text", "content": "ok"}],
+                "finish_reason": "stop",
+            },
+        ]
+
+        async def fake_stream_chat(*_args, **_kwargs):
+            yield StreamEvent(
+                event_type="content",
+                content="ok",
+                sequence=0,
+            )
+            yield StreamEvent(
+                event_type="content",
+                content="",
+                sequence=1,
+                metadata={
+                    "is_complete": True,
+                    "all_messages": [],
+                    "new_messages": new_messages,
+                    "new_messages_serialized": new_messages,
+                    "usage": None,
+                    "tool_events": [{"tool_name": "list_available_providers"}],
+                },
+            )
+
+        monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+        monkeypatch.setattr(
+            "services.agent.providers.ProviderRegistry.get_model",
+            lambda _config: object(),
+        )
+        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+
+        connection_id = uuid4()
+        await worker._process_request_locked(
+            ChatRequest(
+                connection_id=connection_id,
+                content="secret prompt",
+                player_name="Alex",
+                run_id="trace-secret",
+                trace_id="trace-secret",
+                attempt_id="attempt-s",
+            ),
+            connection_id,
+        )
+
+        events = await _flush_trace(recorder)
+        assert events
+        assert all("payload" not in e or e.get("payload") is None for e in events)
+        assert any(e["event_name"] == "trace.completed" for e in events)
+        raw = path.read_text(encoding="utf-8")
+        assert "secret prompt" not in raw
+    finally:
+        set_trace_recorder(None)
+
+
+@pytest.mark.asyncio
+async def test_stream_error_emits_trace_failed_once(tmp_path, monkeypatch):
+    from services.agent.core import StreamEvent
+    from services.agent.trace import TraceRecorder, set_trace_recorder
+
+    settings = _make_settings()
+    path = tmp_path / "worker_trace_err.jsonl"
+    recorder = TraceRecorder(path=path, enabled=True, include_content=False, max_records=100)
+    await recorder.start()
+    set_trace_recorder(recorder)
+    try:
+        broker = MagicMock()
+        broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+        broker.get_conversation_history = MagicMock(return_value=[])
+        broker.send_response = AsyncMock(return_value=True)
+        broker.get_response_queue = MagicMock(return_value=object())
+        worker = AgentWorker(broker, settings)
+
+        async def fake_stream_chat(*_args, **_kwargs):
+            yield StreamEvent(
+                event_type="error",
+                content="预算超限",
+                sequence=0,
+                metadata={"error_kind": "DENIED", "diagnostic_summary": "UsageLimitExceeded"},
+            )
+
+        monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+        monkeypatch.setattr(
+            "services.agent.providers.ProviderRegistry.get_model",
+            lambda _config: object(),
+        )
+        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+
+        connection_id = uuid4()
+        await worker._process_request_locked(
+            ChatRequest(
+                connection_id=connection_id,
+                content="budget",
+                player_name="Alex",
+                run_id="trace-err",
+                trace_id="trace-err",
+                attempt_id="attempt-err",
+            ),
+            connection_id,
+        )
+        events = await _flush_trace(recorder)
+        failed = [e for e in events if e["event_name"] == "trace.failed"]
+        assert len(failed) == 1
+        assert failed[0]["status"] == "failed"
+        assert failed[0]["attributes"]["error_kind"] == "DENIED"
+        # include_content=False must not leak free-text diagnostics into attributes
+        assert "diagnostic_summary" not in failed[0]["attributes"]
+        raw = path.read_text(encoding="utf-8")
+        assert "UsageLimitExceeded" not in raw
+    finally:
+        set_trace_recorder(None)
+
+
+@pytest.mark.asyncio
+async def test_approval_suspended_records_model_pairs_without_duplicate_proposed(
+    tmp_path, monkeypatch
+):
+    """approval_required flushes model pairs before suspended; no worker tool.proposed."""
+    from types import SimpleNamespace
+
+    from pydantic_ai.messages import ToolCallPart
+    from pydantic_ai.tools import DeferredToolRequests
+
+    from services.agent.core import StreamEvent
+    from services.agent.harness.approvals import PendingApprovalStore
+    from services.agent.trace import TraceRecorder, set_trace_recorder
+
+    settings = _make_settings()
+    settings.approval_ttl = 120.0
+    settings.tool_policy_version = "test"
+    path = tmp_path / "worker_trace_approval.jsonl"
+    recorder = TraceRecorder(
+        path=path, enabled=True, include_content=True, max_records=500
+    )
+    await recorder.start()
+    set_trace_recorder(recorder)
+    try:
+        broker = MagicMock()
+        broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+        broker.get_conversation_history = MagicMock(return_value=[])
+        broker.set_conversation_history = MagicMock(return_value=True)
+        broker.get_response_queue = MagicMock(return_value=object())
+        broker.send_response = AsyncMock(return_value=True)
+        broker.mark_conversation_title_generating = MagicMock(return_value=False)
+        worker = AgentWorker(broker, settings)
+
+        new_messages = [
+            {
+                "kind": "request",
+                "parts": [{"part_kind": "user-prompt", "content": "set day"}],
+            },
+            {
+                "kind": "response",
+                "parts": [
+                    {
+                        "part_kind": "tool-call",
+                        "tool_name": "run_minecraft_command",
+                        "tool_call_id": "tc-ap1",
+                        "args": {"command": "time set day"},
+                    }
+                ],
+                "finish_reason": "tool_calls",
+            },
+        ]
+        deferred = DeferredToolRequests(
+            approvals=[
+                ToolCallPart(
+                    tool_name="run_minecraft_command",
+                    tool_call_id="tc-ap1",
+                    args={"command": "time set day"},
+                )
+            ],
+            metadata={
+                "tc-ap1": {
+                    "normalized_args": {"command": "time set day"},
+                    "args_summary": "command=time set day",
+                    "args_hash": "h",
+                    "policy_version": "test",
+                    "reason": "needs approval",
+                }
+            },
+        )
+
+        async def fake_stream_chat(*_args, **_kwargs):
+            yield StreamEvent(
+                event_type="approval_required",
+                content="工具调用需要玩家审批",
+                sequence=0,
+                metadata={
+                    "deferred_requests": deferred,
+                    "all_messages": [],
+                    "new_messages": new_messages,
+                    "new_messages_serialized": new_messages,
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                    "run_id": "trace-ap-susp",
+                },
+            )
+
+        store = PendingApprovalStore(default_ttl_seconds=120.0)
+        runtime = SimpleNamespace(
+            get_pending_approval_store=lambda _settings=None: store,
+            refresh_mcp_tools=lambda _s: None,
+            get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
+                check_and_compress=AsyncMock(return_value=(False, "")),
+            ),
+        )
+        monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+        monkeypatch.setattr(
+            "services.agent.providers.ProviderRegistry.get_model",
+            lambda _config: object(),
+        )
+        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+        monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: runtime)
+
+        connection_id = uuid4()
+        await worker._process_request_locked(
+            ChatRequest(
+                connection_id=connection_id,
+                content="set day",
+                player_name="Alex",
+                run_id="trace-ap-susp",
+                trace_id="trace-ap-susp",
+                attempt_id="attempt-ap",
+            ),
+            connection_id,
+        )
+
+        events = await _flush_trace(recorder)
+        names = [e["event_name"] for e in events]
+        assert "model.request.completed" in names
+        assert "approval.requested" in names
+        assert "trace.suspended" in names
+        # Worker no longer re-emits tool.proposed (harness owns that boundary).
+        assert "tool.proposed" not in names
+        assert names.index("model.request.completed") < names.index("trace.suspended")
+        assert names.index("approval.requested") < names.index("trace.suspended")
+        suspended = [e for e in events if e["event_name"] == "trace.suspended"]
+        assert len(suspended) == 1
+        assert suspended[0]["status"] == "suspended"
+    finally:
+        set_trace_recorder(None)

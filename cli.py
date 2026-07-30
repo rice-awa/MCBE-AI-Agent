@@ -21,6 +21,24 @@ from services.auth.jwt_handler import JWTHandler
 logger = get_logger(__name__)
 
 
+async def _start_trace_recorder(settings: Any) -> None:
+    """Start process TraceRecorder from settings (no-op when disabled)."""
+    from services.agent.trace import get_trace_recorder
+
+    recorder = get_trace_recorder(settings)
+    await recorder.start()
+
+
+async def _stop_trace_recorder(settings: Any | None = None) -> None:
+    """Stop process TraceRecorder and flush remaining events (fail-soft)."""
+    from services.agent.trace import get_trace_recorder
+
+    try:
+        await get_trace_recorder(settings).stop()
+    except Exception as exc:  # noqa: BLE001 — shutdown must not fail hard
+        logger.warning("trace_recorder_stop_failed", error=str(exc))
+
+
 class Application:
     """MCBE AI Agent 应用"""
 
@@ -47,6 +65,9 @@ class Application:
             worker_count=self.settings.llm_worker_count,
             dev_mode=self.settings.dev_mode,
         )
+
+        # Trace journal writer must be running before workers accept traffic
+        await _start_trace_recorder(self.settings)
 
         agent_runtime = get_agent_runtime()
         mcp_connected = await agent_runtime.initialize(self.settings)
@@ -92,6 +113,9 @@ class Application:
 
         # 关闭 Agent runtime 维护的 MCP 和 Provider 资源
         await get_agent_runtime().shutdown()
+
+        # Flush remaining trace events after workers stop (no new emits)
+        await _stop_trace_recorder(self.settings)
 
         logger.info("application_stopped")
 
@@ -290,6 +314,182 @@ def runtime_harness_analyze(recent: int | None, json_output: bool, no_llm: bool)
         return
 
     _echo_runtime_harness_analysis(analysis, no_llm=no_llm)
+
+
+@cli.group()
+def trace():
+    """Agent Trace 审计查询与本地只读 API。"""
+    pass
+
+
+def _trace_query():
+    """Build TraceQuery from configured journal path."""
+    from services.agent.trace_query import TraceQuery
+
+    settings = get_settings()
+    return TraceQuery(settings.agent_trace_path)
+
+
+def _format_cell(value: Any, width: int) -> str:
+    text = "-" if value is None or value == "" else str(value)
+    if len(text) > width:
+        return text[: max(0, width - 1)] + "…"
+    return text.ljust(width)
+
+
+def _echo_trace_list_rows(summaries: list[dict[str, Any]]) -> None:
+    # Compact table: TRACE STATUS PLAYER STARTED DURATION EVENTS
+    header = (
+        f"{'TRACE':<36} {'STATUS':<12} {'PLAYER':<16} "
+        f"{'STARTED':<28} {'DURATION_MS':>11} {'EVENTS':>6}"
+    )
+    click.echo(header)
+    click.echo("-" * len(header))
+    if not summaries:
+        click.echo("(no traces)")
+        return
+    for s in summaries:
+        click.echo(
+            f"{_format_cell(s.get('trace_id'), 36)} "
+            f"{_format_cell(s.get('status'), 12)} "
+            f"{_format_cell(s.get('player_name'), 16)} "
+            f"{_format_cell(s.get('started_at'), 28)} "
+            f"{_format_cell(s.get('duration_ms'), 11)} "
+            f"{_format_cell(s.get('event_count'), 6)}"
+        )
+
+
+def _echo_trace_detail(detail: dict[str, Any]) -> None:
+    summary = detail.get("summary") or {}
+    click.echo("=== Trace Summary ===")
+    for key in (
+        "trace_id",
+        "run_id",
+        "status",
+        "player_name",
+        "connection_id",
+        "conversation_id",
+        "message_id",
+        "started_at",
+        "ended_at",
+        "duration_ms",
+        "event_count",
+        "attempt_count",
+        "last_event_name",
+    ):
+        if key in summary:
+            click.echo(f"{key}: {summary.get(key)}")
+
+    events = detail.get("events") or []
+    click.echo("\n=== Timeline ===")
+    if not events:
+        click.echo("(no events)")
+        return
+    for event in events:
+        seq = event.get("sequence", "-")
+        name = event.get("event_name", "-")
+        status = event.get("status", "-")
+        ts = event.get("timestamp", "-")
+        click.echo(f"[{seq}] {ts}  {name}  ({status})")
+
+
+def _echo_trace_health(health: dict[str, Any]) -> None:
+    click.echo("=== Trace Journal Health ===")
+    for key in (
+        "path",
+        "exists",
+        "file_size",
+        "parsed_lines",
+        "malformed_lines",
+        "last_event_timestamp",
+        "trace_count",
+        "abandoned_after_seconds",
+    ):
+        if key in health:
+            click.echo(f"{key}: {health.get(key)}")
+    recorder = health.get("recorder")
+    if recorder is not None:
+        click.echo(f"recorder: {json.dumps(recorder, ensure_ascii=False, default=str)}")
+    else:
+        click.echo("recorder: null")
+
+
+@trace.command("list")
+@click.option(
+    "--recent",
+    default=20,
+    type=click.IntRange(min=1),
+    show_default=True,
+    help="列出最近 N 条 trace 摘要",
+)
+@click.option("--status", default=None, help="按状态过滤 (completed/failed/running/...)")
+@click.option("--player", default=None, help="按玩家名精确过滤")
+def trace_list(recent: int, status: str | None, player: str | None):
+    """列出 journal 中的 trace 摘要（最新优先）。"""
+    query = _trace_query()
+    summaries = query.list_traces(status=status, player=player, limit=recent)
+    _echo_trace_list_rows(summaries)
+
+
+@trace.command("show")
+@click.argument("trace_id")
+@click.option("--json", "json_output", is_flag=True, default=False, help="输出机器可读 JSON")
+def trace_show(trace_id: str, json_output: bool):
+    """显示单条 trace 的摘要与事件时间线。"""
+    query = _trace_query()
+    detail = query.get_trace(trace_id)
+    if detail is None:
+        raise click.ClickException(f"trace not found: {trace_id}")
+
+    if json_output:
+        click.echo(json.dumps(detail, ensure_ascii=False, default=str))
+        return
+
+    _echo_trace_detail(detail)
+
+
+@trace.command("health")
+def trace_health():
+    """显示 journal 健康状态（含 malformed_lines 等）。"""
+    query = _trace_query()
+    health = query.health()
+    _echo_trace_health(health)
+
+
+@trace.command("serve")
+@click.option("--host", default=None, help="API 绑定地址（默认 settings.agent_trace_api_host）")
+@click.option(
+    "--port",
+    default=None,
+    type=click.IntRange(min=0, max=65535),
+    help="API 端口（默认 settings.agent_trace_api_port；0 表示系统分配）",
+)
+def trace_serve(host: str | None, port: int | None):
+    """启动本地只读 Trace API（及相对本仓库的 web/trace 静态工作台）。"""
+    from services.agent.trace_api import TraceAPIServer
+    from services.agent.trace_query import TraceQuery
+
+    settings = get_settings()
+    bind_host = host if host is not None else settings.agent_trace_api_host
+    bind_port = port if port is not None else settings.agent_trace_api_port
+    # Resolve relative to this package/repo root, not process CWD
+    static_dir = Path(__file__).resolve().parent / "web" / "trace"
+    query = TraceQuery(settings.agent_trace_path)
+    server = TraceAPIServer(bind_host, bind_port, query, static_dir)
+
+    click.echo(
+        f"Trace API serving on http://{bind_host}:{bind_port} "
+        f"(journal={settings.agent_trace_path}, static={static_dir})"
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        click.echo("\nTrace API stopped")
+        if hasattr(server, "shutdown"):
+            try:
+                server.shutdown()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
 
 
 def _echo_runtime_harness_analysis(analysis: dict[str, Any], *, no_llm: bool) -> None:

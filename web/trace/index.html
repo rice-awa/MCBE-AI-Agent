@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Trace 审计工作台</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main-workbench">跳到主内容</a>
+
+    <header class="status-bar" role="banner">
+      <div class="status-bar__brand">
+        <h1 class="status-bar__title">Agent Trace 审计</h1>
+        <p class="status-bar__subtitle" id="journal-path" title="Journal path">
+          —
+        </p>
+      </div>
+
+      <div class="status-bar__meta" aria-live="polite">
+        <span class="pill" id="audit-mode" title="由服务端 agent_trace_include_content 决定">
+          审计模式：—
+        </span>
+        <span class="pill pill--muted" id="trace-enabled" title="agent_trace_enabled">
+          采集：—
+        </span>
+        <span class="pill pill--muted" id="health-summary" title="Journal health">
+          健康：—
+        </span>
+        <span class="pill pill--warn is-hidden" id="malformed-badge" title="Malformed journal lines">
+          畸形行：0
+        </span>
+      </div>
+
+      <div class="status-bar__actions">
+        <button
+          type="button"
+          class="btn btn--ghost"
+          id="btn-refresh"
+          title="刷新列表与健康状态"
+          aria-label="刷新"
+        >
+          刷新
+        </button>
+      </div>
+    </header>
+
+    <main id="main-workbench" class="workbench" aria-label="Trace 审计工作台">
+      <section class="panel panel--list" aria-labelledby="list-heading">
+        <header class="panel__header">
+          <h2 id="list-heading" class="panel__title">Trace 列表</h2>
+          <p class="panel__hint" id="list-count">0 条</p>
+        </header>
+
+        <form class="filters" id="filter-form" autocomplete="off">
+          <div class="field">
+            <label for="filter-status">状态</label>
+            <select id="filter-status" name="status">
+              <option value="">全部</option>
+              <option value="completed">completed</option>
+              <option value="failed">failed</option>
+              <option value="cancelled">cancelled</option>
+              <option value="running">running</option>
+              <option value="suspended">suspended</option>
+              <option value="abandoned">abandoned</option>
+              <option value="expired">expired</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="filter-player">玩家</label>
+            <input
+              id="filter-player"
+              name="player"
+              type="search"
+              placeholder="player_name"
+              spellcheck="false"
+            />
+          </div>
+          <div class="field field--narrow">
+            <label for="filter-limit">数量</label>
+            <input
+              id="filter-limit"
+              name="limit"
+              type="number"
+              min="1"
+              max="500"
+              value="50"
+            />
+          </div>
+          <div class="filters__actions">
+            <button type="submit" class="btn btn--primary">应用</button>
+            <button type="button" class="btn btn--ghost" id="btn-clear-filters" title="清除筛选">
+              清除
+            </button>
+          </div>
+        </form>
+
+        <div
+          class="panel__body"
+          id="trace-list-region"
+          role="region"
+          aria-live="polite"
+          aria-busy="false"
+        >
+          <div class="state state--loading" id="list-loading" hidden>
+            <p>正在加载 trace 列表…</p>
+          </div>
+          <div class="state state--empty" id="list-empty" hidden>
+            <p>没有匹配的 trace。</p>
+            <p class="state__hint">调整筛选或确认 journal 中有事件。</p>
+          </div>
+          <div class="state state--error" id="list-error" hidden role="alert">
+            <p id="list-error-text">加载失败</p>
+            <button type="button" class="btn btn--ghost" id="btn-retry-list">重试</button>
+          </div>
+          <ul class="trace-list" id="trace-list" role="listbox" aria-label="Trace 列表"></ul>
+        </div>
+      </section>
+
+      <section class="panel panel--timeline" aria-labelledby="timeline-heading">
+        <header class="panel__header">
+          <div class="panel__heading-row">
+            <h2 id="timeline-heading" class="panel__title">事件时间线</h2>
+            <p class="panel__hint" id="timeline-subtitle">选择左侧 trace</p>
+          </div>
+          <div class="panel__meta" id="timeline-summary" hidden></div>
+        </header>
+
+        <div
+          class="panel__body"
+          id="timeline-region"
+          role="region"
+          aria-live="polite"
+          aria-busy="false"
+        >
+          <div class="state state--empty" id="timeline-empty">
+            <p>未选择 trace。</p>
+            <p class="state__hint">从左侧列表选择一条，或通过 URL hash <code>#trace-id</code> 打开。</p>
+          </div>
+          <div class="state state--loading" id="timeline-loading" hidden>
+            <p>正在加载详情…</p>
+          </div>
+          <div class="state state--error" id="timeline-error" hidden role="alert">
+            <p id="timeline-error-text">加载失败</p>
+            <button type="button" class="btn btn--ghost" id="btn-retry-detail">重试</button>
+          </div>
+          <ol class="timeline" id="timeline" hidden></ol>
+        </div>
+      </section>
+
+      <section class="panel panel--inspector" aria-labelledby="inspector-heading">
+        <header class="panel__header">
+          <div class="panel__heading-row">
+            <h2 id="inspector-heading" class="panel__title">检查器</h2>
+            <div class="panel__header-actions">
+              <button
+                type="button"
+                class="btn btn--ghost btn--icon"
+                id="btn-copy-event"
+                title="复制当前事件 JSON"
+                aria-label="复制当前事件 JSON"
+                hidden
+              >
+                复制事件
+              </button>
+            </div>
+          </div>
+          <p class="panel__hint" id="inspector-subtitle">选择时间线中的事件</p>
+        </header>
+
+        <div class="panel__body" id="inspector-region" role="region" aria-live="polite">
+          <div class="state state--empty" id="inspector-empty">
+            <p>未选择事件。</p>
+            <p class="state__hint">点击时间线条目查看 attributes、payload 与聚合视图。</p>
+          </div>
+          <div id="inspector-content" class="inspector" hidden></div>
+        </div>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>

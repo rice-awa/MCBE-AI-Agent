@@ -3,10 +3,9 @@
 import json
 import re
 from typing import Any, Literal
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
-
 
 _TELLRAW_TARGET_UNQUOTED_RE = re.compile(
     r"^(?:@[a-z](?:\[[A-Za-z0-9_.,=!:-]*\])?|[A-Za-z0-9_.-]+)$"
@@ -40,7 +39,13 @@ def _sanitize_tellraw_target(target: str) -> str:
 
 
 def sanitize_tellraw_text(message: str) -> str:
-    return message.replace('"', '\\"').replace(":", "：").replace("%", "\\%")
+    """Prepare tellraw body text (legacy host helper; SDK path owns wire format).
+
+    Do not double or backslash-escape ``%``: Bedrock rawtext renders a single
+    percent literally, and ``%%`` / ``\\%`` show up as extra characters in chat.
+    Quote escaping for JSON is left to ``json.dumps`` in ``create_tellraw``.
+    """
+    return message.replace(":", "：")
 
 
 class MinecraftHeader(BaseModel):
@@ -108,7 +113,6 @@ class MinecraftCommand(BaseModel):
         command_line = f"tellraw {safe_target} {rawtext}"
         return cls(
             body=MinecraftCommandBody(
-                origin=MinecraftOrigin(type="say"),
                 commandLine=command_line,
             )
         )
