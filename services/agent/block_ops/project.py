@@ -116,6 +116,9 @@ def _changed_flag(payload: dict[str, Any]) -> bool | None:
 
 def _project_place(payload: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {"ok": True, "mode": "place"}
+    status = payload.get("status")
+    if isinstance(status, str) and status:
+        out["status"] = status
     changed = _changed_flag(payload)
     if changed is not None:
         out["changed"] = changed
@@ -141,6 +144,9 @@ def _project_place(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _project_batch(payload: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {"ok": True, "mode": "batch"}
+    status = payload.get("status")
+    if isinstance(status, str) and status:
+        out["status"] = status
     if "changed_count" in payload:
         out["changed_count"] = payload["changed_count"]
     elif isinstance(payload.get("changed"), int):
@@ -164,6 +170,11 @@ def _project_fill(
     authorized_bounds: dict[str, Any] | None,
 ) -> dict[str, Any]:
     out: dict[str, Any] = {"ok": True, "mode": "fill"}
+    status = payload.get("status")
+    if isinstance(status, str) and status:
+        out["status"] = status
+    elif isinstance(payload.get("skipped"), int) and payload["skipped"] > 0:
+        out["status"] = "partial"
     if "changed_count" in payload:
         out["changed_count"] = payload["changed_count"]
     elif isinstance(payload.get("changed"), int):

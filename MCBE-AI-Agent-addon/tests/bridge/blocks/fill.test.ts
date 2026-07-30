@@ -3,6 +3,7 @@ import {
   __resetBlocks,
   __setBlock,
   __setPlayers,
+  BlockTypes,
 } from "../../__mocks__/minecraft-server";
 import { handleFill } from "../../../scripts/bridge/capabilities/blocks/fill";
 
@@ -111,6 +112,76 @@ describe("edit_blocks fill", () => {
     if (!result.ok) return;
     expect(result.payload.ready).toBe(true);
     expect((result.payload.locked_targets as unknown[]).length).toBe(2);
+  });
+
+  it("preflight zero-match on non-air returns PRECONDITION_FAILED with actual_type_counts", async () => {
+    // Glass-replaces-planks scenario: default air-only policy, all cells are planks.
+    BlockTypes.__add("minecraft:glass");
+    BlockTypes.__add("minecraft:oak_planks");
+    __setBlock("minecraft:overworld", 0, 64, 0, { typeId: "minecraft:oak_planks" });
+    __setBlock("minecraft:overworld", 1, 64, 0, { typeId: "minecraft:oak_planks" });
+
+    const result = await handleFill({
+      mode: "fill",
+      coordinate_mode: "absolute",
+      dimension: "minecraft:overworld",
+      from: { x: 0, y: 64, z: 0 },
+      to: { x: 1, y: 64, z: 0 },
+      type_id: "minecraft:glass",
+      phase: "preflight",
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.payload.code).toBe("PRECONDITION_FAILED");
+    expect(result.payload.matched_count).toBe(0);
+    expect(result.payload.actual_type_counts).toMatchObject({
+      "minecraft:oak_planks": 2,
+    });
+  });
+
+  it("preflight all-already-target returns noop status with matched_count 0", async () => {
+    BlockTypes.__add("minecraft:glass");
+    __setBlock("minecraft:overworld", 0, 64, 0, { typeId: "minecraft:glass" });
+    __setBlock("minecraft:overworld", 1, 64, 0, { typeId: "minecraft:glass" });
+
+    const result = await handleFill({
+      mode: "fill",
+      coordinate_mode: "absolute",
+      dimension: "minecraft:overworld",
+      from: { x: 0, y: 64, z: 0 },
+      to: { x: 1, y: 64, z: 0 },
+      type_id: "minecraft:glass",
+      phase: "preflight",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.payload.status).toBe("noop");
+    expect(result.payload.matched_count).toBe(0);
+    expect((result.payload.locked_targets as unknown[]).length).toBe(0);
+  });
+
+  it("execute all-already-target returns noop without writing", async () => {
+    BlockTypes.__add("minecraft:glass");
+    __setBlock("minecraft:overworld", 0, 64, 0, { typeId: "minecraft:glass" });
+    __setBlock("minecraft:overworld", 1, 64, 0, { typeId: "minecraft:glass" });
+
+    const result = await handleFill({
+      mode: "fill",
+      coordinate_mode: "absolute",
+      dimension: "minecraft:overworld",
+      from: { x: 0, y: 64, z: 0 },
+      to: { x: 1, y: 64, z: 0 },
+      type_id: "minecraft:glass",
+      phase: "execute",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.payload.status).toBe("noop");
+    expect(result.payload.changed_count).toBe(0);
+    expect(result.payload.verification).toMatchObject({ ok: true, method: "noop" });
   });
 
   it("tick-slices preflight with small cells_per_tick", async () => {

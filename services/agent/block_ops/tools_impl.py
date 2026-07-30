@@ -57,7 +57,7 @@ class BlockPreflightPlan:
 _EDIT_EXECUTE_FIELDS = frozenset({
     "type_id", "mode", "coordinate_mode", "dimension", "position", "positions",
     "from_pos", "to_pos", "states", "replace_any", "expected_previous",
-    "locked_targets", "phase",
+    "locked_targets", "phase", "status",
 })
 _INSPECT_EXECUTE_FIELDS = frozenset({
     "coordinate_mode", "dimension", "position", "positions", "locked_targets", "phase",
@@ -79,6 +79,16 @@ def project_block_execute_args(tool_name: str, authorized_args: dict[str, Any]) 
     else:
         required = {"coordinate_mode", "dimension", "phase", "locked_targets"}
     missing = [key for key in required if key not in projected]
+    # noop fill: all targets already at desired state; no locked_targets, no write.
+    is_noop = projected.get("status") == "noop"
+    if is_noop and tool_name == "edit_blocks" and projected.get("mode") == "fill":
+        if missing or projected.get("phase") != "execute":
+            raise ValueError("block preflight execution contract is incomplete")
+        if not isinstance(projected.get("from_pos"), dict) or not isinstance(
+            projected.get("to_pos"), dict
+        ):
+            raise ValueError("block preflight execution contract requires fill bounds")
+        return projected
     if missing or projected.get("phase") != "execute" or not projected.get("locked_targets"):
         raise ValueError("block preflight execution contract is incomplete")
     if tool_name == "edit_blocks":
@@ -768,6 +778,7 @@ def merge_canonical_from_preflight(
         "from",
         "to",
         "locked_targets",
+        "status",
     ):
         if key in preflight_payload and preflight_payload[key] is not None:
             canonical[key] = preflight_payload[key]
@@ -900,6 +911,78 @@ def build_block_preflight_plan(
         if key not in authorized_args and key not in {"schema_version", "ok"}
     }
     return BlockPreflightPlan(authorized_args, execute_args, approval_metadata)
+
+
+def _expect_hint_for_args(args: dict[str, Any]) -> str:
+    """Build the ``expect`` repair hint from the original edit args (pre-issue-03 schema)."""
+    if isinstance(args.get("expected_previous"), dict):
+        tid = args["expected_previous"].get("type_id")
+        if isinstance(tid, str) and tid:
+            return tid
+        return "any"
+    if args.get("replace_any"):
+        return "any"
+    return "air"
+
+
+def _classify_zero_match_preflight(
+    tool_name: str,
+    tool_args: dict[str, Any],
+    preflight_fields: dict[str, Any],
+) -> ToolResult | None:
+    """Classify a successful preflight with zero matched targets.
+
+    Returns:
+      - None when the preflight has matched targets or is a genuine noop that
+        should proceed as a no-write plan.
+      - A failure ToolResult (PRECONDITION_FAILED) when zero targets matched and
+        the world is NOT already at the target state.
+
+    This prevents the historical INTERNAL_ERROR mapping when ``locked_targets``
+    is empty (spec §2.3 glass-replaces-planks scenario).
+    """
+    if tool_name != "edit_blocks":
+        return None
+    locked = preflight_fields.get("locked_targets")
+    matched_count = preflight_fields.get("matched_count")
+    if isinstance(matched_count, int) and matched_count > 0:
+        return None
+    if isinstance(locked, list) and locked:
+        return None
+
+    # Determine whether every target was already at the desired state (true noop).
+    already_target = preflight_fields.get("already_target")
+    volume = preflight_fields.get("volume")
+    if isinstance(already_target, int) and isinstance(volume, int) and volume > 0:
+        if already_target == volume:
+            return None  # genuine noop; plan carries status=noop
+    elif preflight_fields.get("status") == "noop":
+        return None
+
+    # Zero match, not a noop -> PRECONDITION_FAILED with actionable type counts.
+    actual_counts = preflight_fields.get("previous_type_counts")
+    if not isinstance(actual_counts, dict) or not actual_counts:
+        actual_counts = preflight_fields.get("actual_type_counts")
+    if not isinstance(actual_counts, dict):
+        actual_counts = {}
+    hint = f"如确实要替换这些方块，请将 expect 设为 {_expect_hint_for_args(tool_args)}"
+    body = build_error_response(
+        BlockErrorCode.PRECONDITION_FAILED,
+        "匹配数为 0：目标方块不满足前置条件，本次操作未发送到 Add-on。",
+        status="failed",
+        matched=0,
+        actual_type_counts=actual_counts,
+        hint=hint,
+        retryable=False,
+        external_state_unknown=False,
+        fallback_allowed=False,
+    )
+    return ToolResult.failure(
+        dumps_payload(body),
+        error_kind="PERMANENT",
+        retryable=False,
+        diagnostic_summary="fill_zero_match_precondition_failed",
+    )
 
 
 async def run_block_preflight(
@@ -1044,6 +1127,9 @@ async def run_block_preflight(
             preflight_fields = body
         else:
             preflight_fields = {}
+        zero_match_failure = _classify_zero_match_preflight(tool_name, tool_args, preflight_fields)
+        if zero_match_failure is not None:
+            return None, zero_match_failure
         plan = build_block_preflight_plan(tool_name, tool_args, preflight_fields)
 
         # Reject before approval when the post-omit execute frame would still overflow.

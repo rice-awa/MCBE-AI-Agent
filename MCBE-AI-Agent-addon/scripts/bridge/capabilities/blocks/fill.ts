@@ -31,7 +31,7 @@ import {
   resolvePlayerAnchor,
   type ResolvedTarget,
 } from "./inspect";
-import { buildBlockSnapshot } from "./snapshot";
+import { buildBlockSnapshot, matchesTargetPermutation } from "./snapshot";
 
 const SAMPLE_LIMIT = 8;
 
@@ -158,10 +158,13 @@ export async function scanFillVolume(
   replaceAny: boolean,
   expectedPrevious: EditBlocksPayload["expected_previous"],
   cellsPerTick: number,
+  targetTypeId: string,
+  targetStates?: Record<string, string | number | boolean>,
 ): Promise<
   BridgeResult<{
     matched: ResolvedTarget[];
     skipped: number;
+    already_target: number;
     previous_type_counts: Record<string, number>;
     befores: Array<ReturnType<typeof buildBlockSnapshot>>;
     protected_samples: Array<ReturnType<typeof buildBlockSnapshot>>;
@@ -171,6 +174,7 @@ export async function scanFillVolume(
   const befores: Array<ReturnType<typeof buildBlockSnapshot>> = [];
   const previous_type_counts: Record<string, number> = {};
   let skipped = 0;
+  let already_target = 0;
   const protected_samples: Array<ReturnType<typeof buildBlockSnapshot>> = [];
 
   for (let i = 0; i < cells.length; i++) {
@@ -203,6 +207,11 @@ export async function scanFillVolume(
       return check;
     }
     if (check.payload.skip) {
+      // Distinguish "already at target state" (true no-op) from "does not match expect"
+      // so zero-match classification can pick noop vs PRECONDITION_FAILED.
+      if (matchesTargetPermutation(snapshot, targetTypeId, targetStates)) {
+        already_target += 1;
+      }
       skipped += 1;
       continue;
     }
@@ -213,6 +222,7 @@ export async function scanFillVolume(
   return ok({
     matched,
     skipped,
+    already_target,
     previous_type_counts,
     befores,
     protected_samples,
@@ -349,6 +359,8 @@ export async function handleFill(
     prepared.payload.replace_any,
     prepared.payload.expected_previous,
     cellsPerTick,
+    prepared.payload.type_id,
+    prepared.payload.states,
   );
   if (!scan.ok) {
     return {
@@ -378,6 +390,7 @@ export async function handleFill(
     volume: cells.length,
     matched_count: scan.payload.matched.length,
     skipped: scan.payload.skipped,
+    already_target: scan.payload.already_target,
     previous_type_counts: scan.payload.previous_type_counts,
     type_id: prepared.payload.type_id,
     states: prepared.payload.states ?? {},
@@ -390,10 +403,47 @@ export async function handleFill(
     before_samples: scan.payload.befores.slice(0, SAMPLE_LIMIT),
   };
 
+  // Zero-match classification: noop (all already target) vs PRECONDITION_FAILED.
+  if (scan.payload.matched.length === 0) {
+    if (scan.payload.already_target === cells.length) {
+      if (phase === "preflight") {
+        return ok({
+          ...baseMeta,
+          ok: true,
+          status: "noop" as const,
+          locked_targets: [],
+          ready: true,
+        });
+      }
+      // Execute: nothing to write.
+      return ok({
+        ...baseMeta,
+        ok: true,
+        status: "noop" as const,
+        changed_count: 0,
+        verification: { ok: true, method: "noop" },
+        rollback: { promised: false },
+      });
+    }
+    return fail(
+      "PRECONDITION_FAILED",
+      "fill 匹配数为 0：目标方块不满足 expect 前置条件。",
+      {
+        status: "failed" as const,
+        matched_count: 0,
+        actual_type_counts: scan.payload.previous_type_counts,
+        hint: `如确实要替换这些方块，请将 expect 设为 ${expectedPreviousHint(prepared.payload)}`,
+        fallback_allowed: false,
+        retryable: false,
+      },
+    );
+  }
+
   if (phase === "preflight") {
     return ok({
       ...baseMeta,
       ok: true,
+      status: scan.payload.skipped > 0 ? ("partial" as const) : ("applied" as const),
       locked_targets: scan.payload.matched,
       ready: true,
     });
@@ -446,6 +496,9 @@ export async function handleFill(
           return ok({
             ...baseMeta,
             ok: true,
+            status: (scan.payload.skipped > 0 ? "partial" : "applied") as
+              | "applied"
+              | "partial",
             changed_count: matched.length,
             verification: { ok: true, method: "fillBlocks" },
             rollback: { promised: false },
@@ -471,6 +524,7 @@ export async function handleFill(
       if (!reblock.ok) {
         return fail("STATE_UNKNOWN", reblock.payload.message, {
           ...baseMeta,
+          status: "unknown" as const,
           changed_count: changed,
           failed_index: i,
           retryable: false,
@@ -483,6 +537,7 @@ export async function handleFill(
         const message = error instanceof Error ? error.message : String(error);
         return fail("STATE_UNKNOWN", message, {
           ...baseMeta,
+          status: "unknown" as const,
           changed_count: changed,
           failed_index: i,
           retryable: false,
@@ -493,6 +548,9 @@ export async function handleFill(
     return ok({
       ...baseMeta,
       ok: true,
+      status: (scan.payload.skipped > 0 ? "partial" : "applied") as
+        | "applied"
+        | "partial",
       changed_count: changed,
       verification: { ok: true, method: "cell_by_cell" },
       rollback: { promised: false },
@@ -501,10 +559,25 @@ export async function handleFill(
     const message = error instanceof Error ? error.message : String(error);
     return fail("STATE_UNKNOWN", message, {
       ...baseMeta,
+      status: "unknown" as const,
       retryable: false,
       rollback: { promised: false },
     });
   }
+}
+
+/**
+ * Build an expect hint string from the prepared write policy.
+ * Air-only -> "any"; expected_previous -> its type_id; otherwise "any".
+ */
+function expectedPreviousHint(prepared: {
+  replace_any: boolean;
+  expected_previous?: EditBlocksPayload["expected_previous"];
+}): string {
+  if (prepared.expected_previous) {
+    return prepared.expected_previous.type_id ?? "any";
+  }
+  return prepared.replace_any ? "any" : "air";
 }
 
 // silence unused
