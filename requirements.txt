@@ -1,6 +1,5 @@
 # Core dependencies
-# Local gateway SDK (monorepo path; publishable independently)
--e ./mcbe-ws-sdk
+mcbe-ws-sdk>=0.1.0
 pydantic>=2.0
 pydantic-settings>=2.0
 pydantic-ai~=1.94.0
