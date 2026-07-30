@@ -9,7 +9,6 @@ from uuid import UUID, uuid4
 import httpx
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ThinkingPart
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
-
 from core.queue import MessageBroker
 from services.agent.core import stream_chat, _extract_exception_details, player_facing_error, classify_run_exception
 from services.agent.harness.approvals import PendingApproval
