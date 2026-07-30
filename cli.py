@@ -263,24 +263,29 @@ def init():
     config_file = Path("config.json")
     config_example = Path("config.example.json")
 
-    if env_file.exists():
-        click.confirm(".env 已存在，是否覆盖?", abort=True)
-    if config_file.exists():
-        click.confirm("config.json 已存在，是否覆盖?", abort=True)
+    copy_env = not env_file.exists() or click.confirm(".env 已存在，是否覆盖?")
+    copy_config = not config_file.exists() or click.confirm("config.json 已存在，是否覆盖?")
 
-    if not env_example.exists():
-        click.echo(f"❌ 找不到模板文件: {env_example.absolute()}", err=True)
-        sys.exit(1)
-    if not config_example.exists():
-        click.echo(f"❌ 找不到模板文件: {config_example.absolute()}", err=True)
-        sys.exit(1)
+    if not copy_env and not copy_config:
+        click.echo("无需创建任何文件。")
+        return
 
     try:
-        env_file.write_text(env_example.read_text(encoding="utf-8"), encoding="utf-8")
-        config_file.write_text(config_example.read_text(encoding="utf-8"), encoding="utf-8")
-        click.echo(f"✅ 敏感配置文件已创建: {env_file.absolute()}")
-        click.echo(f"✅ 应用配置文件已创建: {config_file.absolute()}")
-        click.echo("\n请编辑 .env 填入密钥，并按需编辑 config.json 调整普通配置")
+        if copy_env:
+            if not env_example.exists():
+                click.echo(f"❌ 找不到模板文件: {env_example.absolute()}", err=True)
+                sys.exit(1)
+            env_file.write_text(env_example.read_text(encoding="utf-8"), encoding="utf-8")
+            click.echo(f"✅ 敏感配置文件已创建: {env_file.absolute()}")
+        if copy_config:
+            if not config_example.exists():
+                click.echo(f"❌ 找不到模板文件: {config_example.absolute()}", err=True)
+                sys.exit(1)
+            config_file.write_text(config_example.read_text(encoding="utf-8"), encoding="utf-8")
+            click.echo(f"✅ 应用配置文件已创建: {config_file.absolute()}")
+
+        if copy_env or copy_config:
+            click.echo("\n请编辑 .env 填入密钥，并按需编辑 config.json 调整普通配置")
     except Exception as e:
         click.echo(f"❌ 创建配置文件失败: {e}", err=True)
         sys.exit(1)
