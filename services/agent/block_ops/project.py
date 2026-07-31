@@ -52,6 +52,48 @@ def _aabb_volume(from_pos: dict[str, Any], to_pos: dict[str, Any]) -> int | None
         return None
 
 
+def _project_inspect(payload: dict[str, Any]) -> dict[str, Any]:
+    """Project an inspect payload to model decision fields (issue 02).
+
+    - Single/few points: return full ``blocks`` with type_id/states/waterlogged/
+      is_air/is_liquid.
+    - Multi-point/box summary: return ``bounds/count/type_counts/unknown_count/
+      samples``.
+    - Strip internal metadata (targets, player_origin, facing, player_name,
+      repairs_applied, coordinate_mode, bridge diagnostics) from model result.
+    """
+    out: dict[str, Any] = {"ok": True}
+    status = payload.get("status")
+    if isinstance(status, str) and status:
+        out["status"] = status
+    else:
+        out["status"] = "inspected"
+
+    # Summary path: bounded projection.
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        out["bounds"] = summary.get("bounds", {})
+        out["count"] = summary.get("count", 0)
+        type_counts = summary.get("type_counts")
+        if isinstance(type_counts, dict):
+            out["type_counts"] = type_counts
+        out["unknown_count"] = summary.get("unknown_count", 0)
+        samples = summary.get("samples")
+        if isinstance(samples, list):
+            out["samples"] = samples
+        return out
+
+    # Full snapshots path.
+    blocks = payload.get("blocks")
+    if isinstance(blocks, list):
+        out["blocks"] = blocks
+    # Dimension only when explicitly relevant (single dimension result).
+    dimension = payload.get("dimension")
+    if isinstance(dimension, str) and dimension:
+        out["dimension"] = dimension
+    return out
+
+
 def _pick_type_id(payload: dict[str, Any]) -> str | None:
     type_id = payload.get("type_id")
     if isinstance(type_id, str) and type_id:
@@ -241,7 +283,10 @@ def project_block_result_for_model(
 ) -> dict[str, Any]:
     """Project a successful block-tool payload down to model decision fields.
 
-    Non place/batch/fill payloads are returned largely as-is (inspect / legacy).
+    Inspect payloads (no ``mode`` or ``status=inspected``) are projected via
+    :func:`_project_inspect` which strips internal metadata (targets,
+    player_origin, facing, player_name, repairs_applied, coordinate_mode) and
+    returns either full ``blocks`` or a bounded ``summary``.
     Full audit fields (targets, before/after, before_samples, verification,
     rollback, phase) are stripped for mutation modes.
     """
@@ -259,9 +304,5 @@ def project_block_result_for_model(
     if effective_mode == "fill":
         return _project_fill(payload, authorized_bounds=authorized_bounds)
 
-    # inspect / unknown: pass through with ok, drop nothing required
-    if payload.get("ok") is True:
-        return dict(payload)
-    out = dict(payload)
-    out.setdefault("ok", True)
-    return out
+    # inspect / unknown: project bounded result, strip internal metadata.
+    return _project_inspect(payload)

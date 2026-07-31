@@ -93,6 +93,56 @@ class _FakeBridge:
                 },
             }
         if capability == "inspect_block":
+            # Unified target path (issue 02): target.positions or target.box
+            target = payload.get("target")
+            if isinstance(target, dict):
+                if isinstance(target.get("positions"), list):
+                    positions_list = target["positions"]
+                    blocks = []
+                    for p in positions_list:
+                        if "x" in p:
+                            blocks.append({
+                                "dimension": payload.get("dimension") or "minecraft:overworld",
+                                "x": p["x"], "y": p["y"], "z": p["z"],
+                                "type_id": "minecraft:stone",
+                                "states": {},
+                                "waterlogged": False,
+                                "is_air": False,
+                                "is_liquid": False,
+                            })
+                    return {
+                        "ok": True,
+                        "payload": {
+                            "schema_version": "1",
+                            "ok": True,
+                            "status": "inspected",
+                            "blocks": blocks,
+                            "coordinate_mode": payload.get("coordinate_mode", "absolute"),
+                            "dimension": payload.get("dimension", "minecraft:overworld"),
+                        },
+                    }
+                if isinstance(target.get("box"), dict):
+                    return {
+                        "ok": True,
+                        "payload": {
+                            "schema_version": "1",
+                            "ok": True,
+                            "status": "inspected",
+                            "summary": {
+                                "bounds": {
+                                    "from": target["box"]["from"],
+                                    "to": target["box"]["to"],
+                                },
+                                "count": 4,
+                                "type_counts": {"minecraft:stone": 4},
+                                "unknown_count": 0,
+                                "samples": [],
+                            },
+                            "coordinate_mode": payload.get("coordinate_mode", "absolute"),
+                            "dimension": payload.get("dimension", "minecraft:overworld"),
+                        },
+                    }
+            # Legacy path
             pos = payload.get("position") or {"x": 0, "y": 64, "z": 0}
             return {
                 "ok": True,
@@ -1582,6 +1632,351 @@ async def test_inspect_block_validation_missing_position() -> None:
     assert body["code"] == "INVALID_ARGUMENT"
 
 
+# ---------------------------------------------------------------------------
+# Issue 02: unified target inspect_block
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_inspect_target_positions_absolute() -> None:
+    from services.agent.block_ops.target import normalize_inspect_target
+
+    normalized, error = normalize_inspect_target({
+        "positions": [{"x": 1, "y": 64, "z": 2}, {"x": 3, "y": 65, "z": 4}],
+    })
+    assert error is None
+    assert normalized is not None
+    assert normalized.shape == "positions"
+    assert normalized.coordinate_mode == "absolute"
+    assert len(normalized.positions) == 2
+
+
+def test_normalize_inspect_target_positions_relative() -> None:
+    from services.agent.block_ops.target import normalize_inspect_target
+
+    normalized, error = normalize_inspect_target({
+        "positions": [{"forward": 1, "right": 0, "up": 0}],
+    })
+    assert error is None
+    assert normalized is not None
+    assert normalized.shape == "positions"
+    assert normalized.coordinate_mode == "player_relative"
+
+
+def test_normalize_inspect_target_box_absolute() -> None:
+    from services.agent.block_ops.target import normalize_inspect_target
+
+    normalized, error = normalize_inspect_target({
+        "box": {"from": {"x": 0, "y": 64, "z": 0}, "to": {"x": 2, "y": 66, "z": 2}},
+    })
+    assert error is None
+    assert normalized is not None
+    assert normalized.shape == "box"
+    assert normalized.coordinate_mode == "absolute"
+
+
+def test_normalize_inspect_target_rejects_both_shapes() -> None:
+    from services.agent.block_ops.target import normalize_inspect_target
+
+    normalized, error = normalize_inspect_target({
+        "positions": [{"x": 0, "y": 64, "z": 0}],
+        "box": {"from": {"x": 0, "y": 64, "z": 0}, "to": {"x": 1, "y": 64, "z": 1}},
+    })
+    assert error is not None
+    body = json.loads(error.output)
+    assert body["code"] == "INVALID_ARGUMENT"
+
+
+def test_normalize_inspect_target_rejects_neither_shape() -> None:
+    from services.agent.block_ops.target import normalize_inspect_target
+
+    normalized, error = normalize_inspect_target({})
+    assert error is not None
+    body = json.loads(error.output)
+    assert body["code"] == "INVALID_ARGUMENT"
+
+
+def test_normalize_inspect_target_rejects_mixed_coord_modes() -> None:
+    from services.agent.block_ops.target import normalize_inspect_target
+
+    # positions mixing absolute and relative
+    normalized, error = normalize_inspect_target({
+        "positions": [
+            {"x": 0, "y": 64, "z": 0},
+            {"forward": 1, "right": 0, "up": 0},
+        ],
+    })
+    assert error is not None
+    body = json.loads(error.output)
+    assert body["code"] == "INVALID_COORDINATE"
+    assert "混用" in body["message"]
+
+
+def test_normalize_inspect_target_box_rejects_mixed_coord_modes() -> None:
+    from services.agent.block_ops.target import normalize_inspect_target
+
+    # box with from=absolute, to=relative
+    normalized, error = normalize_inspect_target({
+        "box": {
+            "from": {"x": 0, "y": 64, "z": 0},
+            "to": {"forward": 1, "right": 0, "up": 0},
+        },
+    })
+    assert error is not None
+    body = json.loads(error.output)
+    assert body["code"] == "INVALID_COORDINATE"
+
+
+def test_normalize_inspect_target_rejects_empty_positions() -> None:
+    from services.agent.block_ops.target import normalize_inspect_target
+
+    normalized, error = normalize_inspect_target({"positions": []})
+    assert error is not None
+    body = json.loads(error.output)
+    assert body["code"] == "INVALID_ARGUMENT"
+
+
+def test_normalize_inspect_target_rejects_non_dict() -> None:
+    from services.agent.block_ops.target import normalize_inspect_target
+
+    normalized, error = normalize_inspect_target("not a dict")
+    assert error is not None
+    body = json.loads(error.output)
+    assert body["code"] == "INVALID_ARGUMENT"
+
+
+def test_project_inspect_full_snapshots_strips_internal_metadata() -> None:
+    from services.agent.block_ops.project import project_block_result_for_model
+
+    payload = {
+        "schema_version": "1",
+        "ok": True,
+        "status": "inspected",
+        "blocks": [{"x": 0, "y": 64, "z": 0, "type_id": "minecraft:stone", "states": {}, "waterlogged": False, "is_air": False, "is_liquid": False}],
+        "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld",
+        "facing": "south",
+        "player_origin": {"x": 0, "y": 64, "z": 0},
+        "player_name": "Steve",
+        "targets": [{"dimension": "minecraft:overworld", "x": 0, "y": 64, "z": 0}],
+        "repairs_applied": [],
+    }
+    projected = project_block_result_for_model(payload)
+    assert projected["ok"] is True
+    assert projected["status"] == "inspected"
+    assert projected["blocks"] == payload["blocks"]
+    # Internal metadata stripped.
+    assert "targets" not in projected
+    assert "player_origin" not in projected
+    assert "facing" not in projected
+    assert "player_name" not in projected
+    assert "repairs_applied" not in projected
+    assert "coordinate_mode" not in projected
+
+
+def test_project_inspect_summary_bounded_result() -> None:
+    from services.agent.block_ops.project import project_block_result_for_model
+
+    payload = {
+        "schema_version": "1",
+        "ok": True,
+        "status": "inspected",
+        "summary": {
+            "bounds": {"from": {"x": 0, "y": 64, "z": 0}, "to": {"x": 2, "y": 66, "z": 2}},
+            "count": 27,
+            "type_counts": {"minecraft:stone": 20, "minecraft:air": 7},
+            "unknown_count": 0,
+            "samples": [],
+        },
+        "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld",
+    }
+    projected = project_block_result_for_model(payload)
+    assert projected["ok"] is True
+    assert projected["status"] == "inspected"
+    assert projected["count"] == 27
+    assert projected["type_counts"] == {"minecraft:stone": 20, "minecraft:air": 7}
+    assert projected["unknown_count"] == 0
+    assert projected["bounds"]["from"] == {"x": 0, "y": 64, "z": 0}
+    # No blocks array on summary path.
+    assert "blocks" not in projected
+    # Internal metadata stripped.
+    assert "coordinate_mode" not in projected
+
+
+@pytest.mark.asyncio
+async def test_inspect_block_impl_target_positions() -> None:
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+    result = await inspect_block_impl(
+        ctx,  # type: ignore[arg-type]
+        target={"positions": [{"x": 1, "y": 64, "z": 2}]},
+        dimension="minecraft:overworld",
+    )
+    assert result.is_success
+    # Verify the bridge received the unified target shape.
+    inspect_calls = [c for c in bridge.calls if c[0] == "inspect_block"]
+    assert inspect_calls
+    payload = inspect_calls[-1][1]
+    assert "target" in payload
+    assert payload["target"]["positions"] == [{"x": 1, "y": 64, "z": 2}]
+
+
+@pytest.mark.asyncio
+async def test_inspect_block_impl_target_box() -> None:
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+    result = await inspect_block_impl(
+        ctx,  # type: ignore[arg-type]
+        target={"box": {"from": {"x": 0, "y": 64, "z": 0}, "to": {"x": 2, "y": 66, "z": 2}}},
+        dimension="minecraft:overworld",
+    )
+    assert result.is_success
+    inspect_calls = [c for c in bridge.calls if c[0] == "inspect_block"]
+    payload = inspect_calls[-1][1]
+    assert payload["target"]["box"]["from"] == {"x": 0, "y": 64, "z": 0}
+    # Result should be the summary projection (flattened, no blocks array).
+    body = json.loads(result.output)
+    assert body["status"] == "inspected"
+    assert "count" in body
+    assert "type_counts" in body
+    assert "blocks" not in body
+
+
+@pytest.mark.asyncio
+async def test_inspect_block_impl_target_rejects_mixed_coords() -> None:
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+    result = await inspect_block_impl(
+        ctx,  # type: ignore[arg-type]
+        target={"positions": [{"x": 0, "y": 64, "z": 0}, {"forward": 1, "right": 0, "up": 0}]},
+        dimension="minecraft:overworld",
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "INVALID_COORDINATE"
+
+
+@pytest.mark.asyncio
+async def test_inspect_block_impl_target_rejects_both_shapes() -> None:
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+    result = await inspect_block_impl(
+        ctx,  # type: ignore[arg-type]
+        target={
+            "positions": [{"x": 0, "y": 64, "z": 0}],
+            "box": {"from": {"x": 0, "y": 64, "z": 0}, "to": {"x": 1, "y": 64, "z": 1}},
+        },
+        dimension="minecraft:overworld",
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "INVALID_ARGUMENT"
+
+
+@pytest.mark.asyncio
+async def test_inspect_block_impl_target_box_volume_limit() -> None:
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+    # 10x10x10 = 1000 volume, exceeds default 4096? No. Use a small override.
+    # Actually default max_fill_volume=4096; 1000 < 4096 so it passes host check.
+    # Use 200x200x200 = 8M to exceed.
+    result = await inspect_block_impl(
+        ctx,  # type: ignore[arg-type]
+        target={"box": {"from": {"x": 0, "y": 0, "z": 0}, "to": {"x": 199, "y": 199, "z": 199}}},
+        dimension="minecraft:overworld",
+    )
+    # Host rejects before bridge call.
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "LIMIT_EXCEEDED"
+
+
+def test_inspect_config_defaults_and_hard_caps() -> None:
+    from services.agent.block_ops.config import (
+        DEFAULT_INSPECT_SUMMARY_THRESHOLD,
+        DEFAULT_INSPECT_SAMPLE_LIMIT,
+        HARD_MAX_INSPECT_SUMMARY_THRESHOLD,
+        HARD_MAX_INSPECT_SAMPLE_LIMIT,
+        get_block_tools_limits,
+    )
+
+    limits = get_block_tools_limits(None)
+    assert limits.inspect_summary_threshold == DEFAULT_INSPECT_SUMMARY_THRESHOLD
+    assert limits.inspect_sample_limit == DEFAULT_INSPECT_SAMPLE_LIMIT
+
+    # Hard cap enforcement.
+    settings = SimpleNamespace(
+        addon=SimpleNamespace(
+            block_tools={
+                "inspect_summary_threshold": 1000,
+                "inspect_sample_limit": 1000,
+            }
+        )
+    )
+    limits = get_block_tools_limits(settings)
+    assert limits.inspect_summary_threshold == HARD_MAX_INSPECT_SUMMARY_THRESHOLD
+    assert limits.inspect_sample_limit == HARD_MAX_INSPECT_SAMPLE_LIMIT
+
+
+def test_inspect_model_schema_only_exposes_target_and_dimension() -> None:
+    """Model-facing inspect_block schema must only expose target + dimension.
+
+    ``locked_targets`` and ``phase`` are harness-recovery-only fields present
+    in the raw function schema but stripped by ``strip_block_internal_tool_schema``
+    before the model sees them.
+    """
+    from services.agent.harness.execution import strip_block_internal_tool_schema
+    from pydantic_ai.tools import ToolDefinition
+
+    agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
+    register_agent_tools(agent)
+    tools = iter_registered_tools(agent)  # type: ignore[arg-type]
+    raw_schema = tools["inspect_block"].function_schema.json_schema
+    raw_props = set(raw_schema.get("properties") or {})
+    # target and dimension are the model-visible fields.
+    assert "target" in raw_props
+    assert "dimension" in raw_props
+    # Legacy fields removed from the model-facing signature.
+    assert "coordinate_mode" not in raw_props
+    assert "position" not in raw_props
+    assert "positions" not in raw_props
+    # locked_targets / phase are present in raw schema (harness recovery) but
+    # stripped before model exposure.
+    assert "locked_targets" in raw_props
+    assert "phase" in raw_props
+
+    # After harness stripping, only target + dimension remain.
+    stripped = strip_block_internal_tool_schema(
+        ToolDefinition(
+            name="inspect_block",
+            description=raw_schema.get("description", ""),
+            parameters_json_schema=raw_schema,
+        )
+    )
+    stripped_props = set(stripped.parameters_json_schema.get("properties") or {})
+    assert "target" in stripped_props
+    assert "dimension" in stripped_props
+    assert "locked_targets" not in stripped_props
+    assert "phase" not in stripped_props
+    required = set(stripped.parameters_json_schema.get("required") or [])
+    assert "target" in required
+
+
 @pytest.mark.asyncio
 async def test_edit_blocks_impl_place() -> None:
     bridge = _FakeBridge()
@@ -3060,11 +3455,16 @@ def test_project_block_execute_args_is_subset_of_public_tool_signatures() -> Non
 
     inspect_plan = build_block_preflight_plan(
         "inspect_block",
-        {"coordinate_mode": "player_relative", "position": {"forward": 1}},
+        {
+            "coordinate_mode": "player_relative",
+            "dimension": "minecraft:overworld",
+            "target": {
+                "positions": [{"forward": 1, "right": 0, "up": 0}],
+            },
+        },
         {
             "locked_targets": [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}],
             "dimension": "minecraft:overworld",
-            "position": {"x": 1, "y": 64, "z": 1},
             "facing": "east",
             "player_origin": {"x": 0, "y": 64, "z": 0},
         },

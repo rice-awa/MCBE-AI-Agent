@@ -2,16 +2,27 @@ import { world, BlockPermutation } from "@minecraft/server";
 
 import {
   DEFAULT_MAX_POSITIONS,
+  DEFAULT_MAX_FILL_VOLUME,
+  DEFAULT_INSPECT_SUMMARY_THRESHOLD,
+  DEFAULT_INSPECT_SAMPLE_LIMIT,
   HARD_MAX_DISCRETE,
+  HARD_MAX_FILL_VOLUME,
+  HARD_MAX_INSPECT_SUMMARY_THRESHOLD,
+  HARD_MAX_INSPECT_SAMPLE_LIMIT,
   SCHEMA_VERSION,
   fail,
   ok,
   type AbsolutePosition,
+  type BlockSnapshot,
+  type BoxTarget,
   type BridgeResult,
   type CoordinateMode,
+  type InspectSummary,
   type PositionInput,
   type RelativePosition,
   type RepairApplied,
+  type UnknownSample,
+  type UnifiedTarget,
 } from "./types";
 import { repairDimension } from "./repair";
 import {
@@ -28,8 +39,15 @@ type InspectPayload = {
   dimension?: string;
   position?: PositionInput;
   positions?: PositionInput[];
+  /** Unified target (issue 02+): positions XOR box. */
+  target?: UnifiedTarget;
   player_name?: string;
   max_positions?: number;
+  max_fill_volume?: number;
+  /** Inspect auto-summary: above this count, return a bounded summary. */
+  inspect_summary_threshold?: number;
+  /** Maximum sample count in bounded summary. */
+  inspect_sample_limit?: number;
 };
 
 function isAbsolutePos(p: PositionInput): p is AbsolutePosition {
@@ -238,6 +256,83 @@ export function resolveTargets(
   );
 }
 
+/** Resolve a single corner (absolute or relative) to an absolute target. */
+export function resolveBoxCorner(
+  coordinateMode: CoordinateMode,
+  dimension: string,
+  corner: PositionInput | undefined,
+  field: string,
+  anchor: PlayerAnchor | undefined,
+  repairs: RepairApplied[],
+): BridgeResult<ResolvedTarget> {
+  if (!corner) {
+    return fail("INVALID_ARGUMENT", `${field} is required for box target`);
+  }
+  if (coordinateMode === "absolute") {
+    if (!isAbsolutePos(corner)) {
+      return fail("INVALID_COORDINATE", `${field} must be absolute {x,y,z}`);
+    }
+    if (![corner.x, corner.y, corner.z].every((n) => typeof n === "number" && Number.isFinite(n))) {
+      return fail("INVALID_COORDINATE", `${field} has non-finite coordinates`);
+    }
+    const floored = floorAbsolutePosition(corner, field, repairs);
+    return ok({ dimension, ...floored });
+  }
+  if (!anchor) {
+    return fail("INVALID_ARGUMENT", "player anchor required for player_relative box");
+  }
+  if (!isRelativePos(corner)) {
+    return fail("INVALID_COORDINATE", `${field} must be relative {forward,right,up}`);
+  }
+  if (![corner.forward, corner.right, corner.up].every((n) => typeof n === "number" && Number.isFinite(n))) {
+    return fail("INVALID_COORDINATE", `${field} has non-finite offsets`);
+  }
+  const f = Math.floor(corner.forward);
+  const r = Math.floor(corner.right);
+  const u = Math.floor(corner.up);
+  if (f !== corner.forward) {
+    repairs.push({ field: `${field}.forward`, from: corner.forward, to: f, reason: "math_floor" });
+  }
+  if (r !== corner.right) {
+    repairs.push({ field: `${field}.right`, from: corner.right, to: r, reason: "math_floor" });
+  }
+  if (u !== corner.up) {
+    repairs.push({ field: `${field}.up`, from: corner.up, to: u, reason: "math_floor" });
+  }
+  const abs = resolveRelativePosition(anchor.origin, anchor.facing, { forward: f, right: r, up: u });
+  return ok({ dimension: anchor.dimension, ...abs });
+}
+
+/** Enumerate all cells in a normalized AABB (min/max ordered). */
+export function enumerateBoxCells(
+  fromAbs: AbsolutePosition,
+  toAbs: AbsolutePosition,
+): AbsolutePosition[] {
+  const minX = Math.min(fromAbs.x, toAbs.x);
+  const maxX = Math.max(fromAbs.x, toAbs.x);
+  const minY = Math.min(fromAbs.y, toAbs.y);
+  const maxY = Math.max(fromAbs.y, toAbs.y);
+  const minZ = Math.min(fromAbs.z, toAbs.z);
+  const maxZ = Math.max(fromAbs.z, toAbs.z);
+  const cells: AbsolutePosition[] = [];
+  for (let x = minX; x <= maxX; x++) {
+    for (let y = minY; y <= maxY; y++) {
+      for (let z = minZ; z <= maxZ; z++) {
+        cells.push({ x, y, z });
+      }
+    }
+  }
+  return cells;
+}
+
+export function boxVolume(fromAbs: AbsolutePosition, toAbs: AbsolutePosition): number {
+  return (
+    (Math.abs(toAbs.x - fromAbs.x) + 1) *
+    (Math.abs(toAbs.y - fromAbs.y) + 1) *
+    (Math.abs(toAbs.z - fromAbs.z) + 1)
+  );
+}
+
 export function getBlockSafe(
   dimensionId: string,
   location: AbsolutePosition,
@@ -316,65 +411,335 @@ export function resolvePermutation(
   }
 }
 
+/** Classify a getBlockSafe failure into an UnknownSample status. */
+function unknownStatusFromCode(
+  code: string,
+): UnknownSample["status"] {
+  if (code === "OUT_OF_BOUNDS") return "out_of_bounds";
+  if (code === "UNLOADED_CHUNK") return "unloaded";
+  return "unknown";
+}
+
+/** Build a bounded summary for multi-point or box targets. */
+function buildInspectSummary(
+  snapshots: BlockSnapshot[],
+  unknowns: UnknownSample[],
+  fromAbs: AbsolutePosition,
+  toAbs: AbsolutePosition,
+  sampleLimit: number,
+): InspectSummary {
+  const type_counts: Record<string, number> = {};
+  for (const s of snapshots) {
+    type_counts[s.type_id] = (type_counts[s.type_id] ?? 0) + 1;
+  }
+  // Samples: prefer unknowns first (they need attention), then fill with snapshots.
+  const samples: Array<BlockSnapshot | UnknownSample> = [];
+  for (const u of unknowns.slice(0, sampleLimit)) {
+    samples.push(u);
+  }
+  const remaining = sampleLimit - samples.length;
+  if (remaining > 0) {
+    for (const s of snapshots.slice(0, remaining)) {
+      samples.push(s);
+    }
+  }
+  return {
+    bounds: {
+      from: {
+        x: Math.min(fromAbs.x, toAbs.x),
+        y: Math.min(fromAbs.y, toAbs.y),
+        z: Math.min(fromAbs.z, toAbs.z),
+      },
+      to: {
+        x: Math.max(fromAbs.x, toAbs.x),
+        y: Math.max(fromAbs.y, toAbs.y),
+        z: Math.max(fromAbs.z, toAbs.z),
+      },
+    },
+    count: snapshots.length + unknowns.length,
+    type_counts,
+    unknown_count: unknowns.length,
+    samples,
+  };
+}
+
 export async function handleInspectBlock(
   payload: InspectPayload,
 ): Promise<BridgeResult<Record<string, unknown>>> {
   const repairs: RepairApplied[] = [];
   const coordinateMode = (payload.coordinate_mode ?? "absolute") as CoordinateMode;
-  const collected = collectPositions(payload);
-  if (!Array.isArray(collected)) {
-    return collected;
-  }
   const maxPositions = Math.min(
     payload.max_positions ?? DEFAULT_MAX_POSITIONS,
     HARD_MAX_DISCRETE,
   );
-  if (collected.length === 0) {
-    return fail("INVALID_ARGUMENT", "at least one position is required");
-  }
-  if (collected.length > maxPositions) {
-    return fail("LIMIT_EXCEEDED", `positions exceed limit ${maxPositions}`, {
-      count: collected.length,
-      max: maxPositions,
-    });
-  }
-
-  const resolved = resolveTargets(
-    coordinateMode,
-    payload.dimension,
-    collected,
-    payload.player_name,
-    repairs,
+  const maxFillVolume = Math.min(
+    payload.max_fill_volume ?? DEFAULT_MAX_FILL_VOLUME,
+    HARD_MAX_FILL_VOLUME,
   );
-  if (!resolved.ok) return resolved;
+  const summaryThreshold = Math.min(
+    payload.inspect_summary_threshold ?? DEFAULT_INSPECT_SUMMARY_THRESHOLD,
+    HARD_MAX_INSPECT_SUMMARY_THRESHOLD,
+  );
+  const sampleLimit = Math.min(
+    payload.inspect_sample_limit ?? DEFAULT_INSPECT_SAMPLE_LIMIT,
+    HARD_MAX_INSPECT_SAMPLE_LIMIT,
+  );
 
-  const blocks = [];
-  for (const target of resolved.payload.targets) {
-    const blockResult = getBlockSafe(target.dimension, {
-      x: target.x,
-      y: target.y,
-      z: target.z,
-    });
-    if (!blockResult.ok) return blockResult;
-    blocks.push(
-      buildBlockSnapshot(blockResult.payload.block, target.dimension, {
+  // Unified target shape: target.positions or target.box (mutually exclusive).
+  // Backward-compatible: also accept legacy position / positions.
+  let targetShape: "positions" | "box";
+  let positions: PositionInput[] | undefined;
+  let box: BoxTarget | undefined;
+
+  if (payload.target !== undefined) {
+    if (
+      typeof payload.target !== "object" ||
+      payload.target === null ||
+      (payload.target.positions === undefined && payload.target.box === undefined)
+    ) {
+      return fail("INVALID_ARGUMENT", "target must provide positions or box");
+    }
+    if (
+      payload.target.positions !== undefined &&
+      payload.target.box !== undefined
+    ) {
+      return fail("INVALID_ARGUMENT", "target.positions and target.box are mutually exclusive");
+    }
+    if (payload.target.positions !== undefined) {
+      if (!Array.isArray(payload.target.positions)) {
+        return fail("INVALID_ARGUMENT", "target.positions must be an array");
+      }
+      positions = payload.target.positions;
+      targetShape = "positions";
+    } else {
+      const b = payload.target.box!;
+      if (
+        typeof b !== "object" ||
+        b === null ||
+        b.from === undefined ||
+        b.to === undefined
+      ) {
+        return fail("INVALID_ARGUMENT", "target.box must provide from and to");
+      }
+      box = b;
+      targetShape = "box";
+    }
+  } else {
+    // Legacy path: position / positions.
+    const collected = collectPositions(payload);
+    if (!Array.isArray(collected)) {
+      return collected;
+    }
+    positions = collected;
+    targetShape = "positions";
+  }
+
+  if (targetShape === "positions") {
+    if (!positions || positions.length === 0) {
+      return fail("INVALID_ARGUMENT", "at least one position is required");
+    }
+    if (positions.length > maxPositions) {
+      return fail("LIMIT_EXCEEDED", `positions exceed limit ${maxPositions}`, {
+        count: positions.length,
+        max: maxPositions,
+      });
+    }
+
+    const resolved = resolveTargets(
+      coordinateMode,
+      payload.dimension,
+      positions,
+      payload.player_name,
+      repairs,
+    );
+    if (!resolved.ok) return resolved;
+
+    // Single or few points: full snapshots (never summarized below threshold).
+    if (resolved.payload.targets.length <= summaryThreshold) {
+      const blocks: BlockSnapshot[] = [];
+      for (const target of resolved.payload.targets) {
+        const blockResult = getBlockSafe(target.dimension, {
+          x: target.x,
+          y: target.y,
+          z: target.z,
+        });
+        if (!blockResult.ok) return blockResult;
+        blocks.push(
+          buildBlockSnapshot(blockResult.payload.block, target.dimension, {
+            x: target.x,
+            y: target.y,
+            z: target.z,
+          }),
+        );
+      }
+      return ok({
+        schema_version: SCHEMA_VERSION,
+        ok: true,
+        status: "inspected",
+        blocks,
+        repairs_applied: repairs,
+        coordinate_mode: coordinateMode,
+        dimension: resolved.payload.dimension,
+        facing: resolved.payload.facing,
+        player_origin: resolved.payload.player_origin,
+        player_name: resolved.payload.player_name,
+        targets: resolved.payload.targets,
+      });
+    }
+
+    // Many points: bounded summary.
+    const snapshots: BlockSnapshot[] = [];
+    const unknowns: UnknownSample[] = [];
+    let minT = resolved.payload.targets[0];
+    let maxT = resolved.payload.targets[0];
+    for (const target of resolved.payload.targets) {
+      minT = {
+        x: Math.min(minT.x, target.x),
+        y: Math.min(minT.y, target.y),
+        z: Math.min(minT.z, target.z),
+        dimension: minT.dimension,
+      };
+      maxT = {
+        x: Math.max(maxT.x, target.x),
+        y: Math.max(maxT.y, target.y),
+        z: Math.max(maxT.z, target.z),
+        dimension: maxT.dimension,
+      };
+      const blockResult = getBlockSafe(target.dimension, {
         x: target.x,
         y: target.y,
         z: target.z,
-      }),
+      });
+      if (!blockResult.ok) {
+        unknowns.push({
+          x: target.x,
+          y: target.y,
+          z: target.z,
+          status: unknownStatusFromCode(blockResult.payload.code),
+        });
+        continue;
+      }
+      snapshots.push(
+        buildBlockSnapshot(blockResult.payload.block, target.dimension, {
+          x: target.x,
+          y: target.y,
+          z: target.z,
+        }),
+      );
+    }
+    const summary = buildInspectSummary(
+      snapshots,
+      unknowns,
+      { x: minT.x, y: minT.y, z: minT.z },
+      { x: maxT.x, y: maxT.y, z: maxT.z },
+      sampleLimit,
     );
+    return ok({
+      schema_version: SCHEMA_VERSION,
+      ok: true,
+      status: "inspected",
+      summary,
+      repairs_applied: repairs,
+      coordinate_mode: coordinateMode,
+      dimension: resolved.payload.dimension,
+    });
   }
 
+  // Box target shape.
+  let anchor: PlayerAnchor | undefined;
+  let dimension: string;
+  if (coordinateMode === "absolute") {
+    const dim = repairDimension(payload.dimension, repairs);
+    if (!dim) {
+      return fail("INVALID_ARGUMENT", "dimension is required for absolute box target");
+    }
+    dimension = dim;
+  } else {
+    const anchorResult = resolvePlayerAnchor(payload.player_name ?? "");
+    if (!anchorResult.ok) return anchorResult;
+    anchor = anchorResult.payload;
+    dimension = anchor.dimension;
+  }
+
+  const fromResult = resolveBoxCorner(
+    coordinateMode,
+    dimension,
+    box!.from,
+    "target.box.from",
+    anchor,
+    repairs,
+  );
+  if (!fromResult.ok) return fromResult;
+  const toResult = resolveBoxCorner(
+    coordinateMode,
+    dimension,
+    box!.to,
+    "target.box.to",
+    anchor,
+    repairs,
+  );
+  if (!toResult.ok) return toResult;
+
+  const fromAbs: AbsolutePosition = { x: fromResult.payload.x, y: fromResult.payload.y, z: fromResult.payload.z };
+  const toAbs: AbsolutePosition = { x: toResult.payload.x, y: toResult.payload.y, z: toResult.payload.z };
+  const volume = boxVolume(fromAbs, toAbs);
+  if (volume > maxFillVolume) {
+    return fail("LIMIT_EXCEEDED", `box volume ${volume} exceeds limit ${maxFillVolume}`, {
+      volume,
+      max: maxFillVolume,
+    });
+  }
+
+  const cells = enumerateBoxCells(fromAbs, toAbs);
+
+  // Below threshold: return full snapshots for every cell.
+  if (cells.length <= summaryThreshold) {
+    const blocks: BlockSnapshot[] = [];
+    for (const cell of cells) {
+      const blockResult = getBlockSafe(dimension, cell);
+      if (!blockResult.ok) return blockResult;
+      blocks.push(
+        buildBlockSnapshot(blockResult.payload.block, dimension, cell),
+      );
+    }
+    return ok({
+      schema_version: SCHEMA_VERSION,
+      ok: true,
+      status: "inspected",
+      blocks,
+      repairs_applied: repairs,
+      coordinate_mode: coordinateMode,
+      dimension,
+      facing: anchor?.facing,
+      player_origin: anchor?.origin,
+      player_name: anchor?.player_name,
+    });
+  }
+
+  // Above threshold: bounded summary with unknown tracking.
+  const snapshots: BlockSnapshot[] = [];
+  const unknowns: UnknownSample[] = [];
+  for (const cell of cells) {
+    const blockResult = getBlockSafe(dimension, cell);
+    if (!blockResult.ok) {
+      unknowns.push({
+        x: cell.x,
+        y: cell.y,
+        z: cell.z,
+        status: unknownStatusFromCode(blockResult.payload.code),
+      });
+      continue;
+    }
+    snapshots.push(buildBlockSnapshot(blockResult.payload.block, dimension, cell));
+  }
+  const summary = buildInspectSummary(snapshots, unknowns, fromAbs, toAbs, sampleLimit);
   return ok({
     schema_version: SCHEMA_VERSION,
     ok: true,
-    blocks,
+    status: "inspected",
+    summary,
     repairs_applied: repairs,
     coordinate_mode: coordinateMode,
-    dimension: resolved.payload.dimension,
-    facing: resolved.payload.facing,
-    player_origin: resolved.payload.player_origin,
-    player_name: resolved.payload.player_name,
-    targets: resolved.payload.targets,
+    dimension,
   });
 }

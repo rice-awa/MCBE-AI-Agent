@@ -1374,7 +1374,10 @@ def _python_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     if tool_name == "inspect_block" and args.get("phase") != "execute":
         return {
             key: value for key, value in dict(args or {}).items()
-            if key in {"coordinate_mode", "dimension", "position", "positions", "locked_targets", "phase"}
+            if key in {
+                "coordinate_mode", "dimension", "position", "positions",
+                "target", "locked_targets", "phase",
+            }
         }
     from services.agent.block_ops.tools_impl import project_block_execute_args
 

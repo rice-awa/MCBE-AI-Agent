@@ -20,10 +20,13 @@ _INTENT_GUIDANCE: dict[ToolIntent, str] = {
 
 _BLOCK_TOOL_PRIORITY = (
     "方块操作优先策略：\n"
-    "- 查询用 inspect_block；写入用 edit_blocks（mode=place|batch|fill）。\n"
+    "- 查询用 inspect_block（target.positions 或 target.box）；"
+    "写入用 edit_blocks（mode=place|batch|fill）。\n"
     "- 平台/地板/墙：优先一次 fill 或少量 batch；禁止对连续区域 place×N。\n"
     "- 默认仅替换空气；覆写非空须 replace_any=true（高风险再审批）。\n"
     "- 删除：放置 minecraft:air 并授权覆写。\n"
+    "- inspect 结果：单点/少量点返回完整方块快照；多点/box 返回有界摘要"
+    "（bounds/count/type_counts/unknown_count/samples）。\n"
     "- 成功结果：was / previous_type_counts 仅含被替换的非空气方块；"
     "无 was / 无 previous_type_counts = 原为空气（正常）。"
     "若出现非预期非空 was，应向玩家说明或改 plan / 对齐 replace_any 意图。\n"

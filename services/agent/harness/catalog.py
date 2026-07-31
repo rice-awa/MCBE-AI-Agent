@@ -269,12 +269,13 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         "inspect_block",
         ToolIntent.QUERY_WORLD,
         ToolRisk.LOW,
-        "查询单个或多个方块的 type ID、states、含水/空气/液体标记时使用。",
+        "查询单点、多点或长方体区域的方块状态时使用；返回完整快照或有界摘要。",
         "不要用于修改方块；不要用命令试探方块状态。",
-        "coordinate_mode 为 absolute 或 player_relative；absolute 必须提供 dimension；"
-        "提供 position 或 positions（互斥）。",
+        "target 提供 positions（点集，单点用长度 1）或 box（长方体 from/to，互斥）；"
+        "坐标为 {x,y,z} 或 {forward,right,up}，同一 target 内不能混用；"
+        "dimension 可选（绝对坐标默认当前玩家维度）。",
         preview=ParameterPreviewPolicy(
-            include=("coordinate_mode", "dimension", "position", "positions")
+            include=("target", "dimension")
         ),
         may_have_external_side_effects=False,
     ),

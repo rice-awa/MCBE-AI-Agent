@@ -1124,34 +1124,30 @@ def register_agent_tools(
     @chat_agent.tool
     async def inspect_block(
         ctx: RunContext[AgentDependencies],
-        coordinate_mode: str = "absolute",
+        target: dict[str, Any],
         dimension: str | None = None,
-        position: dict[str, Any] | None = None,
-        positions: list[dict[str, Any]] | None = None,
         locked_targets: list[dict[str, Any]] | None = None,
         phase: str | None = None,
     ) -> str:
-        """查询单个或多个方块快照（type ID、states、含水/空气/液体）。
+        """查询方块快照（type ID、states、含水/空气/液体）或区域摘要。
 
         优先使用本工具查询方块，不要用命令试探。
-        absolute 模式必须提供 dimension；player_relative 使用当前事件玩家脚部原点。
 
         Args:
             ctx: 运行上下文
-            coordinate_mode: absolute 或 player_relative
-            dimension: 维度 ID（absolute 必填）
-            position: 单个坐标 {x,y,z} 或相对 {forward,right,up}
-            positions: 多个坐标列表（与 position 互斥）
+            target: 目标结构。``{positions: [...]}`` 查询点集（单点用长度 1），
+                ``{box: {from, to}}`` 查询长方体区域。两者互斥。
+                坐标为世界坐标 ``{x,y,z}`` 或玩家相对 ``{forward,right,up}``，
+                同一 target 内不能混用。
+            dimension: 维度 ID（绝对坐标默认当前玩家维度；跨维度时需要）
         """
         # locked_targets / phase: harness recovery only; stripped from model schema.
         from services.agent.block_ops.tools_impl import inspect_block_impl
 
         return await inspect_block_impl(
             ctx,
-            coordinate_mode=coordinate_mode,  # type: ignore[arg-type]
+            target=target,
             dimension=dimension,
-            position=position,
-            positions=positions,
             locked_targets=locked_targets,
             phase=phase,
         )

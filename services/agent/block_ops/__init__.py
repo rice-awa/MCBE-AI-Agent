@@ -50,6 +50,11 @@ from services.agent.block_ops.tools_impl import (
     project_block_execute_args,
     run_block_preflight,
 )
+from services.agent.block_ops.target import (
+    NormalizedTarget,
+    build_inspect_payload_from_target,
+    normalize_inspect_target,
+)
 
 __all__ = [
     "BLOCK_OPS_SCHEMA_VERSION",

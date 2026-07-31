@@ -60,7 +60,8 @@ _EDIT_EXECUTE_FIELDS = frozenset({
     "locked_targets", "phase", "status",
 })
 _INSPECT_EXECUTE_FIELDS = frozenset({
-    "coordinate_mode", "dimension", "position", "positions", "locked_targets", "phase",
+    "coordinate_mode", "dimension", "position", "positions", "target",
+    "locked_targets", "phase",
 })
 
 
@@ -77,7 +78,18 @@ def project_block_execute_args(tool_name: str, authorized_args: dict[str, Any]) 
             projected["to_pos"] = authorized_args["to"]
         required = {"type_id", "mode", "coordinate_mode", "dimension", "phase", "locked_targets"}
     else:
-        required = {"coordinate_mode", "dimension", "phase", "locked_targets"}
+        # inspect: target path (issue 02) or legacy position/positions path.
+        has_target = "target" in projected and isinstance(projected["target"], dict)
+        if has_target:
+            # target path: only model-visible fields (target, dimension, phase).
+            # coordinate_mode is derived from target inside inspect_block_impl.
+            projected = {
+                key: value for key, value in projected.items()
+                if key in {"target", "dimension", "phase", "locked_targets"}
+            }
+            required = {"dimension", "phase", "target"}
+        else:
+            required = {"coordinate_mode", "dimension", "phase", "locked_targets"}
     missing = [key for key in required if key not in projected]
     # noop fill: all targets already at desired state; no locked_targets, no write.
     is_noop = projected.get("status") == "noop"
@@ -88,6 +100,11 @@ def project_block_execute_args(tool_name: str, authorized_args: dict[str, Any]) 
             projected.get("to_pos"), dict
         ):
             raise ValueError("block preflight execution contract requires fill bounds")
+        return projected
+    # inspect target path: locked_targets not required (no mutation, no lock).
+    if tool_name == "inspect_block" and has_target:
+        if missing or projected.get("phase") != "execute":
+            raise ValueError("block preflight execution contract is incomplete")
         return projected
     if missing or projected.get("phase") != "execute" or not projected.get("locked_targets"):
         raise ValueError("block preflight execution contract is incomplete")
@@ -208,6 +225,64 @@ def _validate_inspect_args(
                 count=len(positions),
             )
     return None
+
+
+def _validate_inspect_target(
+    target: Any,
+    *,
+    dimension: str | None,
+    max_positions: int,
+    max_fill_volume: int,
+) -> tuple[Any | None, ToolResult | None]:
+    """Validate a unified ``target`` and return (normalized_target, error).
+
+    The normalized target is a :class:`NormalizedTarget` ready for payload
+    construction. Volume / count limits are enforced here so the host rejects
+    oversized targets before the bridge call.
+    """
+    from services.agent.block_ops.target import normalize_inspect_target
+
+    normalized, error = normalize_inspect_target(target)
+    if error is not None:
+        return None, error
+    assert normalized is not None
+    if normalized.coordinate_mode == "absolute" and not dimension:
+        return None, _host_limit_error(
+            BlockErrorCode.INVALID_ARGUMENT,
+            "absolute 模式必须提供 dimension",
+        )
+    if normalized.shape == "positions":
+        count = len(normalized.positions or [])
+        if count > max_positions:
+            return None, _host_limit_error(
+                BlockErrorCode.LIMIT_EXCEEDED,
+                f"positions 数量 {count} 超过上限 {max_positions}",
+                limit=max_positions,
+                count=count,
+            )
+    else:
+        # Box: rough host-side volume check when absolute coords present.
+        from_pos = normalized.box_from
+        to_pos = normalized.box_to
+        try:
+            if (
+                all(k in from_pos for k in ("x", "y", "z"))
+                and all(k in to_pos for k in ("x", "y", "z"))
+            ):
+                dx = abs(int(to_pos["x"]) - int(from_pos["x"])) + 1
+                dy = abs(int(to_pos["y"]) - int(from_pos["y"])) + 1
+                dz = abs(int(to_pos["z"]) - int(from_pos["z"])) + 1
+                volume = dx * dy * dz
+                if volume > max_fill_volume:
+                    return None, _host_limit_error(
+                        BlockErrorCode.LIMIT_EXCEEDED,
+                        f"box 体积 {volume} 超过上限 {max_fill_volume}",
+                        limit=max_fill_volume,
+                        volume=volume,
+                    )
+        except (TypeError, ValueError):
+            pass
+    return normalized, None
 
 
 def _validate_edit_args(
@@ -784,8 +859,11 @@ def merge_canonical_from_preflight(
             canonical[key] = preflight_payload[key]
 
     # Prefer absolute locked targets for subsequent execution.
+    # Inspect target path (issue 02) keeps ``target`` authoritative; do not
+    # synthesize legacy ``position``/``positions`` from locked_targets.
     locked = preflight_payload.get("locked_targets")
-    if isinstance(locked, list) and locked:
+    has_target = isinstance(original_args.get("target"), dict)
+    if isinstance(locked, list) and locked and not has_target:
         canonical["locked_targets"] = locked
         if len(locked) == 1 and isinstance(locked[0], dict):
             t = locked[0]
@@ -1014,6 +1092,47 @@ async def run_block_preflight(
     if tool_name == "inspect_block":
         # inspect is low-risk; preflight only needed for relative resolution.
         # Absolute inspect can execute directly without a separate preflight phase.
+        target = tool_args.get("target")
+        if target is not None:
+            # Unified target path (issue 02): validate shape + limits.
+            normalized, validation = _validate_inspect_target(
+                target,
+                dimension=tool_args.get("dimension"),
+                max_positions=limits.max_discrete_positions,
+                max_fill_volume=limits.max_fill_volume,
+            )
+            if validation is not None:
+                return None, validation
+            assert normalized is not None
+            # Absolute target with no locked_targets can execute directly.
+            if normalized.coordinate_mode == "absolute" and not tool_args.get("locked_targets"):
+                return dict(tool_args), None
+            # Relative target needs Add-on preflight for player anchor resolution.
+            from services.agent.block_ops.target import build_inspect_payload_from_target
+
+            payload = build_inspect_payload_from_target(
+                normalized,
+                dimension=tool_args.get("dimension"),
+                player_name=deps.player_name,
+                phase="preflight",
+                limits=limits_payload,
+            )
+            result = await call_block_capability(deps.addon_bridge, "inspect_block", payload)
+            if not result.is_success:
+                return None, result
+            try:
+                body = json.loads(result.output)
+            except Exception:
+                return dict(tool_args), None
+            if isinstance(body, dict) and body.get("ok") is True:
+                preflight_fields = {
+                    k: v for k, v in body.items() if k not in {"schema_version", "ok"}
+                }
+            else:
+                preflight_fields = body if isinstance(body, dict) else {}
+            return build_block_preflight_plan(tool_name, tool_args, preflight_fields), None
+
+        # Legacy path (harness recovery / internal callers).
         coord_mode = str(tool_args.get("coordinate_mode") or "absolute")
         validation = _validate_inspect_args(
             coordinate_mode=coord_mode,
@@ -1192,6 +1311,7 @@ async def run_block_preflight(
 async def inspect_block_impl(
     ctx: RunContext[AgentDependencies],
     *,
+    target: dict[str, Any] | None = None,
     coordinate_mode: CoordinateMode = "absolute",
     dimension: str | None = None,
     position: dict[str, Any] | None = None,
@@ -1199,7 +1319,12 @@ async def inspect_block_impl(
     locked_targets: list[dict[str, Any]] | None = None,
     phase: str | None = None,
 ) -> ToolResult:
-    """Query one or more block snapshots via addon bridge."""
+    """Query one or more block snapshots via addon bridge.
+
+    The model-facing interface uses the unified ``target`` argument (positions
+    or box). Legacy ``position`` / ``positions`` are accepted for harness
+    recovery and internal callers but are not exposed in the model schema.
+    """
     deps = ctx.deps
     logger.info(
         "agent_tool_call",
@@ -1207,6 +1332,7 @@ async def inspect_block_impl(
         connection_id=_connection_id(deps),
         run_id=deps.run_id,
         player_name=deps.player_name,
+        has_target=target is not None,
         coordinate_mode=coordinate_mode,
     )
 
@@ -1215,6 +1341,39 @@ async def inspect_block_impl(
         return unsupported
 
     limits = get_block_tools_limits(deps.settings)
+    limits_payload = {
+        "max_discrete_positions": limits.max_discrete_positions,
+        "max_fill_volume": limits.max_fill_volume,
+        "cells_per_tick": limits.cells_per_tick,
+        "max_locked_targets_on_wire": limits.max_locked_targets_on_wire,
+        "inspect_summary_threshold": limits.inspect_summary_threshold,
+        "inspect_sample_limit": limits.inspect_sample_limit,
+    }
+
+    # Unified target path (issue 02): normalize then build payload.
+    if target is not None:
+        normalized, validation = _validate_inspect_target(
+            target,
+            dimension=dimension,
+            max_positions=limits.max_discrete_positions,
+            max_fill_volume=limits.max_fill_volume,
+        )
+        if validation is not None:
+            return validation
+        assert normalized is not None
+        from services.agent.block_ops.target import build_inspect_payload_from_target
+
+        payload = build_inspect_payload_from_target(
+            normalized,
+            dimension=dimension,
+            player_name=deps.player_name,
+            phase=phase or "execute",
+            locked_targets=locked_targets,
+            limits=limits_payload,
+        )
+        return await call_block_capability(deps.addon_bridge, "inspect_block", payload)
+
+    # Legacy path (harness recovery / internal callers).
     validation = _validate_inspect_args(
         coordinate_mode=coordinate_mode,
         dimension=dimension,

@@ -20,6 +20,13 @@ DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE = 0
 # MCBE commandLine hard budget (empirically ~461 B); mirrors Settings.flow_control.
 DEFAULT_COMMAND_LINE_BYTE_BUDGET = 461
 
+# Inspect auto-summary (issue 02). Above the threshold, inspect returns a bounded
+# summary instead of enumerating every snapshot. Sample limit caps the samples array.
+DEFAULT_INSPECT_SUMMARY_THRESHOLD = 8
+HARD_MAX_INSPECT_SUMMARY_THRESHOLD = 64
+DEFAULT_INSPECT_SAMPLE_LIMIT = 8
+HARD_MAX_INSPECT_SAMPLE_LIMIT = 32
+
 
 @dataclass(frozen=True)
 class BlockToolsLimits:
@@ -27,6 +34,8 @@ class BlockToolsLimits:
     max_fill_volume: int = DEFAULT_MAX_FILL_VOLUME
     cells_per_tick: int = DEFAULT_CELLS_PER_TICK
     max_locked_targets_on_wire: int = DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE
+    inspect_summary_threshold: int = DEFAULT_INSPECT_SUMMARY_THRESHOLD
+    inspect_sample_limit: int = DEFAULT_INSPECT_SAMPLE_LIMIT
 
 
 def _clamp(value: int, *, minimum: int, hard_max: int) -> int:
@@ -66,6 +75,8 @@ def get_block_tools_limits(settings: Any | None = None) -> BlockToolsLimits:
     max_fill = DEFAULT_MAX_FILL_VOLUME
     cells = DEFAULT_CELLS_PER_TICK
     max_locked_on_wire = DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE
+    inspect_threshold = DEFAULT_INSPECT_SUMMARY_THRESHOLD
+    inspect_samples = DEFAULT_INSPECT_SAMPLE_LIMIT
 
     if block_tools is not None:
         if isinstance(block_tools, dict):
@@ -82,6 +93,12 @@ def get_block_tools_limits(settings: Any | None = None) -> BlockToolsLimits:
                 max_locked_on_wire = DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE
             else:
                 max_locked_on_wire = int(raw_locked)
+            raw_threshold = block_tools.get("inspect_summary_threshold")
+            if raw_threshold is not None:
+                inspect_threshold = int(raw_threshold)
+            raw_sample = block_tools.get("inspect_sample_limit")
+            if raw_sample is not None:
+                inspect_samples = int(raw_sample)
         else:
             max_positions = int(
                 getattr(block_tools, "max_discrete_positions", max_positions)
@@ -96,6 +113,12 @@ def get_block_tools_limits(settings: Any | None = None) -> BlockToolsLimits:
                 max_locked_on_wire = DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE
             else:
                 max_locked_on_wire = int(raw_locked)
+            raw_threshold = getattr(block_tools, "inspect_summary_threshold", None)
+            if raw_threshold is not None:
+                inspect_threshold = int(raw_threshold)
+            raw_sample = getattr(block_tools, "inspect_sample_limit", None)
+            if raw_sample is not None:
+                inspect_samples = int(raw_sample)
 
     return BlockToolsLimits(
         max_discrete_positions=_clamp(
@@ -106,5 +129,15 @@ def get_block_tools_limits(settings: Any | None = None) -> BlockToolsLimits:
         # 0 is intentional (absolute omit preference); clamp only the upper bound.
         max_locked_targets_on_wire=max(
             0, min(int(max_locked_on_wire), HARD_MAX_LOCKED_TARGETS_ON_WIRE)
+        ),
+        inspect_summary_threshold=_clamp(
+            inspect_threshold,
+            minimum=1,
+            hard_max=HARD_MAX_INSPECT_SUMMARY_THRESHOLD,
+        ),
+        inspect_sample_limit=_clamp(
+            inspect_samples,
+            minimum=1,
+            hard_max=HARD_MAX_INSPECT_SAMPLE_LIMIT,
         ),
     )
