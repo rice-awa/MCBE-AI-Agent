@@ -998,7 +998,11 @@ def build_edit_payload(
         )
     # Limits only affect preflight enumeration / host checks. Omitting them on
     # execute saves critical commandLine bytes under the 461 B MCBE budget.
-    if phase != "execute":
+    # A single-cell ``place`` preflight also omits them: the host has already
+    # validated the one position against every limit, the Add-on needs no
+    # enumeration caps for a single cell, and the extra keys push expect-type
+    # frames (``expected_previous``) over the MCBE commandLine budget.
+    if phase != "execute" and mode != "place":
         apply_limits_to_payload(payload, limits)
     return payload
 
@@ -1313,6 +1317,7 @@ class _EditNormalization:
     normalized: Any  # NormalizedTarget
     block_info: dict[str, Any]
     expect_info: dict[str, Any]
+    repairs: list[str] = field(default_factory=list)
 
 
 class _EditTargetError(Exception):
@@ -1381,7 +1386,7 @@ def _normalize_one_edit(
         except (TypeError, ValueError):
             pass
 
-    block_info, _repairs = _normalize_block_input(edit.get("block"))
+    block_info, repairs = _normalize_block_input(edit.get("block"))
     if not block_info.get("type_id"):
         return None, _host_limit_error(
             BlockErrorCode.INVALID_ARGUMENT,
@@ -1389,7 +1394,7 @@ def _normalize_one_edit(
         )
     expect_info = _normalize_expect(edit.get("expect"))
     legacy = _unified_target_to_legacy(normalized, block_info, expect_info, dimension)
-    return _EditNormalization(legacy, normalized, block_info, expect_info), None
+    return _EditNormalization(legacy, normalized, block_info, expect_info, repairs), None
 
 
 def _normalize_edits_for_preflight(
@@ -1521,6 +1526,7 @@ class _GroupEdit:
     is_noop: bool
     # Resolved absolute cells targeted before dedup (for conflict detection).
     resolved_cells: frozenset[tuple[int, int, int]]
+    repairs: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1545,6 +1551,7 @@ class _EditPreflight:
     volume: int
     status: str
     is_noop: bool
+    repairs: list[str] = field(default_factory=list)
 
 
 def _block_states_key(states: Any) -> tuple[tuple[str, Any], ...] | None:
@@ -1676,6 +1683,7 @@ def _build_group_edits(
                 status="noop" if is_noop else pre.status,
                 is_noop=is_noop,
                 resolved_cells=pre.resolved_cells,
+                repairs=pre.repairs,
             ))
         else:
             # Box edit: keep full AABB. It is a noop only if every cell was
@@ -1704,6 +1712,7 @@ def _build_group_edits(
                 status="noop" if is_noop else pre.status,
                 is_noop=is_noop,
                 resolved_cells=pre.resolved_cells,
+                repairs=pre.repairs,
             ))
     return group
 
@@ -1751,7 +1760,7 @@ async def _preflight_one_edit(
     limits_payload: dict[str, Any],
     max_locked_on_wire: int,
     deps: Any,
-    tool_args: dict[str, Any],
+    edit_args: dict[str, Any],
 ) -> tuple[_EditPreflight | None, ToolResult | None]:
     """Run bridge preflight for a single edit and classify its result.
 
@@ -1846,8 +1855,10 @@ async def _preflight_one_edit(
     assert preflight_fields is not None
 
     # Strict zero-match classification (spec §4.3 / §9.2). For position edits a
-    # non-noop zero match rejects the whole group before approval.
-    zero_match_failure = _classify_zero_match_preflight("edit_blocks", tool_args, preflight_fields)
+    # non-noop zero match rejects the whole group before approval. ``edit_args``
+    # carries only this edit so the repair hint names this edit's ``expect``
+    # (not ``edits[0]``) when a later edit fails.
+    zero_match_failure = _classify_zero_match_preflight("edit_blocks", edit_args, preflight_fields)
     if zero_match_failure is not None:
         return None, zero_match_failure
 
@@ -1907,6 +1918,7 @@ async def _preflight_one_edit(
         volume=volume,
         status=status,
         is_noop=is_noop,
+        repairs=normalization.repairs,
     ), None
 
 
@@ -1938,9 +1950,17 @@ async def _run_grouped_edit_preflight(
     assert normalizations is not None
 
     # Per-edit bridge preflight (spec §8.1 steps 7-8). Each edit is independent
-    # and preflighted against the same world snapshot.
+    # and preflighted against the same world snapshot. The zero-match hint must
+    # reference the failing edit's own ``expect``, so each preflight receives a
+    # single-edit args view.
+    raw_edits = tool_args.get("edits")
     preflights: list[_EditPreflight] = []
     for index, normalization in enumerate(normalizations):
+        raw_edit = (
+            raw_edits[index]
+            if isinstance(raw_edits, list) and index < len(raw_edits)
+            else {}
+        )
         preflight, failure = await _preflight_one_edit(
             index=index,
             normalization=normalization,
@@ -1948,7 +1968,7 @@ async def _run_grouped_edit_preflight(
             limits_payload=limits_payload,
             max_locked_on_wire=limits.max_locked_targets_on_wire,
             deps=deps,
-            tool_args=tool_args,
+            edit_args={"edits": [raw_edit]} if isinstance(raw_edit, dict) else {},
         )
         if failure is not None:
             return None, failure
@@ -2021,7 +2041,10 @@ async def _run_grouped_edit_preflight(
     execute_args = dict(authorized_args)
 
     # Approval summary (spec §8.2) — bounded, never includes full locked_targets.
-    approval_metadata = _build_group_approval_metadata(group, preflights, dimension)
+    # Counts reflect the deduped plan (owned cells), not raw preflight overlap.
+    approval_metadata = _build_group_approval_metadata(
+        group, preflights, ownership, dimension
+    )
 
     # Reject before approval if any edit's post-omit execute frame overflows.
     for g in group:
@@ -2113,23 +2136,51 @@ def _aggregate_type_counts(
 def _build_group_approval_metadata(
     group: list[_GroupEdit],
     preflights: list[_EditPreflight],
+    ownership: _CellOwnership,
     dimension: str | None,
 ) -> dict[str, Any]:
-    """Bounded approval summary for the whole group (spec §8.2)."""
+    """Bounded approval summary for the whole group (spec §8.2).
+
+    Counts reflect the *deduped* plan (spec §5.2): each edit contributes only
+    the cells it owns after identical-overlap dedup, so the summary matches
+    what execution can actually change. ``target_block_counts`` counts target
+    cells per block type (not edits), and auto-repair evidence recorded during
+    normalization is surfaced here (spec §4.2 / §8.2).
+    """
     total_targets = 0
     total_matched = 0
     total_skipped = 0
     any_expect_any = False
     any_non_rollbackable_fill = False
-    target_block_counts: list[str] = []
+    target_block_summary: dict[str, Any] = {}
     replaced_counts: list[dict[str, Any]] = []
     repairs: list[str] = []
     per_edit: list[dict[str, Any]] = []
     for g in group:
-        total_targets += len(g.resolved_cells)
+        owned = ownership.owned.get(g.index) or set()
+        effective = len(owned)
+        total_targets += effective
+        matched = 0
         if not g.is_noop:
-            total_matched += g.matched
+            if g.locked_targets:
+                # Exact post-dedup match count: preflight matched cells
+                # (locked_targets) that this edit still owns.
+                matched = sum(
+                    1
+                    for cell in g.locked_targets
+                    if isinstance(cell, dict)
+                    and all(k in cell for k in ("x", "y", "z"))
+                    and _cell_key(cell["x"], cell["y"], cell["z"]) in owned
+                )
+            else:
+                matched = g.matched
+            total_matched += matched
             total_skipped += g.skipped
+        block_id = g.block_info.get("type_id")
+        if isinstance(block_id, str) and block_id and effective:
+            target_block_summary[block_id] = (
+                int(target_block_summary.get(block_id, 0)) + effective
+            )
         if g.expect_info.get("kind") == "any":
             any_expect_any = True
         if g.frozen_positions is None and not g.is_noop:
@@ -2137,19 +2188,16 @@ def _build_group_approval_metadata(
         per_edit.append({
             "index": g.index,
             "mode": "fill" if g.frozen_positions is None else ("place" if len(g.frozen_positions or []) <= 1 else "batch"),
-            "type_id": g.block_info.get("type_id"),
-            "matched": 0 if g.is_noop else g.matched,
+            "type_id": block_id,
+            "matched": matched,
             "skipped": g.skipped,
             "status": g.status,
         })
+        for repair in g.repairs:
+            if repair not in repairs:
+                repairs.append(repair)
     for pr in preflights:
-        block_id = pr.block_info.get("type_id")
-        if isinstance(block_id, str) and block_id:
-            target_block_counts.append(block_id)
         replaced_counts.append(pr.previous_type_counts)
-    target_block_summary: dict[str, Any] = {}
-    for block_id in target_block_counts:
-        target_block_summary[block_id] = int(target_block_summary.get(block_id, 0)) + 1
     return {
         "dimension": dimension,
         "edit_count": len(group),
@@ -2349,46 +2397,19 @@ async def run_block_preflight(
         return build_block_preflight_plan(tool_name, tool_args, preflight_fields), None
 
     if tool_name == "edit_blocks":
-        edits_repairs: list[str] = []
-        if "edits" in tool_args:
-            # Dead path: the grouped preflight branch (issue 04) above intercepts
-            # every ``edit_blocks`` call carrying ``edits`` and returns before
-            # this point. Kept for type-safety and as a defensive fallback.
-            normalizations, validation = _normalize_edits_for_preflight(
-                tool_args,
-                limits.max_discrete_positions,
-                limits.max_fill_volume,
-                limits.max_edits_per_group,
-                limits.max_total_targets_per_group,
-            )
-            if validation is not None:
-                return None, validation
-            assert normalizations is not None
-            normalization = normalizations[0]
-            legacy = normalization.legacy
-            mode = legacy["mode"]
-            coord_mode = legacy["coordinate_mode"]
-            dimension = legacy.get("dimension")
-            position = legacy.get("position")
-            positions = legacy.get("positions")
-            from_pos = legacy.get("from")
-            to_pos = legacy.get("to")
-            type_id_val = legacy["type_id"]
-            states = legacy.get("states")
-            replace_any = legacy["replace_any"]
-            expected_previous = legacy.get("expected_previous")
-        else:
-            mode = str(tool_args.get("mode") or "place")
-            coord_mode = str(tool_args.get("coordinate_mode") or "absolute")
-            dimension = tool_args.get("dimension")
-            position = tool_args.get("position")
-            positions = tool_args.get("positions")
-            from_pos = tool_args.get("from") or tool_args.get("from_pos")
-            to_pos = tool_args.get("to") or tool_args.get("to_pos")
-            type_id_val = str(tool_args.get("type_id") or "")
-            states = tool_args.get("states")
-            replace_any = bool(tool_args.get("replace_any", False))
-            expected_previous = tool_args.get("expected_previous")
+        # Legacy flat path only: every ``edit_blocks`` call carrying ``edits``
+        # is intercepted by the grouped preflight branch above.
+        mode = str(tool_args.get("mode") or "place")
+        coord_mode = str(tool_args.get("coordinate_mode") or "absolute")
+        dimension = tool_args.get("dimension")
+        position = tool_args.get("position")
+        positions = tool_args.get("positions")
+        from_pos = tool_args.get("from") or tool_args.get("from_pos")
+        to_pos = tool_args.get("to") or tool_args.get("to_pos")
+        type_id_val = str(tool_args.get("type_id") or "")
+        states = tool_args.get("states")
+        replace_any = bool(tool_args.get("replace_any", False))
+        expected_previous = tool_args.get("expected_previous")
         validation = _validate_edit_args(
             mode=mode,
             coordinate_mode=coord_mode,
@@ -2692,6 +2713,22 @@ async def _execute_one_group_edit(
     of the group (spec §8.3).
     """
     deps = ctx.deps
+    # Deduped position/batch edits freeze to an empty positions list (spec
+    # §5.2). There is nothing to send: report a truthful noop outcome instead
+    # of failing validation (or raising) on an empty batch payload.
+    target = edit.get("target")
+    if (
+        isinstance(target, dict)
+        and isinstance(target.get("positions"), list)
+        and not target["positions"]
+    ):
+        return {
+            "index": index,
+            "status": "noop",
+            "changed": 0,
+            "skipped": 0,
+            "mode": "place",
+        }
     legacy = _legacy_kwargs_from_edit(edit, dimension)
     mode = legacy["mode"]
     unsupported = await _require_supported(ctx)
@@ -2876,13 +2913,13 @@ async def _execute_edits_group(
     """Execute a group of independent edits in canonical order (spec §8.3).
 
     Each edit is executed via its own bridge call. A definite failure stops the
-    remaining edits; the aggregated result (spec §9.3) never claims full
-    atomicity. Only the projected group result is returned to the model — full
-    before/after/locked_targets/verification stay in the audit log.
+    remaining edits; the aggregated result (spec §9.3) is returned even for a
+    failed/unknown group and never claims full atomicity. Only the projected
+    group result is returned to the model — full before/after/locked_targets/
+    verification stay in the audit log.
     """
     exec_phase = phase or "execute"
     per_edit: list[dict[str, Any]] = []
-    status_counts: dict[str, int] = {}
     for index, edit in enumerate(edits):
         outcome = await _execute_one_group_edit(
             ctx,
@@ -2892,9 +2929,6 @@ async def _execute_edits_group(
             phase=exec_phase,
         )
         per_edit.append(outcome)
-        status_counts[outcome.get("status", "applied")] = (
-            status_counts.get(outcome.get("status", "applied"), 0) + 1
-        )
         # Stop remaining edits on a definite failure (spec §8.3). Unknown also
         # halts because the world state can no longer be trusted for later edits.
         failure = outcome.get("failure")
@@ -2908,10 +2942,19 @@ async def _execute_edits_group(
                     "mode": _mode_of_edit(edits[later_index]),
                     "stopped_by_index": index,
                 })
-            return failure
+            break
 
+    # Always return the aggregated group result (spec §9.3) — even when an edit
+    # failed/unknown — so the model sees which edits landed and never describes
+    # a partial/unknown group as fully complete. The body's ``ok``/``status``
+    # fields carry the group-level outcome; the success ToolResult keeps the
+    # call idempotent (no re-execution of already-applied edits).
     group = project_group_edit_result_for_model(per_edit)
-    return ToolResult.ok(json.dumps(group, ensure_ascii=False))
+    unknown_seen = any(o.get("status") == "unknown" for o in per_edit)
+    return ToolResult(
+        output=json.dumps(group, ensure_ascii=False),
+        external_state_unknown=unknown_seen,
+    )
 
 
 def _mode_of_edit(edit: dict[str, Any]) -> str:

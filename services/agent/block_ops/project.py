@@ -362,7 +362,6 @@ def project_group_edit_result_for_model(
     """
     edits: list[dict[str, Any]] = []
     changed_total = 0
-    statuses: list[str] = []
     warnings: list[str] = []
     any_partial = False
     any_failed = False
@@ -372,7 +371,6 @@ def project_group_edit_result_for_model(
     for outcome in per_edit_results:
         index = outcome.get("index")
         status = outcome.get("status") or "applied"
-        statuses.append(status)
         changed = int(outcome.get("changed") or 0)
         skipped = int(outcome.get("skipped") or 0)
         changed_total += changed
@@ -383,6 +381,17 @@ def project_group_edit_result_for_model(
             skipped_counts = outcome.get("skipped_type_counts")
             if isinstance(skipped_counts, dict) and skipped_counts:
                 entry["skipped_type_counts"] = skipped_counts
+        # Keep a bounded error code on failed/unknown edits so the model can
+        # distinguish a definite failure from an unknown external state
+        # (spec §9.1/§9.3) instead of describing the group as fully complete.
+        if status in ("failed", "unknown"):
+            code = outcome.get("code")
+            if isinstance(code, str) and code:
+                entry["error"] = code
+        # Edits that never ran record which edit stopped them (spec §8.3).
+        stopped_by = outcome.get("stopped_by_index")
+        if isinstance(stopped_by, int):
+            entry["stopped_by_index"] = stopped_by
         edits.append(entry)
 
         if status == "applied" or status == "noop":
@@ -406,12 +415,30 @@ def project_group_edit_result_for_model(
         group_status = "failed"
     elif any_failed:
         group_status = "partial"
+    elif any_applied:
+        group_status = "applied"
     else:
-        group_status = "applied" if any_applied or any_partial else "applied"
+        # Nothing was applied, skipped, failed or unknown: every edit was a
+        # noop. Report the truthful noop group status (spec §9.1).
+        group_status = "noop"
 
     ok = not any_failed and not any_unknown
     if any_partial and not warnings:
         warnings.append("部分位置因前置条件不满足而跳过")
+    if any_failed or any_unknown:
+        # Only edits that actually failed (not the ones stopped before running)
+        # are named in the bounded warning; stopped entries carry
+        # ``stopped_by_index`` instead.
+        failed_indices = [
+            entry.get("index") for entry in edits
+            if entry.get("status") in ("failed", "unknown")
+            and entry.get("stopped_by_index") is None
+        ]
+        if failed_indices:
+            warnings.append(
+                "编辑 " + "、".join(str(i) for i in failed_indices)
+                + " 失败或状态未知，未完成的后续编辑已停止"
+            )
 
     result: dict[str, Any] = {
         "ok": ok,

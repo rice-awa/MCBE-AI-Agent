@@ -59,6 +59,7 @@ from services.agent.block_ops.tools_impl import (
     run_block_preflight,
     project_block_execute_args,
     should_omit_locked_targets_on_wire,
+    _execute_edits_group,
 )
 from services.agent.harness.execution import (
     HarnessCapability,
@@ -4260,3 +4261,433 @@ def test_project_group_edit_result_never_over_claims() -> None:
     ])
     assert unknown["ok"] is False
     assert unknown["status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_grouped_edits_mid_run_failure_returns_aggregated_result() -> None:
+    """A definite failure stops later edits but still returns the aggregate (spec §8.3/§9.3)."""
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks" and payload.get("phase") == "execute":
+            if payload.get("type_id") == "minecraft:iron_block":
+                return {"ok": False, "payload": {"code": "OUT_OF_BOUNDS"}}
+            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": 1}}
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-fail")
+    ctx = SimpleNamespace(deps=deps)
+    result = await _execute_edits_group(
+        ctx,  # type: ignore[arg-type]
+        edits=[
+            {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": {"type_id": "minecraft:gold_block"}},
+            {"target": {"positions": [{"x": 2, "y": 64, "z": 2}]}, "block": {"type_id": "minecraft:iron_block"}},
+            {"target": {"positions": [{"x": 3, "y": 64, "z": 3}]}, "block": {"type_id": "minecraft:diamond_block"}},
+        ],
+        dimension="minecraft:overworld",
+        phase="execute",
+    )
+    # Success-status ToolResult carrying the aggregate keeps the call idempotent
+    # (no re-execution of already-applied edits after a partial failure).
+    assert result.is_success
+    assert result.external_state_unknown is False
+    body = json.loads(result.output)
+    assert body["ok"] is False
+    assert body["status"] == "partial"
+    assert body["changed_total"] == 1
+    assert [e["status"] for e in body["edits"]] == ["applied", "failed", "failed"]
+    assert body["edits"][1]["error"] == "OUT_OF_BOUNDS"
+    # The third edit never ran and records which edit stopped it.
+    assert body["edits"][2]["stopped_by_index"] == 1
+    assert any("编辑 1 失败" in w for w in body.get("warnings", []))
+    # Only two execute payloads reached the bridge (third was stopped).
+    executes = [p for c, p in bridge.calls if c == "edit_blocks" and p.get("phase") == "execute"]
+    assert len(executes) == 2
+
+
+@pytest.mark.asyncio
+async def test_grouped_edits_unknown_halt_marks_external_state_unknown() -> None:
+    """STATE_UNKNOWN halts the group and flags external_state_unknown (spec §8.3)."""
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks" and payload.get("phase") == "execute":
+            if payload.get("type_id") == "minecraft:diamond_block":
+                return {"ok": False, "payload": {"code": "STATE_UNKNOWN"}}
+            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": 1}}
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-unknown")
+    ctx = SimpleNamespace(deps=deps)
+    result = await _execute_edits_group(
+        ctx,  # type: ignore[arg-type]
+        edits=[
+            {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": {"type_id": "minecraft:gold_block"}},
+            {"target": {"positions": [{"x": 2, "y": 64, "z": 2}]}, "block": {"type_id": "minecraft:diamond_block"}},
+            {"target": {"positions": [{"x": 3, "y": 64, "z": 3}]}, "block": {"type_id": "minecraft:iron_block"}},
+        ],
+        dimension="minecraft:overworld",
+        phase="execute",
+    )
+    assert result.is_success
+    assert result.external_state_unknown is True
+    body = json.loads(result.output)
+    assert body["ok"] is False
+    assert body["status"] == "unknown"
+    assert body["changed_total"] == 1
+    assert body["edits"][1]["error"] == "STATE_UNKNOWN"
+    assert body["edits"][2]["stopped_by_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_grouped_edits_deduped_noop_edit_executes_without_crash() -> None:
+    """Identical overlaps dedup; the noop edit reports noop instead of crashing execution."""
+    shared = [{"dimension": "minecraft:overworld", "x": 5, "y": 64, "z": 5}]
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks" and payload.get("phase") == "preflight":
+            return {
+                "ok": True,
+                "payload": {
+                    "ok": True, "phase": "preflight", "mode": "place",
+                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
+                    "locked_targets": shared,
+                },
+            }
+        if capability == "edit_blocks" and payload.get("phase") == "execute":
+            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": 1}}
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test", deps_type=_Deps, output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    )
+    register_agent_tools(agent)
+    original_args = {
+        "edits": [
+            {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "minecraft:gold_block"},
+            {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "minecraft:gold_block"},
+        ],
+        "dimension": "minecraft:overworld",
+    }
+    mc = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal mc
+        mc += 1
+        if mc == 1:
+            return ModelResponse(parts=[ToolCallPart(tool_name="edit_blocks", tool_call_id="tc-d", args=original_args)])
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-dedup")
+    first = await agent.run("edit", model=FunctionModel(model_fn), deps=deps)
+    assert isinstance(first.output, DeferredToolRequests)
+    assert len(first.output.approvals) == 1
+    approval = first.output.approvals[0]
+    meta = first.output.metadata[approval.tool_call_id]
+    execute_args = meta["execute_args"]
+    # Approval summary reflects the deduped plan (spec §5.2 / §8.2).
+    approval_meta = meta["approval_metadata"]
+    assert approval_meta["edit_count"] == 2
+    assert approval_meta["total_targets"] == 1
+    assert approval_meta["matched"] == 1
+    assert approval_meta["target_block_counts"] == {"minecraft:gold_block": 1}
+    assert [e["status"] for e in approval_meta["edits"]] == ["applied", "noop"]
+
+    second = await agent.run(
+        message_history=first.all_messages(),
+        deferred_tool_results=DeferredToolResults(
+            approvals={approval.tool_call_id: ToolApproved(override_args=execute_args)},
+        ),
+        model=FunctionModel(model_fn),
+        deps=deps,
+    )
+    assert not isinstance(second.output, DeferredToolRequests)
+    phases = [p["phase"] for c, p in bridge.calls if c == "edit_blocks"]
+    # Second (deduped noop) edit never sends a payload.
+    assert phases == ["preflight", "preflight", "execute"]
+    tool_contents = [
+        str(getattr(part, "content", ""))
+        for message in second.all_messages()
+        for part in getattr(message, "parts", [])
+    ]
+    group_result = json.loads(next(c for c in tool_contents if c.startswith("{") and "changed_total" in c))
+    assert group_result["ok"] is True
+    assert group_result["status"] == "applied"
+    assert group_result["changed_total"] == 1
+    assert [e["status"] for e in group_result["edits"]] == ["applied", "noop"]
+
+
+@pytest.mark.asyncio
+async def test_grouped_edits_relative_targets_freeze_absolute_coordinates() -> None:
+    """Approval resume uses frozen absolute coordinates and current player_name."""
+    locked = [{"dimension": "minecraft:overworld", "x": 10, "y": 64, "z": 10}]
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks" and payload.get("phase") == "preflight":
+            return {
+                "ok": True,
+                "payload": {
+                    "ok": True, "phase": "preflight", "mode": "place",
+                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
+                    "locked_targets": locked,
+                },
+            }
+        if capability == "edit_blocks" and payload.get("phase") == "execute":
+            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": 1}}
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-frozen")
+    ctx = SimpleNamespace(deps=deps)
+    plan, failure = await run_block_preflight(
+        ctx,  # type: ignore[arg-type]
+        "edit_blocks",
+        {
+            "edits": [
+                {"target": {"positions": [{"forward": 0, "right": 0, "up": 0}]}, "block": "minecraft:gold_block"},
+            ],
+            "dimension": "minecraft:overworld",
+        },
+    )
+    assert failure is None
+    assert plan is not None
+    frozen = plan.execute_args["edits"][0]["target"]["positions"]
+    assert frozen == [{"x": 10, "y": 64, "z": 10}]
+
+    result = await _execute_edits_group(
+        ctx,  # type: ignore[arg-type]
+        edits=plan.execute_args["edits"],
+        dimension=plan.execute_args.get("dimension"),
+        phase="execute",
+    )
+    body = json.loads(result.output)
+    assert body["ok"] is True
+    assert body["changed_total"] == 1
+    executes = [p for c, p in bridge.calls if c == "edit_blocks" and p.get("phase") == "execute"]
+    assert len(executes) == 1
+    assert executes[0]["coordinate_mode"] == "absolute"
+    assert executes[0]["position"] == {"x": 10, "y": 64, "z": 10}
+    assert executes[0]["player_name"] == deps.player_name
+
+
+@pytest.mark.asyncio
+async def test_grouped_edits_in_group_state_dependency_rejected_at_preflight() -> None:
+    """A plan where a later edit depends on an earlier edit fails preflight (spec §5.1)."""
+    gold_cell = [{"dimension": "minecraft:overworld", "x": 5, "y": 64, "z": 5}]
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks" and payload.get("phase") == "preflight":
+            expected = payload.get("expected_previous")
+            if isinstance(expected, dict) and expected.get("type_id") == "minecraft:gold_block":
+                # World does not have gold yet: the dependent edit cannot pass.
+                return {
+                    "ok": True,
+                    "payload": {
+                        "ok": True, "phase": "preflight", "mode": "place",
+                        "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
+                        "locked_targets": [], "matched_count": 0,
+                    },
+                }
+            return {
+                "ok": True,
+                "payload": {
+                    "ok": True, "phase": "preflight", "mode": "place",
+                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
+                    "locked_targets": gold_cell, "matched_count": 1,
+                },
+            }
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-dep")
+    ctx = SimpleNamespace(deps=deps)
+    plan, failure = await run_block_preflight(
+        ctx,  # type: ignore[arg-type]
+        "edit_blocks",
+        {
+            "edits": [
+                {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "minecraft:gold_block"},
+                {"target": {"positions": [{"x": 6, "y": 64, "z": 6}]}, "block": "minecraft:diamond_block",
+                 "expect": "minecraft:gold_block"},
+            ],
+            "dimension": "minecraft:overworld",
+        },
+    )
+    # Rejected before approval: the group cannot rely on list order.
+    assert plan is None
+    assert failure is not None
+    body = json.loads(failure.output)
+    assert body["code"] == BlockErrorCode.PRECONDITION_FAILED
+    # The repair hint names the failing edit's own expect, not edits[0]'s.
+    assert "minecraft:gold_block" in body["hint"]
+    assert "设为 air" not in body["hint"]
+
+
+@pytest.mark.asyncio
+async def test_grouped_edits_approval_metadata_deduped_counts_and_repairs() -> None:
+    """Approval counts reflect deduped cells and surface auto-repair evidence."""
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks" and payload.get("phase") == "preflight":
+            cells = payload.get("positions") or [payload.get("position")]
+            locked = [
+                {"dimension": "minecraft:overworld", "x": p["x"], "y": p["y"], "z": p["z"]}
+                for p in cells
+                if isinstance(p, dict) and "x" in p
+            ]
+            return {
+                "ok": True,
+                "payload": {
+                    "ok": True, "phase": "preflight", "mode": payload.get("mode") or "place",
+                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
+                    "locked_targets": locked, "matched_count": len(locked),
+                },
+            }
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-meta")
+    ctx = SimpleNamespace(deps=deps)
+    plan, failure = await run_block_preflight(
+        ctx,  # type: ignore[arg-type]
+        "edit_blocks",
+        {
+            "edits": [
+                # Two identical edits: the second is fully deduped (noop).
+                {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "GOLD_BLOCK"},
+                {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "GOLD_BLOCK"},
+                # Two independent iron cells.
+                {"target": {"positions": [{"x": 6, "y": 64, "z": 6}]}, "block": {"type_id": "minecraft:iron_block"}},
+                {"target": {"positions": [{"x": 7, "y": 64, "z": 7}]}, "block": {"type_id": "minecraft:iron_block"}},
+            ],
+            "dimension": "minecraft:overworld",
+        },
+    )
+    assert failure is None
+    assert plan is not None
+    meta = plan.approval_metadata
+    assert meta["edit_count"] == 4
+    assert meta["total_targets"] == 3
+    assert meta["matched"] == 3
+    assert meta["target_block_counts"] == {
+        "minecraft:gold_block": 1,
+        "minecraft:iron_block": 2,
+    }
+    assert [e["status"] for e in meta["edits"]] == ["applied", "noop", "applied", "applied"]
+    assert [e["matched"] for e in meta["edits"]] == [1, 0, 1, 1]
+    # Auto-repairs from block-id normalization are bounded and deduped (spec §4.2).
+    assert meta["repairs_applied"] == [
+        "block.type_id: lowercased 'GOLD_BLOCK' -> 'gold_block'",
+        "block.type_id: added namespace -> 'minecraft:gold_block'",
+    ]
+
+
+def test_place_preflight_payload_with_expect_type_fits_command_line_budget() -> None:
+    """Place preflight omits enumeration caps so expect-type frames stay under budget.
+
+    ``expected_previous`` plus the preflight limit keys previously pushed a
+    single place edit past the 461 B MCBE commandLine budget, making
+    ``expect: <type_id>`` unusable in both the single-edit and grouped paths.
+    """
+    payload = build_edit_payload(
+        mode="place",
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        position={"x": 5, "y": 64, "z": 5},
+        positions=None,
+        from_pos=None,
+        to_pos=None,
+        type_id="minecraft:glass",
+        states=None,
+        replace_any=False,
+        expected_previous={"type_id": "minecraft:stone"},
+        player_name="Steve",
+        phase="preflight",
+        limits={
+            "max_discrete_positions": 256,
+            "max_positions": 256,
+            "max_fill_volume": 4096,
+            "cells_per_tick": 128,
+            "max_locked_targets_on_wire": 0,
+        },
+    )
+    # Enumeration caps are host-enforced for a single cell and are omitted.
+    assert "max_discrete" not in payload
+    assert "max_fill_volume" not in payload
+    assert "expected_previous" in payload
+    assert check_bridge_command_line_budget(
+        "edit_blocks", payload, budget=DEFAULT_COMMAND_LINE_BYTE_BUDGET
+    ) is None
+
+    # Batch/fill preflight still carries the enumeration caps for the Add-on.
+    batch_payload = build_edit_payload(
+        mode="batch",
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        position=None,
+        positions=[{"x": 1, "y": 64, "z": 1}, {"x": 2, "y": 64, "z": 2}],
+        from_pos=None,
+        to_pos=None,
+        type_id="minecraft:glass",
+        states=None,
+        replace_any=False,
+        expected_previous={"type_id": "minecraft:stone"},
+        player_name="Steve",
+        phase="preflight",
+        limits={
+            "max_discrete_positions": 256,
+            "max_positions": 256,
+            "max_fill_volume": 4096,
+            "cells_per_tick": 128,
+            "max_locked_targets_on_wire": 0,
+        },
+    )
+    assert "max_discrete" in batch_payload
+    assert "cells_per_tick" in batch_payload
+
+
+def test_project_group_edit_result_noop_group_reports_noop() -> None:
+    """A group whose edits are all noops reports noop, never applied (spec §9.1)."""
+    from services.agent.block_ops.project import project_group_edit_result_for_model
+
+    noop = project_group_edit_result_for_model([
+        {"index": 0, "status": "noop", "changed": 0, "skipped": 0},
+        {"index": 1, "status": "noop", "changed": 0, "skipped": 0},
+    ])
+    assert noop["ok"] is True
+    assert noop["status"] == "noop"
+    assert noop["changed_total"] == 0
+
+    mixed = project_group_edit_result_for_model([
+        {"index": 0, "status": "noop", "changed": 0, "skipped": 0},
+        {"index": 1, "status": "applied", "changed": 2, "skipped": 0},
+    ])
+    assert mixed["ok"] is True
+    assert mixed["status"] == "applied"
+    assert mixed["changed_total"] == 2
