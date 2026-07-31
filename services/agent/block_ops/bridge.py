@@ -419,6 +419,7 @@ async def call_block_capability(
     *,
     mode: str | None = None,
     authorized_bounds: dict[str, Any] | None = None,
+    project_for_model: bool | None = None,
 ) -> ToolResult:
     """Invoke a block capability and map the response to ToolResult.
 
@@ -448,6 +449,8 @@ async def call_block_capability(
     # Only project execute (model-visible) success bodies for block tools.
     phase = payload.get("phase") if isinstance(payload, dict) else None
     project = capability in _BLOCK_CAPABILITIES and phase != "preflight"
+    if project_for_model is not None:
+        project = project_for_model
     effective_mode = mode
     if effective_mode is None and isinstance(payload, dict):
         raw_mode = payload.get("mode")

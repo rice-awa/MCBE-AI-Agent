@@ -179,6 +179,10 @@ def build_audit_record(
         record["authorized_parameters"] = preview_parameters(tool_name, authorized_args)
     if approval_evidence is not None:
         record["approval_evidence"] = _summarize_approval_evidence(approval_evidence)
+    if isinstance(result, ToolResult) and isinstance(result.audit_evidence, dict):
+        record["execution_evidence"] = _summarize_execution_evidence(
+            result.audit_evidence
+        )
     return record
 
 
@@ -189,6 +193,27 @@ def _summarize_approval_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
         {key: value for key, value in evidence.items() if str(key).lower() not in excluded},
         max_length=DEFAULT_PARAM_MAX,
     )
+
+
+def _summarize_execution_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Keep before/after/verification evidence bounded and free of bridge metadata."""
+    edits = evidence.get("edits")
+    if not isinstance(edits, list):
+        return {}
+    allowed = {
+        "index", "code", "before", "after", "before_samples", "after_samples",
+        "verification", "verification_summary", "rollback", "failed_index", "written_count",
+    }
+    return {
+        "edits": [
+            redact_mapping(
+                {key: value for key, value in edit.items() if key in allowed},
+                max_length=DEFAULT_PARAM_MAX,
+            )
+            for edit in edits[:64]
+            if isinstance(edit, dict)
+        ]
+    }
 
 
 def summarize_result(
@@ -206,6 +231,24 @@ def summarize_result(
         }
 
     if isinstance(result, ToolResult):
+        structured_failure: dict[str, Any] | None = None
+        if result.is_success:
+            try:
+                payload = json.loads(result.output)
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict) and payload.get("ok") is False:
+                structured_failure = payload
+        if structured_failure is not None:
+            status = str(structured_failure.get("status") or "failed")
+            unknown = result.external_state_unknown or status == "unknown"
+            return {
+                "success": "failure",
+                "result_preview": None,
+                "failure_reason": str(structured_failure.get("code") or status),
+                "error_kind": "TRANSIENT" if unknown else "PERMANENT",
+                "external_state_unknown": "true" if unknown else "false",
+            }
         return {
             "success": result.status,
             "result_preview": None,

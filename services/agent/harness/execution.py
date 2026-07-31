@@ -609,6 +609,25 @@ def materialize_tool_result(result: Any) -> Any:
     return result
 
 
+def _block_result_observability_status(result: ToolResult) -> tuple[bool, bool]:
+    """Classify a cached block group result for audit and tracing.
+
+    A grouped edit with an execution failure remains a successful ``ToolResult``
+    so the harness can cache it and prevent duplicate side effects. Its JSON
+    body is nevertheless an operation failure and must not be audited or traced
+    as a successful edit group.
+    """
+    success = result.is_success
+    unknown = result.external_state_unknown
+    try:
+        body = json.loads(result.output)
+    except (TypeError, ValueError):
+        return success, unknown
+    if not isinstance(body, dict) or body.get("ok") is not False:
+        return success, unknown
+    return False, unknown or body.get("status") == "unknown"
+
+
 _GLOBAL_IDEMPOTENCY = IdempotencyStore()
 
 
@@ -948,8 +967,11 @@ class HarnessToolset(WrapperToolset[Any]):
         external_unknown = False
         success = True
         if isinstance(raw_result, ToolResult):
-            success = raw_result.is_success
-            external_unknown = raw_result.external_state_unknown
+            if name in _BLOCK_OPS_TOOLS:
+                success, external_unknown = _block_result_observability_status(raw_result)
+            else:
+                success = raw_result.is_success
+                external_unknown = raw_result.external_state_unknown
             if not raw_result.is_success and name in _BLOCK_OPS_TOOLS:
                 log_tool_execution_failed(
                     tool_name=name,
@@ -1329,7 +1351,9 @@ def _duration_ms(start: float) -> int:
 
 
 # Model-facing tool schema must not advertise recovery-only fields.
-_BLOCK_INTERNAL_SCHEMA_KEYS = frozenset({"locked_targets", "phase"})
+_BLOCK_INTERNAL_SCHEMA_KEYS = frozenset({
+    "locked_targets", "locked_targets_by_edit", "noop_edit_indices", "phase",
+})
 
 
 def strip_block_internal_tool_schema(tool_def: ToolDefinition) -> ToolDefinition:

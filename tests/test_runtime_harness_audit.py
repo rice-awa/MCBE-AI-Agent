@@ -248,6 +248,55 @@ def test_summarize_result_uses_structured_tool_result_success() -> None:
     assert summary["external_state_unknown"] == "false"
 
 
+def test_summarize_result_marks_structured_group_failure_despite_cached_success() -> None:
+    """A cached partial edit is operationally failed for audit purposes."""
+    result = ToolResult.success(
+        '{"ok": false, "status": "partial", "changed_total": 1, "edits": []}'
+    )
+
+    summary = summarize_result(result=result)
+
+    assert result.is_success
+    assert summary["success"] == "failure"
+    assert summary["failure_reason"] == "partial"
+    assert summary["error_kind"] == "PERMANENT"
+
+
+def test_audit_record_keeps_bounded_group_execution_evidence() -> None:
+    ctx = SimpleNamespace(deps=DummyDeps(Settings()))
+    result = ToolResult(
+        output="ok",
+        audit_evidence={
+            "edits": [{
+                "index": 0,
+                "before": {"type_id": "minecraft:air"},
+                "after": {"type_id": "minecraft:stone"},
+                "verification": {"ok": True},
+                "player_name": "not-allowed",
+                "locked_targets": [{"x": 1, "y": 64, "z": 1}],
+            }]
+        },
+    )
+
+    record = build_audit_record(
+        tool_name="edit_blocks",
+        parameters={},
+        ctx=ctx,
+        status="success",
+        duration_ms=1,
+        result=result,
+    )
+
+    assert record["execution_evidence"] == {
+        "edits": [{
+            "index": 0,
+            "before": {"type_id": "minecraft:air"},
+            "after": {"type_id": "minecraft:stone"},
+            "verification": {"ok": True},
+        }]
+    }
+
+
 @pytest.mark.asyncio
 async def test_audit_disabled_does_not_write_jsonl(tmp_path):
     audit_path = tmp_path / "runtime_harness_tools.jsonl"

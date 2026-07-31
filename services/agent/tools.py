@@ -1158,6 +1158,8 @@ def register_agent_tools(
         edits: list[dict[str, Any]],
         dimension: str | None = None,
         locked_targets: list[dict[str, Any]] | None = None,
+        locked_targets_by_edit: list[list[dict[str, Any]]] | None = None,
+        noop_edit_indices: list[int] | None = None,
         phase: str | None = None,
     ) -> str:
         """写入方块：place 单格 / batch 离散批量 / fill 区域填充。
@@ -1194,7 +1196,7 @@ def register_agent_tools(
             edits: 编辑列表（1 项或多项，每项 {target, block, expect}）
             dimension: 维度 ID（absolute 必填）
         """
-        # locked_targets / phase: harness recovery only; stripped from model schema.
+        # Recovery-only fields are stripped from the model-facing schema.
         from services.agent.block_ops.tools_impl import edit_blocks_impl
 
         return await edit_blocks_impl(
@@ -1202,6 +1204,8 @@ def register_agent_tools(
             edits=edits,
             dimension=dimension,
             locked_targets=locked_targets,
+            locked_targets_by_edit=locked_targets_by_edit,
+            noop_edit_indices=noop_edit_indices,
             phase=phase,
         )
 

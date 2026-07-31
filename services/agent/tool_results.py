@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 ErrorKind = Literal[
     "INVALID_ARGUMENT",
@@ -107,6 +107,8 @@ class ToolResult:
     error_type: str | None = None
     # 兼容旧字段名（审计/测试）
     failure_reason: str | None = None
+    # 仅供运行时 Harness 审计使用的有界执行证据，不会发送给模型。
+    audit_evidence: dict[str, Any] | None = None
 
     @classmethod
     def ok(cls, text: str) -> ToolResult:

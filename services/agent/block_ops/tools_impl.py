@@ -52,6 +52,10 @@ _COMMAND_LINE_BUDGET_HINT = (
     "禁止拆成大量 place（禁止 place 风暴）；勿用命令绕过审批。"
 )
 _COMMAND_LINE_BUDGET_MESSAGE = "出站帧超出 MCBE commandLine 字节预算，请求未发送。"
+_AUDIT_EDIT_EVIDENCE_FIELDS = frozenset({
+    "before", "after", "before_samples", "after_samples", "verification",
+    "verification_summary", "rollback", "failed_index", "written_count",
+})
 
 
 @dataclass(frozen=True)
@@ -70,7 +74,7 @@ _EDIT_EXECUTE_FIELDS = frozenset({
     "edits", "dimension", "block", "expect", "status",
     "type_id", "mode", "coordinate_mode", "position", "positions",
     "from_pos", "to_pos", "states", "replace_any", "expected_previous",
-    "locked_targets", "phase",
+    "locked_targets", "locked_targets_by_edit", "noop_edit_indices", "phase",
 })
 _INSPECT_EXECUTE_FIELDS = frozenset({
     "coordinate_mode", "dimension", "position", "positions", "target",
@@ -91,7 +95,11 @@ def project_block_execute_args(tool_name: str, authorized_args: dict[str, Any]) 
         if "edits" in projected:
             projected = {
                 key: value for key, value in projected.items()
-                if key in {"edits", "dimension", "locked_targets", "phase", "status"}
+                if key in {
+                    "edits", "dimension", "locked_targets",
+                    "locked_targets_by_edit", "noop_edit_indices", "phase", "status",
+                }
+                and value is not None
             }
             return _project_new_edit_execute_args(projected)
         # Legacy flat contract (harness recovery of previously-approved ops).
@@ -1309,6 +1317,28 @@ def _normalize_edits_target(edit: dict[str, Any]) -> Any:
     return normalized
 
 
+def _target_box_volume(normalized: Any) -> int | None:
+    """Return the inclusive volume for an absolute or relative normalized box."""
+    if normalized.shape != "box":
+        return None
+    from_pos = normalized.box_from
+    to_pos = normalized.box_to
+    keys = (
+        ("x", "y", "z")
+        if normalized.coordinate_mode == "absolute"
+        else ("forward", "right", "up")
+    )
+    try:
+        if not isinstance(from_pos, dict) or not isinstance(to_pos, dict):
+            return None
+        if not all(key in from_pos and key in to_pos for key in keys):
+            return None
+        lengths = [abs(int(to_pos[key]) - int(from_pos[key])) + 1 for key in keys]
+    except (TypeError, ValueError):
+        return None
+    return lengths[0] * lengths[1] * lengths[2]
+
+
 @dataclass(frozen=True)
 class _EditNormalization:
     """Per-edit normalized input ready for preflight payload construction."""
@@ -1364,27 +1394,14 @@ def _normalize_one_edit(
                 count=count,
             )
     else:
-        from_pos = normalized.box_from
-        to_pos = normalized.box_to
-        try:
-            if (
-                normalized.coordinate_mode == "absolute"
-                and all(k in from_pos for k in ("x", "y", "z"))
-                and all(k in to_pos for k in ("x", "y", "z"))
-            ):
-                dx = abs(int(to_pos["x"]) - int(from_pos["x"])) + 1
-                dy = abs(int(to_pos["y"]) - int(from_pos["y"])) + 1
-                dz = abs(int(to_pos["z"]) - int(from_pos["z"])) + 1
-                volume = dx * dy * dz
-                if volume > max_fill_volume:
-                    return None, _host_limit_error(
-                        BlockErrorCode.LIMIT_EXCEEDED,
-                        f"box 体积 {volume} 超过上限 {max_fill_volume}",
-                        limit=max_fill_volume,
-                        volume=volume,
-                    )
-        except (TypeError, ValueError):
-            pass
+        volume = _target_box_volume(normalized)
+        if volume is not None and volume > max_fill_volume:
+            return None, _host_limit_error(
+                BlockErrorCode.LIMIT_EXCEEDED,
+                f"box 体积 {volume} 超过上限 {max_fill_volume}",
+                limit=max_fill_volume,
+                volume=volume,
+            )
 
     block_info, repairs = _normalize_block_input(edit.get("block"))
     if not block_info.get("type_id"):
@@ -1427,6 +1444,7 @@ def _normalize_edits_for_preflight(
     dimension = tool_args.get("dimension")
     results: list[_EditNormalization] = []
     total_targets = 0
+    total_discrete_positions = 0
     for idx, edit in enumerate(edits):
         normalization, error = _normalize_one_edit(
             edit, dimension, max_positions, max_fill_volume
@@ -1439,25 +1457,22 @@ def _normalize_edits_for_preflight(
         # discrete count; for box it is the (absolute, when known) volume.
         norm = normalization.normalized
         if norm.shape == "positions":
-            total_targets += len(norm.positions or [])
+            positions_count = len(norm.positions or [])
+            total_targets += positions_count
+            total_discrete_positions += positions_count
         else:
-            from_pos = norm.box_from
-            to_pos = norm.box_to
-            try:
-                if (
-                    norm.coordinate_mode == "absolute"
-                    and all(k in from_pos for k in ("x", "y", "z"))
-                    and all(k in to_pos for k in ("x", "y", "z"))
-                ):
-                    dx = abs(int(to_pos["x"]) - int(from_pos["x"])) + 1
-                    dy = abs(int(to_pos["y"]) - int(from_pos["y"])) + 1
-                    dz = abs(int(to_pos["z"]) - int(from_pos["z"])) + 1
-                    total_targets += dx * dy * dz
-                else:
-                    total_targets += len(norm.positions or [])  # relative: unknown, best-effort low
-            except (TypeError, ValueError):
-                pass
+            total_targets += _target_box_volume(norm) or 0
 
+    if total_discrete_positions > max_positions:
+        return None, _host_limit_error(
+            BlockErrorCode.LIMIT_EXCEEDED,
+            (
+                f"编辑组离散位置数 {total_discrete_positions} 超过上限 "
+                f"{max_positions}"
+            ),
+            limit=max_positions,
+            count=total_discrete_positions,
+        )
     if total_targets > max_total_targets_per_group:
         return None, _host_limit_error(
             BlockErrorCode.LIMIT_EXCEEDED,
@@ -1510,13 +1525,14 @@ class _GroupEdit:
     legacy: dict[str, Any]
     block_info: dict[str, Any]
     expect_info: dict[str, Any]
-    # Frozen absolute target actually executed (positions edits are filtered to
-    # owned cells; box edits keep their full resolved AABB).
+    # Frozen absolute target actually executed. A box with a partial match or
+    # overlap is lowered to owned positions so it cannot rewrite skipped or
+    # deduped cells at execute time.
     frozen_target: dict[str, Any]
     frozen_positions: list[dict[str, Any]] | None
     frozen_from: dict[str, Any] | None
     frozen_to: dict[str, Any] | None
-    locked_targets: list[dict[str, Any]]
+    locked_targets: list[dict[str, Any]]  # owned, matched absolute cells only
     signature: tuple[Any, ...]
     matched: int
     skipped: int
@@ -1653,15 +1669,38 @@ def _build_group_edits(
 ) -> list[_GroupEdit]:
     """Freeze each edit's executable target to its owned cells (spec §8.3).
 
-    Position edits drop cells owned by earlier edits (dedup). Box edits keep
-    their full resolved AABB — the Add-on fill handler applies filter semantics
-    per cell, and overlap with an earlier identical edit is a no-op there.
+    Position edits drop cells owned by earlier edits. A box keeps its AABB only
+    when every cell is both owned and preflight-matched; otherwise it is lowered
+    to owned matched positions. This is necessary for ``expect=any``: replaying
+    a partially-overlapping fill would otherwise write shared cells twice.
     """
     group: list[_GroupEdit] = []
     for pre in preflights:
         owned = ownership.owned.get(pre.index) or set()
-        if pre.resolved_positions is not None:
-            frozen_positions = _freeze_owned_positions(owned) if owned else []
+        owned_locked_targets = [
+            cell
+            for cell in pre.locked_targets
+            if isinstance(cell, dict)
+            and all(key in cell for key in ("x", "y", "z"))
+            and _cell_key(cell["x"], cell["y"], cell["z"]) in owned
+        ]
+        owned_matched_cells = {
+            _cell_key(cell["x"], cell["y"], cell["z"])
+            for cell in owned_locked_targets
+        }
+        # A discrete target already has an exact owned set. A box with either
+        # an overlap or preflight filtering needs exact position execution.
+        lower_box_to_positions = (
+            pre.resolved_positions is None
+            and (
+                owned != pre.resolved_cells
+                or owned_matched_cells != owned
+            )
+        )
+        if pre.resolved_positions is not None or lower_box_to_positions:
+            frozen_positions = _freeze_owned_positions(
+                owned if pre.resolved_positions is not None else owned_matched_cells
+            )
             frozen_target: dict[str, Any] = {"positions": frozen_positions}
             is_noop = pre.is_noop or not frozen_positions
             group.append(_GroupEdit(
@@ -1674,7 +1713,7 @@ def _build_group_edits(
                 frozen_positions=frozen_positions,
                 frozen_from=None,
                 frozen_to=None,
-                locked_targets=pre.locked_targets,
+                locked_targets=owned_locked_targets,
                 signature=pre.signature,
                 matched=pre.matched if not is_noop else 0,
                 skipped=pre.skipped,
@@ -1686,8 +1725,7 @@ def _build_group_edits(
                 repairs=pre.repairs,
             ))
         else:
-            # Box edit: keep full AABB. It is a noop only if every cell was
-            # already owned by an earlier identical edit (owns nothing itself).
+            # Full box: every resolved cell remains owned and matched.
             owns_any = bool(pre.resolved_cells and owned)
             is_noop = pre.is_noop or (bool(pre.resolved_cells) and not owns_any)
             frozen_target = {
@@ -1703,7 +1741,7 @@ def _build_group_edits(
                 frozen_positions=None,
                 frozen_from=pre.resolved_from,
                 frozen_to=pre.resolved_to,
-                locked_targets=pre.locked_targets,
+                locked_targets=owned_locked_targets,
                 signature=pre.signature,
                 matched=0 if is_noop else pre.matched,
                 skipped=pre.skipped,
@@ -2029,15 +2067,20 @@ async def _run_grouped_edit_preflight(
     frozen_edits = [_edit_to_frozen_args(g) for g in group]
     # Flat merged locked_targets keeps backward compatibility with harness
     # recovery that reads execute_args["locked_targets"] as a single list.
-    flat_locked: list[dict[str, Any]] = []
-    for g in group:
-        flat_locked.extend(g.locked_targets)
+    locked_targets_by_edit = [list(g.locked_targets) for g in group]
+    flat_locked = [cell for locks in locked_targets_by_edit for cell in locks]
     authorized_args: dict[str, Any] = {
         "edits": frozen_edits,
         "dimension": dimension,
         "locked_targets": flat_locked,
+        "locked_targets_by_edit": locked_targets_by_edit,
+        "noop_edit_indices": [g.index for g in group if g.is_noop],
         "phase": "execute",
     }
+    if group and all(g.is_noop for g in group):
+        # A no-op plan is still canonical executable state, but it deliberately
+        # has no locks and must pass the strict approval-resume projection.
+        authorized_args["status"] = "noop"
     execute_args = dict(authorized_args)
 
     # Approval summary (spec §8.2) — bounded, never includes full locked_targets.
@@ -2298,7 +2341,14 @@ async def run_block_preflight(
     }
 
     # If already canonical with locked_targets from a prior approval recovery, skip re-preflight.
-    if tool_args.get("phase") == "execute" and tool_args.get("locked_targets"):
+    if tool_args.get("phase") == "execute" and (
+        tool_args.get("locked_targets")
+        or (
+            tool_name == "edit_blocks"
+            and tool_args.get("status") == "noop"
+            and isinstance(tool_args.get("edits"), list)
+        )
+    ):
         return dict(tool_args), None
 
     budget = get_command_line_byte_budget(deps.settings)
@@ -2705,6 +2755,8 @@ async def _execute_one_group_edit(
     edit: dict[str, Any],
     dimension: str | None,
     phase: str,
+    locked_targets: list[dict[str, Any]] | None,
+    is_noop: bool,
 ) -> dict[str, Any]:
     """Execute a single (frozen) edit and return a per-edit outcome dict.
 
@@ -2713,6 +2765,14 @@ async def _execute_one_group_edit(
     of the group (spec §8.3).
     """
     deps = ctx.deps
+    if is_noop:
+        return {
+            "index": index,
+            "status": "noop",
+            "changed": 0,
+            "skipped": 0,
+            "mode": _mode_of_edit(edit),
+        }
     # Deduped position/batch edits freeze to an empty positions list (spec
     # §5.2). There is nothing to send: report a truthful noop outcome instead
     # of failing validation (or raising) on an empty batch payload.
@@ -2782,6 +2842,7 @@ async def _execute_one_group_edit(
         expected_previous=legacy.get("expected_previous"),
         player_name=deps.player_name,
         phase=phase,
+        locked_targets=locked_targets,
         limits={
             "max_discrete_positions": limits.max_discrete_positions,
             "max_fill_volume": limits.max_fill_volume,
@@ -2840,6 +2901,7 @@ async def _execute_one_group_edit(
             payload,
             mode=mode,
             authorized_bounds=authorized_bounds,
+            project_for_model=False,
         )
     except Exception as exc:
         mapped = map_bridge_exception(exc, tool_name="edit_blocks")
@@ -2864,6 +2926,7 @@ async def _execute_one_group_edit(
             "mode": mode,
             "failure": result,
             "code": code,
+            "audit_evidence": {"index": index, "code": code},
         }
 
     try:
@@ -2887,6 +2950,7 @@ async def _execute_one_group_edit(
         "skipped_type_counts": skipped_counts,
         "mode": mode,
         "warning": warning,
+        "audit_evidence": _bounded_edit_audit_evidence(index, body),
     }
 
 
@@ -2903,12 +2967,26 @@ def _error_code_from_failure(result: ToolResult) -> str:
     return BlockErrorCode.INTERNAL_ERROR
 
 
+def _bounded_edit_audit_evidence(index: int, body: dict[str, Any]) -> dict[str, Any]:
+    """Retain bounded Add-on execution evidence for tool audit only."""
+    evidence: dict[str, Any] = {"index": index}
+    for key in _AUDIT_EDIT_EVIDENCE_FIELDS:
+        value = body.get(key)
+        if isinstance(value, list):
+            evidence[key] = value[:8]
+        elif value is not None:
+            evidence[key] = value
+    return evidence
+
+
 async def _execute_edits_group(
     ctx: RunContext[AgentDependencies],
     *,
     edits: list[dict[str, Any]],
     dimension: str | None,
     phase: str | None,
+    locked_targets_by_edit: list[list[dict[str, Any]]] | None = None,
+    noop_edit_indices: list[int] | None = None,
 ) -> ToolResult:
     """Execute a group of independent edits in canonical order (spec §8.3).
 
@@ -2919,14 +2997,26 @@ async def _execute_edits_group(
     verification stay in the audit log.
     """
     exec_phase = phase or "execute"
+    noop_indices = {
+        index for index in (noop_edit_indices or []) if isinstance(index, int)
+    }
     per_edit: list[dict[str, Any]] = []
     for index, edit in enumerate(edits):
+        edit_locks = None
+        if (
+            isinstance(locked_targets_by_edit, list)
+            and index < len(locked_targets_by_edit)
+            and isinstance(locked_targets_by_edit[index], list)
+        ):
+            edit_locks = locked_targets_by_edit[index]
         outcome = await _execute_one_group_edit(
             ctx,
             index=index,
             edit=edit,
             dimension=dimension,
             phase=exec_phase,
+            locked_targets=edit_locks,
+            is_noop=index in noop_indices,
         )
         per_edit.append(outcome)
         # Stop remaining edits on a definite failure (spec §8.3). Unknown also
@@ -2951,9 +3041,17 @@ async def _execute_edits_group(
     # call idempotent (no re-execution of already-applied edits).
     group = project_group_edit_result_for_model(per_edit)
     unknown_seen = any(o.get("status") == "unknown" for o in per_edit)
+    audit_evidence = {
+        "edits": [
+            outcome["audit_evidence"]
+            for outcome in per_edit
+            if isinstance(outcome.get("audit_evidence"), dict)
+        ]
+    }
     return ToolResult(
         output=json.dumps(group, ensure_ascii=False),
         external_state_unknown=unknown_seen,
+        audit_evidence=audit_evidence,
     )
 
 
@@ -2982,6 +3080,8 @@ async def edit_blocks_impl(
     replace_any: bool = False,
     expected_previous: dict[str, Any] | None = None,
     locked_targets: list[dict[str, Any]] | None = None,
+    locked_targets_by_edit: list[list[dict[str, Any]]] | None = None,
+    noop_edit_indices: list[int] | None = None,
     phase: str | None = None,
     edits: list[dict[str, Any]] | None = None,
 ) -> ToolResult:
@@ -3002,6 +3102,8 @@ async def edit_blocks_impl(
             edits=edits,
             dimension=dimension,
             phase=phase,
+            locked_targets_by_edit=locked_targets_by_edit,
+            noop_edit_indices=noop_edit_indices,
         )
 
     # Legacy flat contract (harness recovery of previously-approved operations).

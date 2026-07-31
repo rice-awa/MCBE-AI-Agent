@@ -1992,6 +1992,8 @@ def test_inspect_model_schema_only_exposes_target_and_dimension() -> None:
     assert "target" in stripped_props
     assert "dimension" in stripped_props
     assert "locked_targets" not in stripped_props
+    assert "locked_targets_by_edit" not in stripped_props
+    assert "noop_edit_indices" not in stripped_props
     assert "phase" not in stripped_props
     required = set(stripped.parameters_json_schema.get("required") or [])
     assert "target" in required
@@ -4087,6 +4089,7 @@ async def test_grouped_edits_produce_single_approval_then_aggregate_result() -> 
     assert len(execute_args["edits"]) == 2
     assert execute_args["edits"][0]["block"] == {"type_id": "minecraft:gold_block"}
     assert execute_args["edits"][1]["block"] == {"type_id": "minecraft:iron_block"}
+    assert execute_args["locked_targets_by_edit"] == [targets_a, targets_b]
 
     second = await agent.run(
         message_history=first.all_messages(),
@@ -4112,6 +4115,186 @@ async def test_grouped_edits_produce_single_approval_then_aggregate_result() -> 
     assert group_result["changed_total"] == 2
     assert len(group_result["edits"]) == 2
     assert sum(e["changed"] for e in group_result["edits"]) == group_result["changed_total"]
+
+
+@pytest.mark.asyncio
+async def test_grouped_noop_edits_resume_without_execute_bridge_calls() -> None:
+    """All-noop groups retain their canonical execute contract without writes."""
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks" and payload.get("phase") == "preflight":
+            return {
+                "ok": True,
+                "payload": {
+                    "ok": True,
+                    "phase": "preflight",
+                    "mode": "place",
+                    "coordinate_mode": "absolute",
+                    "dimension": "minecraft:overworld",
+                    "status": "noop",
+                    "locked_targets": [],
+                },
+            }
+        pytest.fail(f"unexpected bridge call: {capability} {payload}")
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test", deps_type=_Deps, output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    )
+    register_agent_tools(agent)
+    original_args = {
+        "edits": [
+            {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:gold_block"},
+            {"target": {"positions": [{"x": 2, "y": 64, "z": 2}]}, "block": "minecraft:iron_block"},
+        ],
+        "dimension": "minecraft:overworld",
+    }
+    model_calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 1:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="edit_blocks", tool_call_id="tc-noop", args=original_args,
+            )])
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-noop")
+    first = await agent.run("edit", model=FunctionModel(model_fn), deps=deps)
+    assert isinstance(first.output, DeferredToolRequests)
+    approval = first.output.approvals[0]
+    execute_args = first.output.metadata[approval.tool_call_id]["execute_args"]
+    assert execute_args["status"] == "noop"
+    assert execute_args["locked_targets_by_edit"] == [[], []]
+
+    second = await agent.run(
+        message_history=first.all_messages(),
+        deferred_tool_results=DeferredToolResults(
+            approvals={approval.tool_call_id: ToolApproved(override_args=execute_args)},
+        ),
+        model=FunctionModel(model_fn),
+        deps=deps,
+    )
+    assert not isinstance(second.output, DeferredToolRequests)
+    phases = [p["phase"] for c, p in bridge.calls if c == "edit_blocks"]
+    assert phases == ["preflight", "preflight"]
+
+
+@pytest.mark.asyncio
+async def test_grouped_relative_box_honors_per_edit_volume_limit() -> None:
+    """Relative box dimensions are known before the bridge and cannot bypass limits."""
+    settings = Settings()
+    settings.addon.block_tools.max_fill_volume = 2
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=settings, run_id="run-relative-limit")
+
+    plan, failure = await run_block_preflight(
+        SimpleNamespace(deps=deps),  # type: ignore[arg-type]
+        "edit_blocks",
+        {
+            "edits": [{
+                "target": {"box": {
+                    "from": {"forward": 0, "right": 0, "up": 0},
+                    "to": {"forward": 2, "right": 0, "up": 0},
+                }},
+                "block": "minecraft:stone",
+            }],
+        },
+    )
+    assert plan is None
+    assert failure is not None
+    assert json.loads(failure.output)["code"] == BlockErrorCode.LIMIT_EXCEEDED
+    assert not any(capability == "edit_blocks" for capability, _ in bridge.calls)
+
+
+@pytest.mark.asyncio
+async def test_grouped_discrete_positions_honor_group_limit() -> None:
+    """Several valid batches cannot bypass the group's discrete-position budget."""
+    settings = Settings()
+    settings.addon.block_tools.max_discrete_positions = 2
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=settings, run_id="run-discrete-limit")
+
+    plan, failure = await run_block_preflight(
+        SimpleNamespace(deps=deps),  # type: ignore[arg-type]
+        "edit_blocks",
+        {
+            "edits": [
+                {"target": {"positions": [{"x": 1, "y": 64, "z": 1}, {"x": 2, "y": 64, "z": 1}]}, "block": "minecraft:stone"},
+                {"target": {"positions": [{"x": 3, "y": 64, "z": 1}]}, "block": "minecraft:stone"},
+            ],
+            "dimension": "minecraft:overworld",
+        },
+    )
+    assert plan is None
+    assert failure is not None
+    assert json.loads(failure.output)["code"] == BlockErrorCode.LIMIT_EXCEEDED
+    assert not any(capability == "edit_blocks" for capability, _ in bridge.calls)
+
+
+@pytest.mark.asyncio
+async def test_grouped_partial_box_overlap_lowers_later_edit_to_owned_positions() -> None:
+    """Identical overlapping fills never replay shared cells under expect=any."""
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks" and payload.get("phase") == "preflight":
+            from_pos = payload["from"]
+            to_pos = payload["to"]
+            locked = [
+                {"dimension": "minecraft:overworld", "x": x, "y": 64, "z": 1}
+                for x in range(min(from_pos["x"], to_pos["x"]), max(from_pos["x"], to_pos["x"]) + 1)
+            ]
+            return {
+                "ok": True,
+                "payload": {
+                    "ok": True, "phase": "preflight", "mode": "fill",
+                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
+                    "from": from_pos, "to": to_pos,
+                    "locked_targets": locked,
+                    "matched_count": len(locked),
+                    "volume": len(locked),
+                },
+            }
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-box-dedup")
+    plan, failure = await run_block_preflight(
+        SimpleNamespace(deps=deps),  # type: ignore[arg-type]
+        "edit_blocks",
+        {
+            "edits": [
+                {"target": {"box": {"from": {"x": 1, "y": 64, "z": 1}, "to": {"x": 2, "y": 64, "z": 1}}}, "block": "minecraft:stone", "expect": "any"},
+                {"target": {"box": {"from": {"x": 2, "y": 64, "z": 1}, "to": {"x": 3, "y": 64, "z": 1}}}, "block": "minecraft:stone", "expect": "any"},
+            ],
+            "dimension": "minecraft:overworld",
+        },
+    )
+    assert failure is None
+    assert plan is not None
+    assert plan.execute_args["edits"][0]["target"] == {
+        "box": {"from": {"x": 1, "y": 64, "z": 1}, "to": {"x": 2, "y": 64, "z": 1}}
+    }
+    assert plan.execute_args["edits"][1]["target"] == {
+        "positions": [{"x": 3, "y": 64, "z": 1}]
+    }
+    assert plan.execute_args["locked_targets_by_edit"][1] == [
+        {"dimension": "minecraft:overworld", "x": 3, "y": 64, "z": 1}
+    ]
 
 
 @pytest.mark.asyncio
@@ -4345,6 +4528,48 @@ async def test_grouped_edits_unknown_halt_marks_external_state_unknown() -> None
     assert body["changed_total"] == 1
     assert body["edits"][1]["error"] == "STATE_UNKNOWN"
     assert body["edits"][2]["stopped_by_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_grouped_edit_keeps_bounded_write_evidence_for_audit() -> None:
+    """The model projection excludes proof while the ToolResult retains it for audit."""
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks" and payload.get("phase") == "execute":
+            return {
+                "ok": True,
+                "payload": {
+                    "ok": True,
+                    "status": "applied",
+                    "changed": 1,
+                    "before": {"type_id": "minecraft:air"},
+                    "after": {"type_id": "minecraft:stone"},
+                    "verification": {"ok": True},
+                    "player_name": "must-not-be-retained",
+                },
+            }
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    result = await _execute_edits_group(
+        SimpleNamespace(deps=_Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings())),  # type: ignore[arg-type]
+        edits=[{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": {"type_id": "minecraft:stone"}}],
+        dimension="minecraft:overworld",
+        phase="execute",
+    )
+    assert "before" not in json.loads(result.output)
+    assert result.audit_evidence == {
+        "edits": [{
+            "index": 0,
+            "before": {"type_id": "minecraft:air"},
+            "after": {"type_id": "minecraft:stone"},
+            "verification": {"ok": True},
+        }]
+    }
 
 
 @pytest.mark.asyncio
