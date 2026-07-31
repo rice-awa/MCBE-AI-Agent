@@ -344,12 +344,13 @@ def test_block_approval_audit_keeps_authorized_preview_without_locked_targets() 
     ctx = SimpleNamespace(deps=DummyDeps(settings, run_id="run-block-audit"), tool_call_id="tc-block-audit")
     record = build_audit_record(
         tool_name="edit_blocks",
-        parameters={"mode": "fill", "type_id": "minecraft:stone"},
+        parameters={"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"},
         authorized_args={
-            "mode": "fill",
-            "coordinate_mode": "absolute",
+            "edits": [{
+                "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
+                "block": "minecraft:stone",
+            }],
             "dimension": "minecraft:overworld",
-            "type_id": "minecraft:stone",
             "locked_targets": [{"x": 1, "y": 64, "z": 1}],
         },
         approval_evidence={
@@ -366,7 +367,8 @@ def test_block_approval_audit_keeps_authorized_preview_without_locked_targets() 
 
     assert record["run_id"] == "run-block-audit"
     assert record["tool_call_id"] == "tc-block-audit"
-    assert record["authorized_parameters"]["type_id"] == "minecraft:stone"
+    assert record["authorized_parameters"]["dimension"] == "minecraft:overworld"
+    assert record["authorized_parameters"]["edits"][0]["block"] == "minecraft:stone"
     assert record["approval_evidence"] == {"repairs_applied": ["normalized_bounds"]}
     dumped = json.dumps(record, ensure_ascii=False)
     assert "locked_targets" not in dumped

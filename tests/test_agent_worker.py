@@ -96,24 +96,22 @@ async def test_worker_rejects_block_approval_without_execute_args() -> None:
                 tool_name="edit_blocks",
                 tool_call_id="tc-fill",
                 args={
-                    "type_id": "minecraft:stone",
-                    "mode": "place",
-                    "coordinate_mode": "absolute",
+                    "edits": [{
+                        "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
+                        "block": "minecraft:stone",
+                    }],
                     "dimension": "minecraft:overworld",
-                    "position": {"x": 1, "y": 64, "z": 1},
-                    "repairs_applied": ["should-not-reach-python"],
                 },
             )
         ],
         metadata={
             "tc-fill": {
                 "normalized_args": {
-                    "type_id": "minecraft:stone",
-                    "mode": "place",
-                    "coordinate_mode": "absolute",
+                    "edits": [{
+                        "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
+                        "block": "minecraft:stone",
+                    }],
                     "dimension": "minecraft:overworld",
-                    "position": {"x": 1, "y": 64, "z": 1},
-                    "repairs_applied": ["should-not-reach-python"],
                     "phase": "execute",
                 },
                 # deliberately omit execute_args
@@ -435,7 +433,7 @@ async def test_error_event_persists_partial_run_history(monkeypatch):
             parts=[
                 ToolCallPart(
                     tool_name="edit_blocks",
-                    args={"mode": "place", "type_id": "minecraft:torch"},
+                    args={"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:torch"}]},
                     tool_call_id="tc-1",
                 )
             ]
@@ -459,7 +457,7 @@ async def test_error_event_persists_partial_run_history(monkeypatch):
             metadata={
                 "tool_name": "edit_blocks",
                 "tool_call_id": "tc-1",
-                "args": {"mode": "place"},
+                "args": {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:torch"}]},
             },
         )
         yield StreamEvent(

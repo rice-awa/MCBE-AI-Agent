@@ -283,28 +283,20 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         "edit_blocks",
         ToolIntent.CHANGE_WORLD,
         ToolRisk.HIGH,
-        "放置、批量放置或填充方块时使用；平台/地板/墙优先一次 fill 或少量 batch；"
-        "默认仅替换空气，需要覆写非空地面时 replace_any=true 并再审批。",
-        "不要用于查询；可表达的方块写入不要改用 setblock/fill 命令；"
-        "禁止对连续区域 place×N。",
-        "mode=place|batch|fill；coordinate_mode=absolute|player_relative；"
-        "place 用 position，batch 用 positions，fill 用 from/to；"
-        "type_id 必填；states 可选；replace_any 与 expected_previous 互斥；"
-        "成功结果仅在 was / previous_type_counts 中报告被替换的非空气方块。",
+        "写入方块时使用（每次仅一个编辑 edits[0]：target + block + expect）；"
+        "平台/地板/墙优先 fill（target.box）或少量 batch（多点 target.positions）。"
+        "LIMIT_EXCEEDED 时减小 target 数量或 box 体积；"
+        "PRECONDITION_FAILED 时调整 expect 再审批。",
+        "不要用于查询；可表达的方块写入不要改用 setblock/fill 命令。",
+        "edits 为长度 1 的列表，每项 {target, block, expect}；"
+        "target.positions 为点集（单点长度 1），target.box 为 from/to 长方体，互斥；"
+        "坐标为 {x,y,z} 或 {forward,right,up}，同一 target 内不能混用；"
+        "block 为 type_id 字符串或 {type_id, states}；"
+        "expect 默认 air（仅替换空气），可选 any / type_id / {type_id, states}；"
+        "dimension 可选（绝对坐标默认当前玩家维度）；"
+        "成功结果 was / previous_type_counts 仅含被替换的非空气方块（无 was = 原为空气）。",
         preview=ParameterPreviewPolicy(
-            include=(
-                "mode",
-                "coordinate_mode",
-                "dimension",
-                "type_id",
-                "position",
-                "positions",
-                "from",
-                "to",
-                "replace_any",
-                "expected_previous",
-                "states",
-            )
+            include=("edits", "dimension")
         ),
         may_have_external_side_effects=True,
     ),

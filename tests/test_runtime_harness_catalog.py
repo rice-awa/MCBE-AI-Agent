@@ -67,10 +67,12 @@ def test_edit_blocks_catalog_contains_recovery_guidance() -> None:
             entry.parameter_constraints,
         )
     )
+    assert "edits" in text
+    assert "expect" in text
     assert "fill" in text
     assert "batch" in text
-    assert "LIMIT_EXCEEDED" in text
-    assert "replace_any" in text
     assert "PRECONDITION_FAILED" in text
-    assert "place" in text
-    assert any(k in text for k in ("风暴", "place×N", "place×", "并行 place"))
+    assert "LIMIT_EXCEEDED" in text
+    # Recovery codes belong in when_to_use/when_not_to_use, never in constraints.
+    assert "LIMIT_EXCEEDED" not in entry.parameter_constraints
+    assert "PRECONDITION_FAILED" not in entry.parameter_constraints

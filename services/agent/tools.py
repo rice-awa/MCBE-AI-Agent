@@ -1155,61 +1155,46 @@ def register_agent_tools(
     @chat_agent.tool
     async def edit_blocks(
         ctx: RunContext[AgentDependencies],
-        type_id: str,
-        mode: str = "place",
-        coordinate_mode: str = "absolute",
+        edits: list[dict[str, Any]],
         dimension: str | None = None,
-        position: dict[str, Any] | None = None,
-        positions: list[dict[str, Any]] | None = None,
-        from_pos: dict[str, Any] | None = None,
-        to_pos: dict[str, Any] | None = None,
-        states: dict[str, Any] | None = None,
-        replace_any: bool = False,
-        expected_previous: dict[str, Any] | None = None,
         locked_targets: list[dict[str, Any]] | None = None,
         phase: str | None = None,
     ) -> str:
-        """写入方块：place 单格 / batch 离散批量 / fill 区域填充。
+        """写入方块（单次编辑）：place 单格 / batch 离散批量 / fill 区域填充。
 
-        默认仅替换空气；replace_any 与 expected_previous 互斥。
-        删除请显式放置 minecraft:air 并授权覆写。高风险，需玩家审批。
+        每次调用仅提交一个编辑（``edits`` 长度须为 1）。每个编辑包含：
+
+        - ``target``: 目标结构。``{positions: [{x,y,z}...]}`` 查询/写入点集
+          （单点用长度 1），``{box: {from, to}}`` 长方体区域。两者互斥。
+          坐标为世界坐标 ``{x,y,z}`` 或玩家相对 ``{forward,right,up}``，
+          同一 target 内不能混用。
+        - ``block``: 目标方块，字符串 ``type_id``（如 ``"oak_planks"``，会自动
+          补全为 ``minecraft:oak_planks``）或对象 ``{type_id, states}``。
+        - ``expect``: 可选，省略或 ``"air"``（默认，仅替换空气）、``"any"``
+          （覆写任意方块）、或指定 ``"minecraft:oak_planks"``/``{type_id, states}``
+          （条件写入：仅当目标为该方块时才替换）。
+
+        ``dimension`` 为维度 ID（绝对坐标默认当前玩家维度；跨维度时需要）。
+        玩家相对坐标无需 dimension。
+
+        默认仅替换空气；需要覆写非空方块时设 ``expect="any"``（高风险，需审批）。
+        删除请放置 ``minecraft:air`` 并授权覆写。
 
         成功投影字段：ok/mode/changed|changed_count/at|from/to/type_id/states；
         was / previous_type_counts 仅在被替换的为非空气时出现（无 was = 原为空气）。
 
-        fill 模式使用 from / to 两个角点（工具参数名 from_pos / to_pos，
-        与 catalog 的 from/to 同义；harness 与预检会自动映射）。
-
         Args:
             ctx: 运行上下文
-            type_id: 目标方块 ID
-            mode: place | batch | fill
-            coordinate_mode: absolute 或 player_relative
+            edits: 编辑列表（本次仅支持 1 项）
             dimension: 维度 ID（absolute 必填）
-            position: place 单点
-            positions: batch 多点
-            from_pos: fill 角点 A（对应 from）
-            to_pos: fill 角点 B（对应 to）
-            states: 可选 block states
-            replace_any: 是否允许覆写普通非空气方块
-            expected_previous: 条件写入 {type_id, states?}
         """
         # locked_targets / phase: harness recovery only; stripped from model schema.
         from services.agent.block_ops.tools_impl import edit_blocks_impl
 
         return await edit_blocks_impl(
             ctx,
-            mode=mode,  # type: ignore[arg-type]
-            coordinate_mode=coordinate_mode,  # type: ignore[arg-type]
+            edits=edits,
             dimension=dimension,
-            position=position,
-            positions=positions,
-            from_pos=from_pos,
-            to_pos=to_pos,
-            type_id=type_id,
-            states=states,
-            replace_any=replace_any,
-            expected_previous=expected_previous,
             locked_targets=locked_targets,
             phase=phase,
         )

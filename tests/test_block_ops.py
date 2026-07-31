@@ -163,14 +163,33 @@ class _FakeBridge:
         if capability == "edit_blocks":
             phase = payload.get("phase") or "execute"
             if phase == "preflight":
-                locked = [
-                    {
-                        "dimension": payload.get("dimension") or "minecraft:overworld",
-                        "x": (payload.get("position") or {}).get("x", 1),
-                        "y": (payload.get("position") or {}).get("y", 64),
-                        "z": (payload.get("position") or {}).get("z", 1),
-                    }
-                ]
+                pos = payload.get("position")
+                positions = payload.get("positions")
+                from_pos = payload.get("from")
+                to_pos = payload.get("to")
+                locked: list[dict[str, Any]] = []
+                if isinstance(pos, dict):
+                    locked = [{"dimension": payload.get("dimension") or "minecraft:overworld", "x": pos.get("x", 1), "y": pos.get("y", 64), "z": pos.get("z", 1)}]
+                elif isinstance(positions, list) and positions:
+                    locked = [
+                        {
+                            "dimension": payload.get("dimension") or "minecraft:overworld",
+                            "x": p.get("x", 1),
+                            "y": p.get("y", 64),
+                            "z": p.get("z", 1),
+                        }
+                        for p in positions
+                        if isinstance(p, dict)
+                    ]
+                elif isinstance(from_pos, dict) and isinstance(to_pos, dict):
+                    locked = [
+                        {
+                            "dimension": payload.get("dimension") or "minecraft:overworld",
+                            "x": from_pos.get("x", 1),
+                            "y": from_pos.get("y", 64),
+                            "z": from_pos.get("z", 1),
+                        }
+                    ]
                 return {
                     "ok": True,
                     "payload": {
@@ -181,12 +200,12 @@ class _FakeBridge:
                         "type_id": payload.get("type_id"),
                         "locked_targets": locked,
                         "coordinate_mode": "absolute",
-                        "dimension": locked[0]["dimension"],
+                        "dimension": locked[0]["dimension"] if locked else (payload.get("dimension") or "minecraft:overworld"),
                         "position": {
                             "x": locked[0]["x"],
                             "y": locked[0]["y"],
                             "z": locked[0]["z"],
-                        },
+                        } if locked else {"x": 1, "y": 64, "z": 1},
                         "repairs_applied": [],
                     },
                 }
@@ -2526,9 +2545,11 @@ async def test_harness_preflight_exception_is_safe_projection_failure_and_is_log
             tool_name="edit_blocks",
             tool_call_id="tc-preflight-error",
             args={
-                "type_id": "minecraft:stone", "mode": "place",
-                "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
-                "position": {"x": 1, "y": 64, "z": 1},
+                "edits": [{
+                    "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
+                    "block": "minecraft:stone",
+                }],
+                "dimension": "minecraft:overworld",
             },
         )])
 
@@ -2589,8 +2610,8 @@ async def test_harness_rejects_incomplete_non_deferred_execute_projection(monkey
             tool_name="edit_blocks",
             tool_call_id="tc-fast-projection",
             args={
-                "type_id": "minecraft:stone", "mode": "place",
-                "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
+                "edits": [],
+                "dimension": "minecraft:overworld",
                 "phase": "execute", "locked_targets": [{"x": 1, "y": 64, "z": 1}],
             },
         )])
@@ -2896,12 +2917,11 @@ async def test_denied_edit_blocks_approval_never_sends_execute() -> None:
                     tool_name="edit_blocks",
                     tool_call_id="tc-deny-fill",
                     args={
-                        "type_id": "minecraft:stone",
-                        "mode": "fill",
-                        "coordinate_mode": "absolute",
+                        "edits": [{
+                            "target": {"box": {"from": {"x": 1, "y": 64, "z": 1}, "to": {"x": 2, "y": 64, "z": 2}}},
+                            "block": "minecraft:stone",
+                        }],
                         "dimension": "minecraft:overworld",
-                        "from_pos": {"x": 1, "y": 64, "z": 1},
-                        "to_pos": {"x": 2, "y": 64, "z": 2},
                     },
                 )
             ]
@@ -2941,21 +2961,21 @@ async def test_denied_edit_blocks_approval_never_sends_execute() -> None:
         (
             "place",
             {
-                "type_id": "minecraft:gold_block",
-                "mode": "place",
-                "coordinate_mode": "player_relative",
-                "position": {"forward": 2, "right": 1, "up": 0},
+                "edits": [{
+                    "target": {"positions": [{"forward": 2, "right": 1, "up": 0}]},
+                    "block": "minecraft:gold_block",
+                }],
             },
             [{"dimension": "minecraft:overworld", "x": 42, "y": 70, "z": -8}],
         ),
         (
             "batch",
             {
-                "type_id": "minecraft:gold_block",
-                "mode": "batch",
-                "coordinate_mode": "absolute",
+                "edits": [{
+                    "target": {"positions": [{"x": 3, "y": 65, "z": 4}, {"x": 5, "y": 65, "z": 4}]},
+                    "block": "minecraft:gold_block",
+                }],
                 "dimension": "minecraft:the_nether",
-                "positions": [{"x": 3, "y": 65, "z": 4}, {"x": 5, "y": 65, "z": 4}],
             },
             [
                 {"dimension": "minecraft:the_nether", "x": 3, "y": 65, "z": 4},
@@ -3031,10 +3051,12 @@ async def test_place_and_batch_approval_resume_execute_only_frozen_targets(
     execute_args = first.output.metadata[approval.tool_call_id]["execute_args"]
     assert execute_args["locked_targets"] == locked_targets
     assert execute_args["dimension"] == locked_targets[0]["dimension"]
+    # New ``edits`` contract: the resolved absolute target is frozen in edits[0].
+    resolved_positions = execute_args["edits"][0]["target"]["positions"]
     if mode == "place":
-        assert execute_args["position"] == {"x": 42, "y": 70, "z": -8}
+        assert resolved_positions == [{"x": 42, "y": 70, "z": -8}]
     else:
-        assert execute_args["positions"] == [{"x": 3, "y": 65, "z": 4}, {"x": 5, "y": 65, "z": 4}]
+        assert resolved_positions == [{"x": 3, "y": 65, "z": 4}, {"x": 5, "y": 65, "z": 4}]
 
     # Simulate movement/turning while waiting. The execute request must never
     # consult this state again, and cache eviction must not change the result.
@@ -3213,9 +3235,11 @@ async def test_auto_approved_edit_preflights_then_executes_locked_operation() ->
             return ModelResponse(parts=[TextPart(content="done")])
         return ModelResponse(parts=[ToolCallPart(
             tool_name="edit_blocks", tool_call_id="tc-auto", args={
-                "type_id": "minecraft:stone", "mode": "place",
-                "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
-                "position": {"x": 9, "y": 64, "z": 9},
+                "edits": [{
+                    "target": {"positions": [{"x": 9, "y": 64, "z": 9}]},
+                    "block": "minecraft:stone",
+                }],
+                "dimension": "minecraft:overworld",
             },
         )])
 
@@ -3279,24 +3303,13 @@ async def test_auto_approved_fill_uses_execution_projection_idempotency_key() ->
     )
     register_agent_tools(agent)
     original_args = {
-        "type_id": "minecraft:stone",
-        "mode": "fill",
-        "coordinate_mode": "absolute",
+        "edits": [{
+            "target": {"box": {"from": {"x": 2, "y": 64, "z": 2}, "to": {"x": 1, "y": 64, "z": 1}}},
+            "block": "minecraft:stone",
+        }],
         "dimension": "minecraft:overworld",
-        "from_pos": {"x": 2, "y": 64, "z": 2},
-        "to_pos": {"x": 1, "y": 64, "z": 1},
     }
-    python_tool_args = {
-        **original_args,
-        "position": None,
-        "positions": None,
-        "states": None,
-        "replace_any": False,
-        "expected_previous": None,
-        "locked_targets": None,
-        "phase": None,
-    }
-    plan = build_block_preflight_plan("edit_blocks", python_tool_args, preflight_payload)
+    plan = build_block_preflight_plan("edit_blocks", original_args, preflight_payload)
     execution_hash = hash_normalized_args(normalize_tool_args(plan.execute_args))
     authorization_hash = hash_normalized_args(normalize_tool_args(plan.authorized_args))
     original_hash = hash_normalized_args(normalize_tool_args(original_args))
@@ -3343,11 +3356,11 @@ async def test_auto_approved_fill_uses_execution_projection_idempotency_key() ->
 @pytest.mark.parametrize(
     ("args", "mutate"),
     [
-        ({"type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "position": {"x": 1, "y": 64, "z": 1}}, lambda value: value.update(phase="preflight")),
-        ({"type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "position": {"x": 1, "y": 64, "z": 1}}, lambda value: value.update(locked_targets=[])),
-        ({"type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "position": {"x": 1, "y": 64, "z": 1}}, lambda value: value.pop("position")),
-        ({"type_id": "minecraft:stone", "mode": "batch", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "positions": [{"x": 1, "y": 64, "z": 1}]}, lambda value: value.pop("positions")),
-        ({"type_id": "minecraft:stone", "mode": "fill", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "from_pos": {"x": 1, "y": 64, "z": 1}, "to_pos": {"x": 2, "y": 64, "z": 1}}, lambda value: value.pop("to_pos")),
+        ({"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"}, lambda value: value.update(phase="preflight")),
+        ({"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"}, lambda value: value.update(locked_targets=[])),
+        ({"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"}, lambda value: value.update(edits=[])),
+        ({"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}, {"x": 2, "y": 64, "z": 1}]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"}, lambda value: value.update(edits=[])),
+        ({"edits": [{"target": {"box": {"from": {"x": 1, "y": 64, "z": 1}, "to": {"x": 2, "y": 64, "z": 1}}}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"}, lambda value: value.update(edits=[])),
     ],
 )
 async def test_corrupt_approved_override_never_executes_block_bridge(
@@ -3428,17 +3441,16 @@ def test_project_block_execute_args_is_subset_of_public_tool_signatures() -> Non
     edit_sig = public_fields("edit_blocks")
     inspect_sig = public_fields("inspect_block")
 
+    # New ``edits`` contract (issue 03): execute projection is a subset of the
+    # model-visible signature (edits/dimension/locked_targets/phase).
     edit_plan = build_block_preflight_plan(
         "edit_blocks",
         {
-            "type_id": "minecraft:stone",
-            "mode": "fill",
-            "coordinate_mode": "absolute",
+            "edits": [{
+                "target": {"box": {"from": {"x": 4, "y": 64, "z": 3}, "to": {"x": 2, "y": 64, "z": 1}}},
+                "block": "minecraft:stone",
+            }],
             "dimension": "minecraft:overworld",
-            "from_pos": {"x": 4, "y": 64, "z": 3},
-            "to_pos": {"x": 2, "y": 64, "z": 1},
-            "states": {"lit": False},
-            "replace_any": True,
         },
         {
             "locked_targets": [{"dimension": "minecraft:overworld", "x": 2, "y": 64, "z": 1}],
@@ -3452,6 +3464,9 @@ def test_project_block_execute_args_is_subset_of_public_tool_signatures() -> Non
     assert "from" not in edit_plan.execute_args
     assert "to" not in edit_plan.execute_args
     assert "repairs_applied" not in edit_plan.execute_args
+    assert "edits" in edit_plan.execute_args
+    assert "dimension" in edit_plan.execute_args
+    assert "locked_targets" in edit_plan.execute_args
 
     inspect_plan = build_block_preflight_plan(
         "inspect_block",
@@ -3654,3 +3669,299 @@ async def test_harness_inspect_auto_allows_when_supported() -> None:
     result = await agent.run("look at block", model=FunctionModel(model_fn), deps=deps)
     assert not isinstance(result.output, DeferredToolRequests)
     assert any(c[0] == "inspect_block" for c in bridge.calls)
+
+
+# ---------------------------------------------------------------------------
+# Issue 03: new edits/target/block/expect contract
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_block_input_string_normalizes_namespace_and_case() -> None:
+    from services.agent.block_ops.tools_impl import _normalize_block_input
+
+    info, repairs = _normalize_block_input("Oak_Planks")
+    assert info["type_id"] == "minecraft:oak_planks"
+    assert info["states"] is None
+    assert repairs  # namespace + lowercasing recorded
+
+
+def test_normalize_block_input_object_keeps_states() -> None:
+    from services.agent.block_ops.tools_impl import _normalize_block_input
+
+    info, _ = _normalize_block_input({"type_id": "minecraft:stone", "states": {"lit": True}})
+    assert info["type_id"] == "minecraft:stone"
+    assert info["states"] == {"lit": True}
+
+
+def test_normalize_expect_kinds() -> None:
+    from services.agent.block_ops.tools_impl import (
+        _normalize_expect,
+        _expect_info_to_legacy,
+    )
+
+    assert _normalize_expect(None) == {"kind": "air"}
+    assert _normalize_expect("air") == {"kind": "air"}
+    assert _normalize_expect("any") == {"kind": "any"}
+    assert _normalize_expect("minecraft:oak_planks") == {"kind": "type", "type_id": "minecraft:oak_planks"}
+    assert _normalize_expect({"type_id": "minecraft:oak_planks", "states": {"bit": True}}) == {
+        "kind": "permutation", "type_id": "minecraft:oak_planks", "states": {"bit": True},
+    }
+
+    assert _expect_info_to_legacy({"kind": "air"}) == (False, None)
+    assert _expect_info_to_legacy({"kind": "any"}) == (True, None)
+    assert _expect_info_to_legacy({"kind": "type", "type_id": "minecraft:oak_planks"}) == (
+        False, {"type_id": "minecraft:oak_planks"},
+    )
+    assert _expect_info_to_legacy(
+        {"kind": "permutation", "type_id": "minecraft:stone", "states": {"lit": True}}
+    ) == (False, {"type_id": "minecraft:stone", "states": {"lit": True}})
+
+
+def test_new_edit_contract_rejects_zero_and_many_edits() -> None:
+    from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
+
+    limits = SimpleNamespace(max_discrete_positions=256, max_fill_volume=4096)
+    # Zero edits -> invalid.
+    legacy, error = _normalize_edits_for_preflight({"edits": []}, limits.max_discrete_positions, limits.max_fill_volume)
+    assert legacy is None
+    assert error is not None
+    assert json.loads(error.output)["code"] == "INVALID_ARGUMENT"
+    # Two edits -> rejected (this ticket limits to 1).
+    legacy, error = _normalize_edits_for_preflight(
+        {"edits": [
+            {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"},
+            {"target": {"positions": [{"x": 2, "y": 64, "z": 2}]}, "block": "minecraft:stone"},
+        ]},
+        limits.max_discrete_positions, limits.max_fill_volume,
+    )
+    assert legacy is None
+    assert error is not None
+    assert json.loads(error.output)["code"] == "INVALID_ARGUMENT"
+
+
+def test_new_edit_contract_single_position_maps_to_place() -> None:
+    from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
+
+    limits = SimpleNamespace(max_discrete_positions=256, max_fill_volume=4096)
+    legacy, error = _normalize_edits_for_preflight(
+        {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}],
+         "dimension": "minecraft:overworld"},
+        limits.max_discrete_positions, limits.max_fill_volume,
+    )
+    assert error is None
+    assert legacy is not None
+    assert legacy["mode"] == "place"
+    assert legacy["coordinate_mode"] == "absolute"
+    assert legacy["position"] == {"x": 1, "y": 64, "z": 1}
+    assert legacy["type_id"] == "minecraft:stone"
+    assert "from" not in legacy and "to" not in legacy
+    assert legacy["replace_any"] is False
+    assert legacy["expected_previous"] is None
+
+
+def test_new_edit_contract_multi_position_maps_to_batch() -> None:
+    from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
+
+    limits = SimpleNamespace(max_discrete_positions=256, max_fill_volume=4096)
+    legacy, error = _normalize_edits_for_preflight(
+        {"edits": [{"target": {"positions": [
+            {"x": 1, "y": 64, "z": 1}, {"x": 2, "y": 64, "z": 1},
+        ]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"},
+        limits.max_discrete_positions, limits.max_fill_volume,
+    )
+    assert error is None
+    assert legacy is not None
+    assert legacy["mode"] == "batch"
+    assert legacy["positions"] == [{"x": 1, "y": 64, "z": 1}, {"x": 2, "y": 64, "z": 1}]
+    assert "position" not in legacy
+
+
+def test_new_edit_contract_box_maps_to_fill() -> None:
+    from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
+
+    limits = SimpleNamespace(max_discrete_positions=256, max_fill_volume=4096)
+    legacy, error = _normalize_edits_for_preflight(
+        {"edits": [{"target": {"box": {"from": {"x": 5, "y": 64, "z": 5}, "to": {"x": 1, "y": 64, "z": 1}}},
+                    "block": "minecraft:stone"}], "dimension": "minecraft:overworld"},
+        limits.max_discrete_positions, limits.max_fill_volume,
+    )
+    assert error is None
+    assert legacy is not None
+    assert legacy["mode"] == "fill"
+    # Reversed corners are normalized (min/max).
+    assert legacy["from"] == {"x": 1, "y": 64, "z": 1}
+    assert legacy["to"] == {"x": 5, "y": 64, "z": 5}
+    assert "position" not in legacy and "positions" not in legacy
+
+
+def test_new_edit_contract_expect_type_and_any() -> None:
+    from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
+
+    limits = SimpleNamespace(max_discrete_positions=256, max_fill_volume=4096)
+    # expect="minecraft:oak_planks" -> expected_previous={type_id}
+    legacy, _ = _normalize_edits_for_preflight(
+        {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone",
+                    "expect": "minecraft:oak_planks"}], "dimension": "minecraft:overworld"},
+        limits.max_discrete_positions, limits.max_fill_volume,
+    )
+    assert legacy["replace_any"] is False
+    assert legacy["expected_previous"] == {"type_id": "minecraft:oak_planks"}
+    # expect="any" -> replace_any=True
+    legacy, _ = _normalize_edits_for_preflight(
+        {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone",
+                    "expect": "any"}], "dimension": "minecraft:overworld"},
+        limits.max_discrete_positions, limits.max_fill_volume,
+    )
+    assert legacy["replace_any"] is True
+    assert legacy["expected_previous"] is None
+
+
+def test_new_edit_contract_mixed_coords_invalid() -> None:
+    from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
+
+    limits = SimpleNamespace(max_discrete_positions=256, max_fill_volume=4096)
+    legacy, error = _normalize_edits_for_preflight(
+        {"edits": [{"target": {"positions": [
+            {"x": 1, "y": 64, "z": 1}, {"forward": 1, "right": 0, "up": 0},
+        ]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"},
+        limits.max_discrete_positions, limits.max_fill_volume,
+    )
+    assert legacy is None
+    assert error is not None
+    assert json.loads(error.output)["code"] == "INVALID_COORDINATE"
+
+
+def test_new_edit_contract_absolute_without_dimension_invalid() -> None:
+    from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
+
+    limits = SimpleNamespace(max_discrete_positions=256, max_fill_volume=4096)
+    legacy, error = _normalize_edits_for_preflight(
+        {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}]},
+        limits.max_discrete_positions, limits.max_fill_volume,
+    )
+    assert legacy is None
+    assert error is not None
+    assert json.loads(error.output)["code"] == "INVALID_ARGUMENT"
+
+
+@pytest.mark.asyncio
+async def test_new_edit_contract_end_to_end_place_through_harness() -> None:
+    """Full harness run: new edits contract -> preflight -> approval -> execute."""
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    policy = PolicyEngine.from_settings(_Settings())
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=policy)],
+    )
+    register_agent_tools(agent)
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        return ModelResponse(parts=[ToolCallPart(
+            tool_name="edit_blocks", tool_call_id="tc-e2e",
+            args={
+                "edits": [{"target": {"positions": [{"x": 3, "y": 70, "z": 3}]}, "block": "oak_planks"}],
+                "dimension": "minecraft:overworld",
+            },
+        )])
+
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-e2e")
+    first = await agent.run("place", model=FunctionModel(model_fn), deps=deps)
+    assert isinstance(first.output, DeferredToolRequests)
+    approval = first.output.approvals[0]
+    meta = (first.output.metadata or {}).get(approval.tool_call_id) or {}
+    normalized = meta.get("normalized_args") or {}
+    # Target resolved to absolute position and frozen into edits[0]; locked_targets stored.
+    assert normalized["edits"][0]["target"]["positions"] == [{"x": 3, "y": 70, "z": 3}]
+    assert normalized.get("locked_targets")
+    assert normalized["phase"] == "execute"
+    # Preflight ran; execute did not.
+    assert any(c[0] == "edit_blocks" and c[1].get("phase") == "preflight" for c in bridge.calls)
+    assert not any(c[0] == "edit_blocks" and c[1].get("phase") == "execute" for c in bridge.calls)
+
+
+@pytest.mark.asyncio
+async def test_new_edit_contract_zero_match_is_precondition_failed() -> None:
+    """New contract: preflight zero-match -> PRECONDITION_FAILED with actual_type_counts."""
+
+    class _ZeroMatchBridge(_FakeBridge):
+        async def request(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+            if capability == "edit_blocks" and payload.get("phase") == "preflight":
+                return {
+                    "ok": True,
+                    "payload": {
+                        "schema_version": "1",
+                        "ok": True,
+                        "phase": "preflight",
+                        "mode": "place",
+                        "type_id": payload.get("type_id"),
+                        "locked_targets": [],
+                        "matched_count": 0,
+                        "already_target": 0,
+                        "skipped": 1,
+                        "previous_type_counts": {"minecraft:oak_planks": 1},
+                        "coordinate_mode": "absolute",
+                        "dimension": payload.get("dimension"),
+                        "position": payload.get("position"),
+                        "volume": 1,
+                        "repairs_applied": [],
+                    },
+                }
+            return await super().request(capability, payload)
+
+    bridge = _ZeroMatchBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+    plan, failure = await run_block_preflight(
+        ctx,  # type: ignore[arg-type]
+        "edit_blocks",
+        {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:glass"}],
+         "dimension": "minecraft:overworld"},
+    )
+    assert plan is None
+    assert failure is not None
+    body = json.loads(failure.output)
+    assert body["code"] == "PRECONDITION_FAILED"
+    assert body["actual_type_counts"] == {"minecraft:oak_planks": 1}
+    assert "expect" in body.get("hint", "")
+
+
+def test_model_visible_edit_blocks_schema_exposes_only_edits_contract() -> None:
+    """Model-facing schema (after strip) must only expose the new contract."""
+    from services.agent.harness.execution import strip_block_internal_tool_schema
+    from pydantic_ai.tools import ToolDefinition
+
+    agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
+    register_agent_tools(agent)
+    tools = iter_registered_tools(agent)  # type: ignore[arg-type]
+    raw_schema = tools["edit_blocks"].function_schema.json_schema
+    raw_props = set(raw_schema.get("properties") or {})
+    # Model-visible fields are edits + dimension.
+    assert "edits" in raw_props
+    assert "dimension" in raw_props
+    # Old flat params must NOT appear in the model schema at all.
+    for legacy in ("mode", "coordinate_mode", "position", "positions",
+                   "from", "to", "from_pos", "to_pos", "type_id",
+                   "replace_any", "expected_previous"):
+        assert legacy not in raw_props, legacy
+    # locked_targets / phase are harness-only (present in raw, stripped for model).
+    assert "locked_targets" in raw_props
+    assert "phase" in raw_props
+
+    stripped = strip_block_internal_tool_schema(
+        ToolDefinition(
+            name="edit_blocks",
+            description=raw_schema.get("description", ""),
+            parameters_json_schema=raw_schema,
+        )
+    )
+    stripped_props = set(stripped.parameters_json_schema.get("properties") or {})
+    assert "edits" in stripped_props
+    assert "dimension" in stripped_props
+    assert "locked_targets" not in stripped_props
+    assert "phase" not in stripped_props
