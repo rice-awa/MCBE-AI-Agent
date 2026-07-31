@@ -405,7 +405,20 @@ export function resolvePermutation(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (/state|permutation|invalid/i.test(message)) {
-      return fail("STATE_INVALID", message, { type_id: typeId, states });
+      const detail: Record<string, unknown> = { type_id: typeId, states };
+      // Bounded suggestion: valid state keys for this block type, taken from
+      // the default permutation. Lets the model correct the state names rather
+      // than fall back to command tools (spec issue 05 §4.3).
+      try {
+        const defaults = BlockPermutation.resolve(typeId).getAllStates();
+        const keys = Object.keys(defaults ?? {});
+        if (keys.length) {
+          detail.valid_state_keys = keys.slice(0, 8);
+        }
+      } catch {
+        // Block type itself unresolvable: no key suggestions; type_id is carried.
+      }
+      return fail("STATE_INVALID", message, detail);
     }
     return fail("BLOCK_UNKNOWN", message, { type_id: typeId });
   }

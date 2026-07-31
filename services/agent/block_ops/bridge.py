@@ -373,6 +373,83 @@ def _safe_addon_error_body(
         message = _precondition_message(src)
         return build_error_response(stable_code, message, **fields)
 
+    if stable_code == BlockErrorCode.BLOCK_UNKNOWN:
+        fields = {
+            "retryable": False,
+            "external_state_unknown": False,
+            "fallback_allowed": False,
+            "hint": "未知方块类型；请使用 candidates 中的候选或先 inspect_block 确认。",
+        }
+        type_id = src.get("type_id")
+        if isinstance(type_id, str) and type_id and not _looks_sensitive(type_id):
+            fields["type_id"] = type_id
+        candidates = src.get("candidates")
+        if isinstance(candidates, list):
+            bounded = [c for c in candidates if isinstance(c, str) and not _looks_sensitive(c)]
+            if bounded:
+                fields["candidates"] = bounded[:3]
+        return build_error_response(
+            stable_code, "未知方块类型，未发送到 Add-on。", **fields
+        )
+
+    if stable_code == BlockErrorCode.STATE_INVALID:
+        fields = {
+            "retryable": False,
+            "external_state_unknown": False,
+            "fallback_allowed": False,
+            "hint": "方块 states 非法；请使用 valid_state_keys 中的字段重试。",
+        }
+        type_id = src.get("type_id")
+        if isinstance(type_id, str) and type_id and not _looks_sensitive(type_id):
+            fields["type_id"] = type_id
+        valid_keys = src.get("valid_state_keys")
+        if isinstance(valid_keys, list):
+            bounded = [k for k in valid_keys if isinstance(k, str) and not _looks_sensitive(k)]
+            if bounded:
+                fields["valid_state_keys"] = bounded[:8]
+        return build_error_response(
+            stable_code, "方块 states 非法，未发送到 Add-on。", **fields
+        )
+
+    if stable_code == BlockErrorCode.PROTECTED_BLOCK:
+        fields = {
+            "retryable": False,
+            "external_state_unknown": False,
+            "fallback_allowed": False,
+            "hint": "目标含受保护数据（如容器、告示牌、唱片机等），不能覆盖。",
+        }
+        type_id = src.get("type_id")
+        if isinstance(type_id, str) and type_id and not _looks_sensitive(type_id):
+            fields["type_id"] = type_id
+        component = src.get("component")
+        if isinstance(component, str) and component and not _looks_sensitive(component):
+            fields["component"] = component
+        target = _xyz_target(src.get("target"))
+        if target is None:
+            target = _xyz_target(src.get("position"))
+        if target is not None:
+            fields["target"] = target
+        return build_error_response(
+            stable_code, "目标方块含受保护数据，不能覆盖。", **fields
+        )
+
+    if stable_code == BlockErrorCode.UNSUPPORTED_BLOCK_PLACEMENT:
+        fields = {
+            "retryable": False,
+            "external_state_unknown": False,
+            "fallback_allowed": False,
+            "hint": "多格方块（门、床、高草等）需多格放置与整体校验，"
+            "当前工具不支持单格写入；请改用可逐格放置的方块。",
+        }
+        type_id = src.get("type_id")
+        if isinstance(type_id, str) and type_id and not _looks_sensitive(type_id):
+            fields["type_id"] = type_id
+        if src.get("multiblock"):
+            fields["multiblock"] = True
+        return build_error_response(
+            stable_code, "多格方块放置暂不支持，未发送到 Add-on。", **fields
+        )
+
     message = f"Addon 返回错误：{stable_code}。"
     if fallback_allowed:
         message += "可另行使用命令工具作为回退，但该命令仍需独立审批。"
@@ -407,6 +484,7 @@ def _error_kind_for_code(code: str) -> tuple[str, bool, bool]:
         BlockErrorCode.PRECONDITION_CHANGED,
         BlockErrorCode.UNLOADED_CHUNK,
         BlockErrorCode.OUT_OF_BOUNDS,
+        BlockErrorCode.UNSUPPORTED_BLOCK_PLACEMENT,
     }:
         return "PERMANENT", False, False
     return "PERMANENT", False, False

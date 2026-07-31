@@ -12,6 +12,7 @@ export type BlockErrorCode =
   | "LIMIT_EXCEEDED"
   | "ADDON_UNAVAILABLE"
   | "STATE_UNKNOWN"
+  | "UNSUPPORTED_BLOCK_PLACEMENT"
   | "INTERNAL_ERROR";
 
 export type CoordinateMode = "absolute" | "player_relative";

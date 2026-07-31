@@ -12,6 +12,7 @@ describe("get_capabilities", () => {
       place: true,
       batch: true,
       fill: true,
+      multiblock_placement: "unsupported",
     });
   });
 });

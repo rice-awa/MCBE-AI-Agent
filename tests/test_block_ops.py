@@ -4916,3 +4916,326 @@ def test_project_group_edit_result_noop_group_reports_noop() -> None:
     assert mixed["ok"] is True
     assert mixed["status"] == "applied"
     assert mixed["changed_total"] == 2
+
+
+# ---------------------------------------------------------------------------
+# issue 05 — block repair suggestions + multiblock safety (host-side)
+# ---------------------------------------------------------------------------
+
+
+def test_block_unknown_surfaces_candidates_from_addon() -> None:
+    """When the addon returns BLOCK_UNKNOWN with candidates, the host preserves
+    them in the error envelope (spec issue 05 §4.2)."""
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "BLOCK_UNKNOWN",
+                "message": "unknown block type: minecraft:stonx",
+                "type_id": "minecraft:stonx",
+                "candidates": ["minecraft:stone", "minecraft:ston"],
+            },
+        }
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "BLOCK_UNKNOWN"
+    assert body["fallback_allowed"] is False
+    assert body["type_id"] == "minecraft:stonx"
+    assert body["candidates"] == ["minecraft:stone", "minecraft:ston"]
+    assert "hint" in body
+    assert "candidates" in body["hint"]
+
+
+def test_block_unknown_candidates_bounded_to_three() -> None:
+    """The host caps candidate suggestions at 3 (spec §4.2)."""
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "BLOCK_UNKNOWN",
+                "message": "unknown",
+                "candidates": ["a", "b", "c", "d", "e"],
+            },
+        }
+    )
+    body = json.loads(result.output)
+    assert len(body["candidates"]) == 3
+
+
+def test_block_unknown_filters_sensitive_candidates() -> None:
+    """Candidate strings that look like secrets are dropped."""
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "BLOCK_UNKNOWN",
+                "message": "unknown",
+                "candidates": ["minecraft:stone", "token=bridge-secret"],
+            },
+        }
+    )
+    body = json.loads(result.output)
+    assert "bridge-secret" not in json.dumps(body["candidates"])
+
+
+def test_state_invalid_surfaces_valid_state_keys() -> None:
+    """When the addon returns STATE_INVALID with valid_state_keys, the host
+    preserves them so the model can correct the states (spec issue 05 §4.3)."""
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "STATE_INVALID",
+                "message": "Invalid state",
+                "type_id": "minecraft:oak_stairs",
+                "valid_state_keys": [
+                    "minecraft:cardinal_direction",
+                    "minecraft:vertical_half",
+                ],
+            },
+        }
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "STATE_INVALID"
+    assert body["fallback_allowed"] is False
+    assert body["type_id"] == "minecraft:oak_stairs"
+    assert body["valid_state_keys"] == [
+        "minecraft:cardinal_direction",
+        "minecraft:vertical_half",
+    ]
+    assert "hint" in body
+    assert "valid_state_keys" in body["hint"]
+
+
+def test_state_invalid_keys_bounded_to_eight() -> None:
+    """Valid state key suggestions are capped at 8."""
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "STATE_INVALID",
+                "message": "Invalid state",
+                "valid_state_keys": [f"k{i}" for i in range(20)],
+            },
+        }
+    )
+    body = json.loads(result.output)
+    assert len(body["valid_state_keys"]) == 8
+
+
+def test_protected_block_envelope_includes_component_and_target() -> None:
+    """PROTECTED_BLOCK carries type_id, component, and target for the model
+    to understand *why* the edit was rejected (spec issue 05 §4.5)."""
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "PROTECTED_BLOCK",
+                "message": "block has protected component: minecraft:inventory",
+                "type_id": "minecraft:chest",
+                "component": "minecraft:inventory",
+                "target": {"x": 10, "y": 64, "z": 10, "dimension": "minecraft:overworld"},
+            },
+        }
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "PROTECTED_BLOCK"
+    assert body["fallback_allowed"] is False
+    assert body["type_id"] == "minecraft:chest"
+    assert body["component"] == "minecraft:inventory"
+    assert body["target"] == {"x": 10, "y": 64, "z": 10}
+    assert "dimension" not in body["target"]
+    assert "hint" in body
+    assert "受保护" in body["hint"]
+
+
+def test_unsupported_block_placement_preserves_multiblock_flag() -> None:
+    """UNSUPPORTED_BLOCK_PLACEMENT is a PERMANENT error with fallback_allowed=False
+    and carries the type_id + multiblock flag (spec issue 05 §6/§7)."""
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "UNSUPPORTED_BLOCK_PLACEMENT",
+                "message": "multiblock block requires multi-cell placement",
+                "type_id": "minecraft:oak_door",
+                "multiblock": True,
+            },
+        }
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "UNSUPPORTED_BLOCK_PLACEMENT"
+    assert body["fallback_allowed"] is False
+    assert body["retryable"] is False
+    assert body["type_id"] == "minecraft:oak_door"
+    assert body["multiblock"] is True
+    assert "hint" in body
+    assert "多格" in body["hint"]
+
+
+@pytest.mark.parametrize(
+    ("code", "fallback_allowed"),
+    [
+        ("BLOCK_UNKNOWN", False),
+        ("STATE_INVALID", False),
+        ("UNSUPPORTED_BLOCK_PLACEMENT", False),
+    ],
+)
+def test_issue_05_error_codes_never_allow_fallback(
+    code: str, fallback_allowed: bool
+) -> None:
+    """All issue 05 error codes have fallback_allowed=False (spec §4.2/§4.3/§6)."""
+    result = map_addon_bridge_result(
+        {"ok": False, "payload": {"code": code, "message": "test"}}
+    )
+    body = json.loads(result.output)
+    assert body["code"] == code
+    assert body["fallback_allowed"] is fallback_allowed
+
+
+def test_audit_evidence_fields_cover_issue_05_metadata() -> None:
+    """The _AUDIT_EDIT_EVIDENCE_FIELDS whitelist includes repair/safety keys
+    so tool audit records capture bounded issue 05 metadata (spec §5 task list)."""
+    from services.agent.block_ops.tools_impl import _AUDIT_EDIT_EVIDENCE_FIELDS
+
+    assert "repairs_applied" in _AUDIT_EDIT_EVIDENCE_FIELDS
+    assert "candidates" in _AUDIT_EDIT_EVIDENCE_FIELDS
+    assert "valid_state_keys" in _AUDIT_EDIT_EVIDENCE_FIELDS
+    assert "protected" in _AUDIT_EDIT_EVIDENCE_FIELDS
+    assert "multiblock" in _AUDIT_EDIT_EVIDENCE_FIELDS
+
+
+@pytest.mark.asyncio
+async def test_grouped_edit_rejects_multiblock_block_before_approval() -> None:
+    """When the addon preflight returns UNSUPPORTED_BLOCK_PLACEMENT for a
+    multiblock block, the group fails before approval (spec issue 05 §6)."""
+    from services.agent.block_ops.tools_impl import run_block_preflight
+    from services.agent.block_ops.capability import ensure_block_capability
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks":
+            return {
+                "ok": False,
+                "payload": {
+                    "code": "UNSUPPORTED_BLOCK_PLACEMENT",
+                    "message": "multiblock not supported",
+                    "type_id": "minecraft:oak_door",
+                    "multiblock": True,
+                },
+            }
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-mb")
+    ctx = SimpleNamespace(deps=deps)
+    plan, failure = await run_block_preflight(
+        ctx,  # type: ignore[arg-type]
+        "edit_blocks",
+        {
+            "edits": [
+                {"target": {"positions": [{"x": 0, "y": 64, "z": 0}]}, "block": "minecraft:oak_door"},
+            ],
+            "dimension": "minecraft:overworld",
+        },
+    )
+    # The group must fail before approval — no plan is returned.
+    assert plan is None
+    assert failure is not None
+    body = json.loads(failure.output)
+    assert body["code"] == "UNSUPPORTED_BLOCK_PLACEMENT"
+    assert body["fallback_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_grouped_edit_preflight_addon_returns_block_unknown_with_candidates() -> None:
+    """When the addon preflight returns BLOCK_UNKNOWN with candidates, the
+    host exposes them in the preflight failure (spec issue 05 §4.2)."""
+    from services.agent.block_ops.tools_impl import run_block_preflight
+    from services.agent.block_ops.capability import ensure_block_capability
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks":
+            return {
+                "ok": False,
+                "payload": {
+                    "code": "BLOCK_UNKNOWN",
+                    "message": "unknown block type",
+                    "type_id": "minecraft:stonx",
+                    "candidates": ["minecraft:stone", "minecraft:ston"],
+                },
+            }
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-bu")
+    ctx = SimpleNamespace(deps=deps)
+    plan, failure = await run_block_preflight(
+        ctx,  # type: ignore[arg-type]
+        "edit_blocks",
+        {
+            "edits": [
+                {"target": {"positions": [{"x": 0, "y": 64, "z": 0}]}, "block": "minecraft:stonx"},
+            ],
+            "dimension": "minecraft:overworld",
+        },
+    )
+    assert plan is None
+    assert failure is not None
+    body = json.loads(failure.output)
+    assert body["code"] == "BLOCK_UNKNOWN"
+    assert body["candidates"] == ["minecraft:stone", "minecraft:ston"]
+
+
+@pytest.mark.asyncio
+async def test_grouped_edit_preflight_addon_returns_state_invalid_with_keys() -> None:
+    """When the addon preflight returns STATE_INVALID with valid_state_keys,
+    the host surfaces them in the preflight failure (spec issue 05 §4.3)."""
+    from services.agent.block_ops.tools_impl import run_block_preflight
+    from services.agent.block_ops.capability import ensure_block_capability
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks":
+            return {
+                "ok": False,
+                "payload": {
+                    "code": "STATE_INVALID",
+                    "message": "Invalid state",
+                    "type_id": "minecraft:oak_stairs",
+                    "valid_state_keys": ["minecraft:cardinal_direction"],
+                },
+            }
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-si")
+    ctx = SimpleNamespace(deps=deps)
+    plan, failure = await run_block_preflight(
+        ctx,  # type: ignore[arg-type]
+        "edit_blocks",
+        {
+            "edits": [
+                {"target": {"positions": [{"x": 0, "y": 64, "z": 0}]}, "block": {"type_id": "minecraft:oak_stairs", "states": {"bad": True}}},
+            ],
+            "dimension": "minecraft:overworld",
+        },
+    )
+    assert plan is None
+    assert failure is not None
+    body = json.loads(failure.output)
+    assert body["code"] == "STATE_INVALID"

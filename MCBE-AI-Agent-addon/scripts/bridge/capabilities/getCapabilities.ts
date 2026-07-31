@@ -13,6 +13,10 @@ export function handleGetCapabilities(_payload: Record<string, unknown> = {}): {
         place: boolean;
         batch: boolean;
         fill: boolean;
+        /** "unsupported": multiblock blocks (doors, beds, tall plants) are
+         * rejected as UNSUPPORTED_BLOCK_PLACEMENT until a full multi-cell
+         * placement + verification path exists (spec issue 05 §6). */
+        multiblock_placement: "unsupported";
       };
     };
   };
@@ -28,6 +32,7 @@ export function handleGetCapabilities(_payload: Record<string, unknown> = {}): {
           place: true,
           batch: true,
           fill: true,
+          multiblock_placement: "unsupported",
         },
       },
     },

@@ -6,6 +6,7 @@ import {
   fail,
   ok,
   type AbsolutePosition,
+  type BridgeFailure,
   type BridgeResult,
   type CoordinateMode,
   type ExpectedPrevious,
@@ -13,7 +14,7 @@ import {
   type PositionInput,
   type RepairApplied,
 } from "./types";
-import { repairTypeId } from "./repair";
+import { repairTypeId, findBlockCandidates } from "./repair";
 import {
   collectPositions,
   getBlockSafe,
@@ -23,6 +24,7 @@ import {
 } from "./inspect";
 import { buildBlockSnapshot, matchesExpectedPrevious, matchesTargetPermutation } from "./snapshot";
 import { findProtectedComponent } from "./protect";
+import { isMultiblockBlock } from "./multiblock";
 
 // Re-export DEFAULT for limits that place/batch use
 const DEFAULT_DISCRETE = DEFAULT_MAX_POSITIONS;
@@ -221,6 +223,49 @@ function getBlockTypesRegistry(): { getAll?: () => Array<{ id: string } | string
   return undefined;
 }
 
+/**
+ * Validate ``typeId`` against the BlockTypes registry using the same rule for
+ * target blocks and ``expect`` blocks (spec issue 05 §4.2/§4.4: ``expect`` uses
+ * the same validation and repair rules as the target block). Returns ``null``
+ * when the id is known (or the registry is unavailable), otherwise a
+ * ``BLOCK_UNKNOWN`` failure carrying up to 3 bounded candidate suggestions.
+ */
+function validateKnownTypeId(
+  typeId: string,
+  registry: ReturnType<typeof getBlockTypesRegistry>,
+  field: string,
+): BridgeFailure | null {
+  if (!registry || typeof registry.get !== "function") {
+    return null;
+  }
+  try {
+    const known = registry.get(typeId);
+    if (known !== undefined && known !== null) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  if (typeof registry.getAll !== "function") {
+    return null;
+  }
+  let all: string[];
+  try {
+    all = registry.getAll().map((i) => (typeof i === "string" ? i : i.id));
+  } catch {
+    return null;
+  }
+  if (all.length === 0 || all.includes(typeId)) {
+    return null;
+  }
+  const candidates = findBlockCandidates(typeId, registry);
+  return fail("BLOCK_UNKNOWN", `unknown ${field}: ${typeId}`, {
+    field,
+    type_id: typeId,
+    candidates,
+  });
+}
+
 export function prepareTypeAndPolicy(
   payload: EditBlocksPayload,
   repairs: RepairApplied[],
@@ -231,41 +276,49 @@ export function prepareTypeAndPolicy(
   expected_previous?: ExpectedPrevious;
   permutation: unknown;
 }> {
-  const typeId = repairTypeId(payload.type_id, repairs, getBlockTypesRegistry());
+  const registry = getBlockTypesRegistry();
+  const typeId = repairTypeId(payload.type_id, repairs, registry);
   if (!typeId) {
     return fail("INVALID_ARGUMENT", "type_id is required");
   }
-  // Validate known block if registry available
-  const registry = getBlockTypesRegistry();
-  if (registry?.get) {
-    try {
-      const known = registry.get(typeId);
-      if (known === undefined || known === null) {
-        // try without fail if registry incomplete in tests
-        if (typeof registry.getAll === "function") {
-          // only fail if getAll exists and doesn't include
-          const all = registry.getAll().map((i) => (typeof i === "string" ? i : i.id));
-          if (all.length > 0 && !all.includes(typeId)) {
-            return fail("BLOCK_UNKNOWN", `unknown block type: ${typeId}`, { type_id: typeId });
-          }
-        }
-      }
-    } catch {
-      // ignore registry errors
-    }
+  // Same known-id validation rule for target and expect blocks (spec §4.2).
+  const unknown = validateKnownTypeId(typeId, registry, "block type");
+  if (unknown) return unknown;
+  // Multiblock blocks cannot be placed or verified as a single cell. Reject
+  // before preflight/execute so the model never sees a half-placed structure
+  // reported as success (spec issue 05 §6/§7).
+  if (isMultiblockBlock(typeId)) {
+    return fail(
+      "UNSUPPORTED_BLOCK_PLACEMENT",
+      `multiblock block ${typeId} requires multi-cell placement; single-cell write is not supported`,
+      { type_id: typeId, multiblock: true, reason: "multiblock_not_supported" },
+    );
   }
 
   const replaceAny = Boolean(payload.replace_any);
   const expectedPrevious = payload.expected_previous;
   if (expectedPrevious) {
-    // repair expected type id namespace
+    // Expect uses the same repair + validation rules as the target block
+    // (spec issue 05 §4.4): repair the type id, validate it is known, and
+    // validate its states via resolvePermutation so an invalid expect state
+    // returns STATE_INVALID instead of silently failing to match.
     if (expectedPrevious.type_id) {
       const repairedExpected: RepairApplied[] = [];
-      const et = repairTypeId(expectedPrevious.type_id, repairedExpected, getBlockTypesRegistry());
-      if (et && et !== expectedPrevious.type_id) {
-        expectedPrevious.type_id = et;
-        repairs.push(...repairedExpected.map((r) => ({ ...r, field: `expected_previous.${r.field}` })));
+      const et = repairTypeId(expectedPrevious.type_id, repairedExpected, registry);
+      if (et) {
+        const expectUnknown = validateKnownTypeId(et, registry, "expect type");
+        if (expectUnknown) return expectUnknown;
+        if (et !== expectedPrevious.type_id) {
+          expectedPrevious.type_id = et;
+          repairs.push(
+            ...repairedExpected.map((r) => ({ ...r, field: `expected_previous.${r.field}` })),
+          );
+        }
       }
+    }
+    if (expectedPrevious.states) {
+      const expectPerm = resolvePermutation(expectedPrevious.type_id, expectedPrevious.states);
+      if (!expectPerm.ok) return expectPerm;
     }
   }
 

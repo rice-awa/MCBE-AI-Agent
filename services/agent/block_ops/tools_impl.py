@@ -55,6 +55,8 @@ _COMMAND_LINE_BUDGET_MESSAGE = "出站帧超出 MCBE commandLine 字节预算，
 _AUDIT_EDIT_EVIDENCE_FIELDS = frozenset({
     "before", "after", "before_samples", "after_samples", "verification",
     "verification_summary", "rollback", "failed_index", "written_count",
+    "repairs_applied", "candidates", "valid_state_keys", "protected",
+    "multiblock",
 })
 
 

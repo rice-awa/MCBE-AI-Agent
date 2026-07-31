@@ -137,7 +137,10 @@ export class BlockPermutation {
         }
       }
     }
-    return new BlockPermutation(typeId, states);
+    // No-state resolve returns the default permutation states for the block
+    // type, so STATE_INVALID can suggest valid state keys (spec issue 05 §4.3).
+    const resolvedStates = states ?? defaultBlockStates[typeId];
+    return new BlockPermutation(typeId, resolvedStates);
   }
 
   getAllStates(): Record<string, string | number | boolean> {
@@ -172,7 +175,29 @@ const knownBlockTypes = new Set([
   "minecraft:water",
   "minecraft:sand",
   "minecraft:cobblestone",
+  // Multiblock blocks (known so the UNSUPPORTED_BLOCK_PLACEMENT path is
+  // reachable; they are rejected before placement, spec issue 05 §6/§7).
+  "minecraft:oak_door",
+  "minecraft:red_bed",
 ]);
+
+/**
+ * Default permutation states for a few block types. Only used to produce
+ * bounded ``valid_state_keys`` suggestions on STATE_INVALID (spec issue 05
+ * §4.3) and to make no-state resolves behave like the real API.
+ */
+const defaultBlockStates: Record<string, Record<string, string | number | boolean>> = {
+  "minecraft:oak_stairs": {
+    "minecraft:cardinal_direction": "north",
+    "minecraft:vertical_half": "bottom",
+  },
+  "minecraft:oak_door": {
+    "minecraft:direction": 0,
+    "minecraft:door_hinge_bit": false,
+    "minecraft:open_bit": false,
+    "minecraft:upper_block_bit": false,
+  },
+};
 
 export const BlockTypes = {
   get(id: string) {
@@ -183,6 +208,9 @@ export const BlockTypes = {
   },
   __add(id: string) {
     knownBlockTypes.add(id);
+  },
+  __remove(id: string) {
+    knownBlockTypes.delete(id);
   },
   __reset() {
     // keep defaults

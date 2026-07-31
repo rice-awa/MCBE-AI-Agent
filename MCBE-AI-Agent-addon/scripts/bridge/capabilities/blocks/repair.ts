@@ -55,6 +55,46 @@ export function fuzzyVanillaBlockId(
   return undefined;
 }
 
+/**
+ * Suggest up to ``limit`` known block IDs closest to ``typeId`` (edit-distance 1,
+ * then 2). Used to give the model a bounded, non-silent choice when an unknown
+ * block ID cannot be uniquely repaired (spec issue 05 §4.2: "非唯一候选不得静默
+ * 选择，应返回最多 3 个建议项"). Custom namespaces never receive suggestions.
+ */
+export function findBlockCandidates(
+  typeId: string,
+  registry: BlockTypesLike | undefined,
+  limit = 3,
+): string[] {
+  if (!typeId.startsWith("minecraft:")) {
+    return [];
+  }
+  if (!registry || typeof registry.getAll !== "function") {
+    return [];
+  }
+  let all: string[];
+  try {
+    all = registry.getAll().map((item) => (typeof item === "string" ? item : item.id));
+  } catch {
+    return [];
+  }
+  const dist1 = all.filter((id) => editDistance(typeId, id) === 1);
+  const dist2 = all.filter((id) => editDistance(typeId, id) === 2);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const id of [...dist1, ...dist2]) {
+    if (seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    out.push(id);
+    if (out.length >= limit) {
+      break;
+    }
+  }
+  return out;
+}
+
 export function repairTypeId(
   raw: unknown,
   repairs: RepairApplied[],
