@@ -10,6 +10,8 @@ HARD_MAX_DISCRETE_POSITIONS = 1024
 HARD_MAX_FILL_VOLUME = 16384
 HARD_MAX_CELLS_PER_TICK = 512
 HARD_MAX_LOCKED_TARGETS_ON_WIRE = 1024
+HARD_MAX_EDITS_PER_GROUP = 64
+HARD_MAX_TOTAL_TARGETS_PER_GROUP = 16384
 
 DEFAULT_MAX_DISCRETE_POSITIONS = 256
 DEFAULT_MAX_FILL_VOLUME = 4096
@@ -19,6 +21,8 @@ DEFAULT_CELLS_PER_TICK = 128
 DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE = 0
 # MCBE commandLine hard budget (empirically ~461 B); mirrors Settings.flow_control.
 DEFAULT_COMMAND_LINE_BYTE_BUDGET = 461
+DEFAULT_MAX_EDITS_PER_GROUP = 16
+DEFAULT_MAX_TOTAL_TARGETS_PER_GROUP = 4096
 
 # Inspect auto-summary (issue 02). Above the threshold, inspect returns a bounded
 # summary instead of enumerating every snapshot. Sample limit caps the samples array.
@@ -36,6 +40,8 @@ class BlockToolsLimits:
     max_locked_targets_on_wire: int = DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE
     inspect_summary_threshold: int = DEFAULT_INSPECT_SUMMARY_THRESHOLD
     inspect_sample_limit: int = DEFAULT_INSPECT_SAMPLE_LIMIT
+    max_edits_per_group: int = DEFAULT_MAX_EDITS_PER_GROUP
+    max_total_targets_per_group: int = DEFAULT_MAX_TOTAL_TARGETS_PER_GROUP
 
 
 def _clamp(value: int, *, minimum: int, hard_max: int) -> int:
@@ -77,6 +83,8 @@ def get_block_tools_limits(settings: Any | None = None) -> BlockToolsLimits:
     max_locked_on_wire = DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE
     inspect_threshold = DEFAULT_INSPECT_SUMMARY_THRESHOLD
     inspect_samples = DEFAULT_INSPECT_SAMPLE_LIMIT
+    max_edits = DEFAULT_MAX_EDITS_PER_GROUP
+    max_total_targets = DEFAULT_MAX_TOTAL_TARGETS_PER_GROUP
 
     if block_tools is not None:
         if isinstance(block_tools, dict):
@@ -99,6 +107,12 @@ def get_block_tools_limits(settings: Any | None = None) -> BlockToolsLimits:
             raw_sample = block_tools.get("inspect_sample_limit")
             if raw_sample is not None:
                 inspect_samples = int(raw_sample)
+            raw_edits = block_tools.get("max_edits_per_group")
+            if raw_edits is not None:
+                max_edits = int(raw_edits)
+            raw_total = block_tools.get("max_total_targets_per_group")
+            if raw_total is not None:
+                max_total_targets = int(raw_total)
         else:
             max_positions = int(
                 getattr(block_tools, "max_discrete_positions", max_positions)
@@ -119,6 +133,12 @@ def get_block_tools_limits(settings: Any | None = None) -> BlockToolsLimits:
             raw_sample = getattr(block_tools, "inspect_sample_limit", None)
             if raw_sample is not None:
                 inspect_samples = int(raw_sample)
+            raw_edits = getattr(block_tools, "max_edits_per_group", None)
+            if raw_edits is not None:
+                max_edits = int(raw_edits)
+            raw_total = getattr(block_tools, "max_total_targets_per_group", None)
+            if raw_total is not None:
+                max_total_targets = int(raw_total)
 
     return BlockToolsLimits(
         max_discrete_positions=_clamp(
@@ -139,5 +159,13 @@ def get_block_tools_limits(settings: Any | None = None) -> BlockToolsLimits:
             inspect_samples,
             minimum=1,
             hard_max=HARD_MAX_INSPECT_SAMPLE_LIMIT,
+        ),
+        max_edits_per_group=_clamp(
+            max_edits, minimum=1, hard_max=HARD_MAX_EDITS_PER_GROUP
+        ),
+        max_total_targets_per_group=_clamp(
+            max_total_targets,
+            minimum=1,
+            hard_max=HARD_MAX_TOTAL_TARGETS_PER_GROUP,
         ),
     )

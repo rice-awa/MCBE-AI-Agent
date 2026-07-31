@@ -3720,36 +3720,68 @@ def test_normalize_expect_kinds() -> None:
 def test_new_edit_contract_rejects_zero_and_many_edits() -> None:
     from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
 
-    limits = SimpleNamespace(max_discrete_positions=256, max_fill_volume=4096)
+    limits = SimpleNamespace(
+        max_discrete_positions=256, max_fill_volume=4096,
+        max_edits_per_group=16, max_total_targets_per_group=4096,
+    )
     # Zero edits -> invalid.
-    legacy, error = _normalize_edits_for_preflight({"edits": []}, limits.max_discrete_positions, limits.max_fill_volume)
-    assert legacy is None
+    norms, error = _normalize_edits_for_preflight(
+        {"edits": []}, limits.max_discrete_positions, limits.max_fill_volume,
+        limits.max_edits_per_group, limits.max_total_targets_per_group,
+    )
+    assert norms is None
     assert error is not None
     assert json.loads(error.output)["code"] == "INVALID_ARGUMENT"
-    # Two edits -> rejected (this ticket limits to 1).
-    legacy, error = _normalize_edits_for_preflight(
+    # Two edits now VALID (issue 04 removes the single-edit limit).
+    norms, error = _normalize_edits_for_preflight(
         {"edits": [
             {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"},
             {"target": {"positions": [{"x": 2, "y": 64, "z": 2}]}, "block": "minecraft:stone"},
-        ]},
+        ], "dimension": "minecraft:overworld"},
         limits.max_discrete_positions, limits.max_fill_volume,
+        limits.max_edits_per_group, limits.max_total_targets_per_group,
     )
-    assert legacy is None
+    assert error is None
+    assert norms is not None
+    assert len(norms) == 2
+    # Exceeding max_edits_per_group -> LIMIT_EXCEEDED.
+    limits_small = SimpleNamespace(
+        max_discrete_positions=256, max_fill_volume=4096,
+        max_edits_per_group=1, max_total_targets_per_group=4096,
+    )
+    norms, error = _normalize_edits_for_preflight(
+        {"edits": [
+            {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"},
+            {"target": {"positions": [{"x": 2, "y": 64, "z": 2}]}, "block": "minecraft:stone"},
+        ], "dimension": "minecraft:overworld"},
+        limits_small.max_discrete_positions, limits_small.max_fill_volume,
+        limits_small.max_edits_per_group, limits_small.max_total_targets_per_group,
+    )
+    assert norms is None
     assert error is not None
-    assert json.loads(error.output)["code"] == "INVALID_ARGUMENT"
+    assert json.loads(error.output)["code"] == "LIMIT_EXCEEDED"
+
+
+def _norm_first(norms):
+    assert norms is not None and norms
+    return norms[0]
 
 
 def test_new_edit_contract_single_position_maps_to_place() -> None:
     from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
 
-    limits = SimpleNamespace(max_discrete_positions=256, max_fill_volume=4096)
-    legacy, error = _normalize_edits_for_preflight(
+    limits = SimpleNamespace(
+        max_discrete_positions=256, max_fill_volume=4096,
+        max_edits_per_group=16, max_total_targets_per_group=4096,
+    )
+    norms, error = _normalize_edits_for_preflight(
         {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}],
          "dimension": "minecraft:overworld"},
         limits.max_discrete_positions, limits.max_fill_volume,
+        limits.max_edits_per_group, limits.max_total_targets_per_group,
     )
     assert error is None
-    assert legacy is not None
+    legacy = _norm_first(norms).legacy
     assert legacy["mode"] == "place"
     assert legacy["coordinate_mode"] == "absolute"
     assert legacy["position"] == {"x": 1, "y": 64, "z": 1}
@@ -3762,15 +3794,19 @@ def test_new_edit_contract_single_position_maps_to_place() -> None:
 def test_new_edit_contract_multi_position_maps_to_batch() -> None:
     from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
 
-    limits = SimpleNamespace(max_discrete_positions=256, max_fill_volume=4096)
-    legacy, error = _normalize_edits_for_preflight(
+    limits = SimpleNamespace(
+        max_discrete_positions=256, max_fill_volume=4096,
+        max_edits_per_group=16, max_total_targets_per_group=4096,
+    )
+    norms, error = _normalize_edits_for_preflight(
         {"edits": [{"target": {"positions": [
             {"x": 1, "y": 64, "z": 1}, {"x": 2, "y": 64, "z": 1},
         ]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"},
         limits.max_discrete_positions, limits.max_fill_volume,
+        limits.max_edits_per_group, limits.max_total_targets_per_group,
     )
     assert error is None
-    assert legacy is not None
+    legacy = _norm_first(norms).legacy
     assert legacy["mode"] == "batch"
     assert legacy["positions"] == [{"x": 1, "y": 64, "z": 1}, {"x": 2, "y": 64, "z": 1}]
     assert "position" not in legacy
@@ -3779,14 +3815,18 @@ def test_new_edit_contract_multi_position_maps_to_batch() -> None:
 def test_new_edit_contract_box_maps_to_fill() -> None:
     from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
 
-    limits = SimpleNamespace(max_discrete_positions=256, max_fill_volume=4096)
-    legacy, error = _normalize_edits_for_preflight(
+    limits = SimpleNamespace(
+        max_discrete_positions=256, max_fill_volume=4096,
+        max_edits_per_group=16, max_total_targets_per_group=4096,
+    )
+    norms, error = _normalize_edits_for_preflight(
         {"edits": [{"target": {"box": {"from": {"x": 5, "y": 64, "z": 5}, "to": {"x": 1, "y": 64, "z": 1}}},
                     "block": "minecraft:stone"}], "dimension": "minecraft:overworld"},
         limits.max_discrete_positions, limits.max_fill_volume,
+        limits.max_edits_per_group, limits.max_total_targets_per_group,
     )
     assert error is None
-    assert legacy is not None
+    legacy = _norm_first(norms).legacy
     assert legacy["mode"] == "fill"
     # Reversed corners are normalized (min/max).
     assert legacy["from"] == {"x": 1, "y": 64, "z": 1}
@@ -3797,21 +3837,28 @@ def test_new_edit_contract_box_maps_to_fill() -> None:
 def test_new_edit_contract_expect_type_and_any() -> None:
     from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
 
-    limits = SimpleNamespace(max_discrete_positions=256, max_fill_volume=4096)
+    limits = SimpleNamespace(
+        max_discrete_positions=256, max_fill_volume=4096,
+        max_edits_per_group=16, max_total_targets_per_group=4096,
+    )
     # expect="minecraft:oak_planks" -> expected_previous={type_id}
-    legacy, _ = _normalize_edits_for_preflight(
+    norms, _ = _normalize_edits_for_preflight(
         {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone",
                     "expect": "minecraft:oak_planks"}], "dimension": "minecraft:overworld"},
         limits.max_discrete_positions, limits.max_fill_volume,
+        limits.max_edits_per_group, limits.max_total_targets_per_group,
     )
+    legacy = _norm_first(norms).legacy
     assert legacy["replace_any"] is False
     assert legacy["expected_previous"] == {"type_id": "minecraft:oak_planks"}
     # expect="any" -> replace_any=True
-    legacy, _ = _normalize_edits_for_preflight(
+    norms, _ = _normalize_edits_for_preflight(
         {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone",
                     "expect": "any"}], "dimension": "minecraft:overworld"},
         limits.max_discrete_positions, limits.max_fill_volume,
+        limits.max_edits_per_group, limits.max_total_targets_per_group,
     )
+    legacy = _norm_first(norms).legacy
     assert legacy["replace_any"] is True
     assert legacy["expected_previous"] is None
 
@@ -3819,14 +3866,18 @@ def test_new_edit_contract_expect_type_and_any() -> None:
 def test_new_edit_contract_mixed_coords_invalid() -> None:
     from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
 
-    limits = SimpleNamespace(max_discrete_positions=256, max_fill_volume=4096)
-    legacy, error = _normalize_edits_for_preflight(
+    limits = SimpleNamespace(
+        max_discrete_positions=256, max_fill_volume=4096,
+        max_edits_per_group=16, max_total_targets_per_group=4096,
+    )
+    norms, error = _normalize_edits_for_preflight(
         {"edits": [{"target": {"positions": [
             {"x": 1, "y": 64, "z": 1}, {"forward": 1, "right": 0, "up": 0},
         ]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"},
         limits.max_discrete_positions, limits.max_fill_volume,
+        limits.max_edits_per_group, limits.max_total_targets_per_group,
     )
-    assert legacy is None
+    assert norms is None
     assert error is not None
     assert json.loads(error.output)["code"] == "INVALID_COORDINATE"
 
@@ -3834,12 +3885,16 @@ def test_new_edit_contract_mixed_coords_invalid() -> None:
 def test_new_edit_contract_absolute_without_dimension_invalid() -> None:
     from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
 
-    limits = SimpleNamespace(max_discrete_positions=256, max_fill_volume=4096)
-    legacy, error = _normalize_edits_for_preflight(
+    limits = SimpleNamespace(
+        max_discrete_positions=256, max_fill_volume=4096,
+        max_edits_per_group=16, max_total_targets_per_group=4096,
+    )
+    norms, error = _normalize_edits_for_preflight(
         {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}]},
         limits.max_discrete_positions, limits.max_fill_volume,
+        limits.max_edits_per_group, limits.max_total_targets_per_group,
     )
-    assert legacy is None
+    assert norms is None
     assert error is not None
     assert json.loads(error.output)["code"] == "INVALID_ARGUMENT"
 
@@ -3965,3 +4020,243 @@ def test_model_visible_edit_blocks_schema_exposes_only_edits_contract() -> None:
     assert "dimension" in stripped_props
     assert "locked_targets" not in stripped_props
     assert "phase" not in stripped_props
+
+
+@pytest.mark.asyncio
+async def test_grouped_edits_produce_single_approval_then_aggregate_result() -> None:
+    """Two independent edits share one preflight + one approval, then execute."""
+    targets_a = [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}]
+    targets_b = [{"dimension": "minecraft:overworld", "x": 2, "y": 64, "z": 2}]
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks" and payload.get("phase") == "preflight":
+            positions = payload.get("positions")
+            if isinstance(positions, list) and positions:
+                locked = [{"dimension": "minecraft:overworld", "x": p["x"], "y": p["y"], "z": p["z"]} for p in positions]
+            else:
+                pos = payload.get("position") or {"x": 1, "y": 64, "z": 1}
+                locked = [{"dimension": "minecraft:overworld", "x": pos["x"], "y": pos["y"], "z": pos["z"]}]
+            return {
+                "ok": True,
+                "payload": {
+                    "ok": True, "phase": "preflight",
+                    "mode": payload.get("mode") or "place",
+                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
+                    "locked_targets": locked,
+                },
+            }
+        if capability == "edit_blocks" and payload.get("phase") == "execute":
+            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": 1}}
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test", deps_type=_Deps, output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    )
+    register_agent_tools(agent)
+    original_args = {
+        "edits": [
+            {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:gold_block"},
+            {"target": {"positions": [{"x": 2, "y": 64, "z": 2}]}, "block": "minecraft:iron_block"},
+        ],
+        "dimension": "minecraft:overworld",
+    }
+    mc = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal mc
+        mc += 1
+        if mc == 1:
+            return ModelResponse(parts=[ToolCallPart(tool_name="edit_blocks", tool_call_id="tc-g", args=original_args)])
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-group")
+    first = await agent.run("edit", model=FunctionModel(model_fn), deps=deps)
+    assert isinstance(first.output, DeferredToolRequests)
+    # Exactly ONE approval covers the whole group.
+    assert len(first.output.approvals) == 1
+    approval = first.output.approvals[0]
+    execute_args = first.output.metadata[approval.tool_call_id]["execute_args"]
+    # The frozen plan carries BOTH edits under the new contract.
+    assert len(execute_args["edits"]) == 2
+    assert execute_args["edits"][0]["block"] == {"type_id": "minecraft:gold_block"}
+    assert execute_args["edits"][1]["block"] == {"type_id": "minecraft:iron_block"}
+
+    second = await agent.run(
+        message_history=first.all_messages(),
+        deferred_tool_results=DeferredToolResults(
+            approvals={approval.tool_call_id: ToolApproved(override_args=execute_args)},
+        ),
+        model=FunctionModel(model_fn),
+        deps=deps,
+    )
+    assert not isinstance(second.output, DeferredToolRequests)
+    # Both edits executed (one preflight each + one execute each), no re-preflight on resume.
+    phases = [p["phase"] for c, p in bridge.calls if c == "edit_blocks"]
+    assert phases == ["preflight", "preflight", "execute", "execute"]
+    # The aggregated group result reports both edits applied without over-claiming.
+    tool_contents = [
+        str(getattr(part, "content", ""))
+        for message in second.all_messages()
+        for part in getattr(message, "parts", [])
+    ]
+    group_result = json.loads(next(c for c in tool_contents if c.startswith("{") and "changed_total" in c))
+    assert group_result["ok"] is True
+    assert group_result["status"] == "applied"
+    assert group_result["changed_total"] == 2
+    assert len(group_result["edits"]) == 2
+    assert sum(e["changed"] for e in group_result["edits"]) == group_result["changed_total"]
+
+
+@pytest.mark.asyncio
+async def test_grouped_edits_conflicting_cell_rejects_with_conflicting_edits() -> None:
+    """Two edits targeting the same cell with different blocks are rejected."""
+    shared = [{"dimension": "minecraft:overworld", "x": 5, "y": 64, "z": 5}]
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks" and payload.get("phase") == "preflight":
+            return {
+                "ok": True,
+                "payload": {
+                    "ok": True, "phase": "preflight", "mode": "place",
+                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
+                    "locked_targets": shared,
+                },
+            }
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-c")
+    ctx = SimpleNamespace(deps=deps)
+    plan, failure = await run_block_preflight(
+        ctx,  # type: ignore[arg-type]
+        "edit_blocks",
+        {
+            "edits": [
+                {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "minecraft:gold_block"},
+                {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "minecraft:iron_block"},
+            ],
+            "dimension": "minecraft:overworld",
+        },
+    )
+    assert plan is None
+    assert failure is not None
+    body = json.loads(failure.output)
+    assert body["code"] == BlockErrorCode.CONFLICTING_EDITS
+    assert body["cell"] == {"x": 5, "y": 64, "z": 5}
+
+
+@pytest.mark.asyncio
+async def test_grouped_edits_identical_cell_dedups_silently() -> None:
+    """Two identical edits targeting the same cell: first wins, second is a noop."""
+    shared = [{"dimension": "minecraft:overworld", "x": 5, "y": 64, "z": 5}]
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks" and payload.get("phase") == "preflight":
+            return {
+                "ok": True,
+                "payload": {
+                    "ok": True, "phase": "preflight", "mode": "place",
+                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
+                    "locked_targets": shared,
+                },
+            }
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-d")
+    ctx = SimpleNamespace(deps=deps)
+    plan, failure = await run_block_preflight(
+        ctx,  # type: ignore[arg-type]
+        "edit_blocks",
+        {
+            "edits": [
+                {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "minecraft:gold_block"},
+                {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "minecraft:gold_block"},
+            ],
+            "dimension": "minecraft:overworld",
+        },
+    )
+    # No conflict: identical signatures dedup. The frozen plan carries both edits.
+    assert failure is None
+    assert plan is not None
+    assert len(plan.execute_args["edits"]) == 2
+    # First edit keeps the cell; second edit's owned set is empty -> noop (no positions).
+    nonempty = [e for e in plan.execute_args["edits"] if e["target"]["positions"]]
+    empty = [e for e in plan.execute_args["edits"] if not e["target"]["positions"]]
+    assert len(nonempty) == 1
+    assert len(empty) == 1
+    assert tuple(nonempty[0]["target"]["positions"][0].values()) == (5, 64, 5)
+
+
+@pytest.mark.asyncio
+async def test_grouped_edits_exceeding_edit_count_limit_rejected() -> None:
+    """Group edit-count limit (max_edits_per_group) is enforced before preflight."""
+    settings_obj = Settings()
+    settings_obj.addon.block_tools.max_edits_per_group = 2
+    edits = [
+        {"target": {"positions": [{"x": i, "y": 64, "z": 1}]}, "block": "minecraft:stone"}
+        for i in range(3)
+    ]
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=settings_obj, run_id="run-lim")
+    ctx = SimpleNamespace(deps=deps)
+    plan, failure = await run_block_preflight(
+        ctx,  # type: ignore[arg-type]
+        "edit_blocks",
+        {"edits": edits, "dimension": "minecraft:overworld"},
+    )
+    assert plan is None
+    assert failure is not None
+    body = json.loads(failure.output)
+    assert body["code"] == BlockErrorCode.LIMIT_EXCEEDED
+    # No bridge edit call should have happened (rejected before preflight).
+    assert not any(cap == "edit_blocks" for cap, _ in bridge.calls)
+
+
+def test_project_group_edit_result_never_over_claims() -> None:
+    """Aggregated group result derives status conservatively (spec §9.3)."""
+    from services.agent.block_ops.project import project_group_edit_result_for_model
+
+    # One applied + one partial (skipped) -> group partial, changed_total sums.
+    per_edit = [
+        {"index": 0, "status": "applied", "changed": 3, "skipped": 0},
+        {"index": 1, "status": "partial", "changed": 1, "skipped": 2,
+         "skipped_type_counts": {"minecraft:water": 2}},
+    ]
+    group = project_group_edit_result_for_model(per_edit)
+    assert group["ok"] is True
+    assert group["status"] == "partial"
+    assert group["changed_total"] == 4
+    assert group["edits"][1]["skipped"] == 2
+    assert group["edits"][1]["skipped_type_counts"] == {"minecraft:water": 2}
+
+    # Any failure with nothing applied -> failed, ok False.
+    failed = project_group_edit_result_for_model([
+        {"index": 0, "status": "applied", "changed": 2, "skipped": 0},
+        {"index": 1, "status": "failed", "changed": 0, "skipped": 0},
+    ])
+    assert failed["ok"] is False
+    assert failed["status"] == "partial"
+
+    # All unknown -> unknown, ok False.
+    unknown = project_group_edit_result_for_model([
+        {"index": 0, "status": "unknown", "changed": 0, "skipped": 0},
+    ])
+    assert unknown["ok"] is False
+    assert unknown["status"] == "unknown"

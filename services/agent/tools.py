@@ -1160,9 +1160,14 @@ def register_agent_tools(
         locked_targets: list[dict[str, Any]] | None = None,
         phase: str | None = None,
     ) -> str:
-        """写入方块（单次编辑）：place 单格 / batch 离散批量 / fill 区域填充。
+        """写入方块：place 单格 / batch 离散批量 / fill 区域填充。
 
-        每次调用仅提交一个编辑（``edits`` 长度须为 1）。每个编辑包含：
+        每次调用可提交 **一个或多个独立编辑**（``edits`` 列表）。所有编辑在
+        调用开始时基于同一世界状态预检，产生 **一次预检 + 一次审批**，随后按
+        稳定顺序逐个执行并汇总结果。同一调用内的编辑互相独立：某个编辑失败
+        不会回滚已应用的编辑（不保证原子性）。
+
+        每个编辑包含：
 
         - ``target``: 目标结构。``{positions: [{x,y,z}...]}`` 查询/写入点集
           （单点用长度 1），``{box: {from, to}}`` 长方体区域。两者互斥。
@@ -1180,12 +1185,13 @@ def register_agent_tools(
         默认仅替换空气；需要覆写非空方块时设 ``expect="any"``（高风险，需审批）。
         删除请放置 ``minecraft:air`` 并授权覆写。
 
-        成功投影字段：ok/mode/changed|changed_count/at|from/to/type_id/states；
-        was / previous_type_counts 仅在被替换的为非空气时出现（无 was = 原为空气）。
+        成功汇总字段：ok/status/changed_total/edits[{index,status,changed,
+        skipped?, skipped_type_counts?}]；was / previous_type_counts 仅在被替换的
+        为非空气时出现。
 
         Args:
             ctx: 运行上下文
-            edits: 编辑列表（本次仅支持 1 项）
+            edits: 编辑列表（1 项或多项，每项 {target, block, expect}）
             dimension: 维度 ID（absolute 必填）
         """
         # locked_targets / phase: harness recovery only; stripped from model schema.

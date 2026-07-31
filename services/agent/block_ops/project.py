@@ -306,3 +306,119 @@ def project_block_result_for_model(
 
     # inspect / unknown: project bounded result, strip internal metadata.
     return _project_inspect(payload)
+
+
+def _non_air_value(value: Any) -> bool:
+    """True when a numeric count value refers to a non-air (overwritten) cell."""
+    return isinstance(value, (int, float)) and value > 0
+
+
+def _per_edit_changed(payload: dict[str, Any]) -> int:
+    """Extract a per-edit changed-cell count from an execute payload."""
+    if "changed_count" in payload:
+        try:
+            return int(payload["changed_count"])
+        except (TypeError, ValueError):
+            return 0
+    if "changed" in payload:
+        changed = payload["changed"]
+        if isinstance(changed, bool):
+            return 1 if changed else 0
+        try:
+            return int(changed)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _per_edit_skipped(payload: dict[str, Any]) -> int:
+    skipped = payload.get("skipped")
+    try:
+        return int(skipped) if skipped is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _per_edit_skipped_type_counts(payload: dict[str, Any]) -> dict[str, Any]:
+    counts = payload.get("skipped_type_counts")
+    if isinstance(counts, dict) and counts:
+        return counts
+    # Fall back to previous_type_counts when the addon only reports that.
+    previous = payload.get("previous_type_counts")
+    filtered = _filter_non_air_counts(previous) if isinstance(previous, dict) else {}
+    return filtered
+
+
+def project_group_edit_result_for_model(
+    per_edit_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate per-edit execute outcomes into the group result (spec §9.3).
+
+    ``per_edit_results`` is the ordered list of per-edit outcome dicts produced
+    by the host execute loop. Each entry carries at least ``index`` and
+    ``status``; successful entries additionally carry ``changed``, ``skipped``
+    and ``skipped_type_counts``. The model receives only decision fields; full
+    before/after/locked_targets/verification/rollback stay in the audit log.
+    """
+    edits: list[dict[str, Any]] = []
+    changed_total = 0
+    statuses: list[str] = []
+    warnings: list[str] = []
+    any_partial = False
+    any_failed = False
+    any_unknown = False
+    any_applied = False
+
+    for outcome in per_edit_results:
+        index = outcome.get("index")
+        status = outcome.get("status") or "applied"
+        statuses.append(status)
+        changed = int(outcome.get("changed") or 0)
+        skipped = int(outcome.get("skipped") or 0)
+        changed_total += changed
+
+        entry: dict[str, Any] = {"index": index, "status": status, "changed": changed}
+        if skipped > 0:
+            entry["skipped"] = skipped
+            skipped_counts = outcome.get("skipped_type_counts")
+            if isinstance(skipped_counts, dict) and skipped_counts:
+                entry["skipped_type_counts"] = skipped_counts
+        edits.append(entry)
+
+        if status == "applied" or status == "noop":
+            if status == "applied":
+                any_applied = True
+        elif status == "partial":
+            any_partial = True
+        elif status == "unknown":
+            any_unknown = True
+        else:  # failed
+            any_failed = True
+
+        if outcome.get("warning"):
+            warnings.append(str(outcome["warning"]))
+
+    if any_unknown:
+        group_status = "unknown"
+    elif any_partial:
+        group_status = "partial"
+    elif any_failed and not any_applied:
+        group_status = "failed"
+    elif any_failed:
+        group_status = "partial"
+    else:
+        group_status = "applied" if any_applied or any_partial else "applied"
+
+    ok = not any_failed and not any_unknown
+    if any_partial and not warnings:
+        warnings.append("部分位置因前置条件不满足而跳过")
+
+    result: dict[str, Any] = {
+        "ok": ok,
+        "status": group_status,
+        "changed_total": changed_total,
+        "edits": edits,
+    }
+    if warnings:
+        result["warnings"] = warnings
+    return result
