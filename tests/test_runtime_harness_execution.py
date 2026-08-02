@@ -267,11 +267,9 @@ def test_fallback_allowed_still_uses_independent_command_approval() -> None:
         ("run_minecraft_commands", {"commands": ["give Steve stone", "fill ~ ~ ~ ~1 ~1 ~1 stone"]}),
         ("run_world_command", {"command": "clone ~ ~ ~ ~1 ~1 ~1 ~2 ~2 ~2"}),
         ("run_minecraft_command", {"command": "execute as @s run setblock ~ ~ ~ stone"}),
-        ("run_minecraft_command", {"command": "function build:wall"}),
-        ("run_minecraft_command", {"command": "schedule delay add build:wall 1t"}),
     ],
 )
-def test_fallback_gate_handles_batch_world_execute_and_opaque_function(
+def test_fallback_gate_handles_batch_world_and_execute_block_commands(
     tool_name: str, args: dict[str, Any]
 ) -> None:
     _set_supported_block_capability("conn-1")
@@ -282,6 +280,23 @@ def test_fallback_gate_handles_batch_world_execute_and_opaque_function(
         run_id="run-1",
     )
     assert _fallback_denial(tool_name=tool_name, args=args) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["function build:wall", "schedule delay add build:wall 1t"],
+)
+def test_fallback_gate_does_not_block_opaque_non_block_commands(command: str) -> None:
+    """Issue 6 only constrains raw setblock, fill and clone fallbacks."""
+    _set_supported_block_capability("conn-1")
+    _record_block_edit_fallback_outcome(
+        '{"ok":false,"fallback_allowed":false}',
+        connection_id="conn-1",
+        player_name="Steve",
+        run_id="run-1",
+    )
+
+    assert _fallback_denial(args={"command": command}) is None
 
 
 def test_fallback_state_isolated_by_player_and_run_and_non_supported_capability() -> None:
@@ -331,6 +346,19 @@ def test_explicit_normalized_command_requires_execution_intent_and_rejects_negat
     assert _fallback_denial(prompt="请执行命令，但不要用 setblock ~ ~ ~ stone") is not None
     assert _fallback_denial(prompt="请执行命令：fill ~ ~ ~ ~1 ~1 ~1 stone") is not None
     assert _fallback_denial(prompt="请执行命令：setblock ~ ~ ~ stone", approved=True) is None
+
+
+def test_explicit_raw_command_does_not_require_a_command_keyword() -> None:
+    """A player can explicitly request the exact raw command without saying “命令” twice."""
+    _set_supported_block_capability("conn-1")
+    _record_block_edit_fallback_outcome(
+        '{"ok":false,"fallback_allowed":false}',
+        connection_id="conn-1",
+        player_name="Steve",
+        run_id="run-1",
+    )
+
+    assert _fallback_denial(prompt="运行 /setblock ~ ~ ~ stone") is None
 
 
 def test_policy_low_risk_allows_and_hard_deny_blocks() -> None:

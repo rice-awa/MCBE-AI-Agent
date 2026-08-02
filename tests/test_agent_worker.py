@@ -718,7 +718,7 @@ async def test_single_tool_trace_contains_model_tool_model_and_final_response(
         assert sum(name == "model.request.completed" for name in names) == 2
         completed = [e for e in events if e["event_name"] == "trace.completed"]
         assert len(completed) == 1
-        assert completed[0]["payload"]["content"] == final_text
+        assert completed[0]["payload"]["final_response"] == final_text
     finally:
         set_trace_recorder(None)
 

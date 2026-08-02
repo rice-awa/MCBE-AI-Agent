@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -1969,6 +1970,28 @@ def test_inspect_config_defaults_and_hard_caps() -> None:
     limits = get_block_tools_limits(settings)
     assert limits.inspect_summary_threshold == HARD_MAX_INSPECT_SUMMARY_THRESHOLD
     assert limits.inspect_sample_limit == HARD_MAX_INSPECT_SAMPLE_LIMIT
+
+
+def test_config_example_exposes_inspect_summary_limits() -> None:
+    """The documented block-tool limits survive Settings validation unchanged."""
+    from config.settings import AddonBlockToolsConfig
+
+    example = json.loads((Path(__file__).parents[1] / "config.example.json").read_text())
+    raw_block_tools = example["addon"]["block_tools"]
+    assert raw_block_tools["inspect_summary_threshold"] == 8
+    assert raw_block_tools["inspect_sample_limit"] == 8
+    assert raw_block_tools["max_edits_per_group"] == 16
+    assert raw_block_tools["max_total_targets_per_group"] == 4096
+
+    block_tools = AddonBlockToolsConfig.model_validate(raw_block_tools)
+    limits = get_block_tools_limits(
+        SimpleNamespace(addon=SimpleNamespace(block_tools=block_tools))
+    )
+
+    assert limits.inspect_summary_threshold == 8
+    assert limits.inspect_sample_limit == 8
+    assert limits.max_edits_per_group == 16
+    assert limits.max_total_targets_per_group == 4096
 
 
 def test_inspect_model_schema_only_exposes_target_and_dimension() -> None:
@@ -4205,6 +4228,32 @@ def test_model_visible_edit_blocks_schema_exposes_only_edits_contract() -> None:
     assert "phase" not in stripped_props
 
 
+@pytest.mark.parametrize("provider", ("deepseek", "openai", "anthropic", "ollama"))
+def test_all_supported_providers_expose_the_same_block_tool_schema(provider: str) -> None:
+    """Provider selection cannot expand the public block-tool contract."""
+    from pydantic_ai.tools import ToolDefinition
+
+    from services.agent.core import ChatAgentManager
+    from services.agent.harness.execution import strip_block_internal_tool_schema
+
+    manager = ChatAgentManager()
+    manager._settings = Settings(default_provider=provider)
+    tools = iter_registered_tools(manager._create_agent())
+    raw_schema = tools["edit_blocks"].function_schema.json_schema
+    visible = strip_block_internal_tool_schema(
+        ToolDefinition(
+            name="edit_blocks",
+            description=raw_schema.get("description", ""),
+            parameters_json_schema=raw_schema,
+        )
+    )
+
+    assert set(visible.parameters_json_schema.get("properties") or {}) == {
+        "edits",
+        "dimension",
+    }
+
+
 @pytest.mark.asyncio
 async def test_grouped_edits_produce_single_approval_then_aggregate_result() -> None:
     """Two independent edits share one preflight + one approval, then execute."""
@@ -4670,6 +4719,42 @@ async def test_grouped_edits_mid_run_failure_returns_aggregated_result() -> None
     # Only two execute payloads reached the bridge (third was stopped).
     executes = [p for c, p in bridge.calls if c == "edit_blocks" and p.get("phase") == "execute"]
     assert len(executes) == 2
+
+
+@pytest.mark.asyncio
+async def test_grouped_edit_propagates_allowed_command_fallback() -> None:
+    """A grouped ADDON_UNAVAILABLE result retains its structured fallback decision."""
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {
+                "ok": True,
+                "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}},
+            }
+        if capability == "edit_blocks" and payload.get("phase") == "execute":
+            return {"ok": False, "payload": {"code": "ADDON_UNAVAILABLE"}}
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-fallback")
+    result = await _execute_edits_group(
+        SimpleNamespace(deps=deps),  # type: ignore[arg-type]
+        edits=[
+            {
+                "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
+                "block": {"type_id": "minecraft:gold_block"},
+            }
+        ],
+        dimension="minecraft:overworld",
+        phase="execute",
+    )
+
+    body = json.loads(result.output)
+    assert body["ok"] is False
+    assert body["code"] == "ADDON_UNAVAILABLE"
+    assert body["fallback_allowed"] is True
 
 
 @pytest.mark.asyncio

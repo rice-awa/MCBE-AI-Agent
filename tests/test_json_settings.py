@@ -109,7 +109,7 @@ def test_agent_run_budget_defaults_when_absent(tmp_path, monkeypatch):
     settings = Settings()
 
     assert settings.request_limit == 8
-    assert settings.tool_calls_limit == 8
+    assert settings.tool_calls_limit == 16
     assert settings.input_tokens_limit is None
     assert settings.output_tokens_limit is None
     assert settings.total_tokens_limit is None

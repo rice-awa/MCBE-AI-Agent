@@ -369,6 +369,7 @@ def project_group_edit_result_for_model(
     any_failed = False
     any_unknown = False
     any_applied = False
+    failed_outcomes: list[dict[str, Any]] = []
 
     for outcome in per_edit_results:
         index = outcome.get("index")
@@ -403,8 +404,12 @@ def project_group_edit_result_for_model(
             any_partial = True
         elif status == "unknown":
             any_unknown = True
+            if outcome.get("stopped_by_index") is None:
+                failed_outcomes.append(outcome)
         else:  # failed
             any_failed = True
+            if outcome.get("stopped_by_index") is None:
+                failed_outcomes.append(outcome)
 
         if outcome.get("warning"):
             warnings.append(str(outcome["warning"]))
@@ -452,4 +457,10 @@ def project_group_edit_result_for_model(
         result["repairs_applied"] = repairs_applied[:8]
     if warnings:
         result["warnings"] = warnings
+    if failed_outcomes:
+        first_code = failed_outcomes[0].get("code")
+        result["code"] = first_code if isinstance(first_code, str) and first_code else "INTERNAL_ERROR"
+        result["fallback_allowed"] = all(
+            bool(outcome.get("fallback_allowed", False)) for outcome in failed_outcomes
+        )
     return result

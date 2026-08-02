@@ -689,6 +689,8 @@ class AddonBlockToolsConfig(BaseModel):
     # 0 = absolute execute omits locked_targets on the wire (preferred).
     # >0 caps locked list only on non-omit paths (player_relative / incomplete geometry).
     max_locked_targets_on_wire: int = Field(default=0, ge=0, le=1024)
+    inspect_summary_threshold: int = Field(default=8, ge=1, le=64)
+    inspect_sample_limit: int = Field(default=8, ge=1, le=32)
     max_edits_per_group: int = Field(default=16, ge=1, le=64)
     max_total_targets_per_group: int = Field(default=4096, ge=1, le=16384)
 

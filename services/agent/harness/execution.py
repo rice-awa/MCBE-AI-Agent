@@ -811,9 +811,8 @@ def _record_block_edit_fallback_outcome(
 def _command_may_be_block_fallback(command: Any) -> bool:
     """Identify direct and ``execute … run`` block mutations.
 
-    A Minecraft ``function`` is opaque to this process; when a dedicated edit
-    failed without permission to fall back it is deliberately treated as a
-    possible block mutation instead of trying to inspect the function body.
+    Opaque ``function`` and ``schedule`` commands are not raw block commands;
+    their existing command-tool risk policy remains responsible for them.
     """
     if not isinstance(command, str):
         return False
@@ -823,11 +822,7 @@ def _command_may_be_block_fallback(command: Any) -> bool:
     if not text:
         return False
     root = extract_command_root(text)
-    if root in _BLOCK_COMMAND_FALLBACK_ROOTS or root == "function":
-        return True
-    # Bedrock ``schedule`` subcommands execute opaque function files (the word
-    # "function" is not present in every syntax variant).
-    if root == "schedule":
+    if root in _BLOCK_COMMAND_FALLBACK_ROOTS:
         return True
     if root != "execute":
         return False
@@ -855,8 +850,10 @@ def _is_explicit_raw_command_prompt(ctx: RunContext[Any], commands: list[str]) -
     normalized_prompt = " ".join(prompt.casefold().split())
     if _PROMPT_NEGATION_RE.search(normalized_prompt):
         return False
-    has_action = normalized_prompt.startswith("/") or bool(
-        _EXPLICIT_COMMAND_ACTION_RE.search(normalized_prompt)
+    has_action = (
+        normalized_prompt.startswith("/")
+        or bool(_EXPLICIT_COMMAND_ACTION_RE.search(normalized_prompt))
+        or bool(re.search(r"(?:执行|运行)(?:\s*(?:这个|该|以下))?\s*/", normalized_prompt))
     )
     if not has_action:
         return False

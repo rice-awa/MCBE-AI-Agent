@@ -358,7 +358,8 @@ async def test_write_failure_does_not_raise_and_counts_failures(tmp_path, contex
     # emit itself must not raise (already returned)
 
 
-def test_settings_agent_trace_defaults_and_validation():
+def test_settings_agent_trace_defaults_and_validation(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     settings = Settings()
     assert settings.agent_trace_enabled is False
     assert settings.agent_trace_include_content is False

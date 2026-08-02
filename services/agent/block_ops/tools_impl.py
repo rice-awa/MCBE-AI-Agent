@@ -2829,6 +2829,7 @@ async def _execute_one_group_edit(
     mode = legacy["mode"]
     unsupported = await _require_supported(ctx)
     if unsupported is not None:
+        code, fallback_allowed = _failure_metadata(unsupported)
         return {
             "index": index,
             "status": "unknown",
@@ -2837,6 +2838,8 @@ async def _execute_one_group_edit(
             "mode": mode,
             "warning": "Addon 桥接不可用",
             "failure": unsupported,
+            "code": code,
+            "fallback_allowed": fallback_allowed,
         }
 
     limits = get_block_tools_limits(deps.settings)
@@ -2942,6 +2945,7 @@ async def _execute_one_group_edit(
     except Exception as exc:
         mapped = map_bridge_exception(exc, tool_name="edit_blocks")
         unknown = bool(getattr(mapped, "external_state_unknown", False))
+        code, fallback_allowed = _failure_metadata(mapped)
         return {
             "index": index,
             "status": "unknown" if unknown else "failed",
@@ -2949,10 +2953,12 @@ async def _execute_one_group_edit(
             "skipped": 0,
             "mode": mode,
             "failure": mapped,
+            "code": code,
+            "fallback_allowed": fallback_allowed,
         }
 
     if not result.is_success:
-        code = _error_code_from_failure(result)
+        code, fallback_allowed = _failure_metadata(result)
         unknown = code == BlockErrorCode.STATE_UNKNOWN
         try:
             failure_body = json.loads(result.output)
@@ -2970,6 +2976,7 @@ async def _execute_one_group_edit(
             "mode": mode,
             "failure": result,
             "code": code,
+            "fallback_allowed": fallback_allowed,
             "audit_evidence": audit_evidence,
         }
 
@@ -2998,17 +3005,17 @@ async def _execute_one_group_edit(
     }
 
 
-def _error_code_from_failure(result: ToolResult) -> str:
-    """Best-effort extract a BlockErrorCode from a failed ToolResult."""
+def _failure_metadata(result: ToolResult) -> tuple[str, bool]:
+    """Extract the stable code and fail-closed fallback decision from a result."""
     try:
         body = json.loads(result.output)
     except Exception:
-        return BlockErrorCode.INTERNAL_ERROR
+        return BlockErrorCode.INTERNAL_ERROR, False
     if isinstance(body, dict):
         code = body.get("code")
         if isinstance(code, str) and code:
-            return code
-    return BlockErrorCode.INTERNAL_ERROR
+            return code, bool(body.get("fallback_allowed", False))
+    return BlockErrorCode.INTERNAL_ERROR, False
 
 
 def _bounded_edit_audit_evidence(index: int, body: dict[str, Any]) -> dict[str, Any]:
