@@ -1160,6 +1160,7 @@ def register_agent_tools(
         locked_targets: list[dict[str, Any]] | None = None,
         locked_targets_by_edit: list[list[dict[str, Any]]] | None = None,
         noop_edit_indices: list[int] | None = None,
+        repairs_applied: list[Any] | None = None,
         phase: str | None = None,
     ) -> str:
         """写入方块：place 单格 / batch 离散批量 / fill 区域填充。
@@ -1206,6 +1207,7 @@ def register_agent_tools(
             locked_targets=locked_targets,
             locked_targets_by_edit=locked_targets_by_edit,
             noop_edit_indices=noop_edit_indices,
+            repairs_applied=repairs_applied,
             phase=phase,
         )
 

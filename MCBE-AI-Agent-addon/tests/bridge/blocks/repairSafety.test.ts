@@ -42,6 +42,25 @@ describe("block id repair + candidate suggestions (issue 05 §4.2)", () => {
     expect(repairs.some((r) => r.reason === "fuzzy_vanilla_edit_distance_1")).toBe(true);
   });
 
+  it("normalizes block id casing deterministically and records the repair", async () => {
+    __setBlock("minecraft:overworld", 0, 64, 0, { typeId: "minecraft:air", isAir: true });
+
+    const result = await handlePlace({
+      mode: "place",
+      coordinate_mode: "absolute",
+      dimension: "minecraft:overworld",
+      position: { x: 0, y: 64, z: 0 },
+      type_id: "Minecraft:STONE",
+      phase: "preflight",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect((result.payload as any).type_id).toBe("minecraft:stone");
+    const repairs = result.payload.repairs_applied as Array<{ reason: string }>;
+    expect(repairs.some((r) => r.reason === "lowercase_type_id")).toBe(true);
+  });
+
   it("returns up to 3 candidates for an ambiguous unknown id, never silently choosing", async () => {
     // Two known ids both at edit-distance 1 from "minecraft:test_ac".
     BlockTypes.__add("minecraft:test_aa");

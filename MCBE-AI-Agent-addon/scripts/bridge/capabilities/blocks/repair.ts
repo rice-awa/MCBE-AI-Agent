@@ -115,6 +115,16 @@ export function repairTypeId(
     });
     value = trimmed;
   }
+  const lowercased = value.toLowerCase();
+  if (lowercased !== value) {
+    repairs.push({
+      field: "type_id",
+      from: value,
+      to: lowercased,
+      reason: "lowercase_type_id",
+    });
+    value = lowercased;
+  }
   if (value && !value.includes(":")) {
     const namespaced = `minecraft:${value}`;
     repairs.push({

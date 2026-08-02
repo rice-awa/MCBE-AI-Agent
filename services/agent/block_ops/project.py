@@ -351,6 +351,8 @@ def _per_edit_skipped_type_counts(payload: dict[str, Any]) -> dict[str, Any]:
 
 def project_group_edit_result_for_model(
     per_edit_results: list[dict[str, Any]],
+    *,
+    repairs_applied: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Aggregate per-edit execute outcomes into the group result (spec §9.3).
 
@@ -446,6 +448,8 @@ def project_group_edit_result_for_model(
         "changed_total": changed_total,
         "edits": edits,
     }
+    if repairs_applied:
+        result["repairs_applied"] = repairs_applied[:8]
     if warnings:
         result["warnings"] = warnings
     return result

@@ -56,7 +56,7 @@ _AUDIT_EDIT_EVIDENCE_FIELDS = frozenset({
     "before", "after", "before_samples", "after_samples", "verification",
     "verification_summary", "rollback", "failed_index", "written_count",
     "repairs_applied", "candidates", "valid_state_keys", "protected",
-    "multiblock",
+    "multiblock", "type_id", "component", "target",
 })
 
 
@@ -76,7 +76,8 @@ _EDIT_EXECUTE_FIELDS = frozenset({
     "edits", "dimension", "block", "expect", "status",
     "type_id", "mode", "coordinate_mode", "position", "positions",
     "from_pos", "to_pos", "states", "replace_any", "expected_previous",
-    "locked_targets", "locked_targets_by_edit", "noop_edit_indices", "phase",
+    "locked_targets", "locked_targets_by_edit", "noop_edit_indices",
+    "repairs_applied", "phase",
 })
 _INSPECT_EXECUTE_FIELDS = frozenset({
     "coordinate_mode", "dimension", "position", "positions", "target",
@@ -99,7 +100,8 @@ def project_block_execute_args(tool_name: str, authorized_args: dict[str, Any]) 
                 key: value for key, value in projected.items()
                 if key in {
                     "edits", "dimension", "locked_targets",
-                    "locked_targets_by_edit", "noop_edit_indices", "phase", "status",
+                    "locked_targets_by_edit", "noop_edit_indices",
+                    "repairs_applied", "phase", "status",
                 }
                 and value is not None
             }
@@ -529,7 +531,11 @@ def _normalize_aabb_corners(
         return from_pos, to_pos
 
 
-def _normalize_block_id(raw: Any) -> tuple[str, list[str]]:
+def _normalize_block_id(
+    raw: Any,
+    *,
+    field_name: str = "block.type_id",
+) -> tuple[str, list[str]]:
     """Lowercase a block type_id and ensure the ``minecraft:`` prefix.
 
     Returns ``(normalized, repairs)`` where ``repair`` records mutations so the
@@ -541,10 +547,10 @@ def _normalize_block_id(raw: Any) -> tuple[str, list[str]]:
     value = raw.strip().lower()
     repairs: list[str] = []
     if value != raw.strip():
-        repairs.append(f"block.type_id: lowercased {raw.strip()!r} -> {value!r}")
+        repairs.append(f"{field_name}: lowercased {raw.strip()!r} -> {value!r}")
     if ":" not in value:
         value = f"minecraft:{value}"
-        repairs.append(f"block.type_id: added namespace -> {value!r}")
+        repairs.append(f"{field_name}: added namespace -> {value!r}")
     return value, repairs
 
 
@@ -568,7 +574,10 @@ def _normalize_block_input(block: Any) -> tuple[dict[str, Any], list[str]]:
     return {"type_id": "", "states": None}, []
 
 
-def _normalize_expect(expect: Any) -> dict[str, Any]:
+def _normalize_expect(
+    expect: Any,
+    repairs: list[str] | None = None,
+) -> dict[str, Any]:
     """Normalize an ``expect`` spec to a tagged descriptor.
 
     Shapes:
@@ -582,10 +591,18 @@ def _normalize_expect(expect: Any) -> dict[str, Any]:
     if expect == "any":
         return {"kind": "any"}
     if isinstance(expect, str):
-        type_id, _ = _normalize_block_id(expect)
+        type_id, expect_repairs = _normalize_block_id(
+            expect, field_name="expect.type_id"
+        )
+        if repairs is not None:
+            repairs.extend(expect_repairs)
         return {"kind": "type", "type_id": type_id}
     if isinstance(expect, dict):
-        type_id, _ = _normalize_block_id(expect.get("type_id"))
+        type_id, expect_repairs = _normalize_block_id(
+            expect.get("type_id"), field_name="expect.type_id"
+        )
+        if repairs is not None:
+            repairs.extend(expect_repairs)
         states = expect.get("states")
         if isinstance(states, dict) and states:
             return {"kind": "permutation", "type_id": type_id, "states": states}
@@ -1217,6 +1234,14 @@ def build_block_preflight_plan(
         for key, value in preflight_payload.items()
         if key not in authorized_args and key not in {"schema_version", "ok"}
     }
+    if (
+        tool_name == "edit_blocks"
+        and isinstance(original_args.get("edits"), list)
+        and isinstance(
+        approval_metadata.get("repairs_applied"), list
+        )
+    ):
+        execute_args["repairs_applied"] = approval_metadata["repairs_applied"][:8]
     return BlockPreflightPlan(authorized_args, execute_args, approval_metadata)
 
 
@@ -1411,7 +1436,7 @@ def _normalize_one_edit(
             BlockErrorCode.INVALID_ARGUMENT,
             "block 必填（type_id 缺失）",
         )
-    expect_info = _normalize_expect(edit.get("expect"))
+    expect_info = _normalize_expect(edit.get("expect"), repairs)
     legacy = _unified_target_to_legacy(normalized, block_info, expect_info, dimension)
     return _EditNormalization(legacy, normalized, block_info, expect_info, repairs), None
 
@@ -2090,6 +2115,8 @@ async def _run_grouped_edit_preflight(
     approval_metadata = _build_group_approval_metadata(
         group, preflights, ownership, dimension
     )
+    if approval_metadata["repairs_applied"]:
+        execute_args["repairs_applied"] = approval_metadata["repairs_applied"][:8]
 
     # Reject before approval if any edit's post-omit execute frame overflows.
     for g in group:
@@ -2253,7 +2280,7 @@ def _build_group_approval_metadata(
         "replaced_non_air_counts": _aggregate_type_counts(replaced_counts),
         "expect_any": any_expect_any,
         "non_rollbackable_fill": any_non_rollbackable_fill,
-        "repairs_applied": repairs,
+        "repairs_applied": repairs[:8],
         "edits": per_edit,
     }
 
@@ -2920,6 +2947,14 @@ async def _execute_one_group_edit(
     if not result.is_success:
         code = _error_code_from_failure(result)
         unknown = code == BlockErrorCode.STATE_UNKNOWN
+        try:
+            failure_body = json.loads(result.output)
+        except Exception:
+            failure_body = {}
+        audit_evidence = _bounded_edit_audit_evidence(
+            index, failure_body if isinstance(failure_body, dict) else {}
+        )
+        audit_evidence["code"] = code
         return {
             "index": index,
             "status": "unknown" if unknown else "failed",
@@ -2928,7 +2963,7 @@ async def _execute_one_group_edit(
             "mode": mode,
             "failure": result,
             "code": code,
-            "audit_evidence": {"index": index, "code": code},
+            "audit_evidence": audit_evidence,
         }
 
     try:
@@ -2989,6 +3024,7 @@ async def _execute_edits_group(
     phase: str | None,
     locked_targets_by_edit: list[list[dict[str, Any]]] | None = None,
     noop_edit_indices: list[int] | None = None,
+    repairs_applied: list[Any] | None = None,
 ) -> ToolResult:
     """Execute a group of independent edits in canonical order (spec §8.3).
 
@@ -3041,7 +3077,9 @@ async def _execute_edits_group(
     # a partial/unknown group as fully complete. The body's ``ok``/``status``
     # fields carry the group-level outcome; the success ToolResult keeps the
     # call idempotent (no re-execution of already-applied edits).
-    group = project_group_edit_result_for_model(per_edit)
+    group = project_group_edit_result_for_model(
+        per_edit, repairs_applied=repairs_applied
+    )
     unknown_seen = any(o.get("status") == "unknown" for o in per_edit)
     audit_evidence = {
         "edits": [
@@ -3084,6 +3122,7 @@ async def edit_blocks_impl(
     locked_targets: list[dict[str, Any]] | None = None,
     locked_targets_by_edit: list[list[dict[str, Any]]] | None = None,
     noop_edit_indices: list[int] | None = None,
+    repairs_applied: list[Any] | None = None,
     phase: str | None = None,
     edits: list[dict[str, Any]] | None = None,
 ) -> ToolResult:
@@ -3106,6 +3145,7 @@ async def edit_blocks_impl(
             phase=phase,
             locked_targets_by_edit=locked_targets_by_edit,
             noop_edit_indices=noop_edit_indices,
+            repairs_applied=repairs_applied,
         )
 
     # Legacy flat contract (harness recovery of previously-approved operations).

@@ -1352,7 +1352,8 @@ def _duration_ms(start: float) -> int:
 
 # Model-facing tool schema must not advertise recovery-only fields.
 _BLOCK_INTERNAL_SCHEMA_KEYS = frozenset({
-    "locked_targets", "locked_targets_by_edit", "noop_edit_indices", "phase",
+    "locked_targets", "locked_targets_by_edit", "noop_edit_indices",
+    "repairs_applied", "phase",
 })
 
 

@@ -3466,7 +3466,9 @@ def test_project_block_execute_args_is_subset_of_public_tool_signatures() -> Non
     assert set(edit_plan.execute_args) <= edit_sig
     assert "from" not in edit_plan.execute_args
     assert "to" not in edit_plan.execute_args
-    assert "repairs_applied" not in edit_plan.execute_args
+    # Bounded repair evidence is the one recovery-only exception: it must
+    # survive approval resume so the final model result can explain canonicalization.
+    assert edit_plan.execute_args["repairs_applied"] == ["reversed_bounds"]
     assert "edits" in edit_plan.execute_args
     assert "dimension" in edit_plan.execute_args
     assert "locked_targets" in edit_plan.execute_args
@@ -4808,7 +4810,7 @@ async def test_grouped_edits_approval_metadata_deduped_counts_and_repairs() -> N
                 {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "GOLD_BLOCK"},
                 {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "GOLD_BLOCK"},
                 # Two independent iron cells.
-                {"target": {"positions": [{"x": 6, "y": 64, "z": 6}]}, "block": {"type_id": "minecraft:iron_block"}},
+                {"target": {"positions": [{"x": 6, "y": 64, "z": 6}]}, "block": {"type_id": "minecraft:iron_block"}, "expect": "STONE"},
                 {"target": {"positions": [{"x": 7, "y": 64, "z": 7}]}, "block": {"type_id": "minecraft:iron_block"}},
             ],
             "dimension": "minecraft:overworld",
@@ -4830,6 +4832,8 @@ async def test_grouped_edits_approval_metadata_deduped_counts_and_repairs() -> N
     assert meta["repairs_applied"] == [
         "block.type_id: lowercased 'GOLD_BLOCK' -> 'gold_block'",
         "block.type_id: added namespace -> 'minecraft:gold_block'",
+        "expect.type_id: lowercased 'STONE' -> 'stone'",
+        "expect.type_id: added namespace -> 'minecraft:stone'",
     ]
 
 
@@ -4916,6 +4920,18 @@ def test_project_group_edit_result_noop_group_reports_noop() -> None:
     assert mixed["ok"] is True
     assert mixed["status"] == "applied"
     assert mixed["changed_total"] == 2
+
+
+def test_project_group_edit_result_surfaces_bounded_repairs() -> None:
+    """Canonical block/expect repairs remain visible in the final group result."""
+    from services.agent.block_ops.project import project_group_edit_result_for_model
+
+    result = project_group_edit_result_for_model(
+        [{"index": 0, "status": "applied", "changed": 1, "skipped": 0}],
+        repairs_applied=[f"repair-{index}" for index in range(12)],
+    )
+
+    assert result["repairs_applied"] == [f"repair-{index}" for index in range(8)]
 
 
 # ---------------------------------------------------------------------------
@@ -5107,6 +5123,44 @@ def test_audit_evidence_fields_cover_issue_05_metadata() -> None:
     assert "valid_state_keys" in _AUDIT_EDIT_EVIDENCE_FIELDS
     assert "protected" in _AUDIT_EDIT_EVIDENCE_FIELDS
     assert "multiblock" in _AUDIT_EDIT_EVIDENCE_FIELDS
+
+
+@pytest.mark.asyncio
+async def test_grouped_edit_failure_keeps_bounded_issue_05_evidence_for_audit() -> None:
+    """Structured repair/safety metadata survives a grouped execute failure."""
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks" and payload.get("phase") == "execute":
+            return {
+                "ok": False,
+                "payload": {
+                    "code": "BLOCK_UNKNOWN",
+                    "type_id": "minecraft:stonx",
+                    "candidates": ["minecraft:stone", "minecraft:ston"],
+                },
+            }
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    result = await _execute_edits_group(
+        SimpleNamespace(deps=_Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings())),  # type: ignore[arg-type]
+        edits=[{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stonx"}],
+        dimension="minecraft:overworld",
+        phase="execute",
+    )
+
+    assert result.audit_evidence == {
+        "edits": [{
+            "index": 0,
+            "code": "BLOCK_UNKNOWN",
+            "type_id": "minecraft:stonx",
+            "candidates": ["minecraft:stone", "minecraft:ston"],
+        }]
+    }
 
 
 @pytest.mark.asyncio
