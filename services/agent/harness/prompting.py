@@ -4,9 +4,8 @@ from services.agent.harness.catalog import ToolIntent, get_tool_entry, group_too
 
 _INTENT_GUIDANCE: dict[ToolIntent, str] = {
     ToolIntent.CHANGE_WORLD: (
-        "玩家明确要求执行命令、修改世界或改变实体状态时使用。"
-        "凡 inspect_block/edit_blocks 能表达的方块查询与写入，必须优先使用专用工具，"
-        "不要手写 setblock/fill；仅当专用工具不可用或能力不足时，再审批使用命令工具。"
+        "玩家明确要求执行命令、修改世界或改变实体状态时使用；"
+        "优先选择契约最贴近玩家目标的专用工具。"
     ),
     ToolIntent.NOTIFY_DISPLAY: "玩家要求在游戏中展示消息、标题、actionbar 或脚本事件时使用。",
     ToolIntent.QUERY_WORLD: (
@@ -19,22 +18,12 @@ _INTENT_GUIDANCE: dict[ToolIntent, str] = {
 
 
 _BLOCK_TOOL_PRIORITY = (
-    "方块操作优先策略：\n"
-    "- 查询用 inspect_block（target.positions 或 target.box）；"
-    "写入用 edit_blocks（mode=place|batch|fill）。\n"
-    "- 平台/地板/墙：优先一次 fill 或少量 batch；禁止对连续区域 place×N。\n"
-    "- 默认仅替换空气；覆写非空须 replace_any=true（高风险再审批）。\n"
-    "- 删除：放置 minecraft:air 并授权覆写。\n"
-    "- inspect 结果：单点/少量点返回完整方块快照；多点/box 返回有界摘要"
-    "（bounds/count/type_counts/unknown_count/samples）。\n"
-    "- 成功结果：was / previous_type_counts 仅含被替换的非空气方块；"
-    "无 was / 无 previous_type_counts = 原为空气（正常）。"
-    "若出现非预期非空 was，应向玩家说明或改 plan / 对齐 replace_any 意图。\n"
-    "- LIMIT_EXCEEDED：减小 positions 数量或 fill 体积，仍用 batch/fill；禁止 place 风暴。\n"
-    "- PRECONDITION_FAILED 且 actual 非空气：跳过该格，或 replace_any=true 再审批；"
-    "勿无授权对同一格重试。\n"
-    "- 专用工具可用时禁止改用 setblock/fill；"
-    "仅当返回 ADDON_UNAVAILABLE 才可另行审批 run_minecraft_command。"
+    "方块操作编排规则：\n"
+    "- 同一施工阶段中互相独立的编辑合并为一个 edit_blocks 调用。\n"
+    "- 有顺序依赖的编辑拆到下一组，不依赖列表顺序模拟世界状态。\n"
+    "- edit_blocks 已内置写前读取和写后确认，不要机械地前后调用 inspect_block。\n"
+    "- 只有专用方块工具结构化结果明确给出 fallback_allowed=true，"
+    "才可另行调用命令工具并遵循其审批策略。"
 )
 
 

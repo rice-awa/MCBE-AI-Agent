@@ -64,6 +64,24 @@ _COMMAND_APPROVAL_TOOLS: frozenset[str] = frozenset(
     {"run_minecraft_command", "run_minecraft_commands"}
 )
 
+_BLOCK_COMMAND_FALLBACK_TOOLS: frozenset[str] = frozenset(
+    {"run_minecraft_command", "run_minecraft_commands", "run_world_command"}
+)
+_BLOCK_COMMAND_FALLBACK_ROOTS: frozenset[str] = frozenset({"setblock", "fill", "clone"})
+DEFAULT_BLOCK_COMMAND_FALLBACK_TTL_SECONDS = 600.0
+DEFAULT_BLOCK_COMMAND_FALLBACK_MAX_ENTRIES = 2048
+_PROMPT_NEGATION_RE = re.compile(
+    r"(?:不要|别(?:再|用|执行)?|禁止|不(?:要|用|执行)|无需|不要再)"
+    r"|\b(?:do\s+not|don't|dont)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_COMMAND_ACTION_RE = re.compile(
+    r"(?:执行(?:\s*(?:这个|该|以下))?\s*命令|运行(?:\s*(?:这个|该|以下))?\s*命令|"
+    r"原始命令|直接执行|请执行|(?:使用|用)(?:\s+\S+){0,12}\s+命令|"
+    r"\b(?:execute|run|use)\s+(?:the\s+)?(?:raw\s+)?command\b)",
+    re.IGNORECASE,
+)
+
 # 省略 target 时的已知工具默认目标（与 tools.py 签名默认值对齐）。
 # 仅当默认明确是「当前玩家」时才可自动允许 MEDIUM；@a / 多目标默认必须审批。
 # - "@s" / "self": 默认仅当前玩家
@@ -159,6 +177,93 @@ class IdempotencyStore:
     def _purge_unlocked(self, now: float | None = None) -> None:
         current = now if now is not None else time.time()
         expired = [k for k, v in self._items.items() if current - v.created_at >= self._ttl]
+        for key in expired:
+            del self._items[key]
+
+
+@dataclass(frozen=True)
+class BlockCommandFallbackRecord:
+    """最近一次 ``edit_blocks`` 的结构化回退结论。"""
+
+    fallback_allowed: bool
+    created_at: float
+    code: str | None = None
+
+
+class BlockCommandFallbackStore:
+    """按连接、玩家和 run 隔离的有界 TTL 方块命令回退状态。"""
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = DEFAULT_BLOCK_COMMAND_FALLBACK_TTL_SECONDS,
+        max_entries: int = DEFAULT_BLOCK_COMMAND_FALLBACK_MAX_ENTRIES,
+    ) -> None:
+        self._ttl = float(ttl_seconds)
+        self._max_entries = max(1, int(max_entries))
+        self._items: OrderedDict[tuple[str, str, str], BlockCommandFallbackRecord] = OrderedDict()
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def make_key(connection_id: str, player_name: str | None, run_id: str) -> tuple[str, str, str]:
+        return (str(connection_id or ""), str(player_name or ""), str(run_id or ""))
+
+    def get(
+        self,
+        connection_id: str,
+        player_name: str | None,
+        run_id: str,
+    ) -> BlockCommandFallbackRecord | None:
+        key = self.make_key(connection_id, player_name, run_id)
+        with self._lock:
+            self._purge_unlocked()
+            record = self._items.get(key)
+            if record is not None:
+                self._items.move_to_end(key)
+            return record
+
+    def put(
+        self,
+        connection_id: str,
+        player_name: str | None,
+        run_id: str,
+        *,
+        fallback_allowed: bool,
+        code: str | None = None,
+    ) -> None:
+        key = self.make_key(connection_id, player_name, run_id)
+        with self._lock:
+            self._purge_unlocked()
+            self._items[key] = BlockCommandFallbackRecord(
+                fallback_allowed=bool(fallback_allowed),
+                created_at=time.time(),
+                code=code,
+            )
+            self._items.move_to_end(key)
+            while len(self._items) > self._max_entries:
+                self._items.popitem(last=False)
+
+    def clear_run(self, connection_id: str, player_name: str | None, run_id: str) -> bool:
+        key = self.make_key(connection_id, player_name, run_id)
+        with self._lock:
+            return self._items.pop(key, None) is not None
+
+    def clear_connection(self, connection_id: str) -> int:
+        cid = str(connection_id or "")
+        with self._lock:
+            self._purge_unlocked()
+            keys = [key for key in self._items if key[0] == cid]
+            for key in keys:
+                del self._items[key]
+            return len(keys)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+    def _purge_unlocked(self, now: float | None = None) -> None:
+        current = now if now is not None else time.time()
+        expired = [key for key, record in self._items.items() if current - record.created_at >= self._ttl]
         for key in expired:
             del self._items[key]
 
@@ -629,6 +734,7 @@ def _block_result_observability_status(result: ToolResult) -> tuple[bool, bool]:
 
 
 _GLOBAL_IDEMPOTENCY = IdempotencyStore()
+_GLOBAL_BLOCK_COMMAND_FALLBACK = BlockCommandFallbackStore()
 
 
 def get_idempotency_store() -> IdempotencyStore:
@@ -639,12 +745,177 @@ def reset_idempotency_store() -> None:
     _GLOBAL_IDEMPOTENCY.clear()
 
 
+def get_block_command_fallback_store() -> BlockCommandFallbackStore:
+    return _GLOBAL_BLOCK_COMMAND_FALLBACK
+
+
+def reset_block_command_fallback_store() -> None:
+    _GLOBAL_BLOCK_COMMAND_FALLBACK.clear()
+
+
+def clear_block_command_fallback_for_connection(connection_id: str) -> int:
+    """清理断开连接遗留的方块命令回退状态。"""
+    return _GLOBAL_BLOCK_COMMAND_FALLBACK.clear_connection(connection_id)
+
+
+def _structured_block_edit_outcome(result: Any) -> tuple[bool, bool, str | None] | None:
+    """Return ``(failed, fallback_allowed, code)`` for structured edit results.
+
+    Registered production tools stringify ``ToolResult`` before this wrapper can
+    observe it, while direct test/toolset use can still return ``ToolResult``.
+    Treat both representations identically and fail closed for an unstructured
+    failed ``ToolResult``.
+    """
+    tool_result = result if isinstance(result, ToolResult) else None
+    payload = tool_result.output if tool_result is not None else result
+    if isinstance(payload, str):
+        try:
+            body = json.loads(payload)
+        except (TypeError, ValueError):
+            body = None
+        if isinstance(body, dict) and isinstance(body.get("ok"), bool):
+            if body["ok"]:
+                return (False, False, None)
+            code = body.get("code")
+            return (True, bool(body.get("fallback_allowed", False)), str(code) if code else None)
+    if tool_result is not None:
+        return (not tool_result.is_success, False, None)
+    return None
+
+
+def _record_block_edit_fallback_outcome(
+    result: Any,
+    *,
+    connection_id: str,
+    player_name: str | None,
+    run_id: str,
+    store: BlockCommandFallbackStore | None = None,
+) -> None:
+    outcome = _structured_block_edit_outcome(result)
+    if outcome is None:
+        return
+    failed, fallback_allowed, code = outcome
+    target = store if store is not None else get_block_command_fallback_store()
+    if failed:
+        target.put(
+            connection_id,
+            player_name,
+            run_id,
+            fallback_allowed=fallback_allowed,
+            code=code,
+        )
+    else:
+        target.clear_run(connection_id, player_name, run_id)
+
+
+def _command_may_be_block_fallback(command: Any) -> bool:
+    """Identify direct and ``execute … run`` block mutations.
+
+    A Minecraft ``function`` is opaque to this process; when a dedicated edit
+    failed without permission to fall back it is deliberately treated as a
+    possible block mutation instead of trying to inspect the function body.
+    """
+    if not isinstance(command, str):
+        return False
+    text = command.strip()
+    if text.startswith("/"):
+        text = text[1:].lstrip()
+    if not text:
+        return False
+    root = extract_command_root(text)
+    if root in _BLOCK_COMMAND_FALLBACK_ROOTS or root == "function":
+        return True
+    # Bedrock ``schedule`` subcommands execute opaque function files (the word
+    # "function" is not present in every syntax variant).
+    if root == "schedule":
+        return True
+    if root != "execute":
+        return False
+    nested = re.search(r"\brun\s+(.+)$", text, flags=re.IGNORECASE)
+    return bool(nested and _command_may_be_block_fallback(nested.group(1)))
+
+
+def _fallback_commands(tool_name: str, normalized_args: dict[str, Any]) -> list[str]:
+    if tool_name in {"run_minecraft_command", "run_world_command"}:
+        command = normalized_args.get("command")
+        return [command] if isinstance(command, str) and _command_may_be_block_fallback(command) else []
+    if tool_name == "run_minecraft_commands":
+        commands = normalized_args.get("commands")
+        if not isinstance(commands, list):
+            return []
+        return [command for command in commands if _command_may_be_block_fallback(command)]
+    return []
+
+
+def _is_explicit_raw_command_prompt(ctx: RunContext[Any], commands: list[str]) -> bool:
+    """Allow only an exact command quoted in the current, non-negative prompt."""
+    prompt = getattr(ctx, "prompt", None)
+    if not isinstance(prompt, str) or not prompt:
+        return False
+    normalized_prompt = " ".join(prompt.casefold().split())
+    if _PROMPT_NEGATION_RE.search(normalized_prompt):
+        return False
+    has_action = normalized_prompt.startswith("/") or bool(
+        _EXPLICIT_COMMAND_ACTION_RE.search(normalized_prompt)
+    )
+    if not has_action:
+        return False
+    normalized_commands = [
+        " ".join(command.lstrip("/").casefold().split()) for command in commands
+    ]
+    return bool(normalized_commands) and all(
+        command and command in normalized_prompt for command in normalized_commands
+    )
+
+
+def _block_command_fallback_denial(
+    *,
+    tool_name: str,
+    normalized_args: dict[str, Any],
+    ctx: RunContext[Any],
+    connection_id: str,
+    player_name: str | None,
+    run_id: str,
+    store: BlockCommandFallbackStore | None = None,
+) -> PolicyDecision | None:
+    """Return a denial for an automatic raw-command fallback, if applicable."""
+    if tool_name not in _BLOCK_COMMAND_FALLBACK_TOOLS or getattr(ctx, "tool_call_approved", False):
+        return None
+    commands = _fallback_commands(tool_name, normalized_args)
+    if not commands or _is_explicit_raw_command_prompt(ctx, commands):
+        return None
+
+    from services.agent.block_ops.capability import (
+        BlockCapabilityStatus,
+        get_block_capability_cache,
+    )
+
+    capability = get_block_capability_cache().get(connection_id)
+    if capability is None or capability.status != BlockCapabilityStatus.SUPPORTED:
+        return None
+    target = store if store is not None else get_block_command_fallback_store()
+    record = target.get(connection_id, player_name, run_id)
+    if record is None or record.fallback_allowed:
+        return None
+    return PolicyDecision(
+        action=PolicyDecisionKind.DENY,
+        reason=(
+            "专用方块编辑刚刚失败且不允许命令回退；请根据结构化错误修正 edit_blocks "
+            "参数，或等待明确允许回退的结果。"
+        ),
+        metadata={"fallback_code": record.code, "command_count": len(commands)},
+    )
+
+
 @dataclass
 class HarnessToolset(WrapperToolset[Any]):
     """统一策略/审批/幂等/审计包装层。"""
 
     policy: PolicyEngine = field(default_factory=PolicyEngine)
     idempotency: IdempotencyStore = field(default_factory=get_idempotency_store)
+    fallback_store: BlockCommandFallbackStore = field(
+        default_factory=get_block_command_fallback_store
+    )
 
     async def get_tools(self, ctx: RunContext[Any]) -> dict[str, ToolsetTool[Any]]:
         await self._ensure_block_capability(ctx)
@@ -699,6 +970,14 @@ class HarnessToolset(WrapperToolset[Any]):
                 connection_id=connection_id,
             )
             if preflight_failure is not None:
+                if name == "edit_blocks":
+                    _record_block_edit_fallback_outcome(
+                        preflight_failure,
+                        connection_id=connection_id,
+                        player_name=player_name,
+                        run_id=str(run_id),
+                        store=self.fallback_store,
+                    )
                 self._audit(
                     settings=settings,
                     tool_name=name,
@@ -722,6 +1001,53 @@ class HarnessToolset(WrapperToolset[Any]):
             if name in _BLOCK_OPS_TOOLS and execute_args is not None
             else args_hash
         )
+
+        # 回退限制必须早于幂等缓存：同一 call-id 的旧命令结果不能绕过
+        # 当前任务中新出现的 ``fallback_allowed=false`` 方块编辑失败。
+        fallback_denial = _block_command_fallback_denial(
+            tool_name=name,
+            normalized_args=normalized,
+            ctx=ctx,
+            connection_id=connection_id,
+            player_name=player_name,
+            run_id=str(run_id),
+            store=self.fallback_store,
+        )
+        if fallback_denial is not None:
+            denied = ToolResult.failure(
+                fallback_denial.reason,
+                error_kind="DENIED",
+                retryable=False,
+                diagnostic_summary=fallback_denial.reason,
+            )
+            self._audit(
+                settings=settings,
+                tool_name=name,
+                parameters=normalized,
+                ctx=ctx,
+                status="failure",
+                duration_ms=_duration_ms(start),
+                result=denied,
+            )
+            self._trace_policy_decided(
+                trace_recorder,
+                trace_context,
+                tool_name=name,
+                tool_call_id=str(tool_call_id) if tool_call_id else None,
+                decision=fallback_denial,
+                already_approved=False,
+            )
+            self._trace_tool_result(
+                trace_recorder,
+                trace_context,
+                tool_name=name,
+                tool_call_id=str(tool_call_id) if tool_call_id else None,
+                result=fallback_denial.reason,
+                status="denied",
+                duration_ms=_duration_ms(start),
+                attributes={"policy_action": str(fallback_denial.action)},
+            )
+            return ToolDenied(message=fallback_denial.reason)
 
         # 1) 方块工具只按实际执行投影幂等；非方块工具保持原参数哈希兼容。
         if run_id and tool_call_id:
@@ -931,6 +1257,14 @@ class HarnessToolset(WrapperToolset[Any]):
             classified = classify_tool_exception(
                 exc, tool_name=name, execution_stage="invocation"
             )
+            if name == "edit_blocks":
+                _record_block_edit_fallback_outcome(
+                    classified,
+                    connection_id=connection_id,
+                    player_name=player_name,
+                    run_id=str(run_id),
+                    store=self.fallback_store,
+                )
             log_tool_execution_failed(
                 tool_name=name,
                 ctx=ctx,
@@ -964,6 +1298,14 @@ class HarnessToolset(WrapperToolset[Any]):
 
         # 4) 结果分类与幂等写入
         result_for_model = materialize_tool_result(raw_result)
+        if name == "edit_blocks":
+            _record_block_edit_fallback_outcome(
+                raw_result,
+                connection_id=connection_id,
+                player_name=player_name,
+                run_id=str(run_id),
+                store=self.fallback_store,
+            )
         external_unknown = False
         success = True
         if isinstance(raw_result, ToolResult):
@@ -1315,10 +1657,21 @@ class HarnessCapability(AbstractCapability[Any]):
 
     policy: PolicyEngine = field(default_factory=PolicyEngine)
     idempotency: IdempotencyStore | None = None
+    fallback_store: BlockCommandFallbackStore | None = None
 
     def get_wrapper_toolset(self, toolset: AbstractToolset[Any]) -> AbstractToolset[Any]:
         store = self.idempotency if self.idempotency is not None else get_idempotency_store()
-        return HarnessToolset(wrapped=toolset, policy=self.policy, idempotency=store)
+        fallback_store = (
+            self.fallback_store
+            if self.fallback_store is not None
+            else get_block_command_fallback_store()
+        )
+        return HarnessToolset(
+            wrapped=toolset,
+            policy=self.policy,
+            idempotency=store,
+            fallback_store=fallback_store,
+        )
 
     async def prepare_tools(
         self,

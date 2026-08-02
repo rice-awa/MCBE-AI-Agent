@@ -322,7 +322,10 @@ def _safe_addon_error_body(
         stable_code = BlockErrorCode.INTERNAL_ERROR
 
     error_kind, retryable, external_unknown = _error_kind_for_code(stable_code)
-    fallback_allowed = stable_code == BlockErrorCode.ADDON_UNAVAILABLE
+    fallback_allowed = stable_code in {
+        BlockErrorCode.ADDON_UNAVAILABLE,
+        BlockErrorCode.UNSUPPORTED_CAPABILITY,
+    }
     src = payload if isinstance(payload, dict) else {}
 
     if stable_code == BlockErrorCode.LIMIT_EXCEEDED:
@@ -466,6 +469,8 @@ def _error_kind_for_code(code: str) -> tuple[str, bool, bool]:
     """Return (error_kind, retryable, external_state_unknown)."""
     if code == BlockErrorCode.ADDON_UNAVAILABLE:
         return "TRANSIENT", True, False
+    if code == BlockErrorCode.UNSUPPORTED_CAPABILITY:
+        return "PERMANENT", False, False
     if code == BlockErrorCode.STATE_UNKNOWN:
         return "TRANSIENT", False, True
     if code == BlockErrorCode.LIMIT_EXCEEDED:

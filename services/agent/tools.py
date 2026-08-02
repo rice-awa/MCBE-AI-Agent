@@ -1131,8 +1131,6 @@ def register_agent_tools(
     ) -> str:
         """查询方块快照（type ID、states、含水/空气/液体）或区域摘要。
 
-        优先使用本工具查询方块，不要用命令试探。
-
         Args:
             ctx: 运行上下文
             target: 目标结构。``{positions: [...]}`` 查询点集（单点用长度 1），
@@ -1163,12 +1161,10 @@ def register_agent_tools(
         repairs_applied: list[Any] | None = None,
         phase: str | None = None,
     ) -> str:
-        """写入方块：place 单格 / batch 离散批量 / fill 区域填充。
+        """按统一 edits 契约写入一组独立方块编辑。
 
         每次调用可提交 **一个或多个独立编辑**（``edits`` 列表）。所有编辑在
-        调用开始时基于同一世界状态预检，产生 **一次预检 + 一次审批**，随后按
-        稳定顺序逐个执行并汇总结果。同一调用内的编辑互相独立：某个编辑失败
-        不会回滚已应用的编辑（不保证原子性）。
+        调用开始时基于同一世界状态预检，产生一次审批并返回聚合结果。
 
         每个编辑包含：
 
@@ -1185,12 +1181,8 @@ def register_agent_tools(
         ``dimension`` 为维度 ID（绝对坐标默认当前玩家维度；跨维度时需要）。
         玩家相对坐标无需 dimension。
 
-        默认仅替换空气；需要覆写非空方块时设 ``expect="any"``（高风险，需审批）。
-        删除请放置 ``minecraft:air`` 并授权覆写。
-
-        成功汇总字段：ok/status/changed_total/edits[{index,status,changed,
-        skipped?, skipped_type_counts?}]；was / previous_type_counts 仅在被替换的
-        为非空气时出现。
+        结果字段：ok/status/changed_total/edits[{index,status,changed,
+        skipped?, skipped_type_counts?}]；失败包含稳定 code 和 fallback_allowed。
 
         Args:
             ctx: 运行上下文

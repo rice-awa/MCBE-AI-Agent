@@ -58,7 +58,7 @@ def test_group_tools_by_intent_keeps_catalog_entries() -> None:
     assert grouped_names == REGISTERED_AGENT_TOOL_NAMES
 
 
-def test_edit_blocks_catalog_contains_recovery_guidance() -> None:
+def test_edit_blocks_catalog_only_describes_grouped_edit_contract() -> None:
     entry = get_tool_catalog()["edit_blocks"]
     text = " ".join(
         (
@@ -69,10 +69,6 @@ def test_edit_blocks_catalog_contains_recovery_guidance() -> None:
     )
     assert "edits" in text
     assert "expect" in text
-    assert "fill" in text
-    assert "batch" in text
-    assert "PRECONDITION_FAILED" in text
-    assert "LIMIT_EXCEEDED" in text
-    # Recovery codes belong in when_to_use/when_not_to_use, never in constraints.
-    assert "LIMIT_EXCEEDED" not in entry.parameter_constraints
-    assert "PRECONDITION_FAILED" not in entry.parameter_constraints
+    assert "fallback_allowed" in text
+    for obsolete in ("mode=place", "batch", "PRECONDITION_FAILED", "LIMIT_EXCEEDED"):
+        assert obsolete not in text

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -18,15 +19,27 @@ from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults
 from services.agent.harness.approvals import PendingApproval, PendingApprovalStore
 from services.agent.harness.audit import build_audit_record
 from services.agent.harness.execution import (
+    BlockCommandFallbackStore,
     HarnessCapability,
     PolicyDecisionKind,
     PolicyEngine,
+    _block_command_fallback_denial,
+    _record_block_edit_fallback_outcome,
     classify_tool_exception,
+    clear_block_command_fallback_for_connection,
+    get_block_command_fallback_store,
     get_idempotency_store,
     hash_normalized_args,
     log_tool_execution_failed,
     normalize_tool_args,
+    reset_block_command_fallback_store,
     reset_idempotency_store,
+)
+from services.agent.block_ops.capability import (
+    BlockCapabilityRecord,
+    BlockCapabilityStatus,
+    get_block_capability_cache,
+    reset_block_capability_cache,
 )
 from services.agent.block_ops.bridge import map_bridge_exception
 from services.agent.tool_results import ToolResult
@@ -87,8 +100,237 @@ def _build_agent(
 @pytest.fixture(autouse=True)
 def _reset_idempotency():
     reset_idempotency_store()
+    reset_block_command_fallback_store()
+    reset_block_capability_cache()
     yield
     reset_idempotency_store()
+    reset_block_command_fallback_store()
+    reset_block_capability_cache()
+
+
+class _FallbackContext:
+    def __init__(self, prompt: str | None, *, tool_call_approved: bool = False) -> None:
+        self.prompt = prompt
+        self.tool_call_approved = tool_call_approved
+
+
+def _set_supported_block_capability(connection_id: str) -> None:
+    get_block_capability_cache().set(
+        connection_id,
+        BlockCapabilityRecord(
+            status=BlockCapabilityStatus.SUPPORTED,
+            probed_at=time.time(),
+        ),
+    )
+
+
+def _fallback_denial(
+    *,
+    tool_name: str = "run_minecraft_command",
+    args: dict[str, Any] | None = None,
+    connection_id: str = "conn-1",
+    player_name: str = "Steve",
+    run_id: str = "run-1",
+    prompt: str | None = "build a wall",
+    approved: bool = False,
+) -> Any:
+    return _block_command_fallback_denial(
+        tool_name=tool_name,
+        normalized_args=args or {"command": "setblock ~ ~ ~ stone"},
+        ctx=_FallbackContext(prompt, tool_call_approved=approved),
+        connection_id=connection_id,
+        player_name=player_name,
+        run_id=run_id,
+    )
+
+
+def test_block_command_fallback_store_is_bounded_ttl_and_connection_clearable() -> None:
+    store = BlockCommandFallbackStore(ttl_seconds=0.01, max_entries=2)
+    store.put("conn", "Steve", "run-1", fallback_allowed=False)
+    store.put("conn", "Alex", "run-1", fallback_allowed=False)
+    store.put("other", "Steve", "run-1", fallback_allowed=False)
+
+    assert store.get("conn", "Steve", "run-1") is None
+    assert store.clear_connection("conn") == 1
+    assert store.get("other", "Steve", "run-1") is not None
+
+    time.sleep(0.02)
+    assert store.get("other", "Steve", "run-1") is None
+
+
+def test_block_command_fallback_store_supports_concurrent_players_and_runs() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    store = BlockCommandFallbackStore(ttl_seconds=60, max_entries=64)
+
+    def write(index: int) -> None:
+        store.put(
+            "conn",
+            f"player-{index % 4}",
+            f"run-{index}",
+            fallback_allowed=index % 2 == 0,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(write, range(32)))
+
+    for index in range(32):
+        record = store.get("conn", f"player-{index % 4}", f"run-{index}")
+        assert record is not None
+        assert record.fallback_allowed is (index % 2 == 0)
+
+
+def test_edit_failure_store_accepts_preflight_exception_toolresult_and_string_json() -> None:
+    store = get_block_command_fallback_store()
+    _record_block_edit_fallback_outcome(
+        ToolResult.ok('{"ok":false,"code":"PRECONDITION_FAILED","fallback_allowed":false}'),
+        connection_id="conn",
+        player_name="Steve",
+        run_id="run",
+    )
+    assert store.get("conn", "Steve", "run").fallback_allowed is False  # type: ignore[union-attr]
+
+    _record_block_edit_fallback_outcome(
+        classify_tool_exception(RuntimeError("bridge error"), tool_name="edit_blocks"),
+        connection_id="conn",
+        player_name="Steve",
+        run_id="run",
+    )
+    assert store.get("conn", "Steve", "run").code == "STATE_UNKNOWN"  # type: ignore[union-attr]
+
+    _record_block_edit_fallback_outcome(
+        '{"ok":false,"code":"ADDON_UNAVAILABLE","fallback_allowed":true}',
+        connection_id="conn",
+        player_name="Steve",
+        run_id="run",
+    )
+    assert store.get("conn", "Steve", "run").fallback_allowed is True  # type: ignore[union-attr]
+
+
+def test_successful_edit_clears_latest_fallback_state_and_connection_helper() -> None:
+    _record_block_edit_fallback_outcome(
+        '{"ok":false,"code":"PRECONDITION_FAILED","fallback_allowed":false}',
+        connection_id="conn",
+        player_name="Steve",
+        run_id="run",
+    )
+    _record_block_edit_fallback_outcome(
+        '{"ok":true,"status":"succeeded"}',
+        connection_id="conn",
+        player_name="Steve",
+        run_id="run",
+    )
+    assert get_block_command_fallback_store().get("conn", "Steve", "run") is None
+
+    _record_block_edit_fallback_outcome(
+        '{"ok":false,"fallback_allowed":false}',
+        connection_id="conn",
+        player_name="Steve",
+        run_id="other-run",
+    )
+    assert clear_block_command_fallback_for_connection("conn") == 1
+
+
+def test_denies_automatic_direct_block_command_after_nonfallback_edit_failure() -> None:
+    _set_supported_block_capability("conn-1")
+    _record_block_edit_fallback_outcome(
+        '{"ok":false,"code":"PRECONDITION_FAILED","fallback_allowed":false}',
+        connection_id="conn-1",
+        player_name="Steve",
+        run_id="run-1",
+    )
+
+    denial = _fallback_denial()
+    assert denial is not None
+    assert denial.action == PolicyDecisionKind.DENY
+
+
+def test_fallback_allowed_still_uses_independent_command_approval() -> None:
+    _set_supported_block_capability("conn-1")
+    _record_block_edit_fallback_outcome(
+        '{"ok":false,"code":"ADDON_UNAVAILABLE","fallback_allowed":true}',
+        connection_id="conn-1",
+        player_name="Steve",
+        run_id="run-1",
+    )
+
+    assert _fallback_denial() is None
+    decision = PolicyEngine.from_settings(_Settings()).decide(
+        "run_minecraft_command", {"command": "setblock ~ ~ ~ stone"}, player_name="Steve"
+    )
+    assert decision.action == PolicyDecisionKind.REQUIRE_APPROVAL
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("run_minecraft_commands", {"commands": ["give Steve stone", "fill ~ ~ ~ ~1 ~1 ~1 stone"]}),
+        ("run_world_command", {"command": "clone ~ ~ ~ ~1 ~1 ~1 ~2 ~2 ~2"}),
+        ("run_minecraft_command", {"command": "execute as @s run setblock ~ ~ ~ stone"}),
+        ("run_minecraft_command", {"command": "function build:wall"}),
+        ("run_minecraft_command", {"command": "schedule delay add build:wall 1t"}),
+    ],
+)
+def test_fallback_gate_handles_batch_world_execute_and_opaque_function(
+    tool_name: str, args: dict[str, Any]
+) -> None:
+    _set_supported_block_capability("conn-1")
+    _record_block_edit_fallback_outcome(
+        '{"ok":false,"fallback_allowed":false}',
+        connection_id="conn-1",
+        player_name="Steve",
+        run_id="run-1",
+    )
+    assert _fallback_denial(tool_name=tool_name, args=args) is not None
+
+
+def test_fallback_state_isolated_by_player_and_run_and_non_supported_capability() -> None:
+    _set_supported_block_capability("conn-1")
+    _record_block_edit_fallback_outcome(
+        '{"ok":false,"fallback_allowed":false}',
+        connection_id="conn-1",
+        player_name="Steve",
+        run_id="run-1",
+    )
+    assert _fallback_denial(player_name="Alex") is None
+    assert _fallback_denial(run_id="run-2") is None
+
+    for status in (
+        BlockCapabilityStatus.UNSUPPORTED,
+        BlockCapabilityStatus.UNAVAILABLE,
+        BlockCapabilityStatus.FAILED,
+    ):
+        get_block_capability_cache().set(
+            "conn-1", BlockCapabilityRecord(status=status, probed_at=time.time())
+        )
+        assert _fallback_denial() is None
+
+
+def test_run_world_command_keeps_high_risk_approval_for_non_block_commands() -> None:
+    decision = PolicyEngine.from_settings(_Settings()).decide(
+        "run_world_command",
+        {"command": "say hello"},
+        player_name="Steve",
+    )
+
+    assert decision.action == PolicyDecisionKind.REQUIRE_APPROVAL
+
+
+def test_explicit_normalized_command_requires_execution_intent_and_rejects_negation() -> None:
+    _set_supported_block_capability("conn-1")
+    _record_block_edit_fallback_outcome(
+        '{"ok":false,"fallback_allowed":false}',
+        connection_id="conn-1",
+        player_name="Steve",
+        run_id="run-1",
+    )
+    command = "setblock ~ ~ ~ stone"
+
+    assert _fallback_denial(prompt="请执行命令：/SETBLOCK   ~ ~ ~ STONE") is None
+    assert _fallback_denial(prompt=f"这个命令是什么意思 {command}") is not None
+    assert _fallback_denial(prompt="请执行命令，但不要用 setblock ~ ~ ~ stone") is not None
+    assert _fallback_denial(prompt="请执行命令：fill ~ ~ ~ ~1 ~1 ~1 stone") is not None
+    assert _fallback_denial(prompt="请执行命令：setblock ~ ~ ~ stone", approved=True) is None
 
 
 def test_policy_low_risk_allows_and_hard_deny_blocks() -> None:

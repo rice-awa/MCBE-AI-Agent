@@ -162,6 +162,11 @@ class HostConnectionHook(NoOpHook):
             cid = str(state.id)
             clear_block_capability(cid)
             clear_preflight_for_connection(cid)
+            from services.agent.harness.execution import (
+                clear_block_command_fallback_for_connection,
+            )
+
+            clear_block_command_fallback_for_connection(cid)
         except Exception as exc:
             logger.warning(
                 "block_ops_clear_failed",

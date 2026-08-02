@@ -11,18 +11,21 @@ def test_runtime_harness_prompt_renders_decision_tree_and_cards() -> None:
     assert "工具意图决策" in prompt
     assert "工具卡片" in prompt
     assert "run_minecraft_command [改变世界/高]" in prompt
-    assert "方块操作优先策略" in prompt
+    assert "方块操作编排规则" in prompt
     assert "inspect_block" in prompt
     assert "edit_blocks" in prompt
-    # Recovery guidance for edit_blocks failures / place-storm prevention.
-    assert "LIMIT_EXCEEDED" in prompt
-    assert "place" in prompt and ("风暴" in prompt or "place×N" in prompt or "place×" in prompt)
-    assert "replace_any" in prompt
-    assert "PRECONDITION_FAILED" in prompt
-    assert "batch" in prompt and "fill" in prompt
-    # Success result semantics (was air filter) live in system prompt.
-    assert "was" in prompt or "previous_type_counts" in prompt
-    assert "原为空气" in prompt or "非空气" in prompt
+    assert "同一施工阶段" in prompt
+    assert "顺序依赖" in prompt
+    assert "写前读取和写后确认" in prompt
+    assert "fallback_allowed=true" in prompt
+    for obsolete in (
+        "mode=place|batch|fill",
+        "place×N",
+        "replace_any",
+        "PRECONDITION_FAILED",
+        "previous_type_counts",
+    ):
+        assert obsolete not in prompt
 
 
 def test_edit_blocks_catalog_constraints_omit_recovery_codes() -> None:
@@ -34,7 +37,10 @@ def test_edit_blocks_catalog_constraints_omit_recovery_codes() -> None:
     constraints = entry.parameter_constraints
     assert "LIMIT_EXCEEDED" not in constraints
     assert "PRECONDITION_FAILED" not in constraints
-    assert "非空气" in constraints or "was" in constraints
+    assert "edits" in constraints
+    assert "target" in constraints
+    assert "expect" in constraints
+    assert "previous_type_counts" not in constraints
 
 
 def test_runtime_harness_tool_cards_do_not_duplicate_when_not_to_use_prefix() -> None:

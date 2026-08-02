@@ -68,6 +68,7 @@ from services.agent.harness.execution import (
     get_idempotency_store,
     hash_normalized_args,
     normalize_tool_args,
+    reset_block_command_fallback_store,
     reset_idempotency_store,
     classify_tool_exception,
 )
@@ -253,10 +254,12 @@ class _Settings:
 def _reset_block_caches():
     reset_block_capability_cache()
     reset_preflight_cache()
+    reset_block_command_fallback_store()
     reset_idempotency_store()
     yield
     reset_block_capability_cache()
     reset_preflight_cache()
+    reset_block_command_fallback_store()
     reset_idempotency_store()
 
 
@@ -668,6 +671,7 @@ def test_bridge_response_without_boolean_ok_is_safe_internal_error(response: dic
     ("code", "fallback_allowed"),
     [
         ("ADDON_UNAVAILABLE", True),
+        ("UNSUPPORTED_CAPABILITY", True),
         ("PROTECTED_BLOCK", False),
         ("STATE_UNKNOWN", False),
     ],
@@ -1259,6 +1263,20 @@ async def test_capability_unsupported_old_addon() -> None:
     bridge = _FakeBridge(handler)
     record = await ensure_block_capability("old", bridge)
     assert record.status == BlockCapabilityStatus.UNSUPPORTED
+
+    result = await edit_blocks_impl(
+        SimpleNamespace(
+            deps=_Deps(connection_id="old", addon_bridge=bridge)
+        ),  # type: ignore[arg-type]
+        mode="place",
+        coordinate_mode="absolute",
+        dimension="minecraft:overworld",
+        position={"x": 1, "y": 64, "z": 1},
+        type_id="minecraft:stone",
+    )
+    body = json.loads(result.output)
+    assert body["code"] == "UNSUPPORTED_CAPABILITY"
+    assert body["fallback_allowed"] is True
 
 
 @pytest.mark.asyncio
@@ -2512,6 +2530,166 @@ async def test_harness_preflight_before_approval_for_edit_blocks() -> None:
     cached = cache.get("run-pf-1", approval.tool_call_id, original_hash)
     assert cached is not None
     assert cached.canonical_args.get("locked_targets")
+
+
+def _issue6_fallback_agent() -> Agent[_Deps, str | DeferredToolRequests]:
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=[str, DeferredToolRequests],
+        capabilities=[
+            HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))
+        ],
+    )
+    register_agent_tools(agent)
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_preflight_failure_blocks_raw_command_fallback_in_same_run(
+    monkeypatch,
+) -> None:
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent = _issue6_fallback_agent()
+    command_calls = 0
+
+    async def count_command(*args: Any, **kwargs: Any) -> Any:
+        nonlocal command_calls
+        command_calls += 1
+        return SimpleNamespace(success=True, message="executed")
+
+    monkeypatch.setattr("services.agent.tools._run_command_result", count_command)
+    model_calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 1:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="edit_blocks",
+                tool_call_id="tc-invalid-edit",
+                args={"edits": [], "dimension": "minecraft:overworld"},
+            )])
+        if model_calls == 2:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="run_minecraft_command",
+                tool_call_id="tc-invalid-fallback",
+                args={"command": "setblock ~ ~ ~ stone"},
+            )])
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    deps = _Deps(
+        connection_id=cid,
+        addon_bridge=bridge,
+        settings=_Settings(),
+        run_id="run-preflight-fallback",
+    )
+    result = await agent.run("把方块改好", model=FunctionModel(model_fn), deps=deps)
+
+    assert result.output == "done"
+    assert command_calls == 0
+    assert "INVALID_ARGUMENT" in str(result.all_messages())
+
+
+@pytest.mark.asyncio
+async def test_stringified_group_failure_blocks_raw_fallback_in_same_run(
+    monkeypatch,
+) -> None:
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {
+                "ok": True,
+                "payload": {
+                    "capabilities": {
+                        "block_ops": {
+                            "inspect": True,
+                            "edit": True,
+                            "schema_version": "1",
+                        }
+                    }
+                },
+            }
+        if capability == "edit_blocks" and payload.get("phase") == "preflight":
+            return {
+                "ok": True,
+                "payload": {
+                    "schema_version": "1",
+                    "ok": True,
+                    "phase": "preflight",
+                    "locked_targets": [
+                        {
+                            "dimension": "minecraft:overworld",
+                            "x": 1,
+                            "y": 64,
+                            "z": 1,
+                        }
+                    ],
+                },
+            }
+        if capability == "edit_blocks" and payload.get("phase") == "execute":
+            return {
+                "ok": False,
+                "payload": {
+                    "code": "PROTECTED_BLOCK",
+                    "message": "protected container",
+                    "fallback_allowed": False,
+                },
+            }
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent = _issue6_fallback_agent()
+    command_calls = 0
+
+    async def count_command(*args: Any, **kwargs: Any) -> Any:
+        nonlocal command_calls
+        command_calls += 1
+        return SimpleNamespace(success=True, message="executed")
+
+    monkeypatch.setattr("services.agent.tools._run_command_result", count_command)
+    model_calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 1:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="edit_blocks",
+                tool_call_id="tc-protected-edit",
+                args={
+                    "edits": [{
+                        "target": {
+                            "positions": [{"x": 1, "y": 64, "z": 1}]
+                        },
+                        "block": "minecraft:stone",
+                    }],
+                    "dimension": "minecraft:overworld",
+                },
+            )])
+        if model_calls == 2:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="run_minecraft_command",
+                tool_call_id="tc-protected-fallback",
+                args={"command": "setblock ~ ~ ~ stone"},
+            )])
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    deps = _Deps(
+        connection_id=cid,
+        addon_bridge=bridge,
+        settings=_Settings(),
+        run_id="run-group-fallback",
+        auto_approve_tools=True,
+    )
+    result = await agent.run("把方块改好", model=FunctionModel(model_fn), deps=deps)
+
+    assert result.output == "done"
+    assert command_calls == 0
+    assert "PROTECTED_BLOCK" in str(result.all_messages())
 
 
 @pytest.mark.asyncio

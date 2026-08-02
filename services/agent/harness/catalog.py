@@ -284,19 +284,16 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         ToolIntent.CHANGE_WORLD,
         ToolRisk.HIGH,
         "写入方块时使用（每次可提交 1 项或多项独立编辑；所有编辑基于同一世界"
-        "状态预检，产生一次预检 + 一次审批，随后逐个执行并汇总结果）。"
-        "平台/地板/墙优先 fill（target.box）或少量 batch（多点 target.positions）。"
-        "LIMIT_EXCEEDED 时减小 target 数量或 box 体积；"
-        "PRECONDITION_FAILED 时调整 expect 再审批。",
-        "不要用于查询；可表达的方块写入不要改用 setblock/fill 命令。",
+        "状态预检，产生一次预检 + 一次审批，随后逐个执行并汇总结果）。",
+        "不要用于查询；有顺序依赖的编辑应拆成后续调用。",
         "edits 为编辑列表（1 项或多项），每项 {target, block, expect}；"
         "target.positions 为点集（单点长度 1），target.box 为 from/to 长方体，互斥；"
         "坐标为 {x,y,z} 或 {forward,right,up}，同一 target 内不能混用；"
         "block 为 type_id 字符串或 {type_id, states}；"
         "expect 默认 air（仅替换空气），可选 any / type_id / {type_id, states}；"
         "dimension 可选（绝对坐标默认当前玩家维度）；"
-        "成功结果为汇总的 ok/status/changed_total/edits[...]；"
-        "was / previous_type_counts 仅含被替换的非空气方块（无 was = 原为空气）。",
+        "结果为汇总的 ok/status/changed_total/edits[...]，失败包含稳定 code 和"
+        " fallback_allowed。",
         preview=ParameterPreviewPolicy(
             include=("edits", "dimension")
         ),

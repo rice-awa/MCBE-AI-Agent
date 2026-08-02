@@ -182,9 +182,13 @@ def _connection_id(deps: AgentDependencies) -> str:
     return str(deps.connection_id)
 
 
-def _unavailable_result(reason: str) -> ToolResult:
+def _capability_failure_result(
+    reason: str,
+    *,
+    code: BlockErrorCode = BlockErrorCode.ADDON_UNAVAILABLE,
+) -> ToolResult:
     body = build_error_response(
-        BlockErrorCode.ADDON_UNAVAILABLE,
+        code,
         (
             f"{reason}。"
             "可另行使用命令工具作为回退，但该命令仍需独立审批。"
@@ -208,9 +212,12 @@ async def _require_supported(ctx: RunContext[AgentDependencies]) -> ToolResult |
     if record.status == BlockCapabilityStatus.SUPPORTED:
         return None
     if record.status == BlockCapabilityStatus.UNSUPPORTED:
-        return _unavailable_result("当前 Add-on 不支持专用方块工具（能力握手缺失 block_ops）")
+        return _capability_failure_result(
+            "当前 Add-on 不支持专用方块工具（能力握手缺失 block_ops）",
+            code=BlockErrorCode.UNSUPPORTED_CAPABILITY,
+        )
     if record.status == BlockCapabilityStatus.UNAVAILABLE:
-        return _unavailable_result("Addon 桥接不可用或超时")
+        return _capability_failure_result("Addon 桥接不可用或超时")
     logger.warning(
         "block_capability_probe_failed",
         connection_id=_connection_id(deps),
@@ -218,7 +225,7 @@ async def _require_supported(ctx: RunContext[AgentDependencies]) -> ToolResult |
         player_name=deps.player_name,
         diagnostic_summary=redact_exception(record.detail),
     )
-    return _unavailable_result("方块能力探测失败")
+    return _capability_failure_result("方块能力探测失败")
 
 
 def _host_limit_error(
