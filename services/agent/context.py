@@ -17,6 +17,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
     ToolCallPart,
     ToolReturnPart,
 )
@@ -570,23 +571,22 @@ class ContextBuilder:
         return list(messages[start:])
 
     def _ensure_tool_pairs(self, messages: list[ModelMessage]) -> list[ModelMessage]:
-        """保证不会留下孤立的 tool-call 或 tool-return。"""
+        """保证不会留下孤立的 tool-call 或工具级响应。"""
         call_ids: set[str] = set()
-        return_ids: set[str] = set()
+        response_ids: set[str] = set()
         for message in messages:
             for part in getattr(message, "parts", []) or []:
-                kind = getattr(part, "part_kind", None)
                 call_id = getattr(part, "tool_call_id", None)
                 if not call_id:
                     continue
-                if kind == "tool-call":
+                if isinstance(part, ToolCallPart):
                     call_ids.add(str(call_id))
-                elif kind == "tool-return":
-                    return_ids.add(str(call_id))
+                elif self._is_tool_response_part(part):
+                    response_ids.add(str(call_id))
 
-        unpaired_calls = call_ids - return_ids
-        unpaired_returns = return_ids - call_ids
-        if not unpaired_calls and not unpaired_returns:
+        unpaired_calls = call_ids - response_ids
+        unpaired_responses = response_ids - call_ids
+        if not unpaired_calls and not unpaired_responses:
             return messages
 
         result: list[ModelMessage] = []
@@ -594,23 +594,19 @@ class ContextBuilder:
             parts = list(getattr(message, "parts", []) or [])
             kept: list[Any] = []
             for part in parts:
-                kind = getattr(part, "part_kind", None)
                 call_id = getattr(part, "tool_call_id", None)
-                if kind == "tool-call" and call_id and str(call_id) in unpaired_calls:
+                if isinstance(part, ToolCallPart) and call_id and str(call_id) in unpaired_calls:
                     continue
-                if kind == "tool-return" and call_id and str(call_id) in unpaired_returns:
-                    continue
-                kept.append(part)
-            if not kept:
-                # 若去掉 tool 部分后消息为空，丢弃
-                if any(
-                    getattr(p, "part_kind", None) in {"tool-call", "tool-return"}
-                    for p in parts
-                ) and not any(
-                    getattr(p, "part_kind", None) not in {"tool-call", "tool-return"}
-                    for p in parts
+                if (
+                    self._is_tool_response_part(part)
+                    and call_id
+                    and str(call_id) in unpaired_responses
                 ):
                     continue
+                kept.append(part)
+            # 若去掉 tool 部分后消息为空，丢弃
+            if not kept and parts and all(self._is_tool_part(p) for p in parts):
+                continue
             if isinstance(message, ModelRequest):
                 result.append(ModelRequest(parts=kept) if kept != parts else message)
             elif isinstance(message, ModelResponse):
@@ -618,6 +614,17 @@ class ContextBuilder:
             else:
                 result.append(message)
         return result
+
+    @staticmethod
+    def _is_tool_response_part(part: Any) -> bool:
+        return (
+            isinstance(part, ToolReturnPart)
+            or isinstance(part, RetryPromptPart) and part.tool_name is not None
+        )
+
+    @staticmethod
+    def _is_tool_part(part: Any) -> bool:
+        return isinstance(part, ToolCallPart) or ContextBuilder._is_tool_response_part(part)
 
 
 def build_context_history_processor(settings: Any | None = None) -> ContextBuilder:
