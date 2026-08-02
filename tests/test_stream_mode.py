@@ -11,13 +11,26 @@ from uuid import uuid4
 
 import pytest
 from pydantic_ai import (
+    Agent,
     FunctionToolCallEvent,
     FunctionToolResultEvent,
     PartDeltaEvent,
     PartStartEvent,
     TextPartDelta,
 )
-from pydantic_ai.messages import TextPart, ThinkingPart, ThinkingPartDelta, ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelResponse,
+    RetryPromptPart,
+    TextPart,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolReturnPart,
+)
+from pydantic_ai.models import ModelRequestParameters
+from pydantic_ai.models.function import DeltaToolCall, FunctionModel
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.tools import DeferredToolRequests
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -730,6 +743,144 @@ def test_non_stream_mode_should_populate_tool_events_from_messages(monkeypatch) 
     assert events[-1].metadata.get("run_id") == "test-run-id"
     assert "tool_calls" not in events[-1].metadata
     assert "tool_returns" not in events[-1].metadata
+
+
+def test_streamed_malformed_tool_args_keep_validation_retry_pair() -> None:
+    """真实 FunctionModel 流式 malformed args 应保留同 ID 的 validation retry 配对。"""
+    from services.agent.context import ContextBuilder
+
+    received: list[list[ModelMessage]] = []
+
+    async def stream_function(messages, _info):
+        received.append(messages)
+        has_validation_retry = any(
+            isinstance(part, RetryPromptPart)
+            for message in messages
+            for part in message.parts
+        )
+        if has_validation_retry:
+            yield "recovered"
+        else:
+            yield {
+                0: DeltaToolCall(
+                    name="use_value",
+                    json_args='{"value":',
+                    tool_call_id="call-bad",
+                )
+            }
+
+    agent = Agent(
+        FunctionModel(stream_function=stream_function),
+        output_type=str,
+        tool_retries=1,
+        output_retries=1,
+        history_processors=[ContextBuilder()],
+    )
+
+    @agent.tool_plain
+    def use_value(value: int) -> str:
+        return str(value)
+
+    async def run() -> str:
+        async with agent.run_stream("go") as result:
+            return await result.get_output()
+
+    assert asyncio.run(run()) == "recovered"
+    assert len(received) == 2
+
+    second_request = received[1]
+    tool_call_index = next(
+        index
+        for index, message in enumerate(second_request)
+        if any(isinstance(part, ToolCallPart) for part in message.parts)
+    )
+    retry_index = next(
+        index
+        for index, message in enumerate(second_request)
+        if any(isinstance(part, RetryPromptPart) for part in message.parts)
+    )
+    assert tool_call_index < retry_index
+
+    tool_call = next(
+        part
+        for message in second_request
+        for part in message.parts
+        if isinstance(part, ToolCallPart)
+    )
+    retry = next(
+        part
+        for message in second_request
+        for part in message.parts
+        if isinstance(part, RetryPromptPart)
+    )
+    assert tool_call.tool_call_id == "call-bad"
+    assert tool_call.args == '{"value":'
+    assert retry.tool_name == "use_value"
+    assert retry.tool_call_id == "call-bad"
+
+    mapped = asyncio.run(
+        OpenAIChatModel("gpt-4o", provider="openai")._map_messages(
+            second_request,
+            ModelRequestParameters(),
+        )
+    )
+    assistant = next(message for message in mapped if message["role"] == "assistant")
+    tool = next(message for message in mapped if message["role"] == "tool")
+    assistant_call = assistant["tool_calls"][0]
+    assert assistant_call["id"] == "call-bad"
+    assert assistant_call["function"]["arguments"] == '{"value":'
+    assert tool["tool_call_id"] == assistant_call["id"]
+
+
+def test_non_stream_malformed_tool_args_keep_validation_retry_pair() -> None:
+    """非流式 FunctionModel 也必须由同一消息协议保持 malformed retry 配对。"""
+    from services.agent.context import ContextBuilder
+
+    received: list[list[ModelMessage]] = []
+
+    def model_function(messages, _info):
+        received.append(messages)
+        if any(isinstance(part, RetryPromptPart) for message in messages for part in message.parts):
+            return ModelResponse(parts=[TextPart("recovered")])
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "use_value",
+                    '{"value":',
+                    tool_call_id="call-bad",
+                )
+            ]
+        )
+
+    agent = Agent(
+        FunctionModel(function=model_function),
+        output_type=str,
+        tool_retries=1,
+        output_retries=1,
+        history_processors=[ContextBuilder()],
+    )
+
+    @agent.tool_plain
+    def use_value(value: int) -> str:
+        return str(value)
+
+    async def run() -> str:
+        result = await agent.run("go")
+        return result.output
+
+    assert asyncio.run(run()) == "recovered"
+    assert len(received) == 2
+    second_request = received[1]
+    assert any(
+        isinstance(part, ToolCallPart) and part.tool_call_id == "call-bad"
+        for message in second_request
+        for part in message.parts
+    )
+    assert any(
+        isinstance(part, RetryPromptPart) and part.tool_call_id == "call-bad"
+        for message in second_request
+        for part in message.parts
+    )
 
 
 def test_chat_agent_manager_caches_fallback_agent_after_mcp_failure(monkeypatch) -> None:
