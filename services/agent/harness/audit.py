@@ -183,7 +183,7 @@ def extract_tool_validation_failures(
                     "parameters": _preview_tool_call_parameters(tool_name, call),
                     # Only the Trace content path may consume this field; audit
                     # builders intentionally ignore it.
-                    "validation_content": _copy_validation_content(content),
+                    "validation_content": sanitize_validation_content(tool_name, content),
                 }
             )
 
@@ -344,11 +344,53 @@ def _bounded_validation_locations(value: Any) -> list[str]:
     return result
 
 
-def _copy_validation_content(content: list[Any] | tuple[Any, ...]) -> list[Any]:
-    try:
-        return json.loads(json.dumps(list(content), ensure_ascii=False, default=str))
-    except (TypeError, ValueError):
-        return [truncate_for_log(item, DEFAULT_EXCEPTION_MAX) for item in content[:_MAX_VALIDATION_ERRORS]]
+def sanitize_validation_content(
+    tool_name: str,
+    content: list[Any] | tuple[Any, ...],
+) -> list[dict[str, Any]]:
+    """返回可供 Trace 正文使用的 bounded、目录感知校验摘要。
+
+    Pydantic 的 ``input`` 和 ``msg`` 可能包含整段 malformed 参数或密钥。
+    结构化参数只经过工具目录的 preview policy 投影；非结构化输入和自由文
+    本不回写，避免 content-enabled Trace 变成原始输入转储。
+    """
+    sanitized: list[dict[str, Any]] = []
+    for detail in content[:_MAX_VALIDATION_ERRORS]:
+        if not isinstance(detail, dict):
+            sanitized.append({"type": "validation_error"})
+            continue
+
+        error_type = _bounded_validation_type(detail.get("type"))
+        item: dict[str, Any] = {"type": error_type}
+        if "loc" in detail:
+            item["loc"] = _sanitize_validation_location(detail.get("loc"))
+        if "input" in detail:
+            item["input"] = _sanitize_validation_input(tool_name, detail.get("input"))
+        sanitized.append(item)
+    return sanitized
+
+
+def _sanitize_validation_location(value: Any) -> str | list[str]:
+    if isinstance(value, (list, tuple)):
+        return [
+            truncate_for_log(item, _MAX_VALIDATION_LOCATION_LENGTH)
+            for item in value[:_MAX_VALIDATION_ERRORS]
+        ]
+    return truncate_for_log(value, _MAX_VALIDATION_LOCATION_LENGTH)
+
+
+def _sanitize_validation_input(tool_name: str, value: Any) -> Any:
+    if isinstance(value, dict):
+        return preview_parameters(tool_name, value)
+    # Raw malformed JSON is unstructured by definition; even a bounded copy
+    # could contain an arbitrary secret-like value, so keep only its shape.
+    if isinstance(value, str):
+        return "[REDACTED]"
+    if isinstance(value, list):
+        return {"kind": "list", "items": min(len(value), _MAX_PREVIEW_ITEMS)}
+    if value is None or isinstance(value, (bool, int, float)):
+        return {"kind": type(value).__name__}
+    return {"kind": type(value).__name__}
 
 
 def build_audit_record(

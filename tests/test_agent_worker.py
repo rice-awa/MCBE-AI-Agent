@@ -533,6 +533,76 @@ async def test_error_event_persists_partial_run_history(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_approval_resume_keeps_only_deferred_pending_tool_call(monkeypatch):
+    """审批恢复只保留 deferred results 明确引用的无响应 pending call。"""
+    from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, UserPromptPart
+    from pydantic_ai.tools import DeferredToolResults
+
+    from models.agent import StreamEvent
+
+    settings = _make_settings()
+    broker = MagicMock()
+    broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+    broker.get_response_queue = MagicMock(return_value=object())
+    broker.send_response = AsyncMock(return_value=True)
+    worker = AgentWorker(broker, settings)
+
+    pending_call = ToolCallPart(
+        tool_name="run_minecraft_command",
+        args={"command": "time set day"},
+        tool_call_id="tc-pending",
+    )
+    unrelated_orphan = ToolCallPart(
+        tool_name="run_minecraft_command",
+        args={"command": "say orphan"},
+        tool_call_id="tc-orphan",
+    )
+    resume_history = [
+        ModelRequest(parts=[UserPromptPart("set day")]),
+        ModelResponse(parts=[pending_call, unrelated_orphan]),
+    ]
+    captured: dict[str, object] = {}
+
+    async def fake_stream_chat(*args, **kwargs):
+        captured["message_history"] = kwargs.get("message_history")
+        captured["deferred_tool_results"] = kwargs.get("deferred_tool_results")
+        yield StreamEvent(event_type="content", content="已继续", sequence=0)
+
+    monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+    monkeypatch.setattr(
+        "services.agent.providers.ProviderRegistry.get_model",
+        lambda _config: object(),
+    )
+    monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _settings: None)
+
+    connection_id = uuid4()
+    await worker._process_request_locked(
+        ChatRequest(
+            connection_id=connection_id,
+            content="同意",
+            player_name="Alex",
+            run_id="run-resume-pending",
+            resume_approval_id="approval-1",
+            deferred_tool_results={"approvals": {"tc-pending": True}},
+            resume_message_history=resume_history,
+        ),
+        connection_id,
+    )
+
+    message_history = captured["message_history"]
+    assert isinstance(message_history, list)
+    kept_call_ids = [
+        part.tool_call_id
+        for message in message_history
+        for part in message.parts
+        if isinstance(part, ToolCallPart)
+    ]
+    assert kept_call_ids == ["tc-pending"]
+    assert isinstance(captured["deferred_tool_results"], DeferredToolResults)
+    assert captured["deferred_tool_results"].approvals == {"tc-pending": True}
+
+
+@pytest.mark.asyncio
 async def test_worker_audits_validation_retry_and_later_success_without_execution_start(
     monkeypatch, tmp_path
 ):
@@ -725,6 +795,203 @@ async def test_worker_audits_validation_retry_and_later_success_without_executio
             stop_audit_writer(timeout=2.0)
         finally:
             set_audit_writer(None)
+
+
+@pytest.mark.asyncio
+async def test_approval_required_records_validation_failure_once_before_suspension(
+    monkeypatch, tmp_path
+):
+    """审批暂停前复用 validation audit/Trace 去重，且不伪造执行开始。"""
+    import json
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        RetryPromptPart,
+        ToolCallPart,
+    )
+    from pydantic_ai.tools import DeferredToolRequests
+
+    from models.agent import StreamEvent
+    from services.agent.harness.approvals import PendingApprovalStore
+    from services.agent.harness.audit import (
+        AuditWriter,
+        flush_audit_writer,
+        set_audit_writer,
+        start_audit_writer,
+        stop_audit_writer,
+    )
+    from services.agent.trace import TraceRecorder, set_trace_recorder
+
+    settings = _make_settings()
+    settings.runtime_harness_enabled = True
+    settings.runtime_harness_audit_enabled = True
+    audit_path = tmp_path / "approval-validation.jsonl"
+    settings.runtime_harness_audit_path = str(audit_path)
+    settings.runtime_harness_audit_max_records = 100
+    settings.approval_ttl = 120.0
+    settings.tool_policy_version = "test"
+    settings.compression_enabled = False
+
+    trace_path = tmp_path / "approval-validation-trace.jsonl"
+    recorder = TraceRecorder(
+        path=trace_path,
+        enabled=True,
+        include_content=False,
+        max_records=100,
+    )
+    await recorder.start()
+    set_trace_recorder(recorder)
+
+    broker = MagicMock()
+    broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+    broker.get_response_queue = MagicMock(return_value=object())
+    sent_responses: list[tuple[object, object]] = []
+
+    async def send_response(*args):
+        sent_responses.append(args)
+        return True
+
+    broker.send_response = send_response
+    worker = AgentWorker(broker, settings)
+
+    retry_at = datetime(2026, 8, 2, 15, 0, 0, tzinfo=UTC)
+    messages = [
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="run_minecraft_command",
+                    args={
+                        "command": "time set day",
+                        "api_key": "APPROVAL-VALIDATION-SECRET",
+                    },
+                    tool_call_id="tc-invalid",
+                )
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    [
+                        {
+                            "type": "json_invalid",
+                            "loc": ("command",),
+                            "msg": "Invalid JSON: APPROVAL-VALIDATION-SECRET",
+                            "input": "APPROVAL-VALIDATION-SECRET",
+                        }
+                    ],
+                    tool_name="run_minecraft_command",
+                    tool_call_id="tc-invalid",
+                    timestamp=retry_at,
+                )
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="run_minecraft_command",
+                    args={"command": "time set day"},
+                    tool_call_id="tc-approved",
+                )
+            ]
+        ),
+    ]
+    approved_call = messages[-1].parts[0]
+    deferred = DeferredToolRequests(
+        approvals=[approved_call],
+        metadata={
+            "tc-approved": {
+                "normalized_args": {"command": "time set day"},
+                "args_summary": "command=time set day",
+                "args_hash": "hash",
+                "policy_version": "test",
+                "reason": "needs approval",
+            }
+        },
+    )
+    store = PendingApprovalStore(default_ttl_seconds=120.0)
+
+    async def fake_stream_chat(*_args, **_kwargs):
+        yield StreamEvent(
+            event_type="approval_required",
+            content="工具调用需要玩家审批",
+            sequence=0,
+            metadata={
+                "deferred_requests": deferred,
+                "all_messages": messages,
+                "new_messages": messages,
+                "new_messages_serialized": [],
+                "usage": None,
+                "run_id": "run-approval-validation",
+            },
+        )
+
+    runtime = SimpleNamespace(
+        get_pending_approval_store=lambda _settings=None: store,
+        refresh_mcp_tools=lambda _settings: None,
+    )
+    monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+    monkeypatch.setattr(
+        "services.agent.providers.ProviderRegistry.get_model",
+        lambda _config: object(),
+    )
+    monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _settings: None)
+    monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: runtime)
+
+    writer = AuditWriter()
+    set_audit_writer(writer)
+    start_audit_writer()
+    try:
+        connection_id = uuid4()
+        await worker._process_request_locked(
+            ChatRequest(
+                connection_id=connection_id,
+                content="build",
+                player_name="Alex",
+                run_id="run-approval-validation",
+                trace_id="trace-approval-validation",
+                attempt_id="attempt-approval-validation",
+            ),
+            connection_id,
+        )
+        flush_audit_writer(timeout=2.0)
+        await recorder.stop()
+
+        records = [
+            json.loads(line)
+            for line in audit_path.read_text(encoding="utf-8").splitlines()
+        ]
+        failures = [record for record in records if record["status"] == "failure"]
+        assert len(failures) == 1
+        assert failures[0]["error_kind"] == "INVALID_ARGUMENT"
+        assert failures[0]["result"]["execution_stage"] == "validation"
+
+        trace_events = [
+            json.loads(line)
+            for line in trace_path.read_text(encoding="utf-8").splitlines()
+        ]
+        validation_events = [
+            event
+            for event in trace_events
+            if event["event_name"] == "tool.validation.failed"
+        ]
+        assert len(validation_events) == 1
+        assert not any(
+            event["event_name"] == "tool.execution.started" for event in trace_events
+        )
+        assert len(store) == 1
+        assert any(
+            getattr(item[1], "chunk_type", None) == "approval_required"
+            for item in sent_responses
+        )
+    finally:
+        try:
+            stop_audit_writer(timeout=2.0)
+        finally:
+            set_audit_writer(None)
+            set_trace_recorder(None)
 
 
 @pytest.mark.asyncio
@@ -1274,6 +1541,7 @@ async def test_validation_failure_trace_is_gated_and_does_not_start_execution(
         )
         if include_content:
             assert event["payload"]["error_message"][0]["type"] == "json_invalid"
+            assert event["payload"]["error_message"][0]["input"] == "[REDACTED]"
             model_payloads = [
                 item.get("payload")
                 for item in events
@@ -1287,13 +1555,19 @@ async def test_validation_failure_trace_is_gated_and_does_not_start_execution(
                 )
                 for payload in model_payloads
             )
+            model_tool_calls = [
+                part
+                for payload in model_payloads
+                for message in (payload or {}).get("messages", [])
+                for part in message.get("parts", [])
+                if part.get("part_kind") == "tool-call"
+            ]
+            assert model_tool_calls
+            assert model_tool_calls[0]["args"]["api_key"] == "[REDACTED]"
         else:
             assert "payload" not in event
         raw = path.read_text(encoding="utf-8")
-        if include_content:
-            assert "TRACE-VALIDATION-SECRET" in raw
-        else:
-            assert "TRACE-VALIDATION-SECRET" not in raw
+        assert "TRACE-VALIDATION-SECRET" not in raw
     finally:
         set_trace_recorder(None)
 

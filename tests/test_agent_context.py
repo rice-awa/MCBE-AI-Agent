@@ -371,6 +371,106 @@ def test_context_keeps_same_id_pair_when_recent_turn_cropping_runs():
     assert _find_part(processed, "retry-prompt", "cropped-pair")
 
 
+def test_context_pairs_tool_parts_in_order_one_to_one_without_mutating_mixed_messages():
+    """响应必须匹配此前唯一未配对的 call，重复 ID 不能扩大成多对。"""
+    builder = _large_context_builder()
+    response_before_call = ToolReturnPart(
+        tool_name="edit_blocks",
+        content="response before call",
+        tool_call_id="duplicate-id",
+    )
+    first_call = ToolCallPart(
+        "edit_blocks",
+        {"edits": []},
+        tool_call_id="duplicate-id",
+    )
+    duplicate_call = ToolCallPart(
+        "edit_blocks",
+        {"edits": [{"unexpected": "duplicate"}]},
+        tool_call_id="duplicate-id",
+    )
+    valid_response = ToolReturnPart(
+        tool_name="edit_blocks",
+        content="valid response",
+        tool_call_id="duplicate-id",
+    )
+    messages = [
+        ModelRequest(
+            parts=[UserPromptPart("keep request"), response_before_call],
+            metadata={"source": "request"},
+        ),
+        ModelResponse(
+            parts=[TextPart("keep assistant text"), first_call, duplicate_call],
+            metadata={"source": "response"},
+        ),
+        ModelRequest(
+            parts=[valid_response, UserPromptPart("keep trailing input")],
+            metadata={"source": "return"},
+        ),
+    ]
+
+    processed = builder.process_history(
+        messages,
+        budget=builder.compute_budget(provider_name="test"),
+    )
+
+    calls = [
+        part
+        for message in processed
+        for part in message.parts
+        if getattr(part, "part_kind", None) == "tool-call"
+    ]
+    responses = [
+        part
+        for message in processed
+        for part in message.parts
+        if getattr(part, "part_kind", None) == "tool-return"
+    ]
+    assert len(calls) == 1
+    assert len(responses) == 1
+    assert calls[0].tool_call_id == responses[0].tool_call_id == "duplicate-id"
+    assert responses[0].content == "valid response"
+    assert all(
+        getattr(part, "content", None) != "response before call"
+        for message in processed
+        for part in message.parts
+    )
+    assert any(
+        isinstance(part, TextPart) and part.content == "keep assistant text"
+        for message in processed
+        for part in message.parts
+    )
+    assert any(
+        isinstance(part, UserPromptPart) and part.content == "keep request"
+        for message in processed
+        for part in message.parts
+    )
+    assert any(
+        isinstance(part, UserPromptPart) and part.content == "keep trailing input"
+        for message in processed
+        for part in message.parts
+    )
+
+    processed_request = next(
+        message
+        for message in processed
+        if isinstance(message, ModelRequest) and message.metadata == {"source": "request"}
+    )
+    processed_response = next(
+        message
+        for message in processed
+        if isinstance(message, ModelResponse) and message.metadata == {"source": "response"}
+    )
+    assert processed_request.metadata == {"source": "request"}
+    assert processed_response.metadata == {"source": "response"}
+
+    # Cleaning returns new messages and leaves the provider history untouched.
+    assert messages[0].parts[1] is response_before_call
+    assert messages[1].parts[1] is first_call
+    assert len(messages[1].parts) == 3
+    assert messages[2].parts[0] is valid_response
+
+
 def test_context_cleans_pair_half_left_by_recent_turn_cropping():
     settings = _Settings(context_window=8192)
     settings.max_history_turns = 1

@@ -476,8 +476,12 @@ class AgentWorker:
             and request.resume_approval_id
             and request.deferred_tool_results is not None
         ):
+            deferred_call_ids = self._deferred_tool_result_call_ids(
+                deferred_tool_results
+            )
             message_history, removed_calls, removed_responses = self._sanitize_tool_history(
-                message_history
+                message_history,
+                preserve_call_ids=deferred_call_ids,
             )
             if removed_calls or removed_responses:
                 logger.info(
@@ -749,6 +753,27 @@ class AgentWorker:
                         sequence += 1
 
                 elif event.event_type == "approval_required":
+                    validation_messages = (
+                        event.metadata.get("new_messages")
+                        if event.metadata
+                        else None
+                    )
+                    if not isinstance(validation_messages, list):
+                        validation_messages = (
+                            event.metadata.get("all_messages")
+                            if event.metadata
+                            else None
+                        )
+                    self._record_validation_failures_from_messages(
+                        messages=validation_messages
+                        if isinstance(validation_messages, list)
+                        else None,
+                        run_id=run_id,
+                        deps=deps,
+                        trace_context=resolved_context,
+                        recorder=recorder,
+                        seen=validation_failures_seen,
+                    )
                     # Flush model pairs for this attempt before suspend so the
                     # model leg is present even when tools never execute.
                     if resolved_context is not None and event.metadata:
@@ -1439,6 +1464,8 @@ class AgentWorker:
     @staticmethod
     def _sanitize_tool_history(
         messages: list[ModelMessage],
+        *,
+        preserve_call_ids: set[str] | None = None,
     ) -> tuple[list[ModelMessage], int, int]:
         """清理工具级孤立 part，并返回移除的 call/response 数量。"""
 
@@ -1456,9 +1483,30 @@ class AgentWorker:
             return calls, responses
 
         before_calls, before_responses = count_parts(messages)
-        cleaned = ensure_tool_message_pairs(messages)
+        cleaned = ensure_tool_message_pairs(
+            messages,
+            preserve_call_ids=preserve_call_ids,
+        )
         after_calls, after_responses = count_parts(cleaned)
         return cleaned, before_calls - after_calls, before_responses - after_responses
+
+    @staticmethod
+    def _deferred_tool_result_call_ids(
+        deferred_tool_results: DeferredToolResults | None,
+    ) -> set[str]:
+        """返回当前 resume 结果明确引用的 call IDs，不扩张为全部历史孤儿。"""
+        if deferred_tool_results is None:
+            return set()
+        result: set[str] = set()
+        for field_name in ("approvals", "calls"):
+            values = getattr(deferred_tool_results, field_name, None)
+            if not isinstance(values, dict):
+                continue
+            for call_id in values:
+                normalized = str(call_id)
+                if normalized.strip():
+                    result.add(normalized)
+        return result
 
     @staticmethod
     def _trim_history(

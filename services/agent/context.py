@@ -9,6 +9,7 @@ ContextBuilder 在每次模型请求前裁剪 message_history：
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
@@ -96,47 +97,82 @@ def _tool_call_id(part: Any) -> str | None:
     return call_id if call_id.strip() else None
 
 
-def ensure_tool_message_pairs(messages: list[ModelMessage]) -> list[ModelMessage]:
-    """返回不含孤立工具调用/工具响应的消息列表，不修改输入。"""
-    call_ids: set[str] = set()
-    response_ids: set[str] = set()
-    has_invalid_tool_id = False
-    for message in messages:
-        for part in getattr(message, "parts", []) or []:
-            if not _is_tool_part(part):
+def ensure_tool_message_pairs(
+    messages: list[ModelMessage],
+    *,
+    preserve_call_ids: set[str] | None = None,
+) -> list[ModelMessage]:
+    """清理工具消息，按历史顺序建立一对一的 call/response 配对。
+
+    普通历史要求每个工具级响应都匹配此前唯一未配对的调用，且每个调用
+    都必须有响应。``preserve_call_ids`` 只供审批恢复使用：其中明确列出
+    的、尚未有响应的调用可以暂时保留，等待 DeferredToolResults 消费；不在
+    集合内的孤儿仍会被删除。该函数只构造新消息，不修改输入对象。
+    """
+    preserved_ids = {
+        str(call_id)
+        for call_id in (preserve_call_ids or set())
+        if str(call_id).strip()
+    }
+    pending_calls: dict[str, deque[tuple[int, int]]] = {}
+    removed_positions: set[tuple[int, int]] = set()
+
+    # Flatten the protocol parts in message order. A response can only consume
+    # a call that appeared before it; duplicate IDs consume one occurrence at a
+    # time instead of being accepted by a global set comparison.
+    for message_index, message in enumerate(messages):
+        for part_index, part in enumerate(getattr(message, "parts", []) or []):
+            if isinstance(part, ToolCallPart):
+                call_id = _tool_call_id(part)
+                if call_id is None:
+                    removed_positions.add((message_index, part_index))
+                    continue
+                pending_calls.setdefault(call_id, deque()).append(
+                    (message_index, part_index)
+                )
+                continue
+
+            if not _is_tool_response_part(part):
                 continue
             call_id = _tool_call_id(part)
             if call_id is None:
-                has_invalid_tool_id = True
+                removed_positions.add((message_index, part_index))
                 continue
-            if isinstance(part, ToolCallPart):
-                call_ids.add(call_id)
-            elif _is_tool_response_part(part):
-                response_ids.add(call_id)
+            calls = pending_calls.get(call_id)
+            if not calls:
+                # Response-before-call and excess duplicate responses are both
+                # invalid; a later call cannot retroactively make this valid.
+                removed_positions.add((message_index, part_index))
+                continue
+            calls.popleft()
 
-    unpaired_calls = call_ids - response_ids
-    unpaired_responses = response_ids - call_ids
-    if not has_invalid_tool_id and not unpaired_calls and not unpaired_responses:
+    # All remaining calls are unmatched. Keep at most one explicitly deferred
+    # call per ID as the narrow approval-resume exception; discard all others.
+    for call_id, calls in pending_calls.items():
+        preserved_pending = call_id in preserved_ids
+        kept_pending = False
+        while calls:
+            position = calls.popleft()
+            if preserved_pending and not kept_pending:
+                kept_pending = True
+                continue
+            removed_positions.add(position)
+
+    if not removed_positions:
         return list(messages)
 
     result: list[ModelMessage] = []
-    for message in messages:
+    for message_index, message in enumerate(messages):
         parts = list(getattr(message, "parts", []) or [])
-        kept: list[Any] = []
-        for part in parts:
-            if isinstance(part, ToolCallPart):
-                call_id = _tool_call_id(part)
-                if call_id is None or call_id in unpaired_calls:
-                    continue
-            elif _is_tool_response_part(part):
-                call_id = _tool_call_id(part)
-                if call_id is None or call_id in unpaired_responses:
-                    continue
-            kept.append(part)
+        kept = [
+            part
+            for part_index, part in enumerate(parts)
+            if (message_index, part_index) not in removed_positions
+        ]
         if not kept and parts and all(_is_tool_part(part) for part in parts):
             continue
         if isinstance(message, (ModelRequest, ModelResponse)):
-            result.append(replace(message, parts=kept) if kept != parts else message)
+            result.append(replace(message, parts=kept))
         else:
             result.append(message)
     return result
