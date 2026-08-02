@@ -93,6 +93,7 @@ describe("edit_blocks fill", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.payload.code).toBe("PROTECTED_BLOCK");
+    expect(result.payload.hint ?? "").not.toContain("any");
   });
 
   it("enforces fill volume limits", async () => {
@@ -130,12 +131,12 @@ describe("edit_blocks fill", () => {
     expect((result.payload.locked_targets as unknown[]).length).toBe(2);
   });
 
-  it("preflight zero-match on non-air returns PRECONDITION_FAILED with actual_type_counts", async () => {
-    // Glass-replaces-planks scenario: default air-only policy, all cells are planks.
+  it("preflight zero-match on homogeneous blocks suggests the observed expect", async () => {
+    // Glass-replaces-grass scenario: default air-only policy, all cells are grass.
     BlockTypes.__add("minecraft:glass");
-    BlockTypes.__add("minecraft:oak_planks");
-    __setBlock("minecraft:overworld", 0, 64, 0, { typeId: "minecraft:oak_planks" });
-    __setBlock("minecraft:overworld", 1, 64, 0, { typeId: "minecraft:oak_planks" });
+    BlockTypes.__add("minecraft:grass_block");
+    __setBlock("minecraft:overworld", 0, 64, 0, { typeId: "minecraft:grass_block" });
+    __setBlock("minecraft:overworld", 1, 64, 0, { typeId: "minecraft:grass_block" });
 
     const result = await handleFill({
       mode: "fill",
@@ -152,8 +153,43 @@ describe("edit_blocks fill", () => {
     expect(result.payload.code).toBe("PRECONDITION_FAILED");
     expect(result.payload.matched_count).toBe(0);
     expect(result.payload.actual_type_counts).toMatchObject({
-      "minecraft:oak_planks": 2,
+      "minecraft:grass_block": 2,
     });
+    expect(result.payload.hint).toContain("minecraft:grass_block");
+    expect(result.payload.hint).toContain("any");
+    expect(result.payload.hint).not.toContain("设为 air");
+    for (const hidden of ["replace_any", "expected_previous", "locked_targets", "phase"]) {
+      expect(result.payload.hint).not.toContain(hidden);
+    }
+  });
+
+  it("preflight zero-match on mixed blocks lists exact and any choices", async () => {
+    BlockTypes.__add("minecraft:glass");
+    BlockTypes.__add("minecraft:stone");
+    BlockTypes.__add("minecraft:dirt");
+    __setBlock("minecraft:overworld", 0, 65, 0, { typeId: "minecraft:stone" });
+    __setBlock("minecraft:overworld", 1, 65, 0, { typeId: "minecraft:dirt" });
+
+    const result = await handleFill({
+      mode: "fill",
+      coordinate_mode: "absolute",
+      dimension: "minecraft:overworld",
+      from: { x: 0, y: 65, z: 0 },
+      to: { x: 1, y: 65, z: 0 },
+      type_id: "minecraft:glass",
+      phase: "preflight",
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.payload.code).toBe("PRECONDITION_FAILED");
+    expect(result.payload.actual_type_counts).toMatchObject({
+      "minecraft:stone": 1,
+      "minecraft:dirt": 1,
+    });
+    expect(result.payload.hint).toContain("minecraft:stone");
+    expect(result.payload.hint).toContain("minecraft:dirt");
+    expect(result.payload.hint).toContain("any");
   });
 
   it("preflight all-already-target returns noop status with matched_count 0", async () => {

@@ -23,8 +23,11 @@ _LIMIT_HINT = (
     "禁止拆成大量 place（禁止 place 风暴）；勿用命令绕过审批。"
 )
 _LIMIT_MESSAGE = "出站帧超出 MCBE commandLine 字节预算，请求未发送。"
-_PRECONDITION_HINT = "跳过该格，或设置 replace_any=true 后重新调用（需再审批）。"
+_PRECONDITION_MESSAGE = "目标方块不满足 expect 前置条件。"
 _PRECONDITION_NOT_AIR_MESSAGE = "目标非空气（默认仅替换空气）。"
+_MAX_ACTUAL_TYPE_COUNTS = 8
+_MAX_BLOCK_TYPE_ID_LENGTH = 128
+_SAFE_BLOCK_TYPE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _SENSITIVE_MESSAGE_RE = re.compile(
     r"(password|token|secret|api[_-]?key|authorization|bearer\s+\S+)",
     re.IGNORECASE,
@@ -260,6 +263,88 @@ def _looks_sensitive(text: str) -> bool:
     return bool(_SENSITIVE_MESSAGE_RE.search(text))
 
 
+def _is_safe_block_type_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= _MAX_BLOCK_TYPE_ID_LENGTH
+        and not _looks_sensitive(value)
+        and bool(_SAFE_BLOCK_TYPE_ID_RE.fullmatch(value))
+    )
+
+
+def _safe_nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _safe_actual_type_counts(value: Any) -> dict[str, int]:
+    """Bound and validate actual block type counts before model projection."""
+    if not isinstance(value, dict):
+        return {}
+    valid: list[tuple[str, int]] = []
+    for type_id, count in value.items():
+        if not _is_safe_block_type_id(type_id):
+            continue
+        safe_count = _safe_nonnegative_int(count)
+        if safe_count is not None:
+            valid.append((type_id, safe_count))
+    valid.sort(key=lambda item: (-item[1], item[0]))
+    return dict(valid[:_MAX_ACTUAL_TYPE_COUNTS])
+
+
+def _precondition_hint_for_counts(
+    actual_type_counts: Any,
+    *,
+    avoid_any: bool = False,
+) -> str:
+    """Build a model-facing recovery hint from bounded observed block counts."""
+    counts = _safe_actual_type_counts(actual_type_counts)
+    if len(counts) == 1:
+        type_id = next(iter(counts))
+        suffix = (
+            "当前目标含受保护数据，请先选择未受保护目标。"
+            if avoid_any
+            else "确认允许覆盖任意普通方块时才使用 any（需重新审批）。"
+        )
+        return (
+            f"目标全为 {type_id}；如确实要替换，请将该 edit 的 expect 设为 {type_id}。"
+            f"{suffix}"
+        )
+    if counts:
+        summary = "、".join(f"{type_id}（{count}）" for type_id, count in counts.items())
+        if avoid_any:
+            return (
+                f"目标包含 {summary}；请为该 edit 选择匹配实际类型的精确 expect；"
+                "当前目标含受保护数据，请先选择未受保护目标。"
+            )
+        return (
+            f"目标包含 {summary}；请将该 edit 的 expect 设为其中的精确类型，"
+            "或确认允许覆盖任意普通方块时使用 any（需重新审批）。"
+        )
+    if avoid_any:
+        return "请先确认目标方块类型并设置精确 expect；当前目标含受保护数据，请先选择未受保护目标。"
+    return (
+        "请先确认目标方块类型并设置该 edit 的精确 expect；"
+        "确认允许覆盖任意普通方块时才使用 any（需重新审批）。"
+    )
+
+
+def _precondition_failure_avoids_any(payload: dict[str, Any]) -> bool:
+    """Treat protected-data precondition failures as ineligible for ``any``."""
+    if payload.get("replace_any") is True:
+        return True
+    if payload.get("protected") is True or payload.get("protected_samples"):
+        return True
+    raw_message = payload.get("message")
+    if isinstance(raw_message, str):
+        lower = raw_message.lower()
+        if "protected" in lower or "受保护" in raw_message:
+            return True
+    return False
+
+
 def _xyz_target(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -274,10 +359,10 @@ def _extract_actual_type_id(payload: dict[str, Any]) -> str | None:
     actual = payload.get("actual")
     if isinstance(actual, dict):
         type_id = actual.get("type_id")
-        if isinstance(type_id, str) and type_id and not _looks_sensitive(type_id):
+        if _is_safe_block_type_id(type_id):
             return type_id
     type_id = payload.get("actual_type_id")
-    if isinstance(type_id, str) and type_id and not _looks_sensitive(type_id):
+    if _is_safe_block_type_id(type_id):
         return type_id
     return None
 
@@ -363,9 +448,22 @@ def _safe_addon_error_body(
             "retryable": False,
             "external_state_unknown": False,
             "fallback_allowed": False,
-            "hint": _PRECONDITION_HINT,
         }
+        matched_count = _safe_nonnegative_int(src.get("matched_count"))
+        if matched_count is not None:
+            fields["matched_count"] = matched_count
+        elif stable_code == BlockErrorCode.PRECONDITION_FAILED:
+            fields["matched_count"] = 0
+        actual_type_counts = _safe_actual_type_counts(src.get("actual_type_counts"))
         actual_type_id = _extract_actual_type_id(src)
+        if not actual_type_counts and actual_type_id is not None:
+            actual_type_counts = {actual_type_id: 1}
+        if actual_type_counts or stable_code == BlockErrorCode.PRECONDITION_FAILED:
+            fields["actual_type_counts"] = actual_type_counts
+        fields["hint"] = _precondition_hint_for_counts(
+            actual_type_counts,
+            avoid_any=_precondition_failure_avoids_any(src),
+        )
         if actual_type_id is not None:
             fields["actual_type_id"] = actual_type_id
         target = _xyz_target(src.get("target"))
@@ -373,7 +471,11 @@ def _safe_addon_error_body(
             target = _xyz_target(src.get("position"))
         if target is not None:
             fields["target"] = target
-        message = _precondition_message(src)
+        message = (
+            _PRECONDITION_MESSAGE
+            if stable_code == BlockErrorCode.PRECONDITION_FAILED
+            else _precondition_message(src)
+        )
         return build_error_response(stable_code, message, **fields)
 
     if stable_code == BlockErrorCode.BLOCK_UNKNOWN:

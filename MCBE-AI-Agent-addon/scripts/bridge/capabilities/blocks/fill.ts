@@ -20,6 +20,8 @@ import { getBlockSafe, resolveAbsoluteDimension, resolvePlayerAnchor, type Resol
 import { buildBlockSnapshot, matchesTargetPermutation } from "./snapshot";
 
 const SAMPLE_LIMIT = 8;
+const MAX_ACTUAL_TYPE_COUNTS = 8;
+const SAFE_BLOCK_TYPE_ID_RE = /^[A-Za-z0-9_.:-]+$/;
 
 function isAbsolutePos(p: PositionInput): p is AbsolutePosition {
   return p !== null && typeof p === "object" && "x" in p && typeof (p as AbsolutePosition).x === "number";
@@ -373,11 +375,12 @@ export async function handleFill(payload: EditBlocksPayload): Promise<BridgeResu
         rollback: { promised: false },
       });
     }
-    return fail("PRECONDITION_FAILED", "fill 匹配数为 0：目标方块不满足 expect 前置条件。", {
+    const actualTypeCounts = boundedActualTypeCounts(scan.payload.previous_type_counts);
+    return fail("PRECONDITION_FAILED", "目标方块不满足 expect 前置条件。", {
       status: "failed" as const,
       matched_count: 0,
-      actual_type_counts: scan.payload.previous_type_counts,
-      hint: `如确实要替换这些方块，请将 expect 设为 ${expectedPreviousHint(prepared.payload)}`,
+      actual_type_counts: actualTypeCounts,
+      hint: preconditionHint(prepared.payload, actualTypeCounts),
       fallback_allowed: false,
       retryable: false,
     });
@@ -502,18 +505,61 @@ export async function handleFill(payload: EditBlocksPayload): Promise<BridgeResu
   }
 }
 
+function boundedActualTypeCounts(
+  actualTypeCounts: Record<string, number>,
+): Record<string, number> {
+  const entries = Object.entries(actualTypeCounts)
+    .filter(([typeId, count]) => (
+      typeId.length > 0
+      && typeId.length <= 128
+      && SAFE_BLOCK_TYPE_ID_RE.test(typeId)
+      && Number.isInteger(count)
+      && count >= 0
+    ))
+    .sort(([leftId, leftCount], [rightId, rightCount]) => (
+      rightCount - leftCount || leftId.localeCompare(rightId)
+    ));
+  return Object.fromEntries(entries.slice(0, MAX_ACTUAL_TYPE_COUNTS));
+}
+
 /**
- * Build an expect hint string from the prepared write policy.
- * Air-only -> "any"; expected_previous -> its type_id; otherwise "any".
+ * Select an expect value from observed blocks. Air-only must never be
+ * suggested again when the scan has identified a concrete non-air type.
  */
-function expectedPreviousHint(prepared: {
-  replace_any: boolean;
-  expected_previous?: EditBlocksPayload["expected_previous"];
-}): string {
-  if (prepared.expected_previous) {
-    return prepared.expected_previous.type_id ?? "any";
+function expectedPreviousHint(actualTypeCounts: Record<string, number>): string {
+  const entries = Object.entries(actualTypeCounts);
+  if (entries.length === 1) {
+    return entries[0][0];
   }
-  return prepared.replace_any ? "any" : "air";
+  if (entries.length > 1) return "any";
+  return "any";
+}
+
+function preconditionHint(
+  prepared: {
+    replace_any: boolean;
+    expected_previous?: EditBlocksPayload["expected_previous"];
+  },
+  actualTypeCounts: Record<string, number>,
+): string {
+  const entries = Object.entries(actualTypeCounts);
+  if (entries.length === 1) {
+    const typeId = expectedPreviousHint(actualTypeCounts);
+    const suffix = prepared.replace_any
+      ? "当前目标含受保护数据，请先选择未受保护目标。"
+      : "确认允许覆盖任意普通方块时才使用 any（需重新审批）。";
+    return `目标全为 ${typeId}；如确实要替换，请将该 edit 的 expect 设为 ${typeId}。${suffix}`;
+  }
+  if (entries.length > 1) {
+    const summary = entries.map(([typeId, count]) => `${typeId}（${count}）`).join("、");
+    if (prepared.replace_any) {
+      return `目标包含 ${summary}；请为该 edit 选择匹配实际类型的精确 expect；当前目标含受保护数据，请先选择未受保护目标。`;
+    }
+    return `目标包含 ${summary}；请将该 edit 的 expect 设为其中的精确类型，或确认允许覆盖任意普通方块时使用 any（需重新审批）。`;
+  }
+  return prepared.replace_any
+    ? "请先确认目标方块类型并设置精确 expect；当前目标含受保护数据，请先选择未受保护目标。"
+    : "请先确认目标方块类型并设置该 edit 的精确 expect；确认允许覆盖任意普通方块时才使用 any（需重新审批）。";
 }
 
 // silence unused

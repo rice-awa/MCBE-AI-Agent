@@ -732,6 +732,8 @@ def test_precondition_failed_projects_actual_target_and_hint() -> None:
                     "states": {"some": "state"},
                     "password": "hunter2",
                 },
+                "matched_count": 0,
+                "actual_type_counts": {"minecraft:gravel": 1},
                 "stack": "Traceback password=hunter2",
             },
         }
@@ -742,11 +744,18 @@ def test_precondition_failed_projects_actual_target_and_hint() -> None:
     assert body["actual_type_id"] == "minecraft:gravel"
     assert body["target"] == {"x": -797, "y": 93, "z": 182}
     assert "dimension" not in body["target"]
+    assert body["matched_count"] == 0
+    assert body["actual_type_counts"] == {"minecraft:gravel": 1}
     assert "hint" in body
-    assert "replace_any" in body["hint"]
+    assert "minecraft:gravel" in body["hint"]
+    assert "expect" in body["hint"]
+    assert "replace_any" not in body["hint"]
+    assert "expected_previous" not in body["hint"]
+    assert "locked_targets" not in body["hint"]
+    assert "phase" not in body["hint"]
     assert body["fallback_allowed"] is False
     assert body["retryable"] is False
-    assert "非空气" in body["message"] or "空气" in body["message"]
+    assert body["message"] == "目标方块不满足 expect 前置条件。"
     assert "hunter2" not in result.output
     assert "Traceback" not in result.output
     assert "states" not in body
@@ -2278,35 +2287,45 @@ async def test_fill_preflight_zero_match_non_air_is_precondition_failed_not_inte
     assert body["ok"] is False
     assert body["code"] == "PRECONDITION_FAILED"
     assert body["fallback_allowed"] is False
-    assert body["matched"] == 0 or body.get("matched_count") == 0
+    assert body.get("matched_count") == 0
     assert body["actual_type_counts"] == {"minecraft:oak_planks": 2}
     assert "expect" in body.get("hint", "")
-    # Air-only policy -> hint suggests setting expect to "air".
-    assert "air" in body["hint"]
+    assert "minecraft:oak_planks" in body["hint"]
+    assert "设为 air" not in body["hint"]
+    assert "any" in body["hint"]
+    for hidden in ("replace_any", "expected_previous", "locked_targets", "phase"):
+        assert hidden not in body["hint"]
 
 
-def test_expect_hint_for_args_covers_all_policies() -> None:
-    """Unit-cover the expect repair hint for air-only / replace_any / expected_previous."""
+def test_expect_hint_for_args_uses_actual_type_counts_and_failure_cause() -> None:
+    """Repair hints use observed blocks, not hidden legacy policy fields."""
     from services.agent.block_ops.tools_impl import _expect_hint_for_args
 
-    # Air-only (default) -> "air"
-    assert _expect_hint_for_args({"replace_any": False}) == "air"
-    # replace_any -> "any"
-    assert _expect_hint_for_args({"replace_any": True}) == "any"
-    # expected_previous with type_id -> that type_id
-    assert (
-        _expect_hint_for_args({"expected_previous": {"type_id": "minecraft:dirt"}})
-        == "minecraft:dirt"
+    homogeneous = _expect_hint_for_args(
+        {"edits": [{"expect": "air"}]},
+        {"minecraft:grass_block": 49},
     )
-    # expected_previous without type_id -> "any" (defensive fallback)
-    assert _expect_hint_for_args({"expected_previous": {}}) == "any"
-    # expected_previous takes precedence over replace_any
-    assert (
-        _expect_hint_for_args(
-            {"replace_any": True, "expected_previous": {"type_id": "minecraft:stone"}}
-        )
-        == "minecraft:stone"
+    assert "minecraft:grass_block" in homogeneous
+    assert "设为 air" not in homogeneous
+
+    mixed = _expect_hint_for_args(
+        {"edits": [{"expect": "air"}]},
+        {"minecraft:stone": 3, "minecraft:dirt": 2},
     )
+    assert "minecraft:stone" in mixed
+    assert "minecraft:dirt" in mixed
+    assert "精确" in mixed
+    assert "any" in mixed
+
+    protected_any = _expect_hint_for_args(
+        {"edits": [{"expect": "any"}]},
+        {"minecraft:chest": 1},
+        failure_cause="protected",
+    )
+    assert "minecraft:chest" in protected_any
+    assert "any" not in protected_any
+    for hidden in ("replace_any", "expected_previous", "locked_targets", "phase"):
+        assert hidden not in mixed
 
 
 @pytest.mark.asyncio
@@ -2370,7 +2389,8 @@ async def test_fill_preflight_zero_match_with_expected_previous_hints_its_type()
             pytest.skip("preflight frame over commandLine budget in this env")
         assert body["code"] == "PRECONDITION_FAILED"
         assert body["actual_type_counts"] == {"minecraft:stone": 1}
-        assert "minecraft:dirt" in body["hint"]
+        assert "minecraft:stone" in body["hint"]
+        assert "minecraft:dirt" not in body["hint"]
     else:
         pytest.fail("expected zero-match PRECONDITION_FAILED failure")
 
@@ -4342,6 +4362,67 @@ async def test_new_edit_contract_zero_match_is_precondition_failed() -> None:
     assert body["code"] == "PRECONDITION_FAILED"
     assert body["actual_type_counts"] == {"minecraft:oak_planks": 1}
     assert "expect" in body.get("hint", "")
+    assert "minecraft:oak_planks" in body["hint"]
+
+
+def test_precondition_error_projects_bounded_actual_type_counts() -> None:
+    counts = {f"minecraft:block_{index}": index for index in range(1, 11)}
+    counts.update({
+        "password=secret": 100,
+        "minecraft:negative": -1,
+        "minecraft:boolean": True,
+        "minecraft:" + "x" * 130: 101,
+    })
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "PRECONDITION_FAILED",
+                "message": "untrusted message",
+                "hint": "replace_any=true expected_previous locked_targets phase",
+                "matched_count": -1,
+                "actual_type_counts": counts,
+            },
+        }
+    )
+
+    body = json.loads(result.output)
+    projected = body["actual_type_counts"]
+    assert len(projected) == 8
+    assert list(projected) == [
+        "minecraft:block_10",
+        "minecraft:block_9",
+        "minecraft:block_8",
+        "minecraft:block_7",
+        "minecraft:block_6",
+        "minecraft:block_5",
+        "minecraft:block_4",
+        "minecraft:block_3",
+    ]
+    assert all(isinstance(value, int) and value >= 0 for value in projected.values())
+    assert body["matched_count"] == 0
+    assert "untrusted message" not in body["hint"]
+    for hidden in ("replace_any", "expected_previous", "locked_targets", "phase"):
+        assert hidden not in body["hint"]
+
+
+def test_precondition_any_protected_does_not_suggest_any() -> None:
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "PRECONDITION_FAILED",
+                "replace_any": True,
+                "protected": True,
+                "actual_type_counts": {"minecraft:chest": 1},
+            },
+        }
+    )
+
+    body = json.loads(result.output)
+    assert body["actual_type_counts"] == {"minecraft:chest": 1}
+    assert "minecraft:chest" in body["hint"]
+    assert "any" not in body["hint"]
 
 
 def test_model_visible_edit_blocks_schema_exposes_only_edits_contract() -> None:

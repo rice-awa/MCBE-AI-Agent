@@ -12,6 +12,8 @@ from config.logging import get_logger
 from config.redaction import redact_exception
 from models.agent import AgentDependencies
 from services.agent.block_ops.bridge import (
+    _precondition_hint_for_counts,
+    _safe_actual_type_counts,
     call_block_capability,
     map_bridge_exception,
 )
@@ -1248,31 +1250,27 @@ def build_block_preflight_plan(
     return BlockPreflightPlan(authorized_args, execute_args, approval_metadata)
 
 
-def _expect_hint_for_args(args: dict[str, Any]) -> str:
-    """Build the ``expect`` repair hint from the original edit args.
+def _expect_hint_for_args(
+    args: dict[str, Any],
+    actual_type_counts: Any = None,
+    *,
+    failure_cause: str | None = None,
+) -> str:
+    """Build a model-facing recovery hint from observed block types.
 
-    Supports both the new ``edits[*].expect`` contract and the legacy
-    ``expected_previous``/``replace_any`` fields.
+    The original expect policy is only used to avoid recommending ``any`` for
+    a protected-data failure. It must never be echoed as a hidden legacy
+    parameter or used instead of the observed type counts.
     """
     edits = args.get("edits")
+    expect_kind: Any = None
     if isinstance(edits, list) and edits and isinstance(edits[0], dict):
-        info = _normalize_expect(edits[0].get("expect"))
-        kind = info.get("kind")
-        if kind == "any":
-            return "any"
-        if kind in ("type", "permutation"):
-            type_id = info.get("type_id")
-            if isinstance(type_id, str) and type_id:
-                return type_id
-        return "air"
-    if isinstance(args.get("expected_previous"), dict):
-        tid = args["expected_previous"].get("type_id")
-        if isinstance(tid, str) and tid:
-            return tid
-        return "any"
-    if args.get("replace_any"):
-        return "any"
-    return "air"
+        expect_kind = _normalize_expect(edits[0].get("expect")).get("kind")
+    elif args.get("replace_any") is True:
+        expect_kind = "any"
+
+    avoid_any = failure_cause == "protected" or expect_kind == "any"
+    return _precondition_hint_for_counts(actual_type_counts, avoid_any=avoid_any)
 
 
 def _classify_zero_match_preflight(
@@ -1313,14 +1311,23 @@ def _classify_zero_match_preflight(
     actual_counts = preflight_fields.get("previous_type_counts")
     if not isinstance(actual_counts, dict) or not actual_counts:
         actual_counts = preflight_fields.get("actual_type_counts")
-    if not isinstance(actual_counts, dict):
-        actual_counts = {}
-    hint = f"如确实要替换这些方块，请将 expect 设为 {_expect_hint_for_args(tool_args)}"
+    actual_counts = _safe_actual_type_counts(actual_counts)
+    failure_cause = (
+        "protected"
+        if preflight_fields.get("protected") is True
+        or preflight_fields.get("protected_samples")
+        else None
+    )
+    hint = _expect_hint_for_args(
+        tool_args,
+        actual_counts,
+        failure_cause=failure_cause,
+    )
     body = build_error_response(
         BlockErrorCode.PRECONDITION_FAILED,
-        "匹配数为 0：目标方块不满足前置条件，本次操作未发送到 Add-on。",
+        "目标方块不满足 expect 前置条件。",
         status="failed",
-        matched=0,
+        matched_count=0,
         actual_type_counts=actual_counts,
         hint=hint,
         retryable=False,
