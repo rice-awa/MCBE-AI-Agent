@@ -53,3 +53,37 @@
 
 - findings 中记录的 6 项真实 MCBE development-world smoke checks 仍未运行：当前没有可用开发世界或 bridge；不据此声称端到端通过。
 - 未运行全量 Python、Add-on 测试，符合本次请求的 focused-test 限制。
+
+---
+
+## Re-review finding 修复（2026-08-03）
+
+### Critical 5：Duplicate deferred IDs can bind approval to stale arguments
+
+- 真实恢复回归通过 `AgentWorker._process_request_locked()` 输入实际 `DeferredToolResults`，并在 worker 的流边界内运行一个真实 PydanticAI `Agent`。修复前测试实际执行了旧参数 `say stale`，结果为 `1 failed, 81 passed, 1 warning in 3.76s`，证实 finding 可复现。
+- `ensure_tool_message_pairs()` 的审批例外现在只保留原历史中最近 `ModelResponse` 内、对 deferred ID 唯一的未配对 `ToolCallPart`；更早的同 ID pending calls 全部删除。因此 PydanticAI 的最终 response 恢复与获批参数一致。
+- 若最近 `ModelResponse` 内同一 deferred ID 有多个未配对 call，则全部删除，同时保留该空 response 作为恢复边界。PydanticAI 会因最终 response 无未处理 tool call 而拒绝恢复，不会回退并执行旧参数。
+- 普通 ordered one-to-one 匹配算法、混合文本/metadata 保留及非原地修改语义未改变；生产代码无需修改 `worker.py`。
+- 回归测试：`test_approval_resume_uses_final_duplicate_id_or_fails_closed_if_ambiguous`，覆盖“跨 response 选择最终参数”和“最终 response 内歧义时不执行且返回 error chunk”。
+
+### 本轮测试
+
+命令：
+
+```bash
+.venv/bin/python -m pytest -q tests/test_agent_context.py tests/test_agent_worker.py tests/test_queue_context.py
+```
+
+准确结果：`82 passed, 1 warning in 4.89s`。
+
+warning 来自既有 `test_request_done_called_once_on_process_exception` 的 `AsyncMock` `RuntimeWarning`；失败数为 0，未在本轮责任范围外调整该 mock。
+
+### 本轮 Commit
+
+- message: `fix(agent): disambiguate deferred approval tool calls`
+- 本轮报告、生产修复和回归测试包含在同一 commit 中；最终 commit hash 在交付结果中返回。
+
+### 本轮 Concerns
+
+- findings 中记录的 6 项真实 MCBE development-world smoke checks 仍因没有可用开发世界或 bridge 而未运行。
+- 按要求仅运行上述三个 focused 测试文件，未运行全量 Python 或 Add-on 测试。

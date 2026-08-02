@@ -106,14 +106,23 @@ def ensure_tool_message_pairs(
 
     普通历史要求每个工具级响应都匹配此前唯一未配对的调用，且每个调用
     都必须有响应。``preserve_call_ids`` 只供审批恢复使用：其中明确列出
-    的、尚未有响应的调用可以暂时保留，等待 DeferredToolResults 消费；不在
-    集合内的孤儿仍会被删除。该函数只构造新消息，不修改输入对象。
+    且在最终 ModelResponse 中唯一、尚未有响应的调用可以暂时保留，等待
+    DeferredToolResults 消费；不在集合内或存在歧义的孤儿仍会被删除。该函数
+    只构造新消息，不修改输入对象。
     """
     preserved_ids = {
         str(call_id)
         for call_id in (preserve_call_ids or set())
         if str(call_id).strip()
     }
+    resumable_response_index = next(
+        (
+            message_index
+            for message_index in range(len(messages) - 1, -1, -1)
+            if isinstance(messages[message_index], ModelResponse)
+        ),
+        None,
+    )
     pending_calls: dict[str, deque[tuple[int, int]]] = {}
     removed_positions: set[tuple[int, int]] = set()
 
@@ -146,17 +155,24 @@ def ensure_tool_message_pairs(
                 continue
             calls.popleft()
 
-    # All remaining calls are unmatched. Keep at most one explicitly deferred
-    # call per ID as the narrow approval-resume exception; discard all others.
+    # All remaining calls are unmatched. PydanticAI resumes DeferredToolResults
+    # from the final ModelResponse, so an explicitly deferred ID is safe to keep
+    # only when exactly one unmatched occurrence belongs to that response.
+    # Otherwise remove every occurrence and let resume fail closed rather than
+    # falling back to an older call with the same ID.
     for call_id, calls in pending_calls.items():
-        preserved_pending = call_id in preserved_ids
-        kept_pending = False
-        while calls:
-            position = calls.popleft()
-            if preserved_pending and not kept_pending:
-                kept_pending = True
-                continue
-            removed_positions.add(position)
+        positions = list(calls)
+        resumable_positions = [
+            position
+            for position in positions
+            if call_id in preserved_ids and position[0] == resumable_response_index
+        ]
+        kept_position = (
+            resumable_positions[0] if len(resumable_positions) == 1 else None
+        )
+        removed_positions.update(
+            position for position in positions if position != kept_position
+        )
 
     if not removed_positions:
         return list(messages)
@@ -170,7 +186,12 @@ def ensure_tool_message_pairs(
             if (message_index, part_index) not in removed_positions
         ]
         if not kept and parts and all(_is_tool_part(part) for part in parts):
-            continue
+            if not (
+                preserved_ids
+                and message_index == resumable_response_index
+                and isinstance(message, ModelResponse)
+            ):
+                continue
         if isinstance(message, (ModelRequest, ModelResponse)):
             result.append(replace(message, parts=kept))
         else:

@@ -603,6 +603,142 @@ async def test_approval_resume_keeps_only_deferred_pending_tool_call(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_approval_resume_uses_final_duplicate_id_or_fails_closed_if_ambiguous(
+    monkeypatch,
+):
+    """重复 deferred ID 必须绑定框架最终可恢复 response，而非更早参数。"""
+    from pydantic_ai import Agent
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        TextPart,
+        ToolCallPart,
+        UserPromptPart,
+    )
+    from pydantic_ai.models.function import FunctionModel
+    from pydantic_ai.tools import DeferredToolRequests
+
+    from models.agent import StreamEvent
+
+    settings = _make_settings()
+    broker = MagicMock()
+    broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+    broker.get_response_queue = MagicMock(return_value=object())
+    broker.send_response = AsyncMock(return_value=True)
+    worker = AgentWorker(broker, settings)
+
+    executed_commands: list[str] = []
+    resume_agent: Agent[None, str | DeferredToolRequests] = Agent(
+        "test",
+        output_type=[str, DeferredToolRequests],
+    )
+
+    @resume_agent.tool_plain(requires_approval=True)
+    def run_minecraft_command(command: str) -> str:
+        executed_commands.append(command)
+        return f"executed:{command}"
+
+    resume_history = [
+        ModelRequest(parts=[UserPromptPart("run a command")]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="run_minecraft_command",
+                    args={"command": "say stale"},
+                    tool_call_id="tc-duplicate",
+                )
+            ]
+        ),
+        ModelRequest(parts=[UserPromptPart("use the corrected command")]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="run_minecraft_command",
+                    args={"command": "time set day"},
+                    tool_call_id="tc-duplicate",
+                )
+            ]
+        ),
+    ]
+
+    def finish_after_tool(_messages, _info):
+        return ModelResponse(parts=[TextPart("done")])
+
+    async def resume_with_real_agent(*args, **kwargs):
+        await resume_agent.run(
+            message_history=kwargs.get("message_history"),
+            deferred_tool_results=kwargs.get("deferred_tool_results"),
+            model=FunctionModel(finish_after_tool),
+        )
+        yield StreamEvent(event_type="content", content="已继续", sequence=0)
+
+    monkeypatch.setattr("services.agent.worker.stream_chat", resume_with_real_agent)
+    monkeypatch.setattr(
+        "services.agent.providers.ProviderRegistry.get_model",
+        lambda _config: object(),
+    )
+    monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _settings: None)
+
+    connection_id = uuid4()
+    await worker._process_request_locked(
+        ChatRequest(
+            connection_id=connection_id,
+            content="同意",
+            player_name="Alex",
+            run_id="run-resume-duplicate",
+            resume_approval_id="approval-duplicate",
+            deferred_tool_results={"approvals": {"tc-duplicate": True}},
+            resume_message_history=resume_history,
+        ),
+        connection_id,
+    )
+
+    assert executed_commands == ["time set day"]
+
+    executed_commands.clear()
+    response_count = broker.send_response.await_count
+    ambiguous_history = [
+        ModelRequest(parts=[UserPromptPart("run a command")]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="run_minecraft_command",
+                    args={"command": "say stale"},
+                    tool_call_id="tc-ambiguous",
+                ),
+                ToolCallPart(
+                    tool_name="run_minecraft_command",
+                    args={"command": "time set day"},
+                    tool_call_id="tc-ambiguous",
+                ),
+            ]
+        ),
+    ]
+    await worker._process_request_locked(
+        ChatRequest(
+            connection_id=connection_id,
+            content="同意",
+            player_name="Alex",
+            run_id="run-resume-ambiguous",
+            resume_approval_id="approval-ambiguous",
+            deferred_tool_results={"approvals": {"tc-ambiguous": True}},
+            resume_message_history=ambiguous_history,
+        ),
+        connection_id,
+    )
+
+    assert executed_commands == []
+    new_responses = [
+        call.args[1]
+        for call in broker.send_response.await_args_list[response_count:]
+    ]
+    assert any(
+        getattr(response, "chunk_type", None) == "error"
+        for response in new_responses
+    )
+
+
+@pytest.mark.asyncio
 async def test_worker_audits_validation_retry_and_later_success_without_execution_start(
     monkeypatch, tmp_path
 ):
