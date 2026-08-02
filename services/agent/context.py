@@ -577,7 +577,7 @@ class ContextBuilder:
         for message in messages:
             for part in getattr(message, "parts", []) or []:
                 call_id = getattr(part, "tool_call_id", None)
-                if not call_id:
+                if call_id is None:
                     continue
                 if isinstance(part, ToolCallPart):
                     call_ids.add(str(call_id))
@@ -595,11 +595,15 @@ class ContextBuilder:
             kept: list[Any] = []
             for part in parts:
                 call_id = getattr(part, "tool_call_id", None)
-                if isinstance(part, ToolCallPart) and call_id and str(call_id) in unpaired_calls:
+                if (
+                    isinstance(part, ToolCallPart)
+                    and call_id is not None
+                    and str(call_id) in unpaired_calls
+                ):
                     continue
                 if (
                     self._is_tool_response_part(part)
-                    and call_id
+                    and call_id is not None
                     and str(call_id) in unpaired_responses
                 ):
                     continue
@@ -607,10 +611,8 @@ class ContextBuilder:
             # 若去掉 tool 部分后消息为空，丢弃
             if not kept and parts and all(self._is_tool_part(p) for p in parts):
                 continue
-            if isinstance(message, ModelRequest):
-                result.append(ModelRequest(parts=kept) if kept != parts else message)
-            elif isinstance(message, ModelResponse):
-                result.append(ModelResponse(parts=kept) if kept != parts else message)
+            if isinstance(message, (ModelRequest, ModelResponse)):
+                result.append(replace(message, parts=kept) if kept != parts else message)
             else:
                 result.append(message)
         return result

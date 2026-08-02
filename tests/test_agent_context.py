@@ -1,5 +1,6 @@
 """上下文预算与信任边界不变量测试。"""
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -7,6 +8,7 @@ import pytest
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
+    RequestUsage,
     RetryPromptPart,
     TextPart,
     ToolCallPart,
@@ -175,6 +177,58 @@ def test_context_removes_orphan_tool_call():
     assert _find_part(processed, "tool-call", "orphan-call") is None
 
 
+@pytest.mark.parametrize(
+    ("message", "part_kind"),
+    [
+        (
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "edit_blocks",
+                        '{"edits": []}',
+                        tool_call_id="",
+                    )
+                ]
+            ),
+            "tool-call",
+        ),
+        (
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="edit_blocks",
+                        content="orphan",
+                        tool_call_id="",
+                    )
+                ]
+            ),
+            "tool-return",
+        ),
+        (
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        "invalid JSON",
+                        tool_name="edit_blocks",
+                        tool_call_id="",
+                    )
+                ]
+            ),
+            "retry-prompt",
+        ),
+    ],
+)
+def test_context_removes_orphan_tool_parts_with_empty_tool_call_id(message, part_kind):
+    builder = _large_context_builder()
+
+    processed = builder.process_history(
+        [message],
+        budget=builder.compute_budget(provider_name="test"),
+    )
+
+    assert _find_part(processed, part_kind, "") is None
+
+
 def test_context_preserves_output_retry_without_tool_name():
     builder = _large_context_builder()
     messages = [
@@ -315,6 +369,118 @@ def test_context_keeps_same_id_pair_when_recent_turn_cropping_runs():
 
     assert _find_part(processed, "tool-call", "cropped-pair")
     assert _find_part(processed, "retry-prompt", "cropped-pair")
+
+
+def test_context_cleans_pair_half_left_by_recent_turn_cropping():
+    settings = _Settings(context_window=8192)
+    settings.max_history_turns = 1
+    builder = _large_context_builder(settings)
+    messages = [
+        ModelRequest(parts=[UserPromptPart("old input")]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "edit_blocks",
+                    '{"edits": []}',
+                    tool_call_id="cropped-half",
+                )
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                UserPromptPart("current input"),
+                ToolReturnPart(
+                    tool_name="edit_blocks",
+                    content="return after cropped call",
+                    tool_call_id="cropped-half",
+                ),
+            ]
+        ),
+    ]
+
+    processed = builder.process_history(
+        messages,
+        budget=builder.compute_budget(provider_name="test"),
+    )
+
+    assert _find_part(processed, "tool-call", "cropped-half") is None
+    assert _find_part(processed, "tool-return", "cropped-half") is None
+    assert any(
+        getattr(part, "part_kind", None) == "user-prompt"
+        and getattr(part, "content", None) == "current input"
+        for message in processed
+        for part in message.parts
+    )
+    assert not any(
+        getattr(part, "part_kind", None) == "user-prompt"
+        and getattr(part, "content", None) == "old input"
+        for message in processed
+        for part in message.parts
+    )
+
+
+def test_context_preserves_request_and_response_metadata_when_cleaning_parts():
+    builder = _large_context_builder()
+    request_timestamp = datetime(2025, 1, 2, 3, 4, 5, tzinfo=UTC)
+    response_timestamp = datetime(2025, 1, 2, 3, 4, 6, tzinfo=UTC)
+    request = ModelRequest(
+        parts=[
+            UserPromptPart("keep request prompt"),
+            RetryPromptPart(
+                "invalid JSON",
+                tool_name="edit_blocks",
+                tool_call_id="metadata-request-orphan",
+            ),
+        ],
+        timestamp=request_timestamp,
+        instructions="request instructions",
+        run_id="request-run",
+        conversation_id="metadata-conversation",
+        metadata={"request_source": "test"},
+    )
+    response = ModelResponse(
+        parts=[
+            TextPart(content="keep response text"),
+            ToolCallPart(
+                "edit_blocks",
+                '{"edits": []}',
+                tool_call_id="metadata-response-orphan",
+            ),
+        ],
+        usage=RequestUsage(input_tokens=11, output_tokens=7),
+        model_name="metadata-model",
+        timestamp=response_timestamp,
+        provider_name="metadata-provider",
+        provider_url="https://provider.invalid",
+        provider_details={"region": "test"},
+        provider_response_id="provider-response-id",
+        run_id="response-run",
+        conversation_id="metadata-conversation",
+        metadata={"response_source": "test"},
+    )
+
+    processed = builder.process_history(
+        [request, response],
+        budget=builder.compute_budget(provider_name="test"),
+    )
+
+    processed_request = next(message for message in processed if isinstance(message, ModelRequest))
+    processed_response = next(message for message in processed if isinstance(message, ModelResponse))
+    assert processed_request.timestamp == request_timestamp
+    assert processed_request.instructions == "request instructions"
+    assert processed_request.run_id == "request-run"
+    assert processed_request.conversation_id == "metadata-conversation"
+    assert processed_request.metadata == {"request_source": "test"}
+    assert processed_response.usage == RequestUsage(input_tokens=11, output_tokens=7)
+    assert processed_response.model_name == "metadata-model"
+    assert processed_response.timestamp == response_timestamp
+    assert processed_response.provider_name == "metadata-provider"
+    assert processed_response.provider_url == "https://provider.invalid"
+    assert processed_response.provider_details == {"region": "test"}
+    assert processed_response.provider_response_id == "provider-response-id"
+    assert processed_response.run_id == "response-run"
+    assert processed_response.conversation_id == "metadata-conversation"
+    assert processed_response.metadata == {"response_source": "test"}
 
 
 def test_oversized_single_message_hard_refused_or_truncated():
