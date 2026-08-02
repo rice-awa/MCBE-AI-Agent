@@ -76,6 +76,72 @@ class ContextOversizedError(ValueError):
     """单条消息或预留项已超过可用上下文窗口，硬拒绝。"""
 
 
+def _is_tool_response_part(part: Any) -> bool:
+    """判断 part 是否属于需要和 ToolCallPart 配对的工具级响应。"""
+    return isinstance(part, ToolReturnPart) or (
+        isinstance(part, RetryPromptPart) and part.tool_name is not None
+    )
+
+
+def _is_tool_part(part: Any) -> bool:
+    return isinstance(part, ToolCallPart) or _is_tool_response_part(part)
+
+
+def _tool_call_id(part: Any) -> str | None:
+    """返回可用于配对的工具调用 ID；缺失或空白 ID 不可配对。"""
+    raw_call_id = getattr(part, "tool_call_id", None)
+    if raw_call_id is None:
+        return None
+    call_id = str(raw_call_id)
+    return call_id if call_id.strip() else None
+
+
+def ensure_tool_message_pairs(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """返回不含孤立工具调用/工具响应的消息列表，不修改输入。"""
+    call_ids: set[str] = set()
+    response_ids: set[str] = set()
+    has_invalid_tool_id = False
+    for message in messages:
+        for part in getattr(message, "parts", []) or []:
+            if not _is_tool_part(part):
+                continue
+            call_id = _tool_call_id(part)
+            if call_id is None:
+                has_invalid_tool_id = True
+                continue
+            if isinstance(part, ToolCallPart):
+                call_ids.add(call_id)
+            elif _is_tool_response_part(part):
+                response_ids.add(call_id)
+
+    unpaired_calls = call_ids - response_ids
+    unpaired_responses = response_ids - call_ids
+    if not has_invalid_tool_id and not unpaired_calls and not unpaired_responses:
+        return list(messages)
+
+    result: list[ModelMessage] = []
+    for message in messages:
+        parts = list(getattr(message, "parts", []) or [])
+        kept: list[Any] = []
+        for part in parts:
+            if isinstance(part, ToolCallPart):
+                call_id = _tool_call_id(part)
+                if call_id is None or call_id in unpaired_calls:
+                    continue
+            elif _is_tool_response_part(part):
+                call_id = _tool_call_id(part)
+                if call_id is None or call_id in unpaired_responses:
+                    continue
+            kept.append(part)
+        if not kept and parts and all(_is_tool_part(part) for part in parts):
+            continue
+        if isinstance(message, (ModelRequest, ModelResponse)):
+            result.append(replace(message, parts=kept) if kept != parts else message)
+        else:
+            result.append(message)
+    return result
+
+
 def estimate_tokens(text: str | None) -> int:
     """保守估算文本 token 数。"""
     if not text:
@@ -369,7 +435,7 @@ class ContextBuilder:
             result = self._keep_recent_turns(result, max_turns)
 
         # 最终保证 tool pair 完整
-        result = self._ensure_tool_pairs(result)
+        result = ensure_tool_message_pairs(result)
 
         # missing context_window：裁剪后若历史仍超过 fallback 预算，硬拒绝而非静默放行。
         # 策略说明：无限预算永不使用；元数据缺失时用 8192 fallback 裁剪，
@@ -572,61 +638,15 @@ class ContextBuilder:
 
     def _ensure_tool_pairs(self, messages: list[ModelMessage]) -> list[ModelMessage]:
         """保证不会留下孤立的 tool-call 或工具级响应。"""
-        call_ids: set[str] = set()
-        response_ids: set[str] = set()
-        for message in messages:
-            for part in getattr(message, "parts", []) or []:
-                call_id = getattr(part, "tool_call_id", None)
-                if call_id is None:
-                    continue
-                if isinstance(part, ToolCallPart):
-                    call_ids.add(str(call_id))
-                elif self._is_tool_response_part(part):
-                    response_ids.add(str(call_id))
-
-        unpaired_calls = call_ids - response_ids
-        unpaired_responses = response_ids - call_ids
-        if not unpaired_calls and not unpaired_responses:
-            return messages
-
-        result: list[ModelMessage] = []
-        for message in messages:
-            parts = list(getattr(message, "parts", []) or [])
-            kept: list[Any] = []
-            for part in parts:
-                call_id = getattr(part, "tool_call_id", None)
-                if (
-                    isinstance(part, ToolCallPart)
-                    and call_id is not None
-                    and str(call_id) in unpaired_calls
-                ):
-                    continue
-                if (
-                    self._is_tool_response_part(part)
-                    and call_id is not None
-                    and str(call_id) in unpaired_responses
-                ):
-                    continue
-                kept.append(part)
-            # 若去掉 tool 部分后消息为空，丢弃
-            if not kept and parts and all(self._is_tool_part(p) for p in parts):
-                continue
-            if isinstance(message, (ModelRequest, ModelResponse)):
-                result.append(replace(message, parts=kept) if kept != parts else message)
-            else:
-                result.append(message)
-        return result
+        return ensure_tool_message_pairs(messages)
 
     @staticmethod
     def _is_tool_response_part(part: Any) -> bool:
-        return (
-            isinstance(part, ToolReturnPart)
-            or isinstance(part, RetryPromptPart) and part.tool_name is not None
-        )
+        return _is_tool_response_part(part)
 
     @staticmethod
     def _is_tool_part(part: Any) -> bool:
-        return isinstance(part, ToolCallPart) or ContextBuilder._is_tool_response_part(part)
+        return _is_tool_part(part)
 
 
 def build_context_history_processor(settings: Any | None = None) -> ContextBuilder:

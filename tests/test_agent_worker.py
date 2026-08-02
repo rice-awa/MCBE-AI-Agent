@@ -533,6 +533,93 @@ async def test_error_event_persists_partial_run_history(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_partial_history_persistence_drops_orphan_retry_and_keeps_visible_context(monkeypatch):
+    """partial history 落盘前清除孤立 retry，但保留可见文本和中断说明。"""
+    from pydantic_ai.messages import ModelRequest, ModelResponse, RetryPromptPart, TextPart
+
+    from services.agent.context import ContextBudget, ContextBuilder
+
+    settings = _make_settings()
+    broker = MagicMock()
+    broker.set_conversation_history = MagicMock(return_value=True)
+    broker.send_response = AsyncMock(return_value=True)
+    worker = AgentWorker(broker, settings)
+
+    partial_messages = [
+        ModelResponse(parts=[TextPart(content="工具执行前的可见说明")]),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    "invalid JSON",
+                    tool_name="edit_blocks",
+                    tool_call_id="call-bad",
+                )
+            ]
+        ),
+    ]
+
+    class _NoCompression:
+        async def check_and_compress(self, *_args, **_kwargs):
+            return False, "disabled"
+
+    monkeypatch.setattr(
+        "core.conversation.get_conversation_manager",
+        lambda *_args, **_kwargs: _NoCompression(),
+    )
+
+    connection_id = uuid4()
+    request = ChatRequest(
+        connection_id=connection_id,
+        content="继续",
+        player_name="Alex",
+        conversation_id="partial-conversation",
+        run_id="run-partial-sanitize",
+    )
+    await worker._persist_partial_run_history(
+        connection_id=connection_id,
+        request=request,
+        all_messages=partial_messages,
+        player_error_text="provider interrupted",
+        conversation_invalidation_epoch=7,
+    )
+
+    saved_history = broker.set_conversation_history.call_args.args[2]
+    assert partial_messages[1].parts[0].tool_call_id == "call-bad"
+    assert not any(
+        isinstance(part, RetryPromptPart)
+        for message in saved_history
+        for part in message.parts
+    )
+    assert any(
+        isinstance(part, TextPart) and part.content == "工具执行前的可见说明"
+        for message in saved_history
+        for part in message.parts
+    )
+    assert any(
+        isinstance(part, TextPart) and "[系统] 本轮执行中断" in part.content
+        for message in saved_history
+        for part in message.parts
+    )
+
+    processed = ContextBuilder().process_history(
+        saved_history,
+        budget=ContextBudget(
+            context_window=8192,
+            system_reserve=0,
+            tool_schema_reserve=0,
+            current_input_reserve=0,
+            output_reserve=0,
+            history_budget=8192,
+        ),
+    )
+    assert not any(
+        isinstance(part, RetryPromptPart)
+        for message in processed
+        for part in message.parts
+    )
+
+
+@pytest.mark.asyncio
 async def test_stream_chunks_carry_trace_correlation(monkeypatch):
     """StreamChunk 构造应带上 request 的 trace_id / attempt_id。"""
     from services.agent.core import StreamEvent

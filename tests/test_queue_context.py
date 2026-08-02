@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
     TextPart,
     ThinkingPart,
     UserPromptPart,
@@ -389,6 +390,107 @@ def test_worker_skips_history_write_when_request_invalidation_epoch_is_stale(mon
         )
 
         assert broker.get_conversation_history(connection_id, "alice", "default") == []
+
+    asyncio.run(_run())
+
+
+def test_worker_self_heals_orphan_tool_history_before_model_request(monkeypatch) -> None:
+    """旧 conversation 的孤立 retry 应在模型请求前从 broker 历史中自愈。"""
+
+    async def _run() -> None:
+        broker = MessageBroker()
+        connection_id = uuid4()
+        broker.register_connection(connection_id)
+        settings = Settings(default_provider="ollama", dev_mode=True)
+        worker = AgentWorker(broker, settings)
+
+        polluted_history = [
+            ModelRequest(parts=[UserPromptPart(content="继续建造")]),
+            ModelResponse(parts=[TextPart(content="此前已完成一部分")]),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        "invalid JSON",
+                        tool_name="edit_blocks",
+                        tool_call_id="call-bad",
+                    )
+                ]
+            ),
+        ]
+        broker.set_conversation_history(
+            connection_id,
+            "alice",
+            polluted_history,
+            "legacy",
+        )
+        invalidation_epoch = broker.get_conversation_invalidation_epoch(
+            connection_id,
+            "alice",
+            "legacy",
+        )
+
+        captured: dict[str, object] = {}
+
+        async def fake_stream_chat(*args, **kwargs):
+            captured["deps"] = args[1]
+            captured["message_history"] = kwargs.get("message_history")
+            yield StreamEvent(
+                event_type="content",
+                content="继续",
+                sequence=0,
+                metadata=None,
+            )
+
+        async def fake_check_and_compress(*_args, **_kwargs):
+            return False, "disabled"
+
+        monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+        monkeypatch.setattr(
+            "services.agent.providers.ProviderRegistry.get_model",
+            lambda _config: object(),
+        )
+        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _settings: None)
+        monkeypatch.setattr(
+            "core.conversation.ConversationManager.check_and_compress",
+            fake_check_and_compress,
+        )
+
+        request = ChatRequest(
+            connection_id=connection_id,
+            content="继续",
+            player_name="alice",
+            conversation_id="legacy",
+            run_id="run-self-heal",
+            trace_id="trace-self-heal",
+            attempt_id="attempt-self-heal",
+            conversation_invalidation_epoch=invalidation_epoch,
+        )
+        await worker._process_request_locked(request, connection_id)
+
+        model_history = captured["message_history"]
+        assert isinstance(model_history, list)
+        assert not any(
+            isinstance(part, RetryPromptPart)
+            for message in model_history
+            for part in message.parts
+        )
+        assert polluted_history[2].parts[0].tool_call_id == "call-bad"
+
+        repaired_history = broker.get_conversation_history(
+            connection_id,
+            "alice",
+            "legacy",
+        )
+        assert not any(
+            isinstance(part, RetryPromptPart)
+            for message in repaired_history
+            for part in message.parts
+        )
+        deps = captured["deps"]
+        assert deps.connection_id == connection_id
+        assert deps.player_name == "alice"
+        assert deps.run_id == "run-self-heal"
+        assert deps.conversation_id == "legacy"
 
     asyncio.run(_run())
 

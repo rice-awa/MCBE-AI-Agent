@@ -7,10 +7,20 @@ import time
 from uuid import UUID, uuid4
 
 import httpx
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ThinkingPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    RetryPromptPart,
+    TextPart,
+    ThinkingPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 from core.queue import MessageBroker
 from services.agent.core import stream_chat, _extract_exception_details, player_facing_error, classify_run_exception
+from services.agent.context import ensure_tool_message_pairs
 from services.agent.harness.approvals import PendingApproval
 from services.agent.harness.execution import summarize_args_for_player
 from services.agent.providers import ProviderRegistry
@@ -352,6 +362,7 @@ class AgentWorker:
         message_history: list[ModelMessage] | None = None
         deferred_tool_results: DeferredToolResults | None = None
         resume_prompt: str | None = request.content
+        cleared_count = 0
 
         if request.resume_approval_id and request.deferred_tool_results is not None:
             # 审批恢复：使用原 messages，不把批准文本作为新 prompt
@@ -363,7 +374,35 @@ class AgentWorker:
             raw_history = self.broker.get_conversation_history(
                 connection_id, request.player_name, request.conversation_id
             )
-            message_history, cleared_count = self._strip_reasoning_content(raw_history)
+            message_history, cleared_count = self._sanitize_loaded_history(
+                connection_id=connection_id,
+                request=request,
+                raw_history=raw_history,
+                run_id=run_id,
+                conversation_invalidation_epoch=conversation_invalidation_epoch,
+            )
+        if (
+            message_history is not None
+            and request.resume_approval_id
+            and request.deferred_tool_results is not None
+        ):
+            message_history, removed_calls, removed_responses = self._sanitize_tool_history(
+                message_history
+            )
+            if removed_calls or removed_responses:
+                logger.info(
+                    "chat_history_orphan_tool_parts_removed",
+                    worker_id=self.worker_id,
+                    connection_id=str(connection_id),
+                    player=request.player_name,
+                    conversation_id=request.conversation_id,
+                    run_id=run_id,
+                    removed_orphan_tool_calls=removed_calls,
+                    removed_orphan_tool_responses=removed_responses,
+                )
+        else:
+            removed_calls = removed_responses = 0
+        if message_history is not None and request.use_context:
             logger.debug(
                 "chat_history_loaded",
                 worker_id=self.worker_id,
@@ -450,7 +489,13 @@ class AgentWorker:
                 raw_history = self.broker.get_conversation_history(
                     connection_id, request.player_name, request.conversation_id
                 )
-                message_history, cleared_count = self._strip_reasoning_content(raw_history)
+                message_history, cleared_count = self._sanitize_loaded_history(
+                    connection_id=connection_id,
+                    request=request,
+                    raw_history=raw_history,
+                    run_id=run_id,
+                    conversation_invalidation_epoch=conversation_invalidation_epoch,
+                )
                 await self.broker.send_response(
                     connection_id,
                     SystemNotification(
@@ -1118,7 +1163,9 @@ class AgentWorker:
         if not all_messages:
             return
 
-        history = list(all_messages)
+        history, removed_calls, removed_responses = self._sanitize_tool_history(
+            list(all_messages)
+        )
         note = (player_error_text or "").strip()
         if note:
             # 避免与已有尾部 assistant 文本重复
@@ -1144,6 +1191,13 @@ class AgentWorker:
 
         trimmed_history = self._trim_history(history, self.settings.max_history_turns)
         trimmed_history, cleared_count = self._strip_reasoning_content(trimmed_history)
+        (
+            trimmed_history,
+            trimmed_removed_calls,
+            trimmed_removed_responses,
+        ) = self._sanitize_tool_history(trimmed_history)
+        removed_calls += trimmed_removed_calls
+        removed_responses += trimmed_removed_responses
         try:
             history_updated = self.broker.set_conversation_history(
                 connection_id,
@@ -1170,6 +1224,8 @@ class AgentWorker:
                 conversation_id=request.conversation_id,
                 history_message_count=len(trimmed_history),
                 cleared_reasoning_content_count=cleared_count,
+                removed_orphan_tool_calls=removed_calls,
+                removed_orphan_tool_responses=removed_responses,
             )
             # 失败路径也做一次压缩检查（与成功路径一致），避免超大 partial 历史
             try:
@@ -1215,6 +1271,77 @@ class AgentWorker:
                 player=request.player_name,
                 conversation_id=request.conversation_id,
             )
+
+    def _sanitize_loaded_history(
+        self,
+        *,
+        connection_id: UUID,
+        request: ChatRequest,
+        raw_history: list[ModelMessage],
+        run_id: str,
+        conversation_invalidation_epoch: int | None,
+    ) -> tuple[list[ModelMessage], int]:
+        """清理已存历史，并在当前 epoch 下回写清洗结果。"""
+        message_history, cleared_count = self._strip_reasoning_content(raw_history)
+        message_history, removed_calls, removed_responses = self._sanitize_tool_history(
+            message_history
+        )
+        if not removed_calls and not removed_responses:
+            return message_history, cleared_count
+
+        logger.info(
+            "chat_history_orphan_tool_parts_removed",
+            worker_id=self.worker_id,
+            connection_id=str(connection_id),
+            player=request.player_name,
+            conversation_id=request.conversation_id,
+            run_id=run_id,
+            removed_orphan_tool_calls=removed_calls,
+            removed_orphan_tool_responses=removed_responses,
+        )
+        history_updated = self.broker.set_conversation_history(
+            connection_id,
+            request.player_name,
+            message_history,
+            request.conversation_id,
+            expected_invalidation_epoch=conversation_invalidation_epoch,
+        )
+        if not history_updated:
+            logger.info(
+                "chat_history_orphan_tool_parts_stale_write_skipped",
+                worker_id=self.worker_id,
+                connection_id=str(connection_id),
+                player=request.player_name,
+                conversation_id=request.conversation_id,
+                run_id=run_id,
+                removed_orphan_tool_calls=removed_calls,
+                removed_orphan_tool_responses=removed_responses,
+            )
+        return message_history, cleared_count
+
+    @staticmethod
+    def _sanitize_tool_history(
+        messages: list[ModelMessage],
+    ) -> tuple[list[ModelMessage], int, int]:
+        """清理工具级孤立 part，并返回移除的 call/response 数量。"""
+
+        def count_parts(history: list[ModelMessage]) -> tuple[int, int]:
+            calls = 0
+            responses = 0
+            for message in history:
+                for part in getattr(message, "parts", []) or []:
+                    if isinstance(part, ToolCallPart):
+                        calls += 1
+                    elif isinstance(part, ToolReturnPart) or (
+                        isinstance(part, RetryPromptPart) and part.tool_name is not None
+                    ):
+                        responses += 1
+            return calls, responses
+
+        before_calls, before_responses = count_parts(messages)
+        cleaned = ensure_tool_message_pairs(messages)
+        after_calls, after_responses = count_parts(cleaned)
+        return cleaned, before_calls - after_calls, before_responses - after_responses
 
     @staticmethod
     def _trim_history(
