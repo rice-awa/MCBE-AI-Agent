@@ -19,11 +19,21 @@ _INTENT_GUIDANCE: dict[ToolIntent, str] = {
 
 _BLOCK_TOOL_PRIORITY = (
     "方块操作编排规则：\n"
+    "- edit_blocks 支持 grouped edits：一次调用只做一次预检、一次审批，随后按 edit 执行并汇总。\n"
     "- 同一施工阶段中互相独立的编辑合并为一个 edit_blocks 调用。\n"
+    "- 一个 edit 能用 box 或 positions 表达时，不拆成多个重复 edit。\n"
+    "- 一次调用只提交当前小而完整的施工阶段；复杂建筑按地板、墙体、屋顶、装饰分阶段。\n"
+    "- 同一阶段通常不超过 4 个 edits；超过时优先简化 target 或拆成下一阶段。"
+    "4 是模型提示的软上限；运行时 max_edits_per_group 仍是安全硬上限。\n"
+    "- 不为“凑一次调用”合并本来计划稍后执行的编辑。\n"
+    "- validation retry 时只修正失败调用，不扩大施工范围。\n"
     "- 有顺序依赖的编辑拆到下一组，不依赖列表顺序模拟世界状态。\n"
     "- edit_blocks 已内置写前读取和写后确认，不要机械地前后调用 inspect_block。\n"
     "- 只有专用方块工具结构化结果明确给出 fallback_allowed=true，"
-    "才可另行调用命令工具并遵循其审批策略。"
+    "才可另行调用命令工具并遵循其审批策略。\n"
+    "最短 target 示例（不要把 target 再嵌套在 target 中）：\n"
+    '{"target":{"box":{"from":{"x":0,"y":64,"z":0},"to":{"x":4,"y":64,"z":4}}},"block":"oak_planks","expect":"any"}\n'
+    '{"target":{"positions":[{"x":0,"y":65,"z":0}]},"block":"oak_log","expect":"air"}'
 )
 
 

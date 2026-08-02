@@ -1250,32 +1250,22 @@ def register_agent_tools(
         repairs_applied: list[Any] | None = None,
         phase: str | None = None,
     ) -> str:
-        """按统一 edits 契约写入一组独立方块编辑。
+        """按统一 `edits` 契约写入当前小而完整的施工阶段。
 
-        每次调用可提交 **一个或多个独立编辑**（``edits`` 列表）。所有编辑在
-        调用开始时基于同一世界状态预检，产生一次审批并返回聚合结果。
+        一次调用可提交一个或多个相互独立的编辑，共享一次预检和一次审批；
+        有顺序依赖或计划稍后执行的编辑拆到后续调用。每项只需 `target`、
+        `block`、`expect`，target 在 positions 与 box 中二选一。
 
-        每个编辑包含：
+        最短完整 target 示例（不要把 target 再嵌套在 target 中）：
+        {"target":{"box":{"from":{"x":0,"y":64,"z":0},"to":{"x":4,"y":64,"z":4}}},"block":"oak_planks","expect":"any"}
+        {"target":{"positions":[{"x":0,"y":65,"z":0}]},"block":"oak_log","expect":"air"}
 
-        - ``target``: 目标结构。``{positions: [{x,y,z}...]}`` 查询/写入点集
-          （单点用长度 1），``{box: {from, to}}`` 长方体区域。两者互斥。
-          坐标为世界坐标 ``{x,y,z}`` 或玩家相对 ``{forward,right,up}``，
-          同一 target 内不能混用。
-        - ``block``: 目标方块，字符串 ``type_id``（如 ``"oak_planks"``，会自动
-          补全为 ``minecraft:oak_planks``）或对象 ``{type_id, states}``。
-        - ``expect``: 可选，省略或 ``"air"``（默认，仅替换空气）、``"any"``
-          （覆写任意方块）、或指定 ``"minecraft:oak_planks"``/``{type_id, states}``
-          （条件写入：仅当目标为该方块时才替换）。
-
-        ``dimension`` 为维度 ID（绝对坐标默认当前玩家维度；跨维度时需要）。
-        玩家相对坐标无需 dimension。
-
-        结果字段：ok/status/changed_total/edits[{index,status,changed,
-        skipped?, skipped_type_counts?}]；失败包含稳定 code 和 fallback_allowed。
+        结果返回聚合的 ok/status/changed_total/edits；失败包含稳定 code 和
+        fallback_allowed。
 
         Args:
             ctx: 运行上下文
-            edits: 编辑列表（1 项或多项，每项 {target, block, expect}）
+            edits: 当前施工阶段的一个或多个独立编辑
             dimension: 维度 ID（absolute 必填）
         """
         # Recovery-only fields are stripped from the model-facing schema.

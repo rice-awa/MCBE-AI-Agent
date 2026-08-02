@@ -72,3 +72,7 @@ def test_edit_blocks_catalog_only_describes_grouped_edit_contract() -> None:
     assert "fallback_allowed" in text
     for obsolete in ("mode=place", "batch", "PRECONDITION_FAILED", "LIMIT_EXCEEDED"):
         assert obsolete not in text
+
+    assert "小而完整的施工阶段" in entry.when_to_use
+    assert "一次预检 + 一次审批" in entry.when_to_use
+    assert "稍后执行" in entry.when_not_to_use

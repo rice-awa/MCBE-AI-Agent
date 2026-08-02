@@ -283,9 +283,10 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         "edit_blocks",
         ToolIntent.CHANGE_WORLD,
         ToolRisk.HIGH,
-        "写入方块时使用（每次可提交 1 项或多项独立编辑；所有编辑基于同一世界"
-        "状态预检，产生一次预检 + 一次审批，随后逐个执行并汇总结果）。",
-        "不要用于查询；有顺序依赖的编辑应拆成后续调用。",
+        "写入方块时使用；一次调用只提交当前小而完整的施工阶段。"
+        "多个相互独立的编辑共享一次预检 + 一次审批，随后逐个执行并汇总结果。",
+        "不要用于查询；有顺序依赖或本来计划稍后执行的编辑不要合并；"
+        "validation retry 只修正失败调用，不扩大施工范围。",
         "edits 为编辑列表（1 项或多项），每项 {target, block, expect}；"
         "target.positions 为点集（单点长度 1），target.box 为 from/to 长方体，互斥；"
         "坐标为 {x,y,z} 或 {forward,right,up}，同一 target 内不能混用；"

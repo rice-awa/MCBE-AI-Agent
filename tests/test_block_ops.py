@@ -4434,7 +4434,8 @@ def test_model_visible_edit_blocks_schema_exposes_only_edits_contract() -> None:
     agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
     register_agent_tools(agent)
     tools = iter_registered_tools(agent)  # type: ignore[arg-type]
-    raw_schema = tools["edit_blocks"].function_schema.json_schema
+    tool = tools["edit_blocks"]
+    raw_schema = tool.function_schema.json_schema
     raw_props = set(raw_schema.get("properties") or {})
     # Model-visible fields are edits + dimension.
     assert "edits" in raw_props
@@ -4451,15 +4452,50 @@ def test_model_visible_edit_blocks_schema_exposes_only_edits_contract() -> None:
     stripped = strip_block_internal_tool_schema(
         ToolDefinition(
             name="edit_blocks",
-            description=raw_schema.get("description", ""),
+            description=tool.description or "",
             parameters_json_schema=raw_schema,
         )
     )
     stripped_props = set(stripped.parameters_json_schema.get("properties") or {})
-    assert "edits" in stripped_props
-    assert "dimension" in stripped_props
-    assert "locked_targets" not in stripped_props
-    assert "phase" not in stripped_props
+    assert stripped_props == {"edits", "dimension"}
+    assert not {
+        "locked_targets",
+        "locked_targets_by_edit",
+        "noop_edit_indices",
+        "repairs_applied",
+        "phase",
+    } & stripped_props
+
+    schema_bytes = len(
+        json.dumps(
+            stripped.parameters_json_schema,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    assert schema_bytes <= 4096
+    assert len(stripped.description or "") <= 1600
+
+
+def test_edit_blocks_schema_description_has_short_canonical_examples() -> None:
+    agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
+    register_agent_tools(agent)
+    description = iter_registered_tools(agent)["edit_blocks"].description or ""
+
+    box_example = (
+        '{"target":{"box":{"from":{"x":0,"y":64,"z":0},'
+        '"to":{"x":4,"y":64,"z":4}}},"block":"oak_planks",'
+        '"expect":"any"}'
+    )
+    positions_example = (
+        '{"target":{"positions":[{"x":0,"y":65,"z":0}]},'
+        '"block":"oak_log","expect":"air"}'
+    )
+    assert description.count(box_example) == 1
+    assert description.count(positions_example) == 1
+    assert "target.target" not in description
+    assert "replace_any" not in description
 
 
 @pytest.mark.parametrize("provider", ("deepseek", "openai", "anthropic", "ollama"))
@@ -4486,6 +4522,229 @@ def test_all_supported_providers_expose_the_same_block_tool_schema(provider: str
         "edits",
         "dimension",
     }
+
+
+def _fixed_grouped_shape_model(
+    tool_calls: list[dict[str, Any]],
+    observed: list[dict[str, Any]],
+) -> FunctionModel:
+    """Return a deterministic FunctionModel for one grouped-edit scenario."""
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        del messages, info
+        index = len(observed)
+        if index == len(tool_calls):
+            return ModelResponse(parts=[TextPart(content="done")])
+        if index > len(tool_calls):
+            raise AssertionError("grouped fixture produced too many model calls")
+        args = tool_calls[index]
+        observed.append(args)
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="edit_blocks",
+                    tool_call_id=f"grouped-shape-{index}",
+                    args=args,
+                )
+            ]
+        )
+
+    return FunctionModel(model_fn)
+
+
+async def _run_fixed_grouped_shape_fixture(
+    tool_calls: list[dict[str, Any]],
+    *,
+    bridge: _FakeBridge | None = None,
+) -> list[dict[str, Any]]:
+    bridge = bridge or _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    )
+    register_agent_tools(agent)
+    observed: list[dict[str, Any]] = []
+    result = await agent.run(
+        "按施工阶段完成方块编辑",
+        model=_fixed_grouped_shape_model(tool_calls, observed),
+        deps=_Deps(
+            connection_id=cid,
+            addon_bridge=bridge,
+            settings=_Settings(),
+            run_id="run-grouped-shape",
+            auto_approve_tools=True,
+        ),
+    )
+    assert result.output == "done"
+    return observed
+
+
+@pytest.mark.asyncio
+async def test_grouped_shape_fixture_7x7_floor_uses_one_edit() -> None:
+    floor = {
+        "edits": [
+            {
+                "target": {
+                    "box": {
+                        "from": {"x": 0, "y": 64, "z": 0},
+                        "to": {"x": 6, "y": 64, "z": 6},
+                    }
+                },
+                "block": "oak_planks",
+                "expect": "air",
+            }
+        ],
+        "dimension": "minecraft:overworld",
+    }
+
+    observed = await _run_fixed_grouped_shape_fixture([floor])
+
+    assert len(observed) == 1
+    assert len(observed[0]["edits"]) == 1
+    assert observed[0]["edits"][0]["target"]["box"]["to"] == {
+        "x": 6,
+        "y": 64,
+        "z": 6,
+    }
+
+
+@pytest.mark.asyncio
+async def test_grouped_shape_fixture_four_walls_stays_within_soft_limit() -> None:
+    walls = {
+        "edits": [
+            {
+                "target": {
+                    "box": {
+                        "from": {"x": 0, "y": 65, "z": 0},
+                        "to": {"x": 6, "y": 68, "z": 0},
+                    }
+                },
+                "block": "stone",
+                "expect": "air",
+            },
+            {
+                "target": {
+                    "box": {
+                        "from": {"x": 0, "y": 65, "z": 6},
+                        "to": {"x": 6, "y": 68, "z": 6},
+                    }
+                },
+                "block": "stone",
+                "expect": "air",
+            },
+            {
+                "target": {
+                    "box": {
+                        "from": {"x": 0, "y": 65, "z": 1},
+                        "to": {"x": 0, "y": 68, "z": 5},
+                    }
+                },
+                "block": "stone",
+                "expect": "air",
+            },
+            {
+                "target": {
+                    "box": {
+                        "from": {"x": 6, "y": 65, "z": 1},
+                        "to": {"x": 6, "y": 68, "z": 5},
+                    }
+                },
+                "block": "stone",
+                "expect": "air",
+            },
+        ],
+        "dimension": "minecraft:overworld",
+    }
+
+    observed = await _run_fixed_grouped_shape_fixture([walls])
+
+    assert len(observed) == 1
+    assert 1 <= len(observed[0]["edits"]) <= 4
+    assert all("box" in edit["target"] for edit in observed[0]["edits"])
+
+
+@pytest.mark.asyncio
+async def test_grouped_shape_fixture_doorway_header_uses_positions_without_nested_target() -> None:
+    doorway_header = {
+        "edits": [
+            {
+                "target": {"positions": [{"x": 3, "y": 69, "z": 0}]},
+                "block": "oak_planks",
+                "expect": "air",
+            }
+        ],
+        "dimension": "minecraft:overworld",
+    }
+
+    observed = await _run_fixed_grouped_shape_fixture([doorway_header])
+
+    target = observed[0]["edits"][0]["target"]
+    assert target["positions"] == [{"x": 3, "y": 69, "z": 0}]
+    assert "target" not in target
+
+
+@pytest.mark.asyncio
+async def test_grouped_shape_fixture_validation_retry_repeats_floor_only() -> None:
+    class _RetryFloorBridge(_FakeBridge):
+        def __init__(self) -> None:
+            super().__init__()
+            self.preflight_attempts = 0
+
+        async def request(
+            self, capability: str, payload: dict[str, Any]
+        ) -> dict[str, Any]:
+            if capability == "edit_blocks" and payload.get("phase") == "preflight":
+                self.preflight_attempts += 1
+                if self.preflight_attempts == 1:
+                    return {
+                        "ok": False,
+                        "payload": {
+                            "code": "PRECONDITION_FAILED",
+                            "message": "floor precondition failed",
+                            "actual_type_counts": {"minecraft:stone": 49},
+                        },
+                    }
+            return await super().request(capability, payload)
+
+    floor = {
+        "edits": [
+            {
+                "target": {
+                    "box": {
+                        "from": {"x": 0, "y": 64, "z": 0},
+                        "to": {"x": 6, "y": 64, "z": 6},
+                    }
+                },
+                "block": "oak_planks",
+                "expect": "air",
+            }
+        ],
+        "dimension": "minecraft:overworld",
+    }
+    bridge = _RetryFloorBridge()
+
+    observed = await _run_fixed_grouped_shape_fixture([floor, floor], bridge=bridge)
+
+    assert len(observed) == 2
+    assert observed[1] == observed[0]
+    assert all(len(call["edits"]) == 1 for call in observed)
+    assert {
+        edit["block"]
+        for call in observed
+        for edit in call["edits"]
+    } == {"oak_planks"}
+    assert bridge.preflight_attempts == 2
+    assert len(
+        [
+            payload
+            for capability, payload in bridge.calls
+            if capability == "edit_blocks" and payload.get("phase") == "execute"
+        ]
+    ) == 1
 
 
 @pytest.mark.asyncio
@@ -5229,6 +5488,7 @@ async def test_grouped_edits_in_group_state_dependency_rejected_at_preflight() -
                         "ok": True, "phase": "preflight", "mode": "place",
                         "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
                         "locked_targets": [], "matched_count": 0,
+                        "actual_type_counts": {"minecraft:stone": 1},
                     },
                 }
             return {
@@ -5264,7 +5524,8 @@ async def test_grouped_edits_in_group_state_dependency_rejected_at_preflight() -
     body = json.loads(failure.output)
     assert body["code"] == BlockErrorCode.PRECONDITION_FAILED
     # The repair hint names the failing edit's own expect, not edits[0]'s.
-    assert "minecraft:gold_block" in body["hint"]
+    assert "minecraft:stone" in body["hint"]
+    assert "minecraft:gold_block" not in body["hint"]
     assert "设为 air" not in body["hint"]
 
 

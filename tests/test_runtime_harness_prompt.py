@@ -18,6 +18,19 @@ def test_runtime_harness_prompt_renders_decision_tree_and_cards() -> None:
     assert "顺序依赖" in prompt
     assert "写前读取和写后确认" in prompt
     assert "fallback_allowed=true" in prompt
+    assert "一次预检 + 一次审批" in prompt
+    assert "小而完整的施工阶段" in prompt
+    assert "通常不超过 4 个 edits" in prompt
+    assert "validation retry" in prompt
+    assert (
+        '{"target":{"box":{"from":{"x":0,"y":64,"z":0},'
+        '"to":{"x":4,"y":64,"z":4}}},"block":"oak_planks",'
+        '"expect":"any"}'
+    ) in prompt
+    assert (
+        '{"target":{"positions":[{"x":0,"y":65,"z":0}]},'
+        '"block":"oak_log","expect":"air"}'
+    ) in prompt
     for obsolete in (
         "mode=place|batch|fill",
         "place×N",
@@ -41,6 +54,8 @@ def test_edit_blocks_catalog_constraints_omit_recovery_codes() -> None:
     assert "target" in constraints
     assert "expect" in constraints
     assert "previous_type_counts" not in constraints
+    assert "小而完整的施工阶段" in entry.when_to_use
+    assert "稍后执行" in entry.when_not_to_use
 
 
 def test_runtime_harness_tool_cards_do_not_duplicate_when_not_to_use_prefix() -> None:
