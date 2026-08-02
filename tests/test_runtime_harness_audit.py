@@ -3,6 +3,7 @@
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -13,7 +14,9 @@ from config.redaction import redact_exception
 from services.agent.harness.audit import (
     AuditWriter,
     build_audit_record,
+    build_validation_failure_audit_record,
     enqueue_audit_record,
+    extract_tool_validation_failures,
     flush_audit_writer,
     get_audit_writer,
     preview_parameters,
@@ -159,6 +162,104 @@ def test_parameter_redaction_and_truncation_work():
     assert "raw_player_message" not in preview
     assert preview.get("api_key") == "[REDACTED]"
     assert preview.get("password") == "[REDACTED]"
+
+
+def test_validation_failure_extractor_matches_call_and_deduplicates_retry_timestamp():
+    from pydantic_ai.messages import ModelRequest, ModelResponse, RetryPromptPart, ToolCallPart
+
+    retry_at = datetime(2026, 8, 2, 15, 0, 0, tzinfo=UTC)
+    parameters = {
+        "edits": [
+            {
+                "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
+                "block": "minecraft:stone",
+            }
+            for _ in range(40)
+        ],
+        "dimension": "minecraft:overworld",
+        "api_key": "do-not-record",
+    }
+    validation_content = [{
+        "type": "json_invalid",
+        "loc": ("edits",),
+        "msg": "Invalid JSON: secret-input",
+        "input": "secret-input",
+    }]
+    retry = RetryPromptPart(
+        validation_content,
+        tool_name="edit_blocks",
+        tool_call_id="tc-invalid",
+        timestamp=retry_at,
+    )
+    messages = [
+        ModelResponse(parts=[
+            ToolCallPart(
+                tool_name="edit_blocks",
+                args=parameters,
+                tool_call_id="tc-invalid",
+            )
+        ]),
+        ModelRequest(parts=[retry, RetryPromptPart(
+            validation_content,
+            tool_name="edit_blocks",
+            tool_call_id="tc-invalid",
+            timestamp=retry_at,
+        )]),
+    ]
+
+    failures = extract_tool_validation_failures(messages, run_id="run-invalid")
+
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure["tool_name"] == "edit_blocks"
+    assert failure["tool_call_id"] == "tc-invalid"
+    assert failure["retry_timestamp"] == retry_at.isoformat()
+    assert failure["error_type"] == "json_invalid"
+    assert failure["error_locations"] == ["edits"]
+    assert failure["parameters"]["dimension"] == "minecraft:overworld"
+    assert failure["parameters"]["edits"][0]["block"] == "minecraft:stone"
+    assert len(failure["parameters"]["edits"]) == 32
+    assert failure["parameters"].get("api_key") == "[REDACTED]"
+
+
+def test_validation_failure_audit_record_is_validation_only_and_bounded():
+    settings = Settings()
+    deps = DummyDeps(settings, run_id="run-invalid")
+    ctx = SimpleNamespace(deps=deps, tool_call_id="tc-invalid")
+    failure = {
+        "tool_name": "edit_blocks",
+        "tool_call_id": "tc-invalid",
+        "retry_timestamp": "2026-08-02T15:00:00+00:00",
+        "error_type": "json_invalid",
+        "error_locations": ["edits"],
+        "parameters": {"dimension": "minecraft:overworld"},
+        "validation_content": [{
+            "type": "json_invalid",
+            "loc": ["edits"],
+            "msg": "secret-input",
+            "input": "secret-input",
+        }],
+    }
+
+    record = build_validation_failure_audit_record(
+        failure=failure,
+        ctx=ctx,
+        run_id="run-invalid",
+    )
+
+    assert record["tool_name"] == "edit_blocks"
+    assert record["tool_call_id"] == "tc-invalid"
+    assert record["status"] == "failure"
+    assert record["error_kind"] == "INVALID_ARGUMENT"
+    assert record["result"]["failure_reason"] == "json_invalid"
+    assert record["result"]["execution_stage"] == "validation"
+    assert record["result"]["external_state_unknown"] == "false"
+    assert record["validation_error"] == {
+        "type": "json_invalid",
+        "locations": ["edits"],
+    }
+    dumped = json.dumps(record, ensure_ascii=False)
+    assert "secret-input" not in dumped
 
 
 def test_records_rotate_after_exceeding_max_records(tmp_path):

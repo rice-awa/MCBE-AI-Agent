@@ -4,6 +4,8 @@ import asyncio
 import copy
 import dataclasses
 import time
+from types import SimpleNamespace
+from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
@@ -22,6 +24,10 @@ from core.queue import MessageBroker
 from services.agent.core import stream_chat, _extract_exception_details, player_facing_error, classify_run_exception
 from services.agent.context import ensure_tool_message_pairs
 from services.agent.harness.approvals import PendingApproval
+from services.agent.harness.audit import (
+    enqueue_validation_failure_audit,
+    extract_tool_validation_failures,
+)
 from services.agent.harness.execution import summarize_args_for_player
 from services.agent.providers import ProviderRegistry
 from services.agent.runtime import get_agent_runtime
@@ -287,6 +293,89 @@ class AgentWorker:
         except Exception as exc:  # noqa: BLE001
             logger.debug("trace_model_pairs_failed", error=str(exc))
 
+    def _record_validation_failures_from_messages(
+        self,
+        *,
+        messages: list | None,
+        run_id: str,
+        deps: AgentDependencies,
+        trace_context: TraceContext | None,
+        recorder: Any,
+        seen: set[tuple[str, str, str]],
+    ) -> None:
+        """审计并 Trace 当前 run 的工具参数校验失败。
+
+        该入口同时服务成功终态和 salvage error；消息级 extractor 保持纯函数，
+        这里负责把结果投影到两个有副作用的观察面。失败发生在工具执行前，
+        因此绝不补发 execution.started 或 external_state_unknown。
+        """
+        if not messages:
+            return
+        try:
+            failures = extract_tool_validation_failures(messages, run_id=run_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("tool_validation_failure_extract_failed", error=str(exc))
+            return
+
+        for failure in failures:
+            key = (
+                run_id,
+                str(failure.get("tool_call_id") or ""),
+                str(failure.get("retry_timestamp") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            tool_call_id = str(failure.get("tool_call_id") or "") or None
+            audit_ctx = SimpleNamespace(deps=deps, tool_call_id=tool_call_id)
+            enqueue_validation_failure_audit(
+                failure,
+                settings=self.settings,
+                ctx=audit_ctx,
+                run_id=run_id,
+            )
+            self._emit_validation_failure_trace(
+                recorder,
+                trace_context,
+                failure,
+            )
+
+    def _emit_validation_failure_trace(
+        self,
+        recorder: Any,
+        context: TraceContext | None,
+        failure: dict,
+    ) -> None:
+        if recorder is None or context is None:
+            return
+        try:
+            attributes = {
+                "tool_name": str(failure.get("tool_name") or "unknown"),
+                "tool_call_id": str(failure.get("tool_call_id") or ""),
+                "error_kind": "INVALID_ARGUMENT",
+                "execution_stage": "validation",
+                "validation_error_type": str(
+                    failure.get("error_type") or "validation_error"
+                ),
+                "validation_error_locations": list(
+                    failure.get("error_locations") or []
+                ),
+                "parameters": dict(failure.get("parameters") or {}),
+            }
+            payload = None
+            if getattr(recorder, "include_content", False):
+                payload = {"error_message": failure.get("validation_content")}
+            recorder.emit(
+                "tool.validation.failed",
+                context,
+                status="failed",
+                tool_call_id=str(failure.get("tool_call_id") or "") or None,
+                attributes=attributes,
+                payload=payload,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("trace_tool_validation_failed", error=str(exc))
+
     async def _process_request_locked(
         self,
         request: ChatRequest,
@@ -315,6 +404,7 @@ class AgentWorker:
         )
         recorder = get_trace_recorder(self.settings)
         terminal_emitted = False
+        validation_failures_seen: set[tuple[str, str, str]] = set()
 
         # queue.dequeued + agent.attempt.started / resumed
         dequeue_ms = None
@@ -695,6 +785,19 @@ class AgentWorker:
                     return
 
                 if event.metadata and event.metadata.get("is_complete"):
+                    validation_messages = event.metadata.get("new_messages")
+                    if not isinstance(validation_messages, list):
+                        validation_messages = event.metadata.get("all_messages")
+                    self._record_validation_failures_from_messages(
+                        messages=validation_messages
+                        if isinstance(validation_messages, list)
+                        else None,
+                        run_id=run_id,
+                        deps=deps,
+                        trace_context=resolved_context,
+                        recorder=recorder,
+                        seen=validation_failures_seen,
+                    )
                     all_messages = event.metadata.get("all_messages")
                     if isinstance(all_messages, list):
                         if self.broker.get_response_queue(connection_id) is not None:
@@ -855,6 +958,20 @@ class AgentWorker:
                         salvaged=bool(
                             event.metadata and event.metadata.get("all_messages")
                         ),
+                    )
+
+                    validation_messages = event.metadata.get("new_messages")
+                    if not isinstance(validation_messages, list):
+                        validation_messages = event.metadata.get("all_messages")
+                    self._record_validation_failures_from_messages(
+                        messages=validation_messages
+                        if isinstance(validation_messages, list)
+                        else None,
+                        run_id=run_id,
+                        deps=deps,
+                        trace_context=resolved_context,
+                        recorder=recorder,
+                        seen=validation_failures_seen,
                     )
 
                     # mid-run 失败：尽量落盘已产生的工具/模型消息 + 错误说明，

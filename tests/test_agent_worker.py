@@ -533,6 +533,201 @@ async def test_error_event_persists_partial_run_history(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_worker_audits_validation_retry_and_later_success_without_execution_start(
+    monkeypatch, tmp_path
+):
+    """参数校验失败只审计 validation；修正后的调用仍可产生一条成功审计。"""
+    import json
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from pydantic_ai.messages import (
+        ModelRequest,
+        ModelResponse,
+        RetryPromptPart,
+        TextPart,
+        ToolCallPart,
+        ToolReturnPart,
+    )
+
+    from models.agent import StreamEvent
+    from services.agent.harness.audit import (
+        AuditWriter,
+        flush_audit_writer,
+        set_audit_writer,
+        start_audit_writer,
+        stop_audit_writer,
+        wrap_tool_function,
+    )
+    from services.agent.tool_results import ToolResult
+
+    settings = _make_settings()
+    audit_path = tmp_path / "validation-tools.jsonl"
+    settings.runtime_harness_enabled = True
+    settings.runtime_harness_audit_enabled = True
+    settings.runtime_harness_audit_path = str(audit_path)
+    settings.runtime_harness_audit_max_records = 100
+    settings.agent_trace_enabled = False
+    settings.compression_enabled = False
+
+    broker = MagicMock()
+    broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+    broker.get_conversation_history = MagicMock(return_value=[])
+    broker.set_conversation_history = MagicMock(return_value=True)
+    broker.send_response = AsyncMock(return_value=True)
+    broker.get_response_queue = MagicMock(return_value=object())
+    broker.mark_conversation_title_generating = MagicMock(return_value=False)
+    worker = AgentWorker(broker, settings)
+
+    bad_args = {
+        "edits": [{
+            "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
+            "block": "minecraft:stone",
+        }],
+        "dimension": "minecraft:overworld",
+        "api_key": "do-not-record",
+    }
+    good_args = {
+        "edits": [{
+            "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
+            "block": "minecraft:stone",
+        }],
+        "dimension": "minecraft:overworld",
+    }
+    retry_at = datetime(2026, 8, 2, 15, 0, 0, tzinfo=UTC)
+    retry = RetryPromptPart(
+        [{
+            "type": "json_invalid",
+            "loc": (),
+            "msg": "Invalid JSON: validation-secret",
+            "input": "validation-secret",
+        }],
+        tool_name="edit_blocks",
+        tool_call_id="tc-invalid",
+        timestamp=retry_at,
+    )
+    messages = [
+        ModelResponse(parts=[ToolCallPart(
+            tool_name="edit_blocks",
+            args=bad_args,
+            tool_call_id="tc-invalid",
+        )]),
+        ModelRequest(parts=[retry]),
+        ModelResponse(parts=[ToolCallPart(
+            tool_name="edit_blocks",
+            args=good_args,
+            tool_call_id="tc-corrected",
+        )]),
+        ModelRequest(parts=[ToolReturnPart(
+            tool_name="edit_blocks",
+            content="ok",
+            tool_call_id="tc-corrected",
+        )]),
+        ModelResponse(parts=[TextPart(content="修正成功")]),
+    ]
+
+    async def corrected_tool(ctx, edits, dimension):  # noqa: ARG001
+        return ToolResult.success("ok")
+
+    writer = AuditWriter()
+    set_audit_writer(writer)
+    start_audit_writer()
+    try:
+        corrected = wrap_tool_function("edit_blocks", corrected_tool, settings)
+
+        async def fake_stream_chat(_prompt, deps, *_args, **_kwargs):
+            await corrected(
+                SimpleNamespace(deps=deps, tool_call_id="tc-corrected"),
+                **good_args,
+            )
+            yield StreamEvent(
+                event_type="tool_call",
+                content="edit_blocks",
+                sequence=0,
+                metadata={
+                    "tool_name": "edit_blocks",
+                    "tool_call_id": "tc-invalid",
+                    "args": bad_args,
+                },
+            )
+            yield StreamEvent(
+                event_type="content",
+                content="修正成功",
+                sequence=1,
+                metadata=None,
+            )
+            yield StreamEvent(
+                event_type="content",
+                content="",
+                sequence=2,
+                metadata={
+                    "is_complete": True,
+                    "all_messages": messages,
+                    "new_messages": messages,
+                    "usage": None,
+                    "tool_events": [],
+                },
+            )
+
+        class _NoCompression:
+            async def check_and_compress(self, *_args, **_kwargs):
+                return False, "disabled"
+
+        monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+        monkeypatch.setattr(
+            "services.agent.providers.ProviderRegistry.get_model",
+            lambda _config: object(),
+        )
+        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+        monkeypatch.setattr(
+            "core.conversation.get_conversation_manager",
+            lambda *_args, **_kwargs: _NoCompression(),
+        )
+
+        connection_id = uuid4()
+        await worker._process_request_locked(
+            ChatRequest(
+                connection_id=connection_id,
+                content="edit",
+                player_name="Alex",
+                run_id="run-validation",
+                trace_id="trace-validation",
+                attempt_id="attempt-validation",
+                use_context=False,
+            ),
+            connection_id,
+        )
+        flush_audit_writer(timeout=2.0)
+
+        records = [
+            json.loads(line)
+            for line in audit_path.read_text(encoding="utf-8").splitlines()
+        ]
+        failures = [r for r in records if r["status"] == "failure"]
+        successes = [r for r in records if r["status"] == "success"]
+        assert len(failures) == 1
+        assert len(successes) == 1
+        assert failures[0]["tool_name"] == "edit_blocks"
+        assert failures[0]["error_kind"] == "INVALID_ARGUMENT"
+        assert failures[0]["result"]["failure_reason"] == "json_invalid"
+        assert failures[0]["result"]["execution_stage"] == "validation"
+        assert failures[0]["result"]["external_state_unknown"] == "false"
+        assert failures[0]["parameters"]["dimension"] == "minecraft:overworld"
+        assert failures[0]["parameters"]["api_key"] == "[REDACTED]"
+        assert "validation-secret" not in json.dumps(failures[0], ensure_ascii=False)
+        assert not any(
+            isinstance(call.args[1], dict)
+            and call.args[1].get("type") in {"run_command", "bridge_req"}
+            for call in broker.send_response.await_args_list
+        )
+    finally:
+        try:
+            stop_audit_writer(timeout=2.0)
+        finally:
+            set_audit_writer(None)
+
+
+@pytest.mark.asyncio
 async def test_partial_history_persistence_drops_orphan_retry_and_keeps_visible_context(monkeypatch):
     """partial history 落盘前清除孤立 retry，但保留可见文本和中断说明。"""
     from pydantic_ai.messages import ModelRequest, ModelResponse, RetryPromptPart, TextPart
@@ -948,6 +1143,157 @@ async def test_stream_error_emits_trace_failed_once(tmp_path, monkeypatch):
         assert "diagnostic_summary" not in failed[0]["attributes"]
         raw = path.read_text(encoding="utf-8")
         assert "UsageLimitExceeded" not in raw
+    finally:
+        set_trace_recorder(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_content", [False, True])
+async def test_validation_failure_trace_is_gated_and_does_not_start_execution(
+    tmp_path, monkeypatch, include_content
+):
+    """参数校验失败只产生 validation 事件，正文随 Trace content 开关控制。"""
+    from datetime import UTC, datetime
+
+    from pydantic_ai.messages import ModelRequest, ModelResponse, RetryPromptPart, ToolCallPart
+
+    from services.agent.core import StreamEvent
+    from services.agent.trace import TraceRecorder, set_trace_recorder
+
+    settings = _make_settings()
+    settings.runtime_harness_enabled = False
+    settings.runtime_harness_audit_enabled = False
+    path = tmp_path / f"worker_trace_validation_{include_content}.jsonl"
+    recorder = TraceRecorder(
+        path=path,
+        enabled=True,
+        include_content=include_content,
+        max_records=500,
+    )
+    await recorder.start()
+    set_trace_recorder(recorder)
+    try:
+        broker = MagicMock()
+        broker.get_session_lock = MagicMock(return_value=asyncio.Lock())
+        broker.get_conversation_history = MagicMock(return_value=[])
+        broker.set_conversation_history = MagicMock(return_value=True)
+        broker.get_response_queue = MagicMock(return_value=object())
+        broker.send_response = AsyncMock(return_value=True)
+        broker.mark_conversation_title_generating = MagicMock(return_value=False)
+        worker = AgentWorker(broker, settings)
+
+        retry_content = [
+            {
+                "type": "json_invalid",
+                "loc": ("edits",),
+                "msg": "Invalid JSON: TRACE-VALIDATION-SECRET",
+                "input": "TRACE-VALIDATION-SECRET",
+            }
+        ]
+        messages = [
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="edit_blocks",
+                        tool_call_id="tc-trace-invalid",
+                        args={
+                            "dimension": "minecraft:overworld",
+                            "api_key": "TRACE-VALIDATION-SECRET",
+                        },
+                    )
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        retry_content,
+                        tool_name="edit_blocks",
+                        tool_call_id="tc-trace-invalid",
+                        timestamp=datetime(2026, 8, 2, 12, 0, tzinfo=UTC),
+                    )
+                ]
+            ),
+        ]
+
+        async def fake_stream_chat(*_args, **_kwargs):
+            yield StreamEvent(
+                event_type="content",
+                content="参数无效",
+                sequence=0,
+                metadata=None,
+            )
+            yield StreamEvent(
+                event_type="content",
+                content="",
+                sequence=1,
+                metadata={
+                    "is_complete": True,
+                    "all_messages": messages,
+                    "new_messages": messages,
+                    "usage": None,
+                    "tool_events": [],
+                },
+            )
+
+        monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
+        monkeypatch.setattr(
+            "services.agent.providers.ProviderRegistry.get_model",
+            lambda _config: object(),
+        )
+        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
+
+        connection_id = uuid4()
+        await worker._process_request_locked(
+            ChatRequest(
+                connection_id=connection_id,
+                content="edit",
+                player_name="Alex",
+                run_id="trace-validation-run",
+                trace_id="trace-validation-run",
+                attempt_id="trace-validation-attempt",
+                use_context=False,
+            ),
+            connection_id,
+        )
+
+        events = await _flush_trace(recorder)
+        validation = [
+            event for event in events if event["event_name"] == "tool.validation.failed"
+        ]
+        assert len(validation) == 1
+        event = validation[0]
+        assert event["status"] == "failed"
+        assert event["tool_call_id"] == "tc-trace-invalid"
+        assert event["attributes"]["error_kind"] == "INVALID_ARGUMENT"
+        assert event["attributes"]["execution_stage"] == "validation"
+        assert event["attributes"]["validation_error_type"] == "json_invalid"
+        assert event["attributes"]["validation_error_locations"] == ["edits"]
+        assert event["attributes"]["parameters"]["api_key"] == "[REDACTED]"
+        assert not any(
+            item["event_name"] == "tool.execution.started" for item in events
+        )
+        if include_content:
+            assert event["payload"]["error_message"][0]["type"] == "json_invalid"
+            model_payloads = [
+                item.get("payload")
+                for item in events
+                if item["event_name"] == "model.request.completed"
+            ]
+            assert any(
+                any(
+                    part.get("part_kind") == "retry-prompt"
+                    for message in (payload or {}).get("messages", [])
+                    for part in message.get("parts", [])
+                )
+                for payload in model_payloads
+            )
+        else:
+            assert "payload" not in event
+        raw = path.read_text(encoding="utf-8")
+        if include_content:
+            assert "TRACE-VALIDATION-SECRET" in raw
+        else:
+            assert "TRACE-VALIDATION-SECRET" not in raw
     finally:
         set_trace_recorder(None)
 
