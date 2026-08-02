@@ -1,4 +1,4 @@
-import { BlockTypes } from "@minecraft/server";
+import { BlockTypes, type BlockPermutation } from "@minecraft/server";
 
 import {
   DEFAULT_MAX_POSITIONS,
@@ -15,13 +15,7 @@ import {
   type RepairApplied,
 } from "./types";
 import { repairTypeId, findBlockCandidates } from "./repair";
-import {
-  collectPositions,
-  getBlockSafe,
-  resolvePermutation,
-  resolveTargets,
-  type ResolvedTarget,
-} from "./inspect";
+import { collectPositions, getBlockSafe, resolvePermutation, resolveTargets, type ResolvedTarget } from "./inspect";
 import { buildBlockSnapshot, matchesExpectedPrevious, matchesTargetPermutation } from "./snapshot";
 import { findProtectedComponent } from "./protect";
 import { isMultiblockBlock } from "./multiblock";
@@ -62,7 +56,7 @@ export type PreparedWrite = {
   facing?: string;
   player_origin?: AbsolutePosition;
   player_name?: string;
-  permutation: unknown;
+  permutation: BlockPermutation;
   mode: "place" | "batch" | "fill";
   befores?: Array<ReturnType<typeof buildBlockSnapshot>>;
   // fill-only
@@ -80,19 +74,13 @@ function isAirType(typeId: string): boolean {
 export function validateWritePolicy(
   typeId: string,
   replaceAny: boolean | undefined,
-  expectedPrevious: ExpectedPrevious | undefined,
+  expectedPrevious: ExpectedPrevious | undefined
 ): BridgeResult<void> {
   if (replaceAny && expectedPrevious) {
-    return fail(
-      "INVALID_ARGUMENT",
-      "replace_any and expected_previous are mutually exclusive",
-    );
+    return fail("INVALID_ARGUMENT", "replace_any and expected_previous are mutually exclusive");
   }
   if (isAirType(typeId) && !replaceAny && !expectedPrevious) {
-    return fail(
-      "INVALID_ARGUMENT",
-      "placing air requires replace_any or expected_previous",
-    );
+    return fail("INVALID_ARGUMENT", "placing air requires replace_any or expected_previous");
   }
   return ok(undefined);
 }
@@ -102,14 +90,13 @@ export function checkPrecondition(
   block: { getComponent?: (id: string) => unknown },
   replaceAny: boolean,
   expectedPrevious: ExpectedPrevious | undefined,
-  forFillFilter: boolean,
+  forFillFilter: boolean
 ): BridgeResult<{ skip?: boolean }> {
   // Protected always rejects when we would write over it
-  const wouldWrite =
-    forFillFilter
-      ? // fill: only check protected if this cell matches include filter
-        true
-      : true;
+  const wouldWrite = forFillFilter
+    ? // fill: only check protected if this cell matches include filter
+      true
+    : true;
 
   if (expectedPrevious) {
     if (!matchesExpectedPrevious(snapshot, expectedPrevious)) {
@@ -187,7 +174,7 @@ export function recheckPrecondition(
   block: { getComponent?: (id: string) => unknown },
   replaceAny: boolean,
   expectedPrevious: ExpectedPrevious | undefined,
-  previousSnapshot: ReturnType<typeof buildBlockSnapshot>,
+  previousSnapshot: ReturnType<typeof buildBlockSnapshot>
 ): BridgeResult<void> {
   // Concurrent change: type or states differ from preflight before
   if (
@@ -209,7 +196,8 @@ export function recheckPrecondition(
   return ok(undefined);
 }
 
-function getBlockTypesRegistry(): { getAll?: () => Array<{ id: string } | string>; get?: (id: string) => unknown } | undefined {
+function getBlockTypesRegistry():
+  { getAll?: () => Array<{ id: string } | string>; get?: (id: string) => unknown } | undefined {
   try {
     if (BlockTypes && typeof BlockTypes === "object") {
       return BlockTypes as {
@@ -233,7 +221,7 @@ function getBlockTypesRegistry(): { getAll?: () => Array<{ id: string } | string
 function validateKnownTypeId(
   typeId: string,
   registry: ReturnType<typeof getBlockTypesRegistry>,
-  field: string,
+  field: string
 ): BridgeFailure | null {
   if (!registry || typeof registry.get !== "function") {
     return null;
@@ -268,13 +256,13 @@ function validateKnownTypeId(
 
 export function prepareTypeAndPolicy(
   payload: EditBlocksPayload,
-  repairs: RepairApplied[],
+  repairs: RepairApplied[]
 ): BridgeResult<{
   type_id: string;
   states?: Record<string, string | number | boolean>;
   replace_any: boolean;
   expected_previous?: ExpectedPrevious;
-  permutation: unknown;
+  permutation: BlockPermutation;
 }> {
   const registry = getBlockTypesRegistry();
   const typeId = repairTypeId(payload.type_id, repairs, registry);
@@ -291,7 +279,7 @@ export function prepareTypeAndPolicy(
     return fail(
       "UNSUPPORTED_BLOCK_PLACEMENT",
       `multiblock block ${typeId} requires multi-cell placement; single-cell write is not supported`,
-      { type_id: typeId, multiblock: true, reason: "multiblock_not_supported" },
+      { type_id: typeId, multiblock: true, reason: "multiblock_not_supported" }
     );
   }
 
@@ -310,9 +298,7 @@ export function prepareTypeAndPolicy(
         if (expectUnknown) return expectUnknown;
         if (et !== expectedPrevious.type_id) {
           expectedPrevious.type_id = et;
-          repairs.push(
-            ...repairedExpected.map((r) => ({ ...r, field: `expected_previous.${r.field}` })),
-          );
+          repairs.push(...repairedExpected.map((r) => ({ ...r, field: `expected_previous.${r.field}` })));
         }
       }
     }
@@ -340,7 +326,7 @@ export function prepareTypeAndPolicy(
 export function resolveEditTargets(
   payload: EditBlocksPayload,
   mode: "place" | "batch",
-  repairs: RepairApplied[],
+  repairs: RepairApplied[]
 ): BridgeResult<{
   targets: ResolvedTarget[];
   dimension: string;
@@ -356,14 +342,10 @@ export function resolveEditTargets(
         ? payload.dimension
         : payload.locked_targets.find((t) => typeof t.dimension === "string")?.dimension;
     if (!fallbackDimension) {
-      return fail(
-        "INVALID_ARGUMENT",
-        "locked_targets require dimension (per-cell or top-level)",
-      );
+      return fail("INVALID_ARGUMENT", "locked_targets require dimension (per-cell or top-level)");
     }
     const targets = payload.locked_targets.map((t) => ({
-      dimension:
-        typeof t.dimension === "string" && t.dimension ? t.dimension : fallbackDimension,
+      dimension: typeof t.dimension === "string" && t.dimension ? t.dimension : fallbackDimension,
       x: Math.floor(t.x),
       y: Math.floor(t.y),
       z: Math.floor(t.z),
@@ -392,10 +374,7 @@ export function resolveEditTargets(
     positions = collected;
   }
 
-  const maxDiscrete = Math.min(
-    payload.max_discrete ?? DEFAULT_DISCRETE,
-    HARD_MAX_DISCRETE,
-  );
+  const maxDiscrete = Math.min(payload.max_discrete ?? DEFAULT_DISCRETE, HARD_MAX_DISCRETE);
   if (positions.length > maxDiscrete) {
     return fail("LIMIT_EXCEEDED", `positions exceed limit ${maxDiscrete}`, {
       count: positions.length,
@@ -406,22 +385,21 @@ export function resolveEditTargets(
     return fail("INVALID_ARGUMENT", "at least one position is required");
   }
 
-  return resolveTargets(
-    coordinateMode,
-    payload.dimension,
-    positions,
-    payload.player_name,
-    repairs,
-  );
+  return resolveTargets(coordinateMode, payload.dimension, positions, payload.player_name, repairs);
 }
 
 export function preflightDiscreteTargets(
   targets: ResolvedTarget[],
   replaceAny: boolean,
-  expectedPrevious: ExpectedPrevious | undefined,
+  expectedPrevious: ExpectedPrevious | undefined
 ): BridgeResult<{
   befores: Array<ReturnType<typeof buildBlockSnapshot>>;
-  blocks: Array<{ block: NonNullable<ReturnType<typeof getBlockSafe> extends BridgeResult<infer T> ? T extends { block: infer B } ? B : never : never>; target: ResolvedTarget }>;
+  blocks: Array<{
+    block: NonNullable<
+      ReturnType<typeof getBlockSafe> extends BridgeResult<infer T> ? (T extends { block: infer B } ? B : never) : never
+    >;
+    target: ResolvedTarget;
+  }>;
 }> {
   const befores = [];
   const blocks = [];
@@ -437,13 +415,7 @@ export function preflightDiscreteTargets(
       y: target.y,
       z: target.z,
     });
-    const check = checkPrecondition(
-      snapshot,
-      blockResult.payload.block,
-      replaceAny,
-      expectedPrevious,
-      false,
-    );
+    const check = checkPrecondition(snapshot, blockResult.payload.block, replaceAny, expectedPrevious, false);
     if (!check.ok) return check;
     befores.push(snapshot);
     blocks.push({ block: blockResult.payload.block, target });
@@ -453,7 +425,7 @@ export function preflightDiscreteTargets(
 
 export function writeAndVerify(
   block: {
-    setPermutation: (p: unknown) => void;
+    setPermutation: (p: BlockPermutation) => void;
     permutation?: {
       getAllStates?: () => Record<string, string | number | boolean>;
     };
@@ -464,10 +436,10 @@ export function writeAndVerify(
     getComponent?: (id: string) => unknown;
   },
   target: ResolvedTarget,
-  permutation: unknown,
+  permutation: BlockPermutation,
   typeId: string,
   states: Record<string, string | number | boolean> | undefined,
-  beforeSnapshot: ReturnType<typeof buildBlockSnapshot>,
+  beforeSnapshot: ReturnType<typeof buildBlockSnapshot>
 ): BridgeResult<{
   after: ReturnType<typeof buildBlockSnapshot>;
   changed: boolean;
@@ -510,7 +482,7 @@ export function writeAndVerify(
       // Best-effort: resolve before type as default permutation
       const beforePerm = resolvePermutation(
         beforeSnapshot.type_id,
-        Object.keys(beforeSnapshot.states).length ? beforeSnapshot.states : undefined,
+        Object.keys(beforeSnapshot.states).length ? beforeSnapshot.states : undefined
       );
       if (beforePerm.ok) {
         reread.payload.block.setPermutation(beforePerm.payload.permutation);
@@ -544,7 +516,8 @@ export function writeAndVerify(
 
   return ok({
     after,
-    changed: after.type_id !== beforeSnapshot.type_id ||
+    changed:
+      after.type_id !== beforeSnapshot.type_id ||
       JSON.stringify(after.states) !== JSON.stringify(beforeSnapshot.states),
     verification: { ok: true },
   });
@@ -554,7 +527,7 @@ export function rollbackWritten(
   written: Array<{
     target: ResolvedTarget;
     before: ReturnType<typeof buildBlockSnapshot>;
-  }>,
+  }>
 ): Array<{ target: ResolvedTarget; ok: boolean; message?: string }> {
   const results = [];
   for (const item of written) {
@@ -570,7 +543,7 @@ export function rollbackWritten(
       }
       const beforePerm = resolvePermutation(
         item.before.type_id,
-        Object.keys(item.before.states).length ? item.before.states : undefined,
+        Object.keys(item.before.states).length ? item.before.states : undefined
       );
       if (!beforePerm.ok) {
         results.push({ target: item.target, ok: false, message: "could not resolve before permutation" });
@@ -605,4 +578,3 @@ export function rollbackWritten(
   }
   return results;
 }
-

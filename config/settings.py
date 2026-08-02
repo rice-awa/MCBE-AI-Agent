@@ -7,7 +7,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from _version import __version__
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 from pydantic_settings.sources import JsonConfigSettingsSource
@@ -182,7 +181,7 @@ class MinecraftConfig(BaseModel):
     def get_command_description(self, cmd_type: str) -> tuple[str, str | None]:
         """获取命令描述和用法"""
         # 从 commands 中查找
-        for prefix, cmd in self.commands.items():
+        for _prefix, cmd in self.commands.items():
             if isinstance(cmd, dict) and cmd.get("type") == cmd_type:
                 return cmd.get("description", ""), cmd.get("usage")
             if isinstance(cmd, str) and cmd == cmd_type:

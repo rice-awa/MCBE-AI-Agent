@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from dataclasses import dataclass, field
@@ -15,7 +14,6 @@ import pytest
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
-from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 
 from config.settings import Settings
@@ -28,7 +26,6 @@ from services.agent.block_ops.capability import (
     get_block_capability_cache,
     reset_block_capability_cache,
 )
-from services.agent.block_ops.project import project_block_result_for_model
 from services.agent.block_ops.config import (
     DEFAULT_COMMAND_LINE_BYTE_BUDGET,
     DEFAULT_MAX_LOCKED_TARGETS_ON_WIRE,
@@ -40,6 +37,7 @@ from services.agent.block_ops.preflight_cache import (
     get_preflight_cache,
     reset_preflight_cache,
 )
+from services.agent.block_ops.project import project_block_result_for_model
 from services.agent.block_ops.schema import (
     BLOCK_OPS_SCHEMA_VERSION,
     BlockErrorCode,
@@ -47,31 +45,31 @@ from services.agent.block_ops.schema import (
     build_success_response,
 )
 from services.agent.block_ops.tools_impl import (
+    _execute_edits_group,
     apply_limits_to_payload,
+    build_block_preflight_plan,
     build_edit_payload,
     build_inspect_payload,
-    build_block_preflight_plan,
     check_bridge_command_line_budget,
     edit_blocks_impl,
     estimate_bridge_command_line_bytes,
     inspect_block_impl,
     locked_targets_wire_limit_exceeded,
     merge_canonical_from_preflight,
-    run_block_preflight,
     project_block_execute_args,
+    run_block_preflight,
     should_omit_locked_targets_on_wire,
-    _execute_edits_group,
 )
 from services.agent.harness.execution import (
     HarnessCapability,
     PolicyDecisionKind,
     PolicyEngine,
+    classify_tool_exception,
     get_idempotency_store,
     hash_normalized_args,
     normalize_tool_args,
     reset_block_command_fallback_store,
     reset_idempotency_store,
-    classify_tool_exception,
 )
 from services.agent.tool_results import ToolResult
 from services.agent.tools import iter_registered_tools, register_agent_tools
@@ -1472,8 +1470,9 @@ def test_merge_canonical_fill_accepts_from_to_request_keys() -> None:
 
 
 def test_strip_block_internal_tool_schema_hides_locked_and_phase() -> None:
-    from services.agent.harness.execution import strip_block_internal_tool_schema
     from pydantic_ai.tools import ToolDefinition
+
+    from services.agent.harness.execution import strip_block_internal_tool_schema
 
     raw = ToolDefinition(
         name="edit_blocks",
@@ -1947,10 +1946,10 @@ async def test_inspect_block_impl_target_box_volume_limit() -> None:
 
 def test_inspect_config_defaults_and_hard_caps() -> None:
     from services.agent.block_ops.config import (
-        DEFAULT_INSPECT_SUMMARY_THRESHOLD,
         DEFAULT_INSPECT_SAMPLE_LIMIT,
-        HARD_MAX_INSPECT_SUMMARY_THRESHOLD,
+        DEFAULT_INSPECT_SUMMARY_THRESHOLD,
         HARD_MAX_INSPECT_SAMPLE_LIMIT,
+        HARD_MAX_INSPECT_SUMMARY_THRESHOLD,
         get_block_tools_limits,
     )
 
@@ -2001,8 +2000,9 @@ def test_inspect_model_schema_only_exposes_target_and_dimension() -> None:
     in the raw function schema but stripped by ``strip_block_internal_tool_schema``
     before the model sees them.
     """
-    from services.agent.harness.execution import strip_block_internal_tool_schema
     from pydantic_ai.tools import ToolDefinition
+
+    from services.agent.harness.execution import strip_block_internal_tool_schema
 
     agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
     register_agent_tools(agent)
@@ -2713,6 +2713,77 @@ async def test_stringified_group_failure_blocks_raw_fallback_in_same_run(
     assert result.output == "done"
     assert command_calls == 0
     assert "PROTECTED_BLOCK" in str(result.all_messages())
+
+
+@pytest.mark.asyncio
+async def test_inspect_failure_blocks_raw_fallback_in_same_run(monkeypatch) -> None:
+    """A failed dedicated inspect is also a non-permission to mutate by command."""
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {
+                "ok": True,
+                "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}},
+            }
+        if capability == "inspect_block":
+            return {
+                "ok": False,
+                "payload": {
+                    "code": "PRECONDITION_FAILED",
+                    "message": "inspect failed",
+                    "fallback_allowed": False,
+                },
+            }
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent = _issue6_fallback_agent()
+    command_calls = 0
+
+    async def count_command(*args: Any, **kwargs: Any) -> Any:
+        nonlocal command_calls
+        command_calls += 1
+        return SimpleNamespace(success=True, message="executed")
+
+    monkeypatch.setattr("services.agent.tools._run_command_result", count_command)
+    model_calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 1:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="inspect_block",
+                tool_call_id="tc-inspect-failure",
+                args={
+                    "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
+                    "dimension": "minecraft:overworld",
+                },
+            )])
+        if model_calls == 2:
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="run_minecraft_command",
+                tool_call_id="tc-inspect-fallback",
+                args={"command": "setblock ~ ~ ~ stone"},
+            )])
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    result = await agent.run(
+        "查看后处理方块",
+        model=FunctionModel(model_fn),
+        deps=_Deps(
+            connection_id=cid,
+            addon_bridge=bridge,
+            settings=_Settings(),
+            run_id="run-inspect-fallback",
+            auto_approve_tools=True,
+        ),
+    )
+
+    assert result.output == "done"
+    assert command_calls == 0
+    assert "PRECONDITION_FAILED" in str(result.all_messages())
 
 
 @pytest.mark.asyncio
@@ -3719,7 +3790,6 @@ def test_corrupt_edit_approval_contract_is_rejected_before_bridge(
 @pytest.mark.asyncio
 async def test_harness_approved_edit_uses_preflight_cache() -> None:
     """After preflight cache is warm, approved call_tool executes once with locked args."""
-    from services.agent.harness.execution import HarnessToolset
 
     bridge = _FakeBridge()
     cid = str(uuid4())
@@ -3901,8 +3971,8 @@ def test_normalize_block_input_object_keeps_states() -> None:
 
 def test_normalize_expect_kinds() -> None:
     from services.agent.block_ops.tools_impl import (
-        _normalize_expect,
         _expect_info_to_legacy,
+        _normalize_expect,
     )
 
     assert _normalize_expect(None) == {"kind": "air"}
@@ -4088,7 +4158,7 @@ def test_new_edit_contract_mixed_coords_invalid() -> None:
     assert json.loads(error.output)["code"] == "INVALID_COORDINATE"
 
 
-def test_new_edit_contract_absolute_without_dimension_invalid() -> None:
+def test_new_edit_contract_absolute_without_dimension_is_deferred_to_addon() -> None:
     from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
 
     limits = SimpleNamespace(
@@ -4100,9 +4170,91 @@ def test_new_edit_contract_absolute_without_dimension_invalid() -> None:
         limits.max_discrete_positions, limits.max_fill_volume,
         limits.max_edits_per_group, limits.max_total_targets_per_group,
     )
-    assert norms is None
-    assert error is not None
-    assert json.loads(error.output)["code"] == "INVALID_ARGUMENT"
+    assert error is None
+    assert norms is not None
+    assert _norm_first(norms).legacy["coordinate_mode"] == "absolute"
+    assert "dimension" not in _norm_first(norms).legacy
+
+
+def test_block_tool_schema_rejects_invalid_target_and_edit_shapes() -> None:
+    """The public schema, not only host logic, constrains the new contract."""
+    from pydantic import ValidationError
+
+    from services.agent.tools import BlockEdit, BlockTarget
+
+    with pytest.raises(ValidationError):
+        BlockTarget.model_validate({
+            "positions": [{"x": 1, "y": 64, "z": 1}],
+            "box": {"from": {"x": 1, "y": 64, "z": 1}, "to": {"x": 2, "y": 64, "z": 2}},
+        })
+    with pytest.raises(ValidationError):
+        BlockEdit.model_validate({
+            "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
+        })
+    with pytest.raises(ValidationError):
+        BlockEdit.model_validate({
+            "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
+            "block": {"type_id": "minecraft:stone", "states": "not-an-object"},
+        })
+    target_schema = BlockTarget.model_json_schema()
+    assert len(target_schema["oneOf"]) == 2
+    assert target_schema["oneOf"][0]["required"] == ["positions"]
+    assert target_schema["oneOf"][1]["required"] == ["box"]
+
+
+@pytest.mark.asyncio
+async def test_grouped_absolute_edit_defaults_dimension_and_preserves_addon_repairs() -> None:
+    """The Add-on resolves omitted dimensions and the canonical plan retains its evidence."""
+    repair = {
+        "field": "dimension",
+        "from": None,
+        "to": "minecraft:overworld",
+        "reason": "current_player_dimension_default",
+    }
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
+        if capability == "edit_blocks":
+            assert payload.get("phase") == "preflight"
+            assert "dimension" not in payload
+            position = payload["position"]
+            return {
+                "ok": True,
+                "payload": {
+                    "ok": True,
+                    "phase": "preflight",
+                    "mode": "place",
+                    "dimension": "minecraft:overworld",
+                    "locked_targets": [{
+                        "dimension": "minecraft:overworld",
+                        "x": position["x"],
+                        "y": position["y"],
+                        "z": position["z"],
+                    }],
+                    "repairs_applied": [repair],
+                },
+            }
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-default-dim")
+    plan, failure = await run_block_preflight(
+        SimpleNamespace(deps=deps),  # type: ignore[arg-type]
+        "edit_blocks",
+        {"edits": [
+            {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"},
+            {"target": {"positions": [{"x": 2, "y": 64, "z": 1}]}, "block": "minecraft:dirt"},
+        ]},
+    )
+
+    assert failure is None
+    assert plan is not None
+    assert plan.execute_args["dimension"] == "minecraft:overworld"
+    assert plan.approval_metadata["repairs_applied"] == [repair]
+    assert plan.execute_args["repairs_applied"] == [repair]
 
 
 @pytest.mark.asyncio
@@ -4194,8 +4346,9 @@ async def test_new_edit_contract_zero_match_is_precondition_failed() -> None:
 
 def test_model_visible_edit_blocks_schema_exposes_only_edits_contract() -> None:
     """Model-facing schema (after strip) must only expose the new contract."""
-    from services.agent.harness.execution import strip_block_internal_tool_schema
     from pydantic_ai.tools import ToolDefinition
+
+    from services.agent.harness.execution import strip_block_internal_tool_schema
 
     agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
     register_agent_tools(agent)
@@ -4607,12 +4760,11 @@ async def test_grouped_edits_identical_cell_dedups_silently() -> None:
     assert failure is None
     assert plan is not None
     assert len(plan.execute_args["edits"]) == 2
-    # First edit keeps the cell; second edit's owned set is empty -> noop (no positions).
-    nonempty = [e for e in plan.execute_args["edits"] if e["target"]["positions"]]
-    empty = [e for e in plan.execute_args["edits"] if not e["target"]["positions"]]
-    assert len(nonempty) == 1
-    assert len(empty) == 1
-    assert tuple(nonempty[0]["target"]["positions"][0].values()) == (5, 64, 5)
+    # Approval resume still validates against the public schema, so a deduped
+    # noop retains one frozen representative position and is marked separately.
+    assert all(e["target"]["positions"] for e in plan.execute_args["edits"])
+    assert plan.execute_args["noop_edit_indices"] == [1]
+    assert tuple(plan.execute_args["edits"][0]["target"]["positions"][0].values()) == (5, 64, 5)
 
 
 @pytest.mark.asyncio
@@ -5430,8 +5582,8 @@ async def test_grouped_edit_failure_keeps_bounded_issue_05_evidence_for_audit() 
 async def test_grouped_edit_rejects_multiblock_block_before_approval() -> None:
     """When the addon preflight returns UNSUPPORTED_BLOCK_PLACEMENT for a
     multiblock block, the group fails before approval (spec issue 05 §6)."""
-    from services.agent.block_ops.tools_impl import run_block_preflight
     from services.agent.block_ops.capability import ensure_block_capability
+    from services.agent.block_ops.tools_impl import run_block_preflight
 
     async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
         if capability == "get_capabilities":
@@ -5475,8 +5627,8 @@ async def test_grouped_edit_rejects_multiblock_block_before_approval() -> None:
 async def test_grouped_edit_preflight_addon_returns_block_unknown_with_candidates() -> None:
     """When the addon preflight returns BLOCK_UNKNOWN with candidates, the
     host exposes them in the preflight failure (spec issue 05 §4.2)."""
-    from services.agent.block_ops.tools_impl import run_block_preflight
     from services.agent.block_ops.capability import ensure_block_capability
+    from services.agent.block_ops.tools_impl import run_block_preflight
 
     async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
         if capability == "get_capabilities":
@@ -5519,8 +5671,8 @@ async def test_grouped_edit_preflight_addon_returns_block_unknown_with_candidate
 async def test_grouped_edit_preflight_addon_returns_state_invalid_with_keys() -> None:
     """When the addon preflight returns STATE_INVALID with valid_state_keys,
     the host surfaces them in the preflight failure (spec issue 05 §4.3)."""
-    from services.agent.block_ops.tools_impl import run_block_preflight
     from services.agent.block_ops.capability import ensure_block_capability
+    from services.agent.block_ops.tools_impl import run_block_preflight
 
     async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
         if capability == "get_capabilities":

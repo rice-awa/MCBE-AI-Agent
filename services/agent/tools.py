@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Protocol, cast
 
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
@@ -12,7 +13,6 @@ from config.logging import get_logger
 from models.agent import AgentDependencies, MCColor
 from models.minecraft import MinecraftCommand, sanitize_tellraw_target
 from services.agent.harness.prompting import render_schema_description_prefix
-from services.agent.tool_results import CommandResult, ToolResult
 from services.agent.mcwiki import (
     build_health_url,
     build_mcwiki_url,
@@ -22,10 +22,99 @@ from services.agent.mcwiki import (
     build_search_params,
     normalize_limit,
 )
+from services.agent.tool_results import CommandResult, ToolResult
 
 logger = get_logger(__name__)
 
 BUILTIN_TOOLSET_ID = "mcbe-builtin"
+
+
+class _BlockToolModel(BaseModel):
+    """Strict public JSON-schema building block for dedicated block tools."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class AbsoluteBlockCoordinate(_BlockToolModel):
+    x: float
+    y: float
+    z: float
+
+
+class RelativeBlockCoordinate(_BlockToolModel):
+    forward: float
+    right: float
+    up: float
+
+
+BlockCoordinate = AbsoluteBlockCoordinate | RelativeBlockCoordinate
+BlockStateValue = str | int | float | bool
+
+
+class BlockTargetBox(_BlockToolModel):
+    from_: BlockCoordinate = Field(alias="from")
+    to: BlockCoordinate
+
+
+class BlockTarget(_BlockToolModel):
+    """A non-empty homogeneous point set or a box, but never both."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        json_schema_extra={
+            "oneOf": [
+                {
+                    "required": ["positions"],
+                    "properties": {"positions": {"type": "array"}},
+                    "not": {"required": ["box"]},
+                },
+                {
+                    "required": ["box"],
+                    "properties": {"box": {"type": "object"}},
+                    "not": {"required": ["positions"]},
+                },
+            ],
+        },
+    )
+    positions: list[BlockCoordinate] | None = None
+    box: BlockTargetBox | None = None
+
+    @model_validator(mode="after")
+    def validate_shape_and_coordinate_mode(self) -> BlockTarget:
+        if (self.positions is None) == (self.box is None):
+            raise ValueError("target 必须且只能提供 positions 或 box")
+        if self.positions is not None:
+            if not self.positions:
+                raise ValueError("target.positions 必须是非空列表")
+            kinds = {type(position) for position in self.positions}
+            if len(kinds) != 1:
+                raise ValueError("同一 target 内不能混用绝对坐标和玩家相对坐标")
+        elif self.box is not None and type(self.box.from_) is not type(self.box.to):
+            raise ValueError("同一 target 内不能混用绝对坐标和玩家相对坐标")
+        return self
+
+
+class BlockSpec(_BlockToolModel):
+    type_id: str
+    states: dict[str, BlockStateValue] | None = None
+
+
+BlockInput = str | BlockSpec
+ExpectInput = str | BlockSpec
+
+
+class BlockEdit(_BlockToolModel):
+    target: BlockTarget
+    block: BlockInput
+    expect: ExpectInput | None = None
+
+
+def _block_tool_data(value: BaseModel | dict[str, Any]) -> dict[str, Any]:
+    """Accept both PydanticAI-validated models and approval-resume dictionaries."""
+    if isinstance(value, BaseModel):
+        return value.model_dump(by_alias=True, exclude_none=True)
+    return value
 
 
 class ToolRegistrationSettings(Protocol):
@@ -91,7 +180,7 @@ def _stringify_tool_results(chat_agent: Agent[AgentDependencies, str]) -> None:
             result = await _function(*args, **kwargs)
             return str(result)
 
-        setattr(wrapper, "_tool_result_stringified", True)
+        wrapper._tool_result_stringified = True
         tool.function = wrapper
         function_schema = getattr(tool, "function_schema", None)
         if function_schema is not None and hasattr(function_schema, "function"):
@@ -1124,7 +1213,7 @@ def register_agent_tools(
     @chat_agent.tool
     async def inspect_block(
         ctx: RunContext[AgentDependencies],
-        target: dict[str, Any],
+        target: BlockTarget,
         dimension: str | None = None,
         locked_targets: list[dict[str, Any]] | None = None,
         phase: str | None = None,
@@ -1144,7 +1233,7 @@ def register_agent_tools(
 
         return await inspect_block_impl(
             ctx,
-            target=target,
+            target=_block_tool_data(target),
             dimension=dimension,
             locked_targets=locked_targets,
             phase=phase,
@@ -1153,7 +1242,7 @@ def register_agent_tools(
     @chat_agent.tool
     async def edit_blocks(
         ctx: RunContext[AgentDependencies],
-        edits: list[dict[str, Any]],
+        edits: list[BlockEdit],
         dimension: str | None = None,
         locked_targets: list[dict[str, Any]] | None = None,
         locked_targets_by_edit: list[list[dict[str, Any]]] | None = None,
@@ -1194,7 +1283,7 @@ def register_agent_tools(
 
         return await edit_blocks_impl(
             ctx,
-            edits=edits,
+            edits=[_block_tool_data(edit) for edit in edits],
             dimension=dimension,
             locked_targets=locked_targets,
             locked_targets_by_edit=locked_targets_by_edit,

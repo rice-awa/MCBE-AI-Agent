@@ -14,44 +14,19 @@ import {
   type RepairApplied,
   type RelativePosition,
 } from "./types";
-import { repairDimension } from "./repair";
-import {
-  floorAbsolutePosition,
-  resolveRelativePosition,
-  type CardinalFacing,
-} from "./coords";
-import {
-  checkPrecondition,
-  prepareTypeAndPolicy,
-  recheckPrecondition,
-  type EditBlocksPayload,
-} from "./common";
-import {
-  getBlockSafe,
-  resolvePlayerAnchor,
-  type ResolvedTarget,
-} from "./inspect";
+import { floorAbsolutePosition, resolveRelativePosition, type CardinalFacing } from "./coords";
+import { checkPrecondition, prepareTypeAndPolicy, recheckPrecondition, type EditBlocksPayload } from "./common";
+import { getBlockSafe, resolveAbsoluteDimension, resolvePlayerAnchor, type ResolvedTarget } from "./inspect";
 import { buildBlockSnapshot, matchesTargetPermutation } from "./snapshot";
 
 const SAMPLE_LIMIT = 8;
 
 function isAbsolutePos(p: PositionInput): p is AbsolutePosition {
-  return (
-    p !== null &&
-    typeof p === "object" &&
-    "x" in p &&
-    typeof (p as AbsolutePosition).x === "number"
-  );
+  return p !== null && typeof p === "object" && "x" in p && typeof (p as AbsolutePosition).x === "number";
 }
 
 function isRelativePos(p: PositionInput): p is RelativePosition {
-  return (
-    p !== null &&
-    typeof p === "object" &&
-    "forward" in p &&
-    "right" in p &&
-    "up" in p
-  );
+  return p !== null && typeof p === "object" && "forward" in p && "right" in p && "up" in p;
 }
 
 function resolveCorner(
@@ -60,7 +35,7 @@ function resolveCorner(
   corner: PositionInput | undefined,
   field: string,
   anchor: { origin: AbsolutePosition; facing: CardinalFacing } | undefined,
-  repairs: RepairApplied[],
+  repairs: RepairApplied[]
 ): BridgeResult<AbsolutePosition & { dimension: string }> {
   if (!corner) {
     return fail("INVALID_ARGUMENT", `${field} is required for fill mode`);
@@ -95,13 +70,10 @@ function resolveCorner(
     right: r,
     up: u,
   });
-  return ok({ dimension: anchor.origin ? dimension : dimension, ...abs });
+  return ok({ dimension, ...abs });
 }
 
-function enumerateVolume(
-  from: AbsolutePosition,
-  to: AbsolutePosition,
-): AbsolutePosition[] {
+function enumerateVolume(from: AbsolutePosition, to: AbsolutePosition): AbsolutePosition[] {
   const minX = Math.min(from.x, to.x);
   const maxX = Math.max(from.x, to.x);
   const minY = Math.min(from.y, to.y);
@@ -120,11 +92,7 @@ function enumerateVolume(
 }
 
 function volumeSize(from: AbsolutePosition, to: AbsolutePosition): number {
-  return (
-    (Math.abs(to.x - from.x) + 1) *
-    (Math.abs(to.y - from.y) + 1) *
-    (Math.abs(to.z - from.z) + 1)
-  );
+  return (Math.abs(to.x - from.x) + 1) * (Math.abs(to.y - from.y) + 1) * (Math.abs(to.z - from.z) + 1);
 }
 
 /**
@@ -140,7 +108,7 @@ function nextTick(): Promise<void> {
         (function* () {
           yield;
           resolve();
-        })(),
+        })()
       );
     } else {
       // test environment
@@ -159,7 +127,7 @@ export async function scanFillVolume(
   expectedPrevious: EditBlocksPayload["expected_previous"],
   cellsPerTick: number,
   targetTypeId: string,
-  targetStates?: Record<string, string | number | boolean>,
+  targetStates?: Record<string, string | number | boolean>
 ): Promise<
   BridgeResult<{
     matched: ResolvedTarget[];
@@ -185,15 +153,14 @@ export async function scanFillVolume(
     const blockResult = getBlockSafe(dimension, cell);
     if (!blockResult.ok) return blockResult;
     const snapshot = buildBlockSnapshot(blockResult.payload.block, dimension, cell);
-    previous_type_counts[snapshot.type_id] =
-      (previous_type_counts[snapshot.type_id] ?? 0) + 1;
+    previous_type_counts[snapshot.type_id] = (previous_type_counts[snapshot.type_id] ?? 0) + 1;
 
     const check = checkPrecondition(
       snapshot,
       blockResult.payload.block,
       replaceAny,
       expectedPrevious,
-      true, // fill filter mode
+      true // fill filter mode
     );
     if (!check.ok) {
       // PROTECTED_BLOCK rejects entire fill
@@ -232,16 +199,11 @@ export async function scanFillVolume(
 /**
  * Capability: edit_blocks fill mode with tick-sliced preflight.
  */
-export async function handleFill(
-  payload: EditBlocksPayload,
-): Promise<BridgeResult<Record<string, unknown>>> {
+export async function handleFill(payload: EditBlocksPayload): Promise<BridgeResult<Record<string, unknown>>> {
   const repairs: RepairApplied[] = [];
   const phase = payload.phase ?? "execute";
   const cellsPerTick = Math.max(1, payload.cells_per_tick ?? DEFAULT_CELLS_PER_TICK);
-  const maxVolume = Math.min(
-    payload.max_fill_volume ?? DEFAULT_MAX_FILL_VOLUME,
-    HARD_MAX_FILL_VOLUME,
-  );
+  const maxVolume = Math.min(payload.max_fill_volume ?? DEFAULT_MAX_FILL_VOLUME, HARD_MAX_FILL_VOLUME);
 
   const prepared = prepareTypeAndPolicy(payload, repairs);
   if (!prepared.ok) return prepared;
@@ -257,19 +219,11 @@ export async function handleFill(
 
   if (payload.locked_targets && payload.locked_targets.length > 0) {
     // Host may omit per-cell dimension when it matches top-level (commandLine budget).
-    const firstDim = payload.locked_targets.find(
-      (t) => typeof t.dimension === "string" && t.dimension,
-    )?.dimension;
-    const topDim =
-      typeof payload.dimension === "string" && payload.dimension
-        ? payload.dimension
-        : undefined;
+    const firstDim = payload.locked_targets.find((t) => typeof t.dimension === "string" && t.dimension)?.dimension;
+    const topDim = typeof payload.dimension === "string" && payload.dimension ? payload.dimension : undefined;
     dimension = firstDim ?? topDim ?? "";
     if (!dimension) {
-      return fail(
-        "INVALID_ARGUMENT",
-        "locked_targets require dimension (per-cell or top-level)",
-      );
+      return fail("INVALID_ARGUMENT", "locked_targets require dimension (per-cell or top-level)");
     }
     cells = payload.locked_targets.map((t) => ({
       x: Math.floor(t.x),
@@ -294,15 +248,23 @@ export async function handleFill(
   } else {
     const coordinateMode = (payload.coordinate_mode ?? "absolute") as CoordinateMode;
     let anchor:
-      | { origin: AbsolutePosition; facing: CardinalFacing; dimension: string; player_name: string }
-      | undefined;
+      { origin: AbsolutePosition; facing: CardinalFacing; dimension: string; player_name: string } | undefined;
 
     if (coordinateMode === "absolute") {
-      const dim = repairDimension(payload.dimension, repairs);
-      if (!dim) {
-        return fail("INVALID_ARGUMENT", "dimension is required for absolute fill");
+      const dimensionResult = resolveAbsoluteDimension(payload.dimension, payload.player_name, repairs);
+      if (!dimensionResult.ok) return dimensionResult;
+      dimension = dimensionResult.payload.dimension;
+      if (dimensionResult.payload.anchor) {
+        anchor = {
+          origin: dimensionResult.payload.anchor.origin,
+          facing: dimensionResult.payload.anchor.facing,
+          dimension: dimensionResult.payload.anchor.dimension,
+          player_name: dimensionResult.payload.anchor.player_name,
+        };
+        facing = anchor.facing;
+        player_origin = anchor.origin;
+        player_name = anchor.player_name;
       }
-      dimension = dim;
     } else {
       const anchorResult = resolvePlayerAnchor(payload.player_name ?? "");
       if (!anchorResult.ok) return anchorResult;
@@ -318,23 +280,9 @@ export async function handleFill(
       player_name = anchor.player_name;
     }
 
-    const fromResult = resolveCorner(
-      coordinateMode,
-      dimension,
-      payload.from,
-      "from",
-      anchor,
-      repairs,
-    );
+    const fromResult = resolveCorner(coordinateMode, dimension, payload.from, "from", anchor, repairs);
     if (!fromResult.ok) return fromResult;
-    const toResult = resolveCorner(
-      coordinateMode,
-      dimension,
-      payload.to,
-      "to",
-      anchor,
-      repairs,
-    );
+    const toResult = resolveCorner(coordinateMode, dimension, payload.to, "to", anchor, repairs);
     if (!toResult.ok) return toResult;
 
     fromAbs = { x: fromResult.payload.x, y: fromResult.payload.y, z: fromResult.payload.z };
@@ -360,7 +308,7 @@ export async function handleFill(
     prepared.payload.expected_previous,
     cellsPerTick,
     prepared.payload.type_id,
-    prepared.payload.states,
+    prepared.payload.states
   );
   if (!scan.ok) {
     return {
@@ -425,18 +373,14 @@ export async function handleFill(
         rollback: { promised: false },
       });
     }
-    return fail(
-      "PRECONDITION_FAILED",
-      "fill 匹配数为 0：目标方块不满足 expect 前置条件。",
-      {
-        status: "failed" as const,
-        matched_count: 0,
-        actual_type_counts: scan.payload.previous_type_counts,
-        hint: `如确实要替换这些方块，请将 expect 设为 ${expectedPreviousHint(prepared.payload)}`,
-        fallback_allowed: false,
-        retryable: false,
-      },
-    );
+    return fail("PRECONDITION_FAILED", "fill 匹配数为 0：目标方块不满足 expect 前置条件。", {
+      status: "failed" as const,
+      matched_count: 0,
+      actual_type_counts: scan.payload.previous_type_counts,
+      hint: `如确实要替换这些方块，请将 expect 设为 ${expectedPreviousHint(prepared.payload)}`,
+      fallback_allowed: false,
+      retryable: false,
+    });
   }
 
   if (phase === "preflight") {
@@ -472,7 +416,7 @@ export async function handleFill(
       reblock.payload.block,
       prepared.payload.replace_any,
       prepared.payload.expected_previous,
-      scan.payload.befores[i],
+      scan.payload.befores[i]
     );
     if (!recheck.ok) return recheck;
   }
@@ -480,25 +424,19 @@ export async function handleFill(
   // Prefer fillBlocks API when entire volume matches and replace_any/air-only with no skips
   // Spec: no full rollback promise; on exception return STATE_UNKNOWN
   try {
-    if (
-      scan.payload.skipped === 0 &&
-      matched.length === cells.length &&
-      typeof BlockVolume === "function"
-    ) {
+    if (scan.payload.skipped === 0 && matched.length === cells.length && typeof BlockVolume === "function") {
       try {
         const dim = world.getDimension(dimension);
         const volume = new BlockVolume(
           { x: baseMeta.from.x, y: baseMeta.from.y, z: baseMeta.from.z },
-          { x: baseMeta.to.x, y: baseMeta.to.y, z: baseMeta.to.z },
+          { x: baseMeta.to.x, y: baseMeta.to.y, z: baseMeta.to.z }
         );
         if (typeof dim.fillBlocks === "function") {
           dim.fillBlocks(volume, prepared.payload.permutation as never);
           return ok({
             ...baseMeta,
             ok: true,
-            status: (scan.payload.skipped > 0 ? "partial" : "applied") as
-              | "applied"
-              | "partial",
+            status: (scan.payload.skipped > 0 ? "partial" : "applied") as "applied" | "partial",
             changed_count: matched.length,
             verification: { ok: true, method: "fillBlocks" },
             rollback: { promised: false },
@@ -548,9 +486,7 @@ export async function handleFill(
     return ok({
       ...baseMeta,
       ok: true,
-      status: (scan.payload.skipped > 0 ? "partial" : "applied") as
-        | "applied"
-        | "partial",
+      status: (scan.payload.skipped > 0 ? "partial" : "applied") as "applied" | "partial",
       changed_count: changed,
       verification: { ok: true, method: "cell_by_cell" },
       rollback: { promised: false },

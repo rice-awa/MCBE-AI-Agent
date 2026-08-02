@@ -5,7 +5,6 @@ from services.agent.block_ops.bridge import (
     map_addon_bridge_result,
     map_bridge_exception,
 )
-from services.agent.block_ops.project import project_block_result_for_model
 from services.agent.block_ops.capability import (
     BlockCapabilityCache,
     BlockCapabilityRecord,
@@ -16,8 +15,8 @@ from services.agent.block_ops.capability import (
     reset_block_capability_cache,
 )
 from services.agent.block_ops.config import (
-    BlockToolsLimits,
     DEFAULT_COMMAND_LINE_BYTE_BUDGET,
+    BlockToolsLimits,
     get_block_tools_limits,
     get_command_line_byte_budget,
 )
@@ -27,6 +26,7 @@ from services.agent.block_ops.preflight_cache import (
     get_preflight_cache,
     reset_preflight_cache,
 )
+from services.agent.block_ops.project import project_block_result_for_model
 from services.agent.block_ops.schema import (
     BLOCK_OPS_SCHEMA_VERSION,
     BlockErrorCode,
@@ -49,11 +49,6 @@ from services.agent.block_ops.tools_impl import (
     merge_canonical_from_preflight,
     project_block_execute_args,
     run_block_preflight,
-)
-from services.agent.block_ops.target import (
-    NormalizedTarget,
-    build_inspect_payload_from_target,
-    normalize_inspect_target,
 )
 
 __all__ = [

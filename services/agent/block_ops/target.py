@@ -24,7 +24,6 @@ from typing import Any
 from services.agent.block_ops.schema import BlockErrorCode
 from services.agent.block_ops.tools_impl import _host_limit_error
 
-
 _ABSOLUTE_KEYS = frozenset({"x", "y", "z"})
 _RELATIVE_KEYS = frozenset({"forward", "right", "up"})
 

@@ -6,7 +6,6 @@ import json
 from enum import StrEnum
 from typing import Any
 
-
 BLOCK_OPS_SCHEMA_VERSION = "1"
 
 

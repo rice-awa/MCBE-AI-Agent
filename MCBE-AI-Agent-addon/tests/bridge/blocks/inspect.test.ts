@@ -1,11 +1,11 @@
 import { describe, expect, it, beforeEach } from "vitest";
-import {
-  __resetBlocks,
-  __setBlock,
-  __setPlayers,
-} from "../../__mocks__/minecraft-server";
+import { __resetBlocks, __setBlock, __setPlayers } from "../../__mocks__/minecraft-server";
 import { handleInspectBlock } from "../../../scripts/bridge/capabilities/blocks/inspect";
-import { snapYawToCardinal, resolveRelativePosition, mathFloor } from "../../../scripts/bridge/capabilities/blocks/coords";
+import {
+  snapYawToCardinal,
+  resolveRelativePosition,
+  mathFloor,
+} from "../../../scripts/bridge/capabilities/blocks/coords";
 import { canonicalizeDimension } from "../../../scripts/bridge/capabilities/blocks/dimensions";
 import { editDistance, repairTypeId } from "../../../scripts/bridge/capabilities/blocks/repair";
 import { BlockTypes } from "../../__mocks__/minecraft-server";
@@ -115,14 +115,20 @@ describe("inspect_block", () => {
     expect(repairs.some((r) => r.reason === "canonicalize_dimension_alias")).toBe(true);
   });
 
-  it("requires dimension for absolute mode", async () => {
+  it("defaults absolute mode to the current player's dimension", async () => {
+    __setPlayers([{ name: "Alice", location: { x: 0, y: 64, z: 0 }, dimensionId: "minecraft:nether" }]);
+    __setBlock("minecraft:nether", 0, 64, 0, { typeId: "minecraft:stone" });
     const result = await handleInspectBlock({
       coordinate_mode: "absolute",
       position: { x: 0, y: 64, z: 0 },
+      player_name: "Alice",
     });
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.payload.code).toBe("INVALID_ARGUMENT");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.payload.dimension).toBe("minecraft:nether");
+    expect(result.payload.repairs_applied).toContainEqual(
+      expect.objectContaining({ reason: "current_player_dimension_default" })
+    );
   });
 
   it("supports multiple positions", async () => {

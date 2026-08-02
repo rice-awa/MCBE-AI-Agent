@@ -15,9 +15,9 @@ from typing import Any, Literal
 
 from pydantic_ai import ApprovalRequired, RunContext, ToolDenied
 from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, ToolsetTool
 from pydantic_ai.toolsets.wrapper import WrapperToolset
-from pydantic_ai.tools import ToolDefinition
 
 from config.logging import get_logger
 from config.redaction import redact_exception
@@ -29,7 +29,6 @@ from services.agent.harness.audit import (
 from services.agent.harness.catalog import (
     POLICY_VERSION,
     ToolRisk,
-    ToolSource,
     get_tool_entry,
     list_tool_names,
 )
@@ -584,9 +583,7 @@ class PolicyEngine:
             return True
 
         # 无 target 概念的其它 MEDIUM 工具（send_script_event 等）
-        if tool_name in _MEDIUM_SAFE_AUTO_ALLOW_NO_TARGET:
-            return True
-        return False
+        return tool_name in _MEDIUM_SAFE_AUTO_ALLOW_NO_TARGET
 
     @staticmethod
     def _target_selector_is_current_player(
@@ -967,7 +964,7 @@ class HarnessToolset(WrapperToolset[Any]):
                 connection_id=connection_id,
             )
             if preflight_failure is not None:
-                if name == "edit_blocks":
+                if name in _BLOCK_OPS_TOOLS:
                     _record_block_edit_fallback_outcome(
                         preflight_failure,
                         connection_id=connection_id,
@@ -1254,7 +1251,7 @@ class HarnessToolset(WrapperToolset[Any]):
             classified = classify_tool_exception(
                 exc, tool_name=name, execution_stage="invocation"
             )
-            if name == "edit_blocks":
+            if name in _BLOCK_OPS_TOOLS:
                 _record_block_edit_fallback_outcome(
                     classified,
                     connection_id=connection_id,
@@ -1295,7 +1292,7 @@ class HarnessToolset(WrapperToolset[Any]):
 
         # 4) 结果分类与幂等写入
         result_for_model = materialize_tool_result(raw_result)
-        if name == "edit_blocks":
+        if name in _BLOCK_OPS_TOOLS:
             _record_block_edit_fallback_outcome(
                 raw_result,
                 connection_id=connection_id,

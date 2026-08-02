@@ -24,7 +24,6 @@ from services.agent.block_ops.config import (
     get_block_tools_limits,
     get_command_line_byte_budget,
 )
-from services.agent.block_ops.preflight_cache import get_preflight_cache
 from services.agent.block_ops.project import (
     _per_edit_changed,
     _per_edit_skipped,
@@ -182,6 +181,18 @@ def _connection_id(deps: AgentDependencies) -> str:
     return str(deps.connection_id)
 
 
+def _plain_tool_data(value: Any) -> Any:
+    """Convert validated Pydantic arguments to plain JSON-like data once."""
+    if isinstance(value, dict):
+        return {key: _plain_tool_data(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_plain_tool_data(item) for item in value]
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return _plain_tool_data(model_dump(by_alias=True, exclude_none=True))
+    return value
+
+
 def _capability_failure_result(
     reason: str,
     *,
@@ -253,11 +264,6 @@ def _validate_inspect_args(
             BlockErrorCode.INVALID_ARGUMENT,
             "coordinate_mode 必须是 absolute 或 player_relative",
         )
-    if coordinate_mode == "absolute" and not dimension:
-        return _host_limit_error(
-            BlockErrorCode.INVALID_ARGUMENT,
-            "absolute 模式必须提供 dimension",
-        )
     has_single = position is not None
     has_multi = positions is not None
     if not has_single and not has_multi:
@@ -305,11 +311,6 @@ def _validate_inspect_target(
     if error is not None:
         return None, error
     assert normalized is not None
-    if normalized.coordinate_mode == "absolute" and not dimension:
-        return None, _host_limit_error(
-            BlockErrorCode.INVALID_ARGUMENT,
-            "absolute 模式必须提供 dimension",
-        )
     if normalized.shape == "positions":
         count = len(normalized.positions or [])
         if count > max_positions:
@@ -370,11 +371,6 @@ def _validate_edit_args(
         return _host_limit_error(
             BlockErrorCode.INVALID_ARGUMENT,
             "coordinate_mode 必须是 absolute 或 player_relative",
-        )
-    if coordinate_mode == "absolute" and not dimension:
-        return _host_limit_error(
-            BlockErrorCode.INVALID_ARGUMENT,
-            "absolute 模式必须提供 dimension",
         )
     if not type_id or not str(type_id).strip():
         return _host_limit_error(
@@ -552,7 +548,7 @@ def _normalize_block_id(
     if not isinstance(raw, str) or not raw.strip():
         return "", []
     value = raw.strip().lower()
-    repairs: list[str] = []
+    repairs: list[Any] = []
     if value != raw.strip():
         repairs.append(f"{field_name}: lowercased {raw.strip()!r} -> {value!r}")
     if ":" not in value:
@@ -1413,11 +1409,6 @@ def _normalize_one_edit(
     except _EditTargetError as exc:
         return None, exc.result
 
-    if normalized.coordinate_mode == "absolute" and not dimension:
-        return None, _host_limit_error(
-            BlockErrorCode.INVALID_ARGUMENT,
-            "absolute 模式必须提供 dimension",
-        )
     if normalized.shape == "positions":
         count = len(normalized.positions or [])
         if count > max_positions:
@@ -1479,7 +1470,7 @@ def _normalize_edits_for_preflight(
     results: list[_EditNormalization] = []
     total_targets = 0
     total_discrete_positions = 0
-    for idx, edit in enumerate(edits):
+    for edit in edits:
         normalization, error = _normalize_one_edit(
             edit, dimension, max_positions, max_fill_volume
         )
@@ -1576,7 +1567,7 @@ class _GroupEdit:
     is_noop: bool
     # Resolved absolute cells targeted before dedup (for conflict detection).
     resolved_cells: frozenset[tuple[int, int, int]]
-    repairs: list[str] = field(default_factory=list)
+    repairs: list[Any] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1601,7 +1592,7 @@ class _EditPreflight:
     volume: int
     status: str
     is_noop: bool
-    repairs: list[str] = field(default_factory=list)
+    repairs: list[Any] = field(default_factory=list)
 
 
 def _block_states_key(states: Any) -> tuple[tuple[str, Any], ...] | None:
@@ -1735,8 +1726,18 @@ def _build_group_edits(
             frozen_positions = _freeze_owned_positions(
                 owned if pre.resolved_positions is not None else owned_matched_cells
             )
+            no_owned_positions = not frozen_positions
+            is_noop = pre.is_noop or no_owned_positions
+            if no_owned_positions:
+                # Approval-resume still traverses Pydantic's public schema.
+                # Keep a valid, frozen representative target for a deduped/noop
+                # edit; ``noop_edit_indices`` guarantees it is never executed.
+                frozen_positions = _freeze_owned_positions(pre.resolved_cells)[:1]
+                if not frozen_positions:
+                    original_positions = pre.normalization.normalized.positions
+                    if isinstance(original_positions, list):
+                        frozen_positions = list(original_positions[:1])
             frozen_target: dict[str, Any] = {"positions": frozen_positions}
-            is_noop = pre.is_noop or not frozen_positions
             group.append(_GroupEdit(
                 index=pre.index,
                 normalization=pre.normalization,
@@ -1970,6 +1971,12 @@ async def _preflight_one_edit(
         or (isinstance(already_target, int) and isinstance(volume, int)
             and volume > 0 and already_target == volume)
     )
+    repairs: list[Any] = list(normalization.repairs)
+    addon_repairs = preflight_fields.get("repairs_applied")
+    if isinstance(addon_repairs, list):
+        for repair in addon_repairs:
+            if repair not in repairs:
+                repairs.append(repair)
 
     return _EditPreflight(
         index=index,
@@ -1990,7 +1997,7 @@ async def _preflight_one_edit(
         volume=volume,
         status=status,
         is_noop=is_noop,
-        repairs=normalization.repairs,
+        repairs=repairs,
     ), None
 
 
@@ -2363,6 +2370,9 @@ async def run_block_preflight(
 
     Returns (preflight_plan, failure). Absolute inspect may return direct args.
     """
+    plain_args = _plain_tool_data(tool_args)
+    assert isinstance(plain_args, dict)
+    tool_args = plain_args
     deps = ctx.deps
     unsupported = await _require_supported(ctx)
     if unsupported is not None:
@@ -2473,7 +2483,6 @@ async def run_block_preflight(
             body = json.loads(result.output)
         except Exception:
             return dict(tool_args), None
-        payload_body = body if body.get("ok") is not False else body
         # If response is success envelope with nested fields
         if isinstance(body, dict) and body.get("ok") is True:
             # payload may be flattened into body for versioned responses
@@ -3195,12 +3204,6 @@ async def edit_blocks_impl(
     )
     if validation is not None:
         return validation
-
-    # Prefer locked targets from preflight cache if available and not passed.
-    if locked_targets is None:
-        cache = get_preflight_cache()
-        # Best-effort: callers via harness pass locked_targets in args.
-        pass
 
     exec_phase = phase or "execute"
     payload = build_edit_payload(

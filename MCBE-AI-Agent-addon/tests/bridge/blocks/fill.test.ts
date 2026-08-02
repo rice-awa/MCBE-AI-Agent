@@ -1,16 +1,32 @@
 import { describe, expect, it, beforeEach } from "vitest";
-import {
-  __resetBlocks,
-  __setBlock,
-  __setPlayers,
-  BlockTypes,
-} from "../../__mocks__/minecraft-server";
+import { __resetBlocks, __setBlock, __setPlayers, BlockTypes } from "../../__mocks__/minecraft-server";
 import { handleFill } from "../../../scripts/bridge/capabilities/blocks/fill";
 
 describe("edit_blocks fill", () => {
   beforeEach(() => {
     __resetBlocks();
     __setPlayers([]);
+  });
+
+  it("defaults an absolute fill to the current player's dimension", async () => {
+    __setPlayers([{ name: "Alex", location: { x: 0, y: 64, z: 0 }, dimensionId: "minecraft:nether" }]);
+    __setBlock("minecraft:nether", 0, 64, 0, { typeId: "minecraft:air", isAir: true });
+
+    const result = await handleFill({
+      mode: "fill",
+      coordinate_mode: "absolute",
+      from: { x: 0, y: 64, z: 0 },
+      to: { x: 0, y: 64, z: 0 },
+      type_id: "minecraft:stone",
+      player_name: "Alex",
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.payload.dimension).toBe("minecraft:nether");
+    expect(result.payload.repairs_applied).toContainEqual(
+      expect.objectContaining({ reason: "current_player_dimension_default" })
+    );
   });
 
   it("fills air only by default and skips non-air", async () => {

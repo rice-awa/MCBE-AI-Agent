@@ -62,28 +62,19 @@ function isAbsolutePos(p: PositionInput): p is AbsolutePosition {
 }
 
 function isRelativePos(p: PositionInput): p is RelativePosition {
-  return (
-    p !== null &&
-    typeof p === "object" &&
-    "forward" in p &&
-    "right" in p &&
-    "up" in p
-  );
+  return p !== null && typeof p === "object" && "forward" in p && "right" in p && "up" in p;
 }
 
-function classifyError(error: unknown): { code: "UNLOADED_CHUNK" | "OUT_OF_BOUNDS" | "INTERNAL_ERROR"; message: string } {
+function classifyError(error: unknown): {
+  code: "UNLOADED_CHUNK" | "OUT_OF_BOUNDS" | "INTERNAL_ERROR";
+  message: string;
+} {
   const name = error instanceof Error ? error.name : "";
   const message = error instanceof Error ? error.message : String(error);
-  if (
-    name === "LocationInUnloadedChunkError" ||
-    /unloaded.?chunk/i.test(message)
-  ) {
+  if (name === "LocationInUnloadedChunkError" || /unloaded.?chunk/i.test(message)) {
     return { code: "UNLOADED_CHUNK", message };
   }
-  if (
-    name === "LocationOutOfWorldBoundariesError" ||
-    /out.?of.?world|boundar/i.test(message)
-  ) {
+  if (name === "LocationOutOfWorldBoundariesError" || /out.?of.?world|boundar/i.test(message)) {
     return { code: "OUT_OF_BOUNDS", message };
   }
   return { code: "INTERNAL_ERROR", message };
@@ -103,6 +94,29 @@ export type PlayerAnchor = {
   player_name: string;
 };
 
+export function resolveAbsoluteDimension(
+  dimensionRaw: string | undefined,
+  playerName: string | undefined,
+  repairs: RepairApplied[]
+): BridgeResult<{ dimension: string; anchor?: PlayerAnchor }> {
+  const dimension = repairDimension(dimensionRaw, repairs);
+  if (dimension) {
+    return ok({ dimension });
+  }
+  const anchorResult = resolvePlayerAnchor(playerName ?? "");
+  if (!anchorResult.ok) return anchorResult;
+  repairs.push({
+    field: "dimension",
+    from: dimensionRaw,
+    to: anchorResult.payload.dimension,
+    reason: "current_player_dimension_default",
+  });
+  return ok({
+    dimension: anchorResult.payload.dimension,
+    anchor: anchorResult.payload,
+  });
+}
+
 export function resolvePlayerAnchor(playerName: string): BridgeResult<PlayerAnchor> {
   const name = playerName?.trim();
   if (!name) {
@@ -117,8 +131,7 @@ export function resolvePlayerAnchor(playerName: string): BridgeResult<PlayerAnch
     dimension: { id: string };
     getRotation?: () => { x: number; y: number };
   };
-  const yaw =
-    typeof player.getRotation === "function" ? player.getRotation().y : 0;
+  const yaw = typeof player.getRotation === "function" ? player.getRotation().y : 0;
   const facing = snapYawToCardinal(yaw);
   return ok({
     dimension: player.dimension.id,
@@ -149,7 +162,7 @@ export function resolveTargets(
   dimensionRaw: string | undefined,
   positions: PositionInput[],
   playerName: string | undefined,
-  repairs: RepairApplied[],
+  repairs: RepairApplied[]
 ): BridgeResult<{
   targets: ResolvedTarget[];
   dimension: string;
@@ -158,19 +171,14 @@ export function resolveTargets(
   player_name?: string;
 }> {
   if (coordinateMode === "absolute") {
-    const dimension = repairDimension(dimensionRaw, repairs);
-    if (!dimension) {
-      return fail("INVALID_ARGUMENT", "dimension is required for absolute coordinate_mode");
-    }
+    const dimensionResult = resolveAbsoluteDimension(dimensionRaw, playerName, repairs);
+    if (!dimensionResult.ok) return dimensionResult;
+    const { dimension, anchor } = dimensionResult.payload;
     const targets: ResolvedTarget[] = [];
     for (let i = 0; i < positions.length; i++) {
       const p = positions[i];
       if (!isAbsolutePos(p)) {
-        return fail(
-          "INVALID_COORDINATE",
-          `positions[${i}] must be absolute {x,y,z}`,
-          { index: i },
-        );
+        return fail("INVALID_COORDINATE", `positions[${i}] must be absolute {x,y,z}`, { index: i });
       }
       if (![p.x, p.y, p.z].every((n) => typeof n === "number" && Number.isFinite(n))) {
         return fail("INVALID_COORDINATE", `positions[${i}] has non-finite coordinates`, {
@@ -180,7 +188,13 @@ export function resolveTargets(
       const floored = floorAbsolutePosition(p, `positions[${i}]`, repairs);
       targets.push({ dimension, ...floored });
     }
-    return ok({ targets, dimension });
+    return ok({
+      targets,
+      dimension,
+      facing: anchor?.facing,
+      player_origin: anchor?.origin,
+      player_name: anchor?.player_name,
+    });
   }
 
   if (coordinateMode === "player_relative") {
@@ -191,17 +205,9 @@ export function resolveTargets(
     for (let i = 0; i < positions.length; i++) {
       const p = positions[i];
       if (!isRelativePos(p)) {
-        return fail(
-          "INVALID_COORDINATE",
-          `positions[${i}] must be relative {forward,right,up}`,
-          { index: i },
-        );
+        return fail("INVALID_COORDINATE", `positions[${i}] must be relative {forward,right,up}`, { index: i });
       }
-      if (
-        ![p.forward, p.right, p.up].every(
-          (n) => typeof n === "number" && Number.isFinite(n),
-        )
-      ) {
+      if (![p.forward, p.right, p.up].every((n) => typeof n === "number" && Number.isFinite(n))) {
         return fail("INVALID_COORDINATE", `positions[${i}] has non-finite offsets`, {
           index: i,
         });
@@ -250,10 +256,7 @@ export function resolveTargets(
     });
   }
 
-  return fail(
-    "INVALID_ARGUMENT",
-    `coordinate_mode must be absolute or player_relative, got: ${coordinateMode}`,
-  );
+  return fail("INVALID_ARGUMENT", `coordinate_mode must be absolute or player_relative, got: ${coordinateMode}`);
 }
 
 /** Resolve a single corner (absolute or relative) to an absolute target. */
@@ -263,7 +266,7 @@ export function resolveBoxCorner(
   corner: PositionInput | undefined,
   field: string,
   anchor: PlayerAnchor | undefined,
-  repairs: RepairApplied[],
+  repairs: RepairApplied[]
 ): BridgeResult<ResolvedTarget> {
   if (!corner) {
     return fail("INVALID_ARGUMENT", `${field} is required for box target`);
@@ -304,10 +307,7 @@ export function resolveBoxCorner(
 }
 
 /** Enumerate all cells in a normalized AABB (min/max ordered). */
-export function enumerateBoxCells(
-  fromAbs: AbsolutePosition,
-  toAbs: AbsolutePosition,
-): AbsolutePosition[] {
+export function enumerateBoxCells(fromAbs: AbsolutePosition, toAbs: AbsolutePosition): AbsolutePosition[] {
   const minX = Math.min(fromAbs.x, toAbs.x);
   const maxX = Math.max(fromAbs.x, toAbs.x);
   const minY = Math.min(fromAbs.y, toAbs.y);
@@ -327,15 +327,13 @@ export function enumerateBoxCells(
 
 export function boxVolume(fromAbs: AbsolutePosition, toAbs: AbsolutePosition): number {
   return (
-    (Math.abs(toAbs.x - fromAbs.x) + 1) *
-    (Math.abs(toAbs.y - fromAbs.y) + 1) *
-    (Math.abs(toAbs.z - fromAbs.z) + 1)
+    (Math.abs(toAbs.x - fromAbs.x) + 1) * (Math.abs(toAbs.y - fromAbs.y) + 1) * (Math.abs(toAbs.z - fromAbs.z) + 1)
   );
 }
 
 export function getBlockSafe(
   dimensionId: string,
-  location: AbsolutePosition,
+  location: AbsolutePosition
 ): BridgeResult<{ block: ReturnType<typeof getBlockFromDim>; dimensionId: string }> {
   try {
     const dim = world.getDimension(dimensionId);
@@ -374,8 +372,7 @@ function getBlockFromDim(_location: AbsolutePosition) {
       getAllStates: () => Record<string, string | number | boolean>;
     };
     getComponent: (id: string) => unknown;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    setPermutation: (p: any) => void;
+    setPermutation: (p: BlockPermutation) => void;
     setType?: (t: string) => void;
     x?: number;
     y?: number;
@@ -386,21 +383,15 @@ function getBlockFromDim(_location: AbsolutePosition) {
 }
 
 export type WorldBlock = NonNullable<
-  ReturnType<typeof getBlockSafe> extends BridgeResult<infer T>
-    ? T extends { block: infer B }
-      ? B
-      : never
-    : never
+  ReturnType<typeof getBlockSafe> extends BridgeResult<infer T> ? (T extends { block: infer B } ? B : never) : never
 >;
 
 export function resolvePermutation(
   typeId: string,
-  states?: Record<string, string | number | boolean>,
-): BridgeResult<{ permutation: unknown; type_id: string }> {
+  states?: Record<string, string | number | boolean>
+): BridgeResult<{ permutation: BlockPermutation; type_id: string }> {
   try {
-    const permutation = states
-      ? BlockPermutation.resolve(typeId, states as never)
-      : BlockPermutation.resolve(typeId);
+    const permutation = states ? BlockPermutation.resolve(typeId, states as never) : BlockPermutation.resolve(typeId);
     return ok({ permutation, type_id: typeId });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -425,9 +416,7 @@ export function resolvePermutation(
 }
 
 /** Classify a getBlockSafe failure into an UnknownSample status. */
-function unknownStatusFromCode(
-  code: string,
-): UnknownSample["status"] {
+function unknownStatusFromCode(code: string): UnknownSample["status"] {
   if (code === "OUT_OF_BOUNDS") return "out_of_bounds";
   if (code === "UNLOADED_CHUNK") return "unloaded";
   return "unknown";
@@ -439,7 +428,7 @@ function buildInspectSummary(
   unknowns: UnknownSample[],
   fromAbs: AbsolutePosition,
   toAbs: AbsolutePosition,
-  sampleLimit: number,
+  sampleLimit: number
 ): InspectSummary {
   const type_counts: Record<string, number> = {};
   for (const s of snapshots) {
@@ -476,26 +465,18 @@ function buildInspectSummary(
   };
 }
 
-export async function handleInspectBlock(
-  payload: InspectPayload,
-): Promise<BridgeResult<Record<string, unknown>>> {
+export async function handleInspectBlock(payload: InspectPayload): Promise<BridgeResult<Record<string, unknown>>> {
   const repairs: RepairApplied[] = [];
   const coordinateMode = (payload.coordinate_mode ?? "absolute") as CoordinateMode;
-  const maxPositions = Math.min(
-    payload.max_positions ?? DEFAULT_MAX_POSITIONS,
-    HARD_MAX_DISCRETE,
-  );
-  const maxFillVolume = Math.min(
-    payload.max_fill_volume ?? DEFAULT_MAX_FILL_VOLUME,
-    HARD_MAX_FILL_VOLUME,
-  );
+  const maxPositions = Math.min(payload.max_positions ?? DEFAULT_MAX_POSITIONS, HARD_MAX_DISCRETE);
+  const maxFillVolume = Math.min(payload.max_fill_volume ?? DEFAULT_MAX_FILL_VOLUME, HARD_MAX_FILL_VOLUME);
   const summaryThreshold = Math.min(
     payload.inspect_summary_threshold ?? DEFAULT_INSPECT_SUMMARY_THRESHOLD,
-    HARD_MAX_INSPECT_SUMMARY_THRESHOLD,
+    HARD_MAX_INSPECT_SUMMARY_THRESHOLD
   );
   const sampleLimit = Math.min(
     payload.inspect_sample_limit ?? DEFAULT_INSPECT_SAMPLE_LIMIT,
-    HARD_MAX_INSPECT_SAMPLE_LIMIT,
+    HARD_MAX_INSPECT_SAMPLE_LIMIT
   );
 
   // Unified target shape: target.positions or target.box (mutually exclusive).
@@ -512,10 +493,7 @@ export async function handleInspectBlock(
     ) {
       return fail("INVALID_ARGUMENT", "target must provide positions or box");
     }
-    if (
-      payload.target.positions !== undefined &&
-      payload.target.box !== undefined
-    ) {
+    if (payload.target.positions !== undefined && payload.target.box !== undefined) {
       return fail("INVALID_ARGUMENT", "target.positions and target.box are mutually exclusive");
     }
     if (payload.target.positions !== undefined) {
@@ -526,12 +504,7 @@ export async function handleInspectBlock(
       targetShape = "positions";
     } else {
       const b = payload.target.box!;
-      if (
-        typeof b !== "object" ||
-        b === null ||
-        b.from === undefined ||
-        b.to === undefined
-      ) {
+      if (typeof b !== "object" || b === null || b.from === undefined || b.to === undefined) {
         return fail("INVALID_ARGUMENT", "target.box must provide from and to");
       }
       box = b;
@@ -558,13 +531,7 @@ export async function handleInspectBlock(
       });
     }
 
-    const resolved = resolveTargets(
-      coordinateMode,
-      payload.dimension,
-      positions,
-      payload.player_name,
-      repairs,
-    );
+    const resolved = resolveTargets(coordinateMode, payload.dimension, positions, payload.player_name, repairs);
     if (!resolved.ok) return resolved;
 
     // Single or few points: full snapshots (never summarized below threshold).
@@ -582,7 +549,7 @@ export async function handleInspectBlock(
             x: target.x,
             y: target.y,
             z: target.z,
-          }),
+          })
         );
       }
       return ok({
@@ -637,7 +604,7 @@ export async function handleInspectBlock(
           x: target.x,
           y: target.y,
           z: target.z,
-        }),
+        })
       );
     }
     const summary = buildInspectSummary(
@@ -645,7 +612,7 @@ export async function handleInspectBlock(
       unknowns,
       { x: minT.x, y: minT.y, z: minT.z },
       { x: maxT.x, y: maxT.y, z: maxT.z },
-      sampleLimit,
+      sampleLimit
     );
     return ok({
       schema_version: SCHEMA_VERSION,
@@ -662,11 +629,10 @@ export async function handleInspectBlock(
   let anchor: PlayerAnchor | undefined;
   let dimension: string;
   if (coordinateMode === "absolute") {
-    const dim = repairDimension(payload.dimension, repairs);
-    if (!dim) {
-      return fail("INVALID_ARGUMENT", "dimension is required for absolute box target");
-    }
-    dimension = dim;
+    const dimensionResult = resolveAbsoluteDimension(payload.dimension, payload.player_name, repairs);
+    if (!dimensionResult.ok) return dimensionResult;
+    dimension = dimensionResult.payload.dimension;
+    anchor = dimensionResult.payload.anchor;
   } else {
     const anchorResult = resolvePlayerAnchor(payload.player_name ?? "");
     if (!anchorResult.ok) return anchorResult;
@@ -674,23 +640,9 @@ export async function handleInspectBlock(
     dimension = anchor.dimension;
   }
 
-  const fromResult = resolveBoxCorner(
-    coordinateMode,
-    dimension,
-    box!.from,
-    "target.box.from",
-    anchor,
-    repairs,
-  );
+  const fromResult = resolveBoxCorner(coordinateMode, dimension, box!.from, "target.box.from", anchor, repairs);
   if (!fromResult.ok) return fromResult;
-  const toResult = resolveBoxCorner(
-    coordinateMode,
-    dimension,
-    box!.to,
-    "target.box.to",
-    anchor,
-    repairs,
-  );
+  const toResult = resolveBoxCorner(coordinateMode, dimension, box!.to, "target.box.to", anchor, repairs);
   if (!toResult.ok) return toResult;
 
   const fromAbs: AbsolutePosition = { x: fromResult.payload.x, y: fromResult.payload.y, z: fromResult.payload.z };
@@ -711,9 +663,7 @@ export async function handleInspectBlock(
     for (const cell of cells) {
       const blockResult = getBlockSafe(dimension, cell);
       if (!blockResult.ok) return blockResult;
-      blocks.push(
-        buildBlockSnapshot(blockResult.payload.block, dimension, cell),
-      );
+      blocks.push(buildBlockSnapshot(blockResult.payload.block, dimension, cell));
     }
     return ok({
       schema_version: SCHEMA_VERSION,

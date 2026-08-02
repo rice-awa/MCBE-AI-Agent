@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-
 HARD_MAX_DISCRETE_POSITIONS = 1024
 HARD_MAX_FILL_VOLUME = 16384
 HARD_MAX_CELLS_PER_TICK = 512

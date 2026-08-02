@@ -155,7 +155,7 @@ def map_addon_bridge_result(
             logger.debug(
                 "block_bridge_success_raw",
                 mode=mode or payload.get("mode"),
-                keys=sorted(str(k) for k in payload.keys()),
+                keys=sorted(str(k) for k in payload),
             )
             model_payload = project_block_result_for_model(
                 payload,
