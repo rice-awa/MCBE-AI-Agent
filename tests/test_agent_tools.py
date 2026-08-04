@@ -517,3 +517,118 @@ def test_tool_result_player_message_hides_diagnostics() -> None:
     assert "stacktrace" not in result.player_message()
     assert "TypeError" not in result.player_message()
     assert result.diagnostic_summary == "TypeError: boom"
+
+
+def test_block_tool_schemas_only_expose_public_fields() -> None:
+    """三个新方块工具 schema 只暴露公开参数，不含隐藏字段。"""
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent, settings=Settings(runtime_harness_schema_enabled=False))
+
+    tools = iter_registered_tools(agent)
+
+    # 旧工具已移除
+    assert "edit_blocks" not in tools, "edit_blocks 不应再注册"
+
+    # place_block
+    assert "place_block" in tools, "place_block 应已注册"
+    place_schema = tools["place_block"].tool_def.parameters_json_schema or {}
+    place_props = place_schema.get("properties", {})
+    assert set(place_props) == {"pos", "block", "expect", "states"}, (
+        f"place_block 参数应为 pos/block/expect/states，实际: {set(place_props)}"
+    )
+    assert "edits" not in place_props
+    assert "dimension" not in place_props
+    assert "mode" not in place_props
+    assert "positions" not in place_props
+    assert "coordinate_mode" not in place_props
+    assert "locked_targets" not in place_props
+    assert "phase" not in place_props
+    assert "status" not in place_props
+
+    # fill_block
+    assert "fill_block" in tools, "fill_block 应已注册"
+    fill_schema = tools["fill_block"].tool_def.parameters_json_schema or {}
+    fill_props = fill_schema.get("properties", {})
+    assert set(fill_props) == {"from", "to", "block", "expect", "states"}, (
+        f"fill_block 参数应为 from/to/block/expect/states，实际: {set(fill_props)}"
+    )
+    assert "edits" not in fill_props
+    assert "dimension" not in fill_props
+    assert "mode" not in fill_props
+    assert "positions" not in fill_props
+    assert "coordinate_mode" not in fill_props
+    assert "locked_targets" not in fill_props
+    assert "phase" not in fill_props
+    assert "status" not in fill_props
+
+    # inspect_block
+    assert "inspect_block" in tools, "inspect_block 应已注册"
+    inspect_schema = tools["inspect_block"].tool_def.parameters_json_schema or {}
+    inspect_props = inspect_schema.get("properties", {})
+    assert set(inspect_props) == {"target"}, (
+        f"inspect_block 参数应仅为 target，实际: {set(inspect_props)}"
+    )
+    assert "edits" not in inspect_props
+    assert "dimension" not in inspect_props
+    assert "mode" not in inspect_props
+    assert "positions" not in inspect_props
+    assert "coordinate_mode" not in inspect_props
+    assert "locked_targets" not in inspect_props
+    assert "phase" not in inspect_props
+    assert "status" not in inspect_props
+
+
+def test_block_tool_pos_expect_and_states_constraints() -> None:
+    """pos 长度 3、expect 默认 air、states 可选、fill_block JSON 参数名为 from/to。"""
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent, settings=Settings(runtime_harness_schema_enabled=False))
+
+    tools = iter_registered_tools(agent)
+
+    # place_block pos 约束
+    place_schema = tools["place_block"].tool_def.parameters_json_schema or {}
+    pos_schema = place_schema["properties"]["pos"]
+    assert pos_schema.get("minItems") == 3
+    assert pos_schema.get("maxItems") == 3
+    assert pos_schema.get("type") == "array"
+
+    # expect 默认值
+    expect_schema = place_schema["properties"]["expect"]
+    assert expect_schema.get("default") == "air"
+
+    # states 可选
+    assert "states" not in (place_schema.get("required") or [])
+
+    # fill_block 参数名
+    fill_schema = tools["fill_block"].tool_def.parameters_json_schema or {}
+    fill_props = fill_schema["properties"]
+    assert "from" in fill_props, "fill_block 应有 from（非 from_）"
+    assert "to" in fill_props
+
+
+def test_inspect_block_target_union_schema() -> None:
+    """inspect_block.target 为单点或双角点二选一。"""
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent, settings=Settings(runtime_harness_schema_enabled=False))
+
+    tools = iter_registered_tools(agent)
+
+    inspect_schema = tools["inspect_block"].tool_def.parameters_json_schema or {}
+    target_schema = inspect_schema["properties"]["target"]
+
+    # union 类型应产生 anyOf
+    assert "anyOf" in target_schema, f"target schema 应有 anyOf，实际: {list(target_schema)}"
+    any_of = target_schema["anyOf"]
+    assert len(any_of) == 2, f"anyOf 应有 2 个分支，实际: {len(any_of)}"
+
+    # 分支 1: 单点 [x,y,z]
+    single = any_of[0]
+    assert single.get("type") == "array"
+    assert single.get("minItems") == 3
+    assert single.get("maxItems") == 3
+
+    # 分支 2: 双角点 [[x1,y1,z1],[x2,y2,z2]]
+    dual = any_of[1]
+    assert dual.get("type") == "array"
+    assert dual.get("minItems") == 2
+    assert dual.get("maxItems") == 2
