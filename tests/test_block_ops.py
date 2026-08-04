@@ -2550,8 +2550,8 @@ def test_block_preflight_plan_keeps_unknown_evidence_out_of_operation_args() -> 
     assert plan.approval_metadata["future_evidence"] == {"version": 2}
 
 
-def test_project_block_execute_args_is_subset_of_public_tool_signatures() -> None:
-    """New single-op tools have execute args that are a subset of public signatures."""
+def test_single_op_tool_public_schemas_expose_only_contract_fields() -> None:
+    """Single-op tools' public schemas expose exactly the contract fields, no hidden fields."""
     agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
     register_agent_tools(agent)
     tools = iter_registered_tools(agent)  # type: ignore[arg-type]

@@ -272,9 +272,8 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         "需要确认世界状态（查看方块或区域）时使用；单点返回 block/states/"
         "waterlogged/is_air/is_liquid，区域返回 count/type_counts/samples。",
         "不要用于修改方块；不要机械地在每次编辑前先查一遍；不要用命令试探方块状态。",
-        "target 为单点 [x,y,z] 或两角点 [[x1,y1,z1],[x2,y2,z2]]，"
-        "或 {positions:[...]} / {box:{from,to}}（互斥）；"
-        "坐标为 {x,y,z} 或 {forward,right,up}，同一 target 内不能混用。",
+        "target 为单点 [x,y,z] 或两角点 [[x1,y1,z1],[x2,y2,z2]]；"
+        "所有坐标均为绝对世界坐标整数。",
         preview=ParameterPreviewPolicy(
             include=("target",)
         ),
@@ -286,9 +285,9 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         ToolRisk.HIGH,
         "在单个格子上写入方块时使用；连续区域优先用 fill_block。",
         "不要用于查询；不要拆成多个单格来填充连续区域；不要用于覆盖保护数据。",
-        "pos 为 [x,y,z] 绝对坐标；block 为 type_id 字符串或 {type_id, states}；"
+        "pos 为 [x,y,z] 绝对坐标；block 为 type_id 字符串（如 \"minecraft:stone\"）；"
         "expect 默认 air（仅替换空气），可选 any（需再审批）/ type_id；"
-        "states 为可选方块状态字典。",
+        "states 为可选的方块状态字典。",
         preview=ParameterPreviewPolicy(
             include=("pos", "block", "expect", "states")
         ),
@@ -301,8 +300,8 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         "填充连续区域（地板/墙体/屋顶等）时使用；单格用 place_block。",
         "不要用于查询；不要用多个 place_block 模拟连续区域；不要用于覆盖保护数据。",
         "from 与 to 为两个绝对角点 [x,y,z]（自动归一化）；block 为 type_id 字符串"
-        "或 {type_id, states}；expect 默认 air（仅替换空气），可选 any（需再审批）/ type_id；"
-        "states 为可选方块状态字典。",
+        "（如 \"minecraft:stone\"）；expect 默认 air（仅替换空气），可选 any（需再审批）/ type_id；"
+        "states 为可选的方块状态字典。",
         preview=ParameterPreviewPolicy(
             include=("from", "to", "block", "expect", "states")
         ),
