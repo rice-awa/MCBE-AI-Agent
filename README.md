@@ -20,10 +20,10 @@
 - **对话管理**: 多对话新建/切换/保存/恢复，上下文开关，历史自动压缩
 - **动态系统提示词**: 根据玩家信息与模板动态调整
 
-### 🔌 多 LLM 支持
-- **DeepSeek**: `deepseek-chat`（默认）
-- **OpenAI**: `gpt-4o` 等模型
-- **Anthropic**: `claude-sonnet-4-20250514`
+### 🔌 多 LLM 支持（openai兼容格式）
+- **DeepSeek**: `deepseek-v4-flash`（默认）
+- **OpenAI**: `gpt-5.6` 等模型
+- **Anthropic**: `claude-sonnet-5`
 - **Ollama**: 本地模型（如 `llama3`）
 
 ### 🎮 用户友好
@@ -107,7 +107,7 @@ DEEPSEEK_API_KEY=your-api-key-here
     "deepseek": {
       "api_key": "${DEEPSEEK_API_KEY}",
       "base_url": "https://api.deepseek.com",
-      "model": "deepseek-chat"
+      "model": "deepseek-v4-flash"
     }
   }
 }

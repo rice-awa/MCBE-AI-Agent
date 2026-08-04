@@ -14,16 +14,16 @@
     "deepseek": {
       "api_key": "${DEEPSEEK_API_KEY}",
       "base_url": "https://api.deepseek.com",
-      "model": "deepseek-chat"
+      "model": "deepseek-v4-flash"
     },
     "openai": {
       "api_key": null,
       "base_url": null,
-      "model": "gpt-4o"
+      "model": "gpt-5.6"
     },
     "anthropic": {
       "api_key": null,
-      "model": "claude-sonnet-4-20250514"
+      "model": "claude-sonnet-5"
     },
     "ollama": {
       "base_url": "http://localhost:11434",
