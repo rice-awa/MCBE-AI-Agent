@@ -3664,3 +3664,222 @@ def test_precondition_failed_without_counts_omits_empty_keys() -> None:
     assert "actual_type_id" not in body
     assert body["target"] == {"x": 1, "y": 64, "z": 2}
     assert "hint" in body
+
+
+# ---------------------------------------------------------------------------
+# Task 7: 新契约回归与集成测试（spec §8.2）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_twelve_discrete_points_never_exceed_budget_and_no_limit_exceeded() -> None:
+    """Task 7 Step 2: 旧 12 离散点场景在新契约下不再产生 LIMIT_EXCEEDED。
+
+    旧 contract 的 12 个离散点 batch 帧 654–777B > 461B 必然触发
+    LIMIT_EXCEEDED 重试；新契约模型只能表达 12 个独立 place_block（或
+    4 个 1x3x1 柱形 fill），宿主逐帧通过 commandLine 预算检查（spec §1.2）。
+    """
+    # 旧形态锚点：单帧 12 个离散点必然超预算（回归 spec §1.2 表格）。
+    legacy_positions = [
+        {"x": x, "y": 64, "z": z} for x in range(1, 5) for z in range(1, 4)
+    ]
+    legacy_payload = build_edit_payload(
+        mode="place",
+        coordinate_mode="absolute",
+        dimension=None,
+        position=None,
+        positions=legacy_positions,
+        from_pos=None,
+        to_pos=None,
+        type_id="minecraft:stone",
+        states=None,
+        replace_any=False,
+        expected_previous=None,
+        player_name="Steve",
+        phase="execute",
+    )
+    legacy_bytes = estimate_bridge_command_line_bytes("edit_blocks", legacy_payload)
+    assert legacy_bytes > DEFAULT_COMMAND_LINE_BYTE_BUDGET  # 654–777B > 461B
+
+    # 12 个独立 place_block：全部成功、无 LIMIT_EXCEEDED、每帧合规。
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+
+    for x in range(1, 5):
+        for z in range(1, 4):
+            result = await place_block_impl(
+                ctx,  # type: ignore[arg-type]
+                pos=[x, 64, z],
+                block="stone",
+            )
+            assert result.is_success
+            assert "LIMIT_EXCEEDED" not in result.output
+
+    place_payloads = [p for cap, p in bridge.calls if cap == "edit_blocks"]
+    assert len(place_payloads) == 12
+    for payload in place_payloads:
+        assert check_bridge_command_line_budget("edit_blocks", payload) is None
+        assert (
+            estimate_bridge_command_line_bytes("edit_blocks", payload)
+            <= DEFAULT_COMMAND_LINE_BYTE_BUDGET
+        )
+
+    # 4 个 1x3x1 柱形 fill（旧场景 4 帧 1,484B）：同样无超限。
+    bridge2 = _FakeBridge()
+    cid2 = str(uuid4())
+    await ensure_block_capability(cid2, bridge2)
+    deps2 = _Deps(connection_id=cid2, addon_bridge=bridge2)
+    ctx2 = SimpleNamespace(deps=deps2)
+    for x in range(1, 5):
+        result = await fill_block_impl(
+            ctx2,  # type: ignore[arg-type]
+            from_=[x, 64, 1],
+            to=[x, 66, 1],
+            block="stone",
+        )
+        assert result.is_success
+        assert "LIMIT_EXCEEDED" not in result.output
+
+    fill_payloads = [p for cap, p in bridge2.calls if cap == "edit_blocks"]
+    assert len(fill_payloads) == 4
+    for payload in fill_payloads:
+        assert check_bridge_command_line_budget("edit_blocks", payload) is None
+        assert (
+            estimate_bridge_command_line_bytes("edit_blocks", payload)
+            <= DEFAULT_COMMAND_LINE_BYTE_BUDGET
+        )
+
+
+@pytest.mark.asyncio
+async def test_grass_house_fill_expect_any_succeeds_expect_air_precondition() -> None:
+    """Task 7 Step 3: 草地上盖房子。
+
+    ``expect=any`` 成功覆盖草方块；``expect=air`` 遇到草方块返回可操作的
+    PRECONDITION_FAILED（含 actual_type_counts 与坐标），fallback_allowed=False。
+    """
+    async def grass_handler(cap: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if cap == "get_capabilities":
+            return {
+                "ok": True,
+                "payload": {
+                    "capabilities": {
+                        "block_ops": {"inspect": True, "edit": True, "schema_version": "1"}
+                    }
+                },
+            }
+        if cap == "edit_blocks":
+            if payload.get("replace_any") is True:
+                return {
+                    "ok": True,
+                    "payload": {
+                        "schema_version": "1",
+                        "ok": True,
+                        "status": "succeeded",
+                        "mode": "fill",
+                        "changed": 9,
+                        "skipped": 0,
+                        "from": payload["from"],
+                        "to": payload["to"],
+                    },
+                }
+            return {
+                "ok": False,
+                "payload": {
+                    "code": "PRECONDITION_FAILED",
+                    "message": "expected air but target contains non-air blocks",
+                    "target": payload.get("from") or payload.get("position"),
+                    "actual_type_counts": {"minecraft:grass_block": 3},
+                },
+            }
+        return {"ok": True, "payload": {"ok": True}}
+
+    bridge = _FakeBridge(grass_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+
+    # expect=any：成功覆盖草方块。
+    result = await fill_block_impl(
+        ctx,  # type: ignore[arg-type]
+        from_=[1, 64, 1],
+        to=[3, 64, 3],
+        block="minecraft:oak_planks",
+        expect="any",
+    )
+    assert result.is_success
+    body = json.loads(result.output)
+    assert body["ok"] is True
+    assert body["status"] == "succeeded"
+    wire = [c for c in bridge.calls if c[0] == "edit_blocks"][-1][1]
+    assert wire["replace_any"] is True
+
+    # expect=air：遇到草方块 → PRECONDITION_FAILED（可操作诊断）。
+    result = await fill_block_impl(
+        ctx,  # type: ignore[arg-type]
+        from_=[1, 64, 1],
+        to=[3, 64, 3],
+        block="minecraft:oak_planks",
+        expect="air",
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "PRECONDITION_FAILED"
+    assert body["actual_type_counts"] == {"minecraft:grass_block": 3}
+    assert body["target"] == {"x": 1, "y": 64, "z": 1}
+    assert body["fallback_allowed"] is False
+    assert body["retryable"] is False
+    assert "grass_block" in body.get("hint", "")
+
+
+def test_new_tool_schemas_are_slim_no_hidden_fields_and_prompt_catalog_clean() -> None:
+    """Task 7 Step 5: 三个新工具 schema 无隐藏字段且总字符数 < 旧 2,271 基线。
+
+    - place_block / fill_block / inspect_block 的完整 JSON schema（含描述）
+      不含 locked_targets / phase / status / dimension / mode / edits /
+      positions / coordinate_mode 等内部字段；
+    - 三个 schema 序列化总字符数小于旧 ``edit_blocks`` 单模型 schema 的
+      2,271 字符基线（spec §1.2）；
+    - 提示词与工具目录不含 locked_targets / phase / status 字符串。
+    """
+    agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
+    register_agent_tools(agent)
+    tools = iter_registered_tools(agent)  # type: ignore[arg-type]
+
+    hidden = (
+        "locked_targets",
+        "locked_targets_by_edit",
+        "phase",
+        "status",
+        "dimension",
+        "mode",
+        "edits",
+        "positions",
+        "coordinate_mode",
+        "noop_edit_indices",
+        "repairs_applied",
+        "expected_previous",
+    )
+    total_chars = 0
+    for tool_name in ("place_block", "fill_block", "inspect_block"):
+        schema = tools[tool_name].tool_def.parameters_json_schema
+        serialized = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+        total_chars += len(serialized)
+        for token in hidden:
+            assert token not in serialized, (
+                f"{token} leaked into {tool_name} model-visible schema"
+            )
+
+    assert total_chars < 2271, f"three schemas total {total_chars} chars >= legacy 2271"
+
+    for path in (
+        Path("services/agent/prompt.py"),
+        Path("services/agent/harness/prompting.py"),
+        Path("services/agent/harness/catalog.py"),
+    ):
+        text = path.read_text(encoding="utf-8")
+        for token in ("locked_targets", "phase", "status"):
+            assert token not in text, f"{token} found in {path}"

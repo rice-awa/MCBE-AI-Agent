@@ -1566,3 +1566,136 @@ async def test_plan_id_resume_malformed_payload_rejected_at_validation(
     assert "kwargs" not in captured
     # 拒绝：重新进入待审批，而不是静默通过验证边界
     assert isinstance(rejected.output, DeferredToolRequests)
+
+
+# ---------------------------------------------------------------------------
+# Task 7 Step 4: 命令回退门控对新工具名生效
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_new_tool_failure_denies_command_fallback_in_same_run() -> None:
+    """Task 7 Step 4: 新工具名失败（fallback_allowed=false）门控命令回退。
+
+    place_block（新契约工具名）执行失败后，同一 run 内的 setblock 命令回退
+    被 ``_block_command_fallback_denial`` 拒绝：run_minecraft_command 公共
+    body 不执行，结构化 PRECONDITION_FAILED 诊断回到模型。
+    """
+    counter: dict[str, int] = {}
+    policy = PolicyEngine.from_settings(_Settings())
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=policy)],
+    )
+
+    @agent.tool
+    async def place_block(
+        ctx: RunContext[_Deps], pos: list[int], block: str, expect: str = "air"
+    ) -> str:
+        counter["place_block"] = counter.get("place_block", 0) + 1
+        return ToolResult.failure(
+            json.dumps(
+                {
+                    "ok": False,
+                    "code": "PRECONDITION_FAILED",
+                    "fallback_allowed": False,
+                    "message": "expected air, found minecraft:grass_block",
+                }
+            ),
+            error_kind="PRECONDITION_FAILED",
+            retryable=False,
+        )
+
+    @agent.tool
+    async def run_minecraft_command(ctx: RunContext[_Deps], command: str) -> str:
+        counter["run_minecraft_command"] = counter.get("run_minecraft_command", 0) + 1
+        return ToolResult.ok(f"executed:{command}")
+
+    calls = [
+        ("place_block", {"pos": [1, 64, 1], "block": "stone", "expect": "air"}),
+        ("run_minecraft_command", {"command": "setblock ~ ~ ~ stone"}),
+    ]
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        if calls:
+            tool_name, args = calls.pop(0)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=tool_name,
+                        tool_call_id=f"tc-{tool_name}",
+                        args=args,
+                    )
+                ]
+            )
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    connection_id = "conn-fallback-gate"
+    _set_supported_block_capability(connection_id)
+    deps = _Deps(
+        settings=_Settings(),
+        run_id="run-fallback-gate",
+        auto_approve_tools=True,
+        connection_id=connection_id,
+    )
+
+    result = await agent.run(
+        "place stone then build a wall with setblock",
+        model=FunctionModel(model_fn),
+        deps=deps,
+    )
+
+    assert counter.get("place_block") == 1
+    assert counter.get("run_minecraft_command", 0) == 0
+    record = get_block_command_fallback_store().get(
+        connection_id, "Steve", "run-fallback-gate"
+    )
+    assert record is not None
+    assert record.fallback_allowed is False
+    assert record.code == "PRECONDITION_FAILED"
+    # ToolDenied 以 ToolReturnPart.content 形式回到模型；序列化为文本断言
+    # 结构化诊断（含 code）确实送达。
+    parts_text = [
+        str(getattr(part, "content", ""))
+        for message in result.all_messages()
+        for part in getattr(message, "parts", []) or []
+    ]
+    text = " | ".join(parts_text)
+    assert "PRECONDITION_FAILED" in text
+    assert "不允许命令回退" in text
+
+
+def test_recorded_outcome_from_new_tool_failure_gates_direct_fallback() -> None:
+    """Task 7 Step 4: 直接记录的新工具失败结果同样进入回退门控。
+
+    与旧 ``edit_blocks`` 失败等价的 place_block 失败结果（经桥接映射的
+    ToolResult）写入 fallback store 后，``_block_command_fallback_denial``
+    对 setblock 命令返回 DENY，且原因含结构化 code。
+    """
+    _set_supported_block_capability("conn-1")
+    # 等价于新工具桥接失败映射后的 ToolResult（output 为结构化错误 JSON）。
+    mapped = ToolResult.failure(
+        json.dumps(
+            {
+                "ok": False,
+                "code": "PRECONDITION_FAILED",
+                "fallback_allowed": False,
+                "message": "expected air, found minecraft:grass_block",
+            }
+        ),
+        error_kind="PERMANENT",
+        retryable=False,
+    )
+    _record_block_edit_fallback_outcome(
+        mapped,
+        connection_id="conn-1",
+        player_name="Steve",
+        run_id="run-1",
+    )
+
+    denial = _fallback_denial()
+    assert denial is not None
+    assert denial.action == PolicyDecisionKind.DENY
+    assert "PRECONDITION_FAILED" in denial.reason

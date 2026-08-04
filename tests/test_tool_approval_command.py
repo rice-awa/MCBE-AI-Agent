@@ -600,3 +600,112 @@ async def test_handle_tool_approval_rejects_swapped_original_tool_call_ids(
 
     handler.broker.submit_request.assert_not_awaited()
     assert handler._send_player_reply.await_count >= 3
+
+
+@pytest.mark.asyncio
+async def test_four_parallel_fill_blocks_merge_into_one_approval_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task 7 Step 1: 同一轮 4 个并行 fill_block 合并为一批审批。
+
+    前 3 次 ``AGENT 同意`` 只记录决策并等待；第 4 次齐套后一次性恢复，
+    四个 ``{"kind": "tool-approved", "plan_id": ...}`` 负载一起回到 broker，
+    且 submit_request 只被调用一次。``batch_id`` / ``sibling_approval_ids``
+    语义与旧 contract 完全一致。
+    """
+    store = PendingApprovalStore(default_ttl_seconds=120.0)
+    monkeypatch.setattr(
+        "services.agent.runtime.get_agent_runtime",
+        lambda: SimpleNamespace(get_pending_approval_store=lambda _settings: store),
+    )
+    handler = object.__new__(CommandHandlers)
+    handler.protocol = MagicMock()
+    handler.protocol.create_success_message.return_value = "ok"
+    handler.protocol.create_info_message.return_value = "info"
+    handler.protocol.create_error_message.return_value = "invalid"
+    handler._send_player_reply = AsyncMock()
+    handler.broker = MagicMock()
+    handler.settings = MagicMock()
+    handler.broker.get_active_conversation_id.return_value = "conv-1"
+    handler.broker.get_conversation_generation.return_value = 1
+    handler.broker.get_conversation_invalidation_epoch.return_value = 1
+    handler.broker.submit_request = AsyncMock()
+    session = SimpleNamespace(current_provider="test")
+    handler._require_host = lambda _state: SimpleNamespace(
+        get_player_session=lambda _owner: session,
+        should_auto_approve_tools=lambda *_args: False,
+    )
+    state = SimpleNamespace(id=uuid4())
+
+    batch_id = "batch-fill"
+    sibling_ids = ["f1", "f2", "f3", "f4"]
+    canonical = {
+        "from": [2, 64, 1],
+        "to": [4, 64, 3],
+        "block": "minecraft:stone",
+        "expect": "air",
+    }
+    approval_parts = []
+    for index, ap_id in enumerate(sibling_ids, start=1):
+        tool_call_id = f"tc-fill-{index}"
+        plan_id = f"pid-{index}"
+        pending = _make_pending(
+            approval_id=ap_id,
+            tool_call_id=tool_call_id,
+            batch_id=batch_id,
+            sibling_ids=sibling_ids,
+            plan_id=plan_id,
+        )
+        pending.connection_id = str(state.id)
+        pending.tool_name = "fill_block"
+        pending.expected_tool_call_id = tool_call_id
+        pending.execution_args_hash = hash_normalized_args(
+            normalize_tool_args(canonical)
+        )
+        approval_parts.append(
+            ToolCallPart(
+                tool_name="fill_block", args=canonical, tool_call_id=tool_call_id
+            )
+        )
+        get_preflight_cache().put(
+            run_id=pending.run_id,
+            tool_call_id=tool_call_id,
+            original_args_hash=f"orig-h-{index}",
+            canonical_args=canonical,
+            connection_id=str(state.id),
+            tool_name="fill_block",
+            plan_id=plan_id,
+        )
+        store.put(pending)
+
+    # 同批共享同一组 deferred calls（模型同轮并行发出的 4 个调用）。
+    requests = DeferredToolRequests(approvals=approval_parts)
+    for ap_id in sibling_ids:
+        pending = store.get(str(state.id), "Steve", "conv-1", ap_id)
+        assert pending is not None
+        pending.requests = requests
+
+    for index, ap_id in enumerate(sibling_ids, start=1):
+        await handler.handle_tool_approval(
+            state, ap_id, approved=True, player_name="Steve"
+        )
+        if index < 4:
+            handler.broker.submit_request.assert_not_awaited()
+        else:
+            handler.broker.submit_request.assert_awaited_once()
+
+    payload = handler.broker.submit_request.await_args.args[
+        1
+    ].deferred_tool_results["approvals"]
+    assert payload == {
+        f"tc-fill-{index}": {"kind": "tool-approved", "plan_id": f"pid-{index}"}
+        for index in range(1, 5)
+    }
+
+    # 前 3 次决策各发一条“等待”信息；第 4 次发“继续执行”。
+    info_replies = [
+        call.args[1]
+        for call in handler._send_player_reply.await_args_list
+        if call.args[1] == "info"
+    ]
+    assert len(info_replies) == 3
