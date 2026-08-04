@@ -149,6 +149,8 @@ python cli.py serve --dev
 
 ### 1. 连接服务器
 
+> ⚠️ 连接前请在游戏设置 → 通用中**启用 WebSocket并关闭需要加密的 Websocket选项**。本项目服务端默认使用未加密的 `ws://` 连接，开启加密后 MCBE 会拒绝连接。
+
 在 Minecraft 聊天框输入：
 
 ```
@@ -319,6 +321,8 @@ npm install && npm test && npm run build && npm run local-deploy  # 2. 构建并
 ```
 
 进入世界后确认模拟玩家 `MCBEWS_BRIDGE` 已生成，`/wsserver <IP>:8080` 连接后即可对话触发 Addon 能力。
+
+> **⚠️ 使用 Addon 前置条件**：启用本 Addon 必须在世界设置中开启 **实验性 API**（创建世界时"实验性玩法"或世界设置的"实验性内容"里勾选 **实验性 API / Beta API**）。Addon 依赖实验性游戏测试框架（`@minecraft/server-gametest` 等），未开启时行为包不会加载，`MCBEWS_BRIDGE` 模拟玩家也不会生成。
 
 ## 部署
 
