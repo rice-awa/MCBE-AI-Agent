@@ -190,6 +190,8 @@ def register_agent_tools(
         - ``setblock`` / ``fill`` 的方块状态用 ``["状态名":"值"]`` 语法，如
           ``setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction":"south"]``，
           不要用 Java 的 ``[facing=south,half=lower]``。
+        - 不确定某个命令的用法或参数时，先执行 ``help <命令名>``（即游戏内 ``/help <命令名>``）
+          获取用法说明，不要凭空猜测。
 
         Args:
             ctx: 运行上下文
@@ -238,6 +240,8 @@ def register_agent_tools(
           不要用 Java 的 ``[facing=south,half=lower]``。
         每次最多 20 条命令，超出请拆分为多次调用。
         一次 run 最多 16 次工具调用，请合理规划，避免超限被拒后反复重试。
+        不确定某个命令的用法或参数时，先把 ``help <命令名>``（即游戏内 ``/help <命令名>``）
+        放进命令列表查询用法，不要凭空猜测。
 
         Args:
             ctx: 运行上下文
@@ -1125,6 +1129,8 @@ def register_agent_tools(
         """通过 addon 桥接受控执行世界命令。(仅当run_minecraft_command工具无法使用才用)
         命令必须使用基岩版（Bedrock Edition）命令语法，ID 一律带 ``minecraft:`` 命名空间；
         不支持 Java 版 NBT ``{...}`` 数据标签与 ``[state=value]`` 状态语法。
+        不确定某个命令的用法或参数时，先执行 ``help <命令名>``（即游戏内 ``/help <命令名>``）
+        获取用法说明，不要凭空猜测。
         """
         from services.agent.block_ops.bridge import (
             map_addon_bridge_result,
