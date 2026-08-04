@@ -169,39 +169,35 @@ def test_validation_failure_extractor_matches_call_and_deduplicates_retry_timest
 
     retry_at = datetime(2026, 8, 2, 15, 0, 0, tzinfo=UTC)
     parameters = {
-        "edits": [
-            {
-                "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-                "block": "minecraft:stone",
-            }
-            for _ in range(40)
-        ],
-        "dimension": "minecraft:overworld",
+        "from": [0, 64, 0],
+        "to": [4, 64, 4],
+        "block": "minecraft:stone",
+        "expect": "air",
         "api_key": "do-not-record",
     }
     validation_content = [{
         "type": "json_invalid",
-        "loc": ("edits",),
+        "loc": ("from",),
         "msg": "Invalid JSON: secret-input",
         "input": "secret-input",
     }]
     retry = RetryPromptPart(
         validation_content,
-        tool_name="edit_blocks",
+        tool_name="fill_block",
         tool_call_id="tc-invalid",
         timestamp=retry_at,
     )
     messages = [
         ModelResponse(parts=[
             ToolCallPart(
-                tool_name="edit_blocks",
+                tool_name="fill_block",
                 args=parameters,
                 tool_call_id="tc-invalid",
             )
         ]),
         ModelRequest(parts=[retry, RetryPromptPart(
             validation_content,
-            tool_name="edit_blocks",
+            tool_name="fill_block",
             tool_call_id="tc-invalid",
             timestamp=retry_at,
         )]),
@@ -211,14 +207,14 @@ def test_validation_failure_extractor_matches_call_and_deduplicates_retry_timest
 
     assert len(failures) == 1
     failure = failures[0]
-    assert failure["tool_name"] == "edit_blocks"
+    assert failure["tool_name"] == "fill_block"
     assert failure["tool_call_id"] == "tc-invalid"
     assert failure["retry_timestamp"] == retry_at.isoformat()
     assert failure["error_type"] == "json_invalid"
-    assert failure["error_locations"] == ["edits"]
-    assert failure["parameters"]["dimension"] == "minecraft:overworld"
-    assert failure["parameters"]["edits"][0]["block"] == "minecraft:stone"
-    assert len(failure["parameters"]["edits"]) == 32
+    assert failure["error_locations"] == ["from"]
+    assert failure["parameters"]["from"] == [0, 64, 0]
+    assert failure["parameters"]["block"] == "minecraft:stone"
+    assert failure["parameters"]["expect"] == "air"
     assert failure["parameters"].get("api_key") == "[REDACTED]"
 
 
@@ -493,14 +489,18 @@ def test_block_approval_audit_keeps_authorized_preview_without_locked_targets() 
     settings = Settings()
     ctx = SimpleNamespace(deps=DummyDeps(settings, run_id="run-block-audit"), tool_call_id="tc-block-audit")
     record = build_audit_record(
-        tool_name="edit_blocks",
-        parameters={"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"},
+        tool_name="fill_block",
+        parameters={
+            "from": [0, 64, 0],
+            "to": [4, 64, 4],
+            "block": "minecraft:stone",
+            "expect": "air",
+        },
         authorized_args={
-            "edits": [{
-                "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-                "block": "minecraft:stone",
-            }],
-            "dimension": "minecraft:overworld",
+            "from": [0, 64, 0],
+            "to": [4, 64, 4],
+            "block": "minecraft:stone",
+            "expect": "air",
             "locked_targets": [{"x": 1, "y": 64, "z": 1}],
         },
         approval_evidence={
@@ -517,8 +517,9 @@ def test_block_approval_audit_keeps_authorized_preview_without_locked_targets() 
 
     assert record["run_id"] == "run-block-audit"
     assert record["tool_call_id"] == "tc-block-audit"
-    assert record["authorized_parameters"]["dimension"] == "minecraft:overworld"
-    assert record["authorized_parameters"]["edits"][0]["block"] == "minecraft:stone"
+    assert record["authorized_parameters"]["from"] == [0, 64, 0]
+    assert record["authorized_parameters"]["to"] == [4, 64, 4]
+    assert record["authorized_parameters"]["block"] == "minecraft:stone"
     assert record["approval_evidence"] == {"repairs_applied": ["normalized_bounds"]}
     dumped = json.dumps(record, ensure_ascii=False)
     assert "locked_targets" not in dumped

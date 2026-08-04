@@ -8,17 +8,22 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Annotated, Any
 from uuid import uuid4
 
 import pytest
+from pydantic import Field
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 
 from config.settings import Settings
-from services.agent.block_ops.bridge import map_addon_bridge_result, map_bridge_exception
+from services.agent.block_ops.bridge import (
+    call_block_capability,
+    map_addon_bridge_result,
+    map_bridge_exception,
+)
 from services.agent.block_ops.capability import (
     BlockCapabilityRecord,
     BlockCapabilityStatus,
@@ -863,17 +868,20 @@ def test_place_success_model_projection_is_slim() -> None:
     text = json.dumps(projected, ensure_ascii=False)
     assert len(text) <= 250
     assert projected["ok"] is True
-    assert projected["mode"] == "place"
-    assert projected["changed"] is True
-    assert projected["at"] == {"x": -793, "y": 94, "z": 185}
-    assert projected["type_id"] == "minecraft:stone"
+    assert projected["status"] == "applied"
+    assert projected["at"] == [-793, 94, 185]
+    assert projected["block"] == "minecraft:stone"
     # Air replacements are omitted so was only signals non-air overwrites.
     assert "was" not in projected
+    assert "mode" not in projected
+    assert "changed" not in projected
+    assert "type_id" not in projected
     assert "before" not in projected
     assert "after" not in projected
     assert "targets" not in projected
     assert "verification" not in projected
     assert "phase" not in projected
+    assert "locked_targets" not in projected
 
     mapped = map_addon_bridge_result(
         {"ok": True, "payload": fat_payload},
@@ -901,7 +909,7 @@ def test_place_success_model_projection_reports_non_air_was() -> None:
         mode="place",
     )
     assert projected["was"] == "minecraft:dirt"
-    assert projected["type_id"] == "minecraft:stone"
+    assert projected["block"] == "minecraft:stone"
 
 
 def test_place_success_model_projection_omits_was_for_air_aliases() -> None:
@@ -967,23 +975,20 @@ def test_fill_success_model_projection_uses_authorized_aabb() -> None:
         fat_payload, mode="fill", authorized_bounds=authorized
     )
     assert projected["ok"] is True
-    assert projected["mode"] == "fill"
-    assert projected["changed_count"] == 6
+    assert projected["status"] == "applied"
+    assert projected["changed"] == 6
     assert projected["skipped"] == 19
-    assert projected["volume"] == 25
-    assert projected["from"] == {"x": -797, "y": 93, "z": 180}
-    assert projected["to"] == {"x": -793, "y": 93, "z": 184}
-    assert projected["type_id"] == "minecraft:oak_planks"
+    assert projected["bounds"] == [[-797, 93, 180], [-793, 93, 184]]
     # Air keys stripped; non-air overwrite signal remains.
-    assert "minecraft:air" not in projected["previous_type_counts"]
-    assert projected["previous_type_counts"]["minecraft:grass_path"] == 12
-    assert projected["previous_type_counts"]["minecraft:stone"] == 4
-    assert projected["previous_type_counts"]["minecraft:gravel"] == 3
-    assert "before_samples" not in projected
-    assert "targets" not in projected
-    assert "verification" not in projected
-    assert "rollback" not in projected
-    assert "phase" not in projected
+    assert "minecraft:air" not in projected["type_counts"]
+    assert projected["type_counts"]["minecraft:grass_path"] == 12
+    assert projected["type_counts"]["minecraft:stone"] == 4
+    assert projected["type_counts"]["minecraft:gravel"] == 3
+    for hidden in (
+        "before_samples", "targets", "verification", "rollback", "phase",
+        "mode", "type_id", "volume", "from", "to",
+    ):
+        assert hidden not in projected, hidden
 
     mapped = map_addon_bridge_result(
         {"ok": True, "payload": fat_payload},
@@ -993,10 +998,8 @@ def test_fill_success_model_projection_uses_authorized_aabb() -> None:
     )
     body = json.loads(mapped.output)
     assert "before_samples" not in body
-    assert body["volume"] == 25
-    assert body["from"]["z"] == 180
-    assert body["to"]["z"] == 184
-    assert "minecraft:air" not in body["previous_type_counts"]
+    assert body["bounds"] == [[-797, 93, 180], [-793, 93, 184]]
+    assert "minecraft:air" not in body["type_counts"]
 
 
 def test_fill_success_model_projection_omits_air_only_counts() -> None:
@@ -1012,7 +1015,7 @@ def test_fill_success_model_projection_omits_air_only_counts() -> None:
         },
         mode="fill",
     )
-    assert "previous_type_counts" not in projected
+    assert "type_counts" not in projected
 
 
 def test_fill_partial_and_noop_projection_carries_status() -> None:
@@ -1033,7 +1036,7 @@ def test_fill_partial_and_noop_projection_carries_status() -> None:
     )
     assert partial["status"] == "partial"
     assert partial["skipped"] == 3
-    assert partial["previous_type_counts"] == {"minecraft:oak_planks": 3}
+    assert partial["type_counts"] == {"minecraft:oak_planks": 3}
 
     noop = project_block_result_for_model(
         {
@@ -1049,9 +1052,9 @@ def test_fill_partial_and_noop_projection_carries_status() -> None:
         mode="fill",
     )
     assert noop["status"] == "noop"
-    assert noop["changed_count"] == 0
+    assert noop["changed"] == 0
 
-    # When addon omits status, fill with skips infers partial.
+    # When addon omits status, the spec §5.2 default is applied (no skip-inference).
     inferred = project_block_result_for_model(
         {
             "ok": True,
@@ -1064,7 +1067,7 @@ def test_fill_partial_and_noop_projection_carries_status() -> None:
         },
         mode="fill",
     )
-    assert inferred["status"] == "partial"
+    assert inferred["status"] == "applied"
 
 
 def test_state_unknown_response_has_fallback_allowed_false() -> None:
@@ -1078,7 +1081,8 @@ def test_state_unknown_response_has_fallback_allowed_false() -> None:
     assert body["external_state_unknown"] is True
 
 
-def test_batch_success_model_projection_filters_air_counts() -> None:
+def test_batch_mode_is_no_longer_projected_for_model() -> None:
+    """batch 已退出模型可见契约：投影回退为最小 ok envelope，不泄漏计数。"""
     projected = project_block_result_for_model(
         {
             "ok": True,
@@ -1092,7 +1096,7 @@ def test_batch_success_model_projection_filters_air_counts() -> None:
         },
         mode="batch",
     )
-    assert projected["previous_type_counts"] == {"minecraft:dirt": 1}
+    assert projected == {"ok": True}
 
 
 def test_limits_hard_clamp() -> None:
@@ -1446,9 +1450,7 @@ def test_merge_canonical_fill_sparse_locked_keeps_request_aabb() -> None:
     projected = project_block_result_for_model(
         fat_payload, mode="fill", authorized_bounds=authorized_bounds
     )
-    assert projected["from"] == {"x": -797, "y": 93, "z": 180}
-    assert projected["to"] == {"x": -793, "y": 93, "z": 184}
-    assert projected["volume"] == 25
+    assert projected["bounds"] == [[-797, 93, 180], [-793, 93, 184]]
     assert "before_samples" not in projected
 
 
@@ -1566,11 +1568,24 @@ async def test_harness_prepare_tools_strips_block_internal_params() -> None:
 
     tool_defs = [
         ToolDefinition(
-            name="edit_blocks",
+            name="place_block",
             parameters_json_schema={
                 "type": "object",
                 "properties": {
-                    "type_id": {"type": "string"},
+                    "pos": {"type": "array"},
+                    "block": {"type": "string"},
+                    "locked_targets": {"type": "array"},
+                    "phase": {"type": "string"},
+                },
+            },
+        ),
+        ToolDefinition(
+            name="fill_block",
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "from": {"type": "array"},
+                    "to": {"type": "array"},
                     "locked_targets": {"type": "array"},
                     "phase": {"type": "string"},
                 },
@@ -1590,19 +1605,17 @@ async def test_harness_prepare_tools_strips_block_internal_params() -> None:
     ]
     prepared = await cap.prepare_tools(_Ctx(), tool_defs)  # type: ignore[arg-type]
     by_name = {td.name: td for td in prepared}
-    assert "edit_blocks" in by_name
+    assert "place_block" in by_name
+    assert "fill_block" in by_name
     assert "inspect_block" in by_name
-    # inspect 仍在 _BLOCK_OPS_TOOLS：内部字段被剥除
-    inspect_props = by_name["inspect_block"].parameters_json_schema.get("properties") or {}
-    assert "locked_targets" not in inspect_props
-    assert "phase" not in inspect_props
-    # edit_blocks 已移出单一职责集合：原样透传（Task 6 删除后移除该分支）
-    edit_props = by_name["edit_blocks"].parameters_json_schema.get("properties") or {}
-    assert "locked_targets" in edit_props
-    assert "phase" in edit_props
+    # 三个工具都在 _BLOCK_OPS_TOOLS：恢复专用字段对模型不可见。
+    for name in ("place_block", "fill_block", "inspect_block"):
+        props = by_name[name].parameters_json_schema.get("properties") or {}
+        assert "locked_targets" not in props, name
+        assert "phase" not in props, name
 
 
-def test_policy_edit_blocks_requires_approval_inspect_allows() -> None:
+def test_policy_block_mutations_require_approval_inspect_allows() -> None:
     engine = PolicyEngine.from_settings(_Settings())
     allow = engine.decide(
         "inspect_block",
@@ -1615,32 +1628,46 @@ def test_policy_edit_blocks_requires_approval_inspect_allows() -> None:
     )
     assert allow.action == PolicyDecisionKind.ALLOW
 
-    need = engine.decide(
-        "edit_blocks",
+    need_place = engine.decide(
+        "place_block",
+        {"pos": [0, 64, 0], "block": "minecraft:stone", "expect": "air"},
+        player_name="Steve",
+    )
+    assert need_place.action == PolicyDecisionKind.REQUIRE_APPROVAL
+
+    need_fill = engine.decide(
+        "fill_block",
         {
-            "mode": "place",
-            "type_id": "minecraft:stone",
-            "coordinate_mode": "absolute",
-            "dimension": "minecraft:overworld",
-            "position": {"x": 0, "y": 64, "z": 0},
+            "from": [0, 64, 0],
+            "to": [4, 64, 4],
+            "block": "minecraft:stone",
+            "expect": "air",
         },
         player_name="Steve",
     )
-    assert need.action == PolicyDecisionKind.REQUIRE_APPROVAL
+    assert need_fill.action == PolicyDecisionKind.REQUIRE_APPROVAL
 
     approved = engine.decide(
-        "edit_blocks",
-        {
-            "mode": "place",
-            "type_id": "minecraft:stone",
-            "coordinate_mode": "absolute",
-            "dimension": "minecraft:overworld",
-            "position": {"x": 0, "y": 64, "z": 0},
-        },
+        "place_block",
+        {"pos": [0, 64, 0], "block": "minecraft:stone", "expect": "air"},
         player_name="Steve",
         approved=True,
     )
     assert approved.action == PolicyDecisionKind.ALLOW
+
+    # edit_blocks 已移出目录：不再暴露，直接拒绝。
+    legacy = engine.decide(
+        "edit_blocks",
+        {
+            "mode": "place",
+            "type_id": "minecraft:stone",
+            "coordinate_mode": "absolute",
+            "dimension": "minecraft:overworld",
+            "position": {"x": 0, "y": 64, "z": 0},
+        },
+        player_name="Steve",
+    )
+    assert legacy.action == PolicyDecisionKind.DENY
 
 
 def test_exposure_hidden_without_capability() -> None:
@@ -1661,7 +1688,10 @@ def test_exposure_visible_when_supported() -> None:
     )
     ctx = SimpleNamespace(deps=SimpleNamespace(connection_id=cid))
     assert engine.is_tool_exposed("inspect_block", ctx=ctx) is True
-    assert engine.is_tool_exposed("edit_blocks", ctx=ctx) is True
+    assert engine.is_tool_exposed("place_block", ctx=ctx) is True
+    assert engine.is_tool_exposed("fill_block", ctx=ctx) is True
+    # edit_blocks 已移出目录：即使能力探测通过也不再暴露。
+    assert engine.is_tool_exposed("edit_blocks", ctx=ctx) is False
 
 
 @pytest.mark.asyncio
@@ -1808,7 +1838,7 @@ def test_normalize_inspect_target_rejects_non_dict() -> None:
     assert body["code"] == "INVALID_ARGUMENT"
 
 
-def test_project_inspect_full_snapshots_strips_internal_metadata() -> None:
+def test_project_inspect_single_point_matches_spec_53() -> None:
     from services.agent.block_ops.project import project_block_result_for_model
 
     payload = {
@@ -1825,19 +1855,23 @@ def test_project_inspect_full_snapshots_strips_internal_metadata() -> None:
         "repairs_applied": [],
     }
     projected = project_block_result_for_model(payload)
-    assert projected["ok"] is True
-    assert projected["status"] == "inspected"
-    assert projected["blocks"] == payload["blocks"]
-    # Internal metadata stripped.
-    assert "targets" not in projected
-    assert "player_origin" not in projected
-    assert "facing" not in projected
-    assert "player_name" not in projected
-    assert "repairs_applied" not in projected
-    assert "coordinate_mode" not in projected
+    assert projected == {
+        "ok": True,
+        "block": "minecraft:stone",
+        "states": {},
+        "waterlogged": False,
+        "is_air": False,
+        "is_liquid": False,
+    }
+    # Internal metadata stripped (never mirrored to the model).
+    for hidden in (
+        "status", "blocks", "targets", "player_origin", "facing",
+        "player_name", "repairs_applied", "coordinate_mode", "dimension",
+    ):
+        assert hidden not in projected, hidden
 
 
-def test_project_inspect_summary_bounded_result() -> None:
+def test_project_inspect_region_matches_spec_53() -> None:
     from services.agent.block_ops.project import project_block_result_for_model
 
     payload = {
@@ -1856,15 +1890,15 @@ def test_project_inspect_summary_bounded_result() -> None:
     }
     projected = project_block_result_for_model(payload)
     assert projected["ok"] is True
-    assert projected["status"] == "inspected"
     assert projected["count"] == 27
     assert projected["type_counts"] == {"minecraft:stone": 20, "minecraft:air": 7}
-    assert projected["unknown_count"] == 0
-    assert projected["bounds"]["from"] == {"x": 0, "y": 64, "z": 0}
-    # No blocks array on summary path.
-    assert "blocks" not in projected
-    # Internal metadata stripped.
-    assert "coordinate_mode" not in projected
+    assert projected["samples"] == []
+    # Spec §5.3 region shape omits status/bounds/unknown_count; metadata stripped.
+    for hidden in (
+        "status", "bounds", "unknown_count", "blocks",
+        "coordinate_mode", "dimension",
+    ):
+        assert hidden not in projected, hidden
 
 
 @pytest.mark.asyncio
@@ -1902,11 +1936,12 @@ async def test_inspect_block_impl_target_box() -> None:
     inspect_calls = [c for c in bridge.calls if c[0] == "inspect_block"]
     payload = inspect_calls[-1][1]
     assert payload["target"]["box"]["from"] == {"x": 0, "y": 64, "z": 0}
-    # Result should be the summary projection (flattened, no blocks array).
+    # Result should be the region projection (spec §5.3: count/type_counts/samples, no status).
     body = json.loads(result.output)
-    assert body["status"] == "inspected"
+    assert "status" not in body
     assert "count" in body
     assert "type_counts" in body
+    assert "samples" in body
     assert "blocks" not in body
 
 
@@ -2671,8 +2706,8 @@ async def test_execute_block_plan_concurrent_same_plan_executes_once(monkeypatch
     assert entry.executed is True
     assert isinstance(entry.execution_result, ToolResult)
 @pytest.mark.asyncio
-async def test_reverse_fill_edit_blocks_resumes_with_raw_arguments() -> None:
-    """edit_blocks 移出 harness 后：恢复使用原始参数，无 preflight 归一化。"""
+async def test_reverse_fill_block_approval_then_execute_once() -> None:
+    """fill_block: 审批元数据保留原始参数；恢复后执行一次；重复恢复幂等。"""
     locked_targets = [
         {"dimension": "minecraft:overworld", "x": x, "y": 64, "z": z}
         for x in range(2, 5)
@@ -2739,37 +2774,21 @@ async def test_reverse_fill_edit_blocks_resumes_with_raw_arguments() -> None:
     )
 
     @agent.tool
-    async def edit_blocks(
+    async def fill_block(
         ctx: RunContext[_Deps],
-        type_id: str,
-        mode: str = "place",
-        coordinate_mode: str = "absolute",
-        dimension: str | None = None,
-        position: dict[str, Any] | None = None,
-        positions: list[dict[str, Any]] | None = None,
-        from_pos: dict[str, Any] | None = None,
-        to_pos: dict[str, Any] | None = None,
+        from_: Annotated[list[int], Field(min_length=3, max_length=3, alias="from")],
+        to: Annotated[list[int], Field(min_length=3, max_length=3)],
+        block: str,
+        expect: str = "air",
         states: dict[str, Any] | None = None,
-        replace_any: bool = False,
-        expected_previous: dict[str, Any] | None = None,
-        locked_targets: list[dict[str, Any]] | None = None,
-        phase: str | None = None,
     ) -> str:
-        result = await edit_blocks_impl(
+        result = await fill_block_impl(
             ctx,  # type: ignore[arg-type]
-            type_id=type_id,
-            mode=mode,  # type: ignore[arg-type]
-            coordinate_mode=coordinate_mode,  # type: ignore[arg-type]
-            dimension=dimension,
-            position=position,
-            positions=positions,
-            from_pos=from_pos,
-            to_pos=to_pos,
+            from_=from_,
+            to=to,
+            block=block,
+            expect=expect,
             states=states,
-            replace_any=replace_any,
-            expected_previous=expected_previous,
-            locked_targets=locked_targets,
-            phase=phase,
         )
         return str(result)
 
@@ -2783,15 +2802,12 @@ async def test_reverse_fill_edit_blocks_resumes_with_raw_arguments() -> None:
         return ModelResponse(
             parts=[
                 ToolCallPart(
-                    tool_name="edit_blocks",
+                    tool_name="fill_block",
                     tool_call_id="tc-fill-reverse",
                     args={
-                        "type_id": "minecraft:stone",
-                        "mode": "fill",
-                        "coordinate_mode": "absolute",
-                        "dimension": "minecraft:overworld",
-                        "from_pos": {"x": 4, "y": 64, "z": 3},
-                        "to_pos": {"x": 2, "y": 64, "z": 1},
+                        "from": [4, 64, 3],
+                        "to": [2, 64, 1],
+                        "block": "minecraft:stone",
                     },
                 )
             ]
@@ -2802,22 +2818,26 @@ async def test_reverse_fill_edit_blocks_resumes_with_raw_arguments() -> None:
     assert isinstance(first.output, DeferredToolRequests)
     approval = first.output.approvals[0]
     metadata = first.output.metadata[approval.tool_call_id]
-    # edit_blocks 已移出 _BLOCK_OPS_TOOLS：不再有 harness preflight / 投影，
-    # 审批元数据就是模型原始参数；恢复后由 edit_blocks_impl 在执行线上归一化角点。
+    # fill_block 的审批元数据只含模型可见参数（无 preflight 投影/隐藏字段）。
+    # canonical args 保持模型可见契约：pydantic-ai 经 alias="from" 校验后以
+    # 字段名传入 harness，run_block_preflight 统一转回别名键（from）。
     authorized_args = metadata["normalized_args"]
-    assert authorized_args["from_pos"] == {"x": 4, "y": 64, "z": 3}
-    assert authorized_args["to_pos"] == {"x": 2, "y": 64, "z": 1}
+    assert authorized_args["from"] == [4, 64, 3]
+    assert authorized_args["to"] == [2, 64, 1]
+    assert authorized_args["block"] == "minecraft:stone"
     execute_args = metadata["execute_args"]
-    assert execute_args["from_pos"] == {"x": 4, "y": 64, "z": 3}
-    assert execute_args["to_pos"] == {"x": 2, "y": 64, "z": 1}
-    assert "repairs_applied" not in execute_args
-    assert metadata["approval_metadata"] == {}
+    assert execute_args["from"] == [4, 64, 3]
+    assert execute_args["to"] == [2, 64, 1]
+    for hidden in ("locked_targets", "phase", "status", "repairs_applied"):
+        assert hidden not in execute_args, hidden
+    plan_id = metadata.get("plan_id")
+    assert isinstance(plan_id, str) and plan_id
 
     second = await agent.run(
         message_history=first.all_messages(),
         deferred_tool_results=DeferredToolResults(
             approvals={
-                approval.tool_call_id: ToolApproved(override_args=execute_args),
+                approval.tool_call_id: ToolApproved(override_args={"plan_id": plan_id}),
             }
         ),
         model=FunctionModel(model_fn),
@@ -2831,15 +2851,15 @@ async def test_reverse_fill_edit_blocks_resumes_with_raw_arguments() -> None:
         if capability == "edit_blocks" and payload.get("phase") == "execute"
     ]
     assert len(execute_calls) == 1
-    # edit_blocks 不再经过 harness preflight：原始角点直接上执行线
-    # （角点归一化属于旧 preflight 契约；Task 6 删除 edit_blocks 后不再相关）
-    assert execute_calls[0]["from"] == {"x": 4, "y": 64, "z": 3}
-    assert execute_calls[0]["to"] == {"x": 2, "y": 64, "z": 1}
+    # 恢复路径走 execute_block_plan(plan_id)：fill_block_impl 在执行线上
+    # 归一化角点，min/max 后才是线协议 from/to。
+    assert execute_calls[0]["from"] == {"x": 2, "y": 64, "z": 1}
+    assert execute_calls[0]["to"] == {"x": 4, "y": 64, "z": 3}
 
     repeated = await agent.run(
         message_history=first.all_messages(),
         deferred_tool_results=DeferredToolResults(
-            approvals={approval.tool_call_id: ToolApproved(override_args=execute_args)}
+            approvals={approval.tool_call_id: ToolApproved(override_args={"plan_id": plan_id})}
         ),
         model=FunctionModel(model_fn),
         deps=deps,
@@ -3098,16 +3118,28 @@ async def test_harness_approved_edit_uses_preflight_cache() -> None:
     assert wire.get("phase") == "execute"
     assert wire.get("position") == exec_args.get("position")
     assert recovered.canonical_args.get("locked_targets")
-    # policy: edit requires approval unless approved
-    need = policy.decide("edit_blocks", normalize_tool_args(plan.authorized_args), player_name="Steve")
+    # policy: 世界修改工具（place_block/fill_block）需审批，approved 后放行；
+    # 遗留 edit_blocks 已移出目录，不再暴露。
+    need = policy.decide(
+        "place_block",
+        {"pos": [8, 64, 8], "block": "minecraft:stone", "expect": "air"},
+        player_name="Steve",
+    )
     assert need.action == PolicyDecisionKind.REQUIRE_APPROVAL
     allow = policy.decide(
+        "place_block",
+        {"pos": [8, 64, 8], "block": "minecraft:stone", "expect": "air"},
+        player_name="Steve",
+        approved=True,
+    )
+    assert allow.action == PolicyDecisionKind.ALLOW
+    legacy = policy.decide(
         "edit_blocks",
         normalize_tool_args(plan.authorized_args),
         player_name="Steve",
         approved=True,
     )
-    assert allow.action == PolicyDecisionKind.ALLOW
+    assert legacy.action == PolicyDecisionKind.DENY
 
 
 @pytest.mark.asyncio
@@ -5178,3 +5210,316 @@ async def test_inspect_block_impl_rejects_invalid_array_target() -> None:
         assert not result.is_success, bad
         body = json.loads(result.output)
         assert body["code"] == "INVALID_COORDINATE", bad
+
+
+# ---------------------------------------------------------------------------
+# Task 4 (spec §5): slim result projections — place / fill / inspect shapes
+# ---------------------------------------------------------------------------
+
+
+def test_place_projection_matches_spec_51_shape() -> None:
+    from services.agent.block_ops.project import project_place_result_for_model
+
+    projected = project_place_result_for_model(
+        {
+            "schema_version": "1",
+            "ok": True,
+            "phase": "execute",
+            "mode": "place",
+            "type_id": "minecraft:torch",
+            "position": {"x": 10, "y": 64, "z": -5},
+            "was": "minecraft:air",
+        }
+    )
+    # spec §5.1 example shows was: air but the note is normative: was only
+    # appears when a non-air block was replaced — air stays omitted.
+    assert projected == {
+        "ok": True,
+        "status": "applied",
+        "at": [10, 64, -5],
+        "block": "minecraft:torch",
+    }
+    assert "was" not in projected
+
+    replaced = project_place_result_for_model(
+        {
+            "ok": True,
+            "mode": "place",
+            "type_id": "minecraft:stone",
+            "position": {"x": 1, "y": 2, "z": 3},
+            "before": {"type_id": "minecraft:dirt"},
+        }
+    )
+    assert replaced["was"] == "minecraft:dirt"
+    assert replaced["at"] == [1, 2, 3]
+
+    # at may arrive as an array directly.
+    array_at = project_place_result_for_model(
+        {
+            "ok": True,
+            "mode": "place",
+            "type_id": "minecraft:stone",
+            "at": [7, 8, 9],
+        }
+    )
+    assert array_at["at"] == [7, 8, 9]
+    for hidden in ("mode", "type_id", "phase", "position", "before", "after"):
+        assert hidden not in replaced, hidden
+
+
+def test_fill_projection_matches_spec_52_shape() -> None:
+    from services.agent.block_ops.project import project_fill_result_for_model
+
+    projected = project_fill_result_for_model(
+        {
+            "schema_version": "1",
+            "ok": True,
+            "phase": "execute",
+            "mode": "fill",
+            "type_id": "minecraft:stone",
+            "changed_count": 15,
+            "skipped": 10,
+            "previous_type_counts": {
+                "minecraft:air": 6,
+                "minecraft:grass_block": 10,
+                "minecraft:gravel": 5,
+            },
+            "from": {"x": -797, "y": 93, "z": 180},
+            "to": {"x": -793, "y": 93, "z": 184},
+        }
+    )
+    assert projected["ok"] is True
+    assert projected["status"] == "applied"
+    assert projected["changed"] == 15
+    assert projected["skipped"] == 10
+    # type_counts only carries non-air counts (spec §5.2).
+    assert projected["type_counts"] == {
+        "minecraft:grass_block": 10,
+        "minecraft:gravel": 5,
+    }
+    assert "minecraft:air" not in projected["type_counts"]
+    assert projected["bounds"] == [[-797, 93, 180], [-793, 93, 184]]
+    for hidden in ("mode", "type_id", "phase", "changed_count", "previous_type_counts"):
+        assert hidden not in projected, hidden
+
+
+def test_inspect_projection_matches_spec_53_shapes() -> None:
+    from services.agent.block_ops.project import project_block_result_for_model as project
+
+    single = project(
+        {
+            "ok": True,
+            "blocks": [
+                {
+                    "x": 0,
+                    "y": 64,
+                    "z": 0,
+                    "type_id": "minecraft:air",
+                    "states": {"waterlogged": False},
+                    "waterlogged": False,
+                    "is_air": True,
+                    "is_liquid": False,
+                    "dimension": "minecraft:overworld",
+                }
+            ],
+            "coordinate_mode": "absolute",
+            "dimension": "minecraft:overworld",
+        }
+    )
+    assert single == {
+        "ok": True,
+        "block": "minecraft:air",
+        "states": {"waterlogged": False},
+        "waterlogged": False,
+        "is_air": True,
+        "is_liquid": False,
+    }
+
+    region = project(
+        {
+            "ok": True,
+            "summary": {
+                "bounds": {
+                    "from": {"x": 0, "y": 64, "z": 0},
+                    "to": {"x": 1, "y": 64, "z": 1},
+                },
+                "count": 4,
+                "type_counts": {"minecraft:air": 3, "minecraft:stone": 1},
+                "unknown_count": 0,
+                "samples": [
+                    {"x": 0, "y": 64, "z": 0, "type_id": "minecraft:air"},
+                    {"x": 1, "y": 64, "z": 0, "type_id": "minecraft:air"},
+                    {"x": 0, "y": 64, "z": 1, "type_id": "minecraft:air"},
+                    {"x": 1, "y": 64, "z": 1, "type_id": "minecraft:stone"},
+                ],
+            },
+        }
+    )
+    assert region["count"] == 4
+    assert region["type_counts"] == {"minecraft:air": 3, "minecraft:stone": 1}
+    assert region["samples"] == [
+        [0, 64, 0, "minecraft:air"],
+        [1, 64, 0, "minecraft:air"],
+        [0, 64, 1, "minecraft:air"],
+        [1, 64, 1, "minecraft:stone"],
+    ]
+    for hidden in (
+        "status", "bounds", "unknown_count", "blocks",
+        "coordinate_mode", "dimension",
+    ):
+        assert hidden not in region, hidden
+
+
+def test_inspect_region_samples_are_compact_and_bounded_to_eight() -> None:
+    from services.agent.block_ops.project import project_block_result_for_model as project
+
+    blocks = [
+        {"x": i, "y": 64, "z": j, "type_id": f"minecraft:block_{i}_{j}"}
+        for i in range(4)
+        for j in range(4)
+    ]
+    region = project(
+        {
+            "ok": True,
+            "blocks": blocks,
+            "coordinate_mode": "absolute",
+            "dimension": "minecraft:overworld",
+        }
+    )
+    assert region["count"] == 16
+    assert len(region["samples"]) == 8
+    assert all(
+        isinstance(sample, list)
+        and len(sample) == 4
+        and isinstance(sample[3], str)
+        for sample in region["samples"]
+    )
+    assert region["samples"][0] == [0, 64, 0, "minecraft:block_0_0"]
+    assert "status" not in region
+    assert "blocks" not in region
+
+
+def test_projection_never_mirrors_raw_addon_payload() -> None:
+    """Success projections never mirror raw addon payload internals (spec §5.5)."""
+    fat = {
+        "schema_version": "1",
+        "ok": True,
+        "phase": "execute",
+        "mode": "place",
+        "type_id": "minecraft:stone",
+        "position": {"x": 0, "y": 64, "z": 0, "dimension": "minecraft:overworld"},
+        "targets": [{"x": 0, "y": 64, "z": 0, "type_id": "minecraft:stone"}],
+        "before": {"type_id": "minecraft:dirt", "x": 0, "y": 64, "z": 0},
+        "after": {"type_id": "minecraft:stone", "x": 0, "y": 64, "z": 0},
+        "locked_targets": [{"x": 0, "y": 64, "z": 0}],
+        "repairs_applied": ["reposition"],
+        "verification": {"checked": True},
+        "rollback": {"attempted": False},
+    }
+    projected = project_block_result_for_model(fat, mode="place")
+    assert projected == {
+        "ok": True,
+        "status": "applied",
+        "at": [0, 64, 0],
+        "block": "minecraft:stone",
+        "was": "minecraft:dirt",
+    }
+    for hidden in (
+        "targets", "before", "after", "locked_targets", "repairs_applied",
+        "verification", "rollback", "phase", "mode", "type_id",
+        "schema_version", "dimension", "position",
+    ):
+        assert hidden not in projected, hidden
+
+
+def test_new_mutation_tools_map_timeout_to_state_unknown() -> None:
+    """place_block / fill_block keep the STATE_UNKNOWN + no-fallback contract."""
+    for tool in ("place_block", "fill_block"):
+        result = map_bridge_exception(TimeoutError("bridge timeout"), tool_name=tool)
+        assert not result.is_success
+        assert result.retryable is False
+        assert result.external_state_unknown is True
+        body = json.loads(result.output)
+        assert body["code"] == "STATE_UNKNOWN", tool
+        assert body["fallback_allowed"] is False
+        assert "请勿自动重试" in body["message"]
+
+
+@pytest.mark.asyncio
+async def test_call_block_capability_passes_public_tool_name_for_exception_mapping() -> None:
+    class _RaisingBridge:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def request(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append((capability, payload))
+            raise TimeoutError("bridge request timed out")
+
+    bridge = _RaisingBridge()
+    result = await call_block_capability(
+        bridge,
+        "edit_blocks",
+        {"phase": "execute", "mode": "place"},
+        mode="place",
+        tool_name="place_block",
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "STATE_UNKNOWN"
+    assert body["external_state_unknown"] is True
+    assert body["fallback_allowed"] is False
+
+    result = await call_block_capability(
+        bridge,
+        "inspect_block",
+        {"phase": "execute"},
+        tool_name="inspect_block",
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "ADDON_UNAVAILABLE"
+    assert body["retryable"] is True
+    assert body["fallback_allowed"] is True
+
+
+def test_limit_exceeded_addon_error_carries_estimated_bytes_and_budget() -> None:
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "LIMIT_EXCEEDED",
+                "message": "frame too large",
+                "estimated_bytes": 4128,
+                "budget": 461,
+            },
+        }
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "LIMIT_EXCEEDED"
+    assert body["estimated_bytes"] == 4128
+    assert body["budget"] == 461
+    assert body["retryable"] is True
+    assert body["fallback_allowed"] is False
+    assert body["schema_version"] == "1"
+
+
+def test_precondition_failed_without_counts_omits_empty_keys() -> None:
+    """No counts / no actual_type_id → no empty actual_type_counts key (Step 4)."""
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "PRECONDITION_FAILED",
+                "message": "target is not air",
+                "target": {"x": 1, "y": 64, "z": 2},
+            },
+        }
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "PRECONDITION_FAILED"
+    assert "actual_type_counts" not in body
+    assert "actual_type_id" not in body
+    assert body["target"] == {"x": 1, "y": 64, "z": 2}
+    assert "hint" in body

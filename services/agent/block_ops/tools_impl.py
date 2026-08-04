@@ -1407,16 +1407,21 @@ def _classify_zero_match_preflight(
         actual_counts,
         failure_cause=failure_cause,
     )
+    error_fields: dict[str, Any] = {
+        "status": "failed",
+        "matched_count": 0,
+        "hint": hint,
+        "retryable": False,
+        "external_state_unknown": False,
+        "fallback_allowed": False,
+    }
+    # No observed counts -> do not emit an empty actual_type_counts key.
+    if actual_counts:
+        error_fields["actual_type_counts"] = actual_counts
     body = build_error_response(
         BlockErrorCode.PRECONDITION_FAILED,
         "目标方块不满足 expect 前置条件。",
-        status="failed",
-        matched_count=0,
-        actual_type_counts=actual_counts,
-        hint=hint,
-        retryable=False,
-        external_state_unknown=False,
-        fallback_allowed=False,
+        **error_fields,
     )
     return ToolResult.failure(
         dumps_payload(body),
@@ -2777,6 +2782,13 @@ async def run_block_preflight(
             return None, execute_budget_fail
         return plan, None
 
+    # place/fill 直通：canonical args 必须保持模型可见契约。pydantic-ai 经
+    # alias="from" 校验后以字段名（from_）传入 harness，但 wrap_tool_validate
+    # 与 execute_block_plan 都按模型可见键（from）校验/取参，这里统一转回
+    # 别名键，避免审批恢复时 canonical args 校验失败。
+    if tool_name == "fill_block" and "from_" in tool_args and "from" not in tool_args:
+        from_pos = tool_args.pop("from_")
+        tool_args["from"] = from_pos
     return dict(tool_args), None
 
 
@@ -2930,7 +2942,12 @@ async def inspect_block_impl(
         locked_targets=locked_targets,
         limits=limits_payload,
     )
-    return await call_block_capability(deps.addon_bridge, "inspect_block", payload)
+    return await call_block_capability(
+        deps.addon_bridge,
+        "inspect_block",
+        payload,
+        tool_name="inspect_block",
+    )
 
 
 def _legacy_kwargs_from_edit(edit: dict[str, Any], dimension: str | None) -> dict[str, Any]:
@@ -3541,6 +3558,7 @@ async def place_block_impl(
         "edit_blocks",
         payload,
         mode="place",
+        tool_name="place_block",
     )
 
 
@@ -3644,4 +3662,5 @@ async def fill_block_impl(
         payload,
         mode="fill",
         authorized_bounds={"from": from_pos, "to": to_pos, "volume": volume},
+        tool_name="fill_block",
     )

@@ -32,6 +32,9 @@ _SENSITIVE_MESSAGE_RE = re.compile(
     re.IGNORECASE,
 )
 _BLOCK_CAPABILITIES = frozenset({"edit_blocks", "inspect_block"})
+# Public world-mutating tools (single-op place/fill + legacy edit_blocks) all
+# map bridge failures after send to STATE_UNKNOWN with no fallback.
+_WORLD_MUTATION_TOOL_NAMES = frozenset({"place_block", "fill_block", "edit_blocks"})
 
 
 class _BridgeClient(Protocol):
@@ -211,7 +214,7 @@ def map_bridge_exception(
             error_type=error_type,
         )
 
-    if tool_name == "edit_blocks":
+    if tool_name in _WORLD_MUTATION_TOOL_NAMES:
         # Timeout after a successful outbound means the addon may have written —
         # keep STATE_UNKNOWN + no-auto-retry contract.
         if is_timeout:
@@ -433,7 +436,13 @@ def _safe_addon_error_body(
             fields["reason"] = reason
         else:
             fields["reason"] = "command_line_budget"
-        for key in ("suggested_max_discrete", "matched_count", "volume"):
+        for key in (
+            "suggested_max_discrete",
+            "matched_count",
+            "volume",
+            "estimated_bytes",
+            "budget",
+        ):
             parsed = _optional_int(src.get(key))
             if parsed is not None:
                 fields[key] = parsed
@@ -457,7 +466,7 @@ def _safe_addon_error_body(
         actual_type_id = _extract_actual_type_id(src)
         if not actual_type_counts and actual_type_id is not None:
             actual_type_counts = {actual_type_id: 1}
-        if actual_type_counts or stable_code == BlockErrorCode.PRECONDITION_FAILED:
+        if actual_type_counts:
             fields["actual_type_counts"] = actual_type_counts
         fields["hint"] = _precondition_hint_for_counts(
             actual_type_counts,
@@ -604,10 +613,14 @@ async def call_block_capability(
     mode: str | None = None,
     authorized_bounds: dict[str, Any] | None = None,
     project_for_model: bool | None = None,
+    tool_name: str | None = None,
 ) -> ToolResult:
     """Invoke a block capability and map the response to ToolResult.
 
     Never treats ok:false as success. Block tools project success bodies for the model.
+
+    ``tool_name`` is the public tool name (place_block / fill_block /
+    inspect_block) used for exception mapping; defaults to the wire capability.
     """
     if bridge is None:
         body = build_error_response(
@@ -627,7 +640,7 @@ async def call_block_capability(
     try:
         result = await bridge.request(capability, payload)
     except Exception as exc:
-        return map_bridge_exception(exc, tool_name=capability)
+        return map_bridge_exception(exc, tool_name=tool_name or capability)
 
     # Preflight responses feed merge_canonical / approval; keep full payload.
     # Only project execute (model-visible) success bodies for block tools.
