@@ -1485,7 +1485,25 @@ def test_strip_block_internal_tool_schema_hides_locked_and_phase() -> None:
 
     from services.agent.harness.execution import strip_block_internal_tool_schema
 
-    raw = ToolDefinition(
+    # place_block（单一职责新契约）：公共 schema 无内部字段，原样返回
+    place_raw = ToolDefinition(
+        name="place_block",
+        description="place",
+        parameters_json_schema={
+            "type": "object",
+            "properties": {
+                "pos": {"type": "array"},
+                "block": {"type": "string"},
+                "expect": {"type": "string"},
+            },
+            "required": ["pos", "block"],
+        },
+    )
+    assert strip_block_internal_tool_schema(place_raw) is place_raw
+
+    # 遗留 edit_blocks 已移出 _BLOCK_OPS_TOOLS：即使带内部字段也原样透传
+    # （Task 6 删除 edit_blocks 后该断言随之移除）
+    legacy_raw = ToolDefinition(
         name="edit_blocks",
         description="edit",
         parameters_json_schema={
@@ -1501,13 +1519,7 @@ def test_strip_block_internal_tool_schema_hides_locked_and_phase() -> None:
             "required": ["type_id", "locked_targets"],
         },
     )
-    stripped = strip_block_internal_tool_schema(raw)
-    props = stripped.parameters_json_schema["properties"]
-    assert "locked_targets" not in props
-    assert "phase" not in props
-    assert "type_id" in props
-    assert "from_pos" in props
-    assert "locked_targets" not in stripped.parameters_json_schema.get("required", [])
+    assert strip_block_internal_tool_schema(legacy_raw) is legacy_raw
 
     inspect_raw = ToolDefinition(
         name="inspect_block",
@@ -1579,10 +1591,14 @@ async def test_harness_prepare_tools_strips_block_internal_params() -> None:
     by_name = {td.name: td for td in prepared}
     assert "edit_blocks" in by_name
     assert "inspect_block" in by_name
-    for name in ("edit_blocks", "inspect_block"):
-        props = by_name[name].parameters_json_schema.get("properties") or {}
-        assert "locked_targets" not in props
-        assert "phase" not in props
+    # inspect 仍在 _BLOCK_OPS_TOOLS：内部字段被剥除
+    inspect_props = by_name["inspect_block"].parameters_json_schema.get("properties") or {}
+    assert "locked_targets" not in inspect_props
+    assert "phase" not in inspect_props
+    # edit_blocks 已移出单一职责集合：原样透传（Task 6 删除后移除该分支）
+    edit_props = by_name["edit_blocks"].parameters_json_schema.get("properties") or {}
+    assert "locked_targets" in edit_props
+    assert "phase" in edit_props
 
 
 def test_policy_edit_blocks_requires_approval_inspect_allows() -> None:
@@ -2477,8 +2493,27 @@ async def test_registered_tools_include_block_ops_and_ok_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_harness_preflight_before_approval_for_edit_blocks() -> None:
-    """edit_blocks: preflight before approval; metadata has locked canonical args; no execute yet."""
+async def test_harness_preflight_before_approval_for_place_block(monkeypatch) -> None:
+    """place_block: preflight before approval; plan_id in metadata; no execute yet."""
+    from services.agent.harness import catalog as _catalog_module
+    from services.agent.harness.catalog import ToolIntent, ToolRisk, _entry
+
+    monkeypatch.setattr(
+        _catalog_module,
+        "_TOOL_CATALOG",
+        {
+            **_catalog_module._TOOL_CATALOG,
+            "place_block": _entry(
+                "place_block",
+                ToolIntent.CHANGE_WORLD,
+                ToolRisk.HIGH,
+                "向世界写入单个方块时使用。",
+                "不要用于查询或批量填充。",
+                "pos 为 [x, y, z] 绝对坐标；block 为方块 type_id。",
+                may_have_external_side_effects=True,
+            ),
+        },
+    )
     bridge = _FakeBridge()
     cid = str(uuid4())
     await ensure_block_capability(cid, bridge)
@@ -2491,52 +2526,21 @@ async def test_harness_preflight_before_approval_for_edit_blocks() -> None:
     )
 
     @agent.tool
-    async def edit_blocks(
+    async def place_block(
         ctx: RunContext[_Deps],
-        type_id: str,
-        mode: str = "place",
-        coordinate_mode: str = "absolute",
-        dimension: str | None = None,
-        position: dict[str, Any] | None = None,
-        from_pos: dict[str, Any] | None = None,
-        to_pos: dict[str, Any] | None = None,
-        positions: list[dict[str, Any]] | None = None,
+        pos: list[int],
+        block: str,
+        expect: str = "air",
         states: dict[str, Any] | None = None,
-        replace_any: bool = False,
-        expected_previous: dict[str, Any] | None = None,
-        locked_targets: list[dict[str, Any]] | None = None,
-        phase: str | None = None,
     ) -> str:
-        result = await edit_blocks_impl(
-            ctx,  # type: ignore[arg-type]
-            mode=mode,  # type: ignore[arg-type]
-            coordinate_mode=coordinate_mode,  # type: ignore[arg-type]
-            dimension=dimension,
-            position=position,
-            positions=positions,
-            from_pos=from_pos,
-            to_pos=to_pos,
-            type_id=type_id,
-            states=states,
-            replace_any=replace_any,
-            expected_previous=expected_previous,
-            locked_targets=locked_targets,
-            phase=phase,
-        )
-        return result.output if isinstance(result, ToolResult) else str(result)
+        raise AssertionError("must not execute before approval")
 
     async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
         return ModelResponse(
             parts=[
                 ToolCallPart(
-                    tool_name="edit_blocks",
-                    args={
-                        "mode": "place",
-                        "type_id": "minecraft:stone",
-                        "coordinate_mode": "absolute",
-                        "dimension": "minecraft:overworld",
-                        "position": {"x": 8, "y": 64, "z": 8},
-                    },
+                    tool_name="place_block",
+                    args={"pos": [8, 64, 8], "block": "minecraft:stone", "expect": "air"},
                 )
             ]
         )
@@ -2547,87 +2551,80 @@ async def test_harness_preflight_before_approval_for_edit_blocks() -> None:
     assert first.output.approvals
     approval = first.output.approvals[0]
     meta = (first.output.metadata or {}).get(approval.tool_call_id) or {}
+    plan_id = meta.get("plan_id")
+    assert isinstance(plan_id, str) and plan_id
     normalized = meta.get("normalized_args") or {}
-    assert normalized.get("phase") == "execute"
-    assert normalized.get("locked_targets")
-    assert normalized.get("coordinate_mode") == "absolute"
-    locked = normalized["locked_targets"][0]
-    assert locked.get("x") == 8 and locked.get("y") == 64 and locked.get("z") == 8
-    # Preflight ran; mutation (execute) did not.
-    assert any(c[0] == "edit_blocks" and c[1].get("phase") == "preflight" for c in bridge.calls)
-    assert not any(c[0] == "edit_blocks" and c[1].get("phase") == "execute" for c in bridge.calls)
-    # Preflight cache retains canonical args for approval recovery
-    cache = get_preflight_cache()
-    original_hash = meta.get("original_args_hash")
-    assert original_hash
-    cached = cache.get("run-pf-1", approval.tool_call_id, original_hash)
+    assert normalized.get("pos") == [8, 64, 8]
+    assert normalized.get("block") == "minecraft:stone"
+    # 审批元数据只含模型可见字段
+    for hidden in ("locked_targets", "phase", "status"):
+        assert hidden not in normalized
+    # 绝对坐标直通：除 capability 探测外无任何 bridge 帧，也未执行
+    assert not any(
+        capability in {"edit_blocks", "inspect_block", "place_block", "fill_block"}
+        for capability, _payload in bridge.calls
+    )
+    # 预检缓存持有 plan_id 与 canonical args，供恢复路径使用
+    cached = get_preflight_cache().get_by_plan_id(plan_id)
     assert cached is not None
-    assert cached.canonical_args.get("locked_targets")
+    assert cached.tool_name == "place_block"
+    assert cached.canonical_args.get("pos") == [8, 64, 8]
 
 
 @pytest.mark.asyncio
-async def test_harness_rejects_unhashable_execute_mode_without_bridge_call(monkeypatch) -> None:
+async def test_harness_resume_with_unknown_plan_is_state_unknown_without_bridge_call(
+    monkeypatch,
+) -> None:
+    """未知 plan_id 恢复：STATE_UNKNOWN，不调用 bridge / impl，不抛 TypeError。
+
+    取代旧「unhashable execute_mode 投影失败」用例：新契约的恢复负载只有
+    {plan_id}，未命中预检缓存时结构性返回 STATE_UNKNOWN。
+    """
+    from unittest.mock import MagicMock
+
+    from services.agent.harness.execution import (
+        HarnessToolset,
+        get_block_command_fallback_store,
+    )
+
     bridge = _FakeBridge()
     cid = str(uuid4())
     await ensure_block_capability(cid, bridge)
-    agent: Agent[_Deps, str] = Agent(
-        "test",
-        deps_type=_Deps,
-        output_type=str,
-        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    impl_called: dict[str, int] = {"count": 0}
+
+    async def fake_place_impl(ctx, *, pos, block, expect="air", states=None):
+        impl_called["count"] += 1
+        return ToolResult.ok("placed")
+
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.place_block_impl", fake_place_impl)
+
+    settings = _Settings()
+    ts = HarnessToolset(
+        wrapped=MagicMock(),
+        policy=PolicyEngine.from_settings(settings),
+        idempotency=get_idempotency_store(),
+        fallback_store=get_block_command_fallback_store(),
     )
-
-    @agent.tool
-    async def edit_blocks(
-        ctx: RunContext[_Deps],
-        type_id: str,
-        mode: Any,
-        coordinate_mode: str,
-        dimension: str,
-        locked_targets: list[dict[str, Any]],
-        phase: str,
-    ) -> str:
-        raise AssertionError("invalid projection must not invoke the Python tool")
-
-    captured: dict[str, Any] = {}
-
-    def capture(event: str, **fields: Any) -> None:
-        captured["event"] = event
-        captured.update(fields)
-
-    monkeypatch.setattr("services.agent.harness.execution.logger.error", capture)
-    calls = 0
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal calls
-        calls += 1
-        if calls > 1:
-            return ModelResponse(parts=[TextPart(content="done")])
-        return ModelResponse(parts=[ToolCallPart(
-            tool_name="edit_blocks",
-            tool_call_id="tc-unhashable-mode",
-            args={
-                "type_id": "minecraft:stone", "mode": [],
-                "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
-                "phase": "execute", "locked_targets": [{"x": 1, "y": 64, "z": 1}],
-            },
-        )])
-
-    result = await agent.run(
-        "edit",
-        model=FunctionModel(model_fn),
-        deps=_Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-unhashable-mode"),
+    ctx = SimpleNamespace(
+        deps=_Deps(connection_id=cid, addon_bridge=bridge, settings=settings, run_id="run-unknown-plan"),
+        tool_call_id="tc-unknown-plan",
+        tool_call_approved=True,
     )
+    result = await ts.call_tool("place_block", {"plan_id": "no-such-plan"}, ctx, MagicMock())
 
-    assert "INTERNAL_ERROR" in str(result.all_messages())
+    assert isinstance(result, str)
+    body = json.loads(result)
+    assert body["code"] == "STATE_UNKNOWN"
+    assert body["external_state_unknown"] is True
+    assert impl_called["count"] == 0
+    # 只发生过 capability 探测（ensure_block_capability），绝无方块操作帧
     assert not any(
-        name == "edit_blocks" and payload.get("phase") == "execute"
-        for name, payload in bridge.calls
+        capability in {"edit_blocks", "inspect_block", "place_block", "fill_block"}
+        for capability, _payload in bridge.calls
     )
-    assert captured["event"] == "tool_execution_failed"
-    assert captured["execution_stage"] == "projection"
 @pytest.mark.asyncio
-async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() -> None:
+async def test_reverse_fill_edit_blocks_resumes_with_raw_arguments() -> None:
+    """edit_blocks 移出 harness 后：恢复使用原始参数，无 preflight 归一化。"""
     locked_targets = [
         {"dimension": "minecraft:overworld", "x": x, "y": 64, "z": z}
         for x in range(2, 5)
@@ -2757,29 +2754,16 @@ async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() 
     assert isinstance(first.output, DeferredToolRequests)
     approval = first.output.approvals[0]
     metadata = first.output.metadata[approval.tool_call_id]
+    # edit_blocks 已移出 _BLOCK_OPS_TOOLS：不再有 harness preflight / 投影，
+    # 审批元数据就是模型原始参数；恢复后由 edit_blocks_impl 在执行线上归一化角点。
     authorized_args = metadata["normalized_args"]
-    assert authorized_args["from"] == {"x": 2, "y": 64, "z": 1}
-    assert authorized_args["to"] == {"x": 4, "y": 64, "z": 3}
+    assert authorized_args["from_pos"] == {"x": 4, "y": 64, "z": 3}
+    assert authorized_args["to_pos"] == {"x": 2, "y": 64, "z": 1}
     execute_args = metadata["execute_args"]
-    assert execute_args["from_pos"] == {"x": 2, "y": 64, "z": 1}
-    assert execute_args["to_pos"] == {"x": 4, "y": 64, "z": 3}
+    assert execute_args["from_pos"] == {"x": 4, "y": 64, "z": 3}
+    assert execute_args["to_pos"] == {"x": 2, "y": 64, "z": 1}
     assert "repairs_applied" not in execute_args
-    assert "facing" not in execute_args
-    assert metadata["approval_metadata"] == {
-        "bounds": {
-            "min": {"x": 2, "y": 64, "z": 1},
-            "max": {"x": 4, "y": 64, "z": 3},
-        },
-        "repairs_applied": ["reversed_bounds"],
-        "facing": "south",
-        "player_origin": {"x": 100, "y": 64, "z": 100},
-        "before_samples": [{"type_id": "minecraft:air"}],
-        "future_preflight_evidence": {"source": "addon"},
-    }
-
-    # Approval recovery must use the persisted strict execution projection,
-    # not the in-process preflight cache or bridge-facing authorization args.
-    reset_preflight_cache()
+    assert metadata["approval_metadata"] == {}
 
     second = await agent.run(
         message_history=first.all_messages(),
@@ -2799,12 +2783,10 @@ async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() 
         if capability == "edit_blocks" and payload.get("phase") == "execute"
     ]
     assert len(execute_calls) == 1
-    assert execute_calls[0]["from"] == {"x": 2, "y": 64, "z": 1}
-    assert execute_calls[0]["to"] == {"x": 4, "y": 64, "z": 3}
-    # Continuous fill AABB is frozen by from/to; locked_targets are omitted on the
-    # wire to stay under the MCBE commandLine budget (still present in execute_args).
-    assert "locked_targets" not in execute_calls[0]
-    assert execute_args["locked_targets"] == locked_targets
+    # edit_blocks 不再经过 harness preflight：原始角点直接上执行线
+    # （角点归一化属于旧 preflight 契约；Task 6 删除 edit_blocks 后不再相关）
+    assert execute_calls[0]["from"] == {"x": 4, "y": 64, "z": 3}
+    assert execute_calls[0]["to"] == {"x": 2, "y": 64, "z": 1}
 
     repeated = await agent.run(
         message_history=first.all_messages(),

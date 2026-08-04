@@ -48,6 +48,7 @@ class PendingApproval:
     metadata: dict[str, Any] = field(default_factory=dict)
     execute_args: dict[str, Any] = field(default_factory=dict)
     execution_args_hash: str = ""
+    plan_id: str = ""
     expected_tool_call_id: str = ""
 
     def __post_init__(self) -> None:

@@ -69,9 +69,23 @@ def test_worker_coerces_block_tool_approval_override_args() -> None:
     assert approved.override_args == execute_args
 
 
+def test_worker_coerces_block_plan_id_approval_to_plan_id_override() -> None:
+    """plan_id 恢复负载只产生 {plan_id} override，绝无 status/phase 注入。"""
+    from pydantic_ai.tools import ToolApproved
+
+    worker = AgentWorker(MagicMock(), _make_settings())
+    results = worker._coerce_deferred_tool_results(
+        {"approvals": {"tc-place": {"kind": "tool-approved", "plan_id": "pid-1"}}}
+    )
+
+    approved = results.approvals["tc-place"]
+    assert isinstance(approved, ToolApproved)
+    assert approved.override_args == {"plan_id": "pid-1"}
+
+
 @pytest.mark.asyncio
-async def test_worker_rejects_block_approval_without_execute_args() -> None:
-    """方块工具不得用 normalized_args 回退填充 execute_args 进入审批队列。"""
+async def test_worker_rejects_block_approval_without_plan_id() -> None:
+    """方块工具审批 metadata 必须携带 plan_id；缺失则 fail-closed，不得进入审批队列。"""
     from pydantic_ai.messages import ToolCallPart
     from pydantic_ai.tools import DeferredToolRequests
 
@@ -88,33 +102,20 @@ async def test_worker_rejects_block_approval_without_execute_args() -> None:
         player_name="Steve",
         conversation_id="conv-1",
         content="edit",
-        run_id="run-missing-exec",
+        run_id="run-missing-plan",
     )
     deferred = DeferredToolRequests(
         approvals=[
             ToolCallPart(
-                tool_name="edit_blocks",
-                tool_call_id="tc-fill",
-                args={
-                    "edits": [{
-                        "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-                        "block": "minecraft:stone",
-                    }],
-                    "dimension": "minecraft:overworld",
-                },
+                tool_name="place_block",
+                tool_call_id="tc-place",
+                args={"pos": [1, 64, 1], "block": "stone", "expect": "air"},
             )
         ],
         metadata={
-            "tc-fill": {
-                "normalized_args": {
-                    "edits": [{
-                        "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-                        "block": "minecraft:stone",
-                    }],
-                    "dimension": "minecraft:overworld",
-                    "phase": "execute",
-                },
-                # deliberately omit execute_args
+            "tc-place": {
+                "normalized_args": {"pos": [1, 64, 1], "block": "stone", "expect": "air"},
+                # deliberately omit plan_id
                 "args_hash": "h",
                 "args_summary": "place stone",
             }

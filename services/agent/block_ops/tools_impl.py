@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -35,6 +36,7 @@ from services.agent.block_ops.project import (
 from services.agent.block_ops.schema import (
     BlockErrorCode,
     build_error_response,
+    build_state_unknown_response,
     dumps_payload,
 )
 from services.agent.tool_results import ToolResult
@@ -67,6 +69,7 @@ class BlockPreflightPlan:
     authorized_args: dict[str, Any]
     execute_args: dict[str, Any]
     approval_metadata: dict[str, Any]
+    plan_id: str = ""
 
 
 # Execute-projection fields. The new ``edits`` contract carries the full edit
@@ -1323,7 +1326,12 @@ def build_block_preflight_plan(
         )
     ):
         execute_args["repairs_applied"] = approval_metadata["repairs_applied"][:8]
-    return BlockPreflightPlan(authorized_args, execute_args, approval_metadata)
+    return BlockPreflightPlan(
+        authorized_args,
+        execute_args,
+        approval_metadata,
+        plan_id=secrets.token_hex(16),
+    )
 
 
 def _expect_hint_for_args(
@@ -2497,6 +2505,15 @@ async def run_block_preflight(
         # inspect is low-risk; preflight only needed for relative resolution.
         # Absolute inspect can execute directly without a separate preflight phase.
         target = tool_args.get("target")
+        if isinstance(target, list):
+            # Array target path (spec §3.3): [x,y,z] point or [[a],[b]] box.
+            # Both are absolute and need no bridge preflight; impl normalizes.
+            from services.agent.block_ops.target import normalize_array_target
+
+            _normalized, validation = normalize_array_target(target)
+            if validation is not None:
+                return None, validation
+            return dict(tool_args), None
         if target is not None:
             # Unified target path (issue 02): validate shape + limits.
             normalized, validation = _validate_inspect_target(
@@ -2761,6 +2778,69 @@ async def run_block_preflight(
         return plan, None
 
     return dict(tool_args), None
+
+
+def _state_unknown_result(plan_id: str, *, reason: str = "missing") -> ToolResult:
+    """审批恢复失败：缓存缺失/过期/工具不匹配 → STATE_UNKNOWN（不抛 TypeError）。"""
+    return ToolResult.failure(
+        dumps_payload(
+            build_state_unknown_response(
+                f"方块工具审批计划缺失或已过期（plan_id={plan_id or '空'}，{reason}）；"
+                "请重新发起操作",
+            )
+        ),
+        error_kind="PERMANENT",
+        retryable=False,
+        external_state_unknown=True,
+        diagnostic_summary="block preflight plan not found or expired",
+        error_type=BlockErrorCode.STATE_UNKNOWN,
+    )
+
+
+async def execute_block_plan(plan_id: str, ctx: RunContext[AgentDependencies]) -> ToolResult:
+    """按 plan_id 执行已批准的单点方块操作（place/fill）。
+
+    从预检缓存取 frozen canonical args，直接调用对应 impl；同一 plan 只执行
+    一次（成功写入已执行标记 + 结果缓存）。缓存缺失/过期/工具不支持返回
+    ``STATE_UNKNOWN``。
+    """
+    from services.agent.block_ops.preflight_cache import get_preflight_cache
+
+    pid = str(plan_id or "").strip()
+    entry = get_preflight_cache().get_by_plan_id(pid)
+    if entry is None:
+        return _state_unknown_result(pid)
+
+    if entry.executed and isinstance(entry.execution_result, ToolResult):
+        return entry.execution_result
+
+    tool_name = entry.tool_name
+    canonical = entry.canonical_args
+    if tool_name == "place_block":
+        result = await place_block_impl(
+            ctx,
+            pos=canonical.get("pos"),
+            block=canonical.get("block"),
+            expect=str(canonical.get("expect") or "air"),
+            states=canonical.get("states"),
+        )
+    elif tool_name == "fill_block":
+        result = await fill_block_impl(
+            ctx,
+            from_=canonical.get("from_", canonical.get("from")),
+            to=canonical.get("to"),
+            block=canonical.get("block"),
+            expect=str(canonical.get("expect") or "air"),
+            states=canonical.get("states"),
+        )
+    else:
+        return _state_unknown_result(pid, reason="unsupported-tool")
+
+    # 幂等：成功才落 executed 标记 + 结果缓存；失败允许重新恢复重试。
+    if result.is_success:
+        entry.executed = True
+        entry.execution_result = result
+    return result
 
 
 async def inspect_block_impl(

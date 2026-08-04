@@ -634,3 +634,98 @@ async def test_shutdown_flush_persists_queued_records(tmp_path):
     assert len(records) == 1
     assert records[0]["run_id"] == "run-flush"
     assert records[0]["tool_name"] == "run_minecraft_command"
+
+
+@pytest.mark.asyncio
+async def test_block_plan_resume_audits_canonical_args_without_hidden_kwargs(
+    tmp_path, monkeypatch
+) -> None:
+    """plan_id 恢复的审计 parameters/authorized_args 从缓存 canonical args 还原。
+
+    隐藏字段（locked_targets/phase/status）不得出现在审计 JSON 中；公共
+    工具体体不得被调用（恢复路径直达缓存执行器）。
+    """
+    from unittest.mock import MagicMock
+
+    from services.agent.block_ops.preflight_cache import get_preflight_cache
+    from services.agent.harness import catalog as _catalog_module
+    from services.agent.harness.catalog import (
+        ParameterPreviewPolicy,
+        ToolIntent,
+        ToolRisk,
+        _entry,
+    )
+    from services.agent.harness.execution import (
+        HarnessToolset,
+        PolicyEngine,
+        get_block_command_fallback_store,
+        get_idempotency_store,
+    )
+
+    monkeypatch.setattr(
+        _catalog_module,
+        "_TOOL_CATALOG",
+        {
+            **_catalog_module._TOOL_CATALOG,
+            "place_block": _entry(
+                "place_block",
+                ToolIntent.CHANGE_WORLD,
+                ToolRisk.HIGH,
+                "向世界写入单个方块时使用。",
+                "不要用于查询或批量填充。",
+                "pos 为 [x, y, z] 绝对坐标；block 为方块 type_id。",
+                preview=ParameterPreviewPolicy(include=("pos", "block", "expect")),
+                may_have_external_side_effects=True,
+            ),
+        },
+    )
+
+    audit_path = tmp_path / "runtime_harness_tools.jsonl"
+    settings = AuditOnlySettings(str(audit_path))
+    canonical = {"pos": [1, 64, 1], "block": "stone", "expect": "air"}
+    called: dict[str, int] = {"count": 0}
+
+    async def fake_place_impl(
+        ctx, *, pos, block, expect="air", states=None
+    ):
+        called["count"] += 1
+        return ToolResult.ok(f"placed:{block}")
+
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.place_block_impl", fake_place_impl)
+
+    get_preflight_cache().put(
+        run_id="run-test-1",
+        tool_call_id="tc-1",
+        original_args_hash="orig-h",
+        canonical_args=canonical,
+        tool_name="place_block",
+        plan_id="pid-audit",
+    )
+
+    ts = HarnessToolset(
+        wrapped=MagicMock(),
+        policy=PolicyEngine.from_settings(settings),
+        idempotency=get_idempotency_store(),
+        fallback_store=get_block_command_fallback_store(),
+    )
+    ctx = SimpleNamespace(deps=DummyDeps(settings, run_id="run-test-1"), tool_call_id="tc-1")
+    ctx.tool_call_approved = True
+    result = await ts.call_tool("place_block", {"plan_id": "pid-audit"}, ctx, MagicMock())
+    assert called["count"] == 1
+    assert "placed:stone" in str(result)
+    _flush()
+
+    records = read_jsonl(audit_path)
+    assert len(records) == 1
+    record = records[0]
+    assert record["tool_name"] == "place_block"
+    assert record["status"] == "success"
+    assert record["parameters"] == canonical
+    assert record["authorized_parameters"] == canonical
+    # 隐藏 kwargs 不得出现在审计参数中（record 自身的 status 字段除外）
+    for field_name in ("parameters", "authorized_parameters"):
+        for hidden in ("locked_targets", "phase", "status"):
+            assert hidden not in record[field_name]
+    dumped = json.dumps(record, ensure_ascii=False)
+    assert "locked_targets" not in dumped
+    assert '"phase"' not in dumped

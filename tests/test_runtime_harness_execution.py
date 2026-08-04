@@ -14,8 +14,12 @@ from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
-from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved
 
+from services.agent.block_ops.preflight_cache import (
+    get_preflight_cache,
+    reset_preflight_cache,
+)
 from services.agent.harness.approvals import PendingApproval, PendingApprovalStore
 from services.agent.harness.audit import build_audit_record
 from services.agent.harness.execution import (
@@ -54,6 +58,7 @@ class _Deps:
     conversation_id: str = "conv-1"
     provider: str = "test"
     auto_approve_tools: bool = False
+    addon_bridge: Any = None
 
 
 class _Settings:
@@ -102,10 +107,12 @@ def _reset_idempotency():
     reset_idempotency_store()
     reset_block_command_fallback_store()
     reset_block_capability_cache()
+    reset_preflight_cache()
     yield
     reset_idempotency_store()
     reset_block_command_fallback_store()
     reset_block_capability_cache()
+    reset_preflight_cache()
 
 
 class _FallbackContext:
@@ -122,6 +129,89 @@ def _set_supported_block_capability(connection_id: str) -> None:
             probed_at=time.time(),
         ),
     )
+
+
+@pytest.fixture
+def _block_tool_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """测试内暴露 place_block 到工具目录（Task 5 才会正式纳入目录）。"""
+    from services.agent.harness import catalog as _catalog_module
+    from services.agent.harness.catalog import ToolIntent, ToolRisk, _entry
+
+    monkeypatch.setattr(
+        _catalog_module,
+        "_TOOL_CATALOG",
+        {
+            **_catalog_module._TOOL_CATALOG,
+            "place_block": _entry(
+                "place_block",
+                ToolIntent.CHANGE_WORLD,
+                ToolRisk.HIGH,
+                "向世界写入单个方块时使用。",
+                "不要用于查询或批量填充。",
+                "pos 为 [x, y, z] 绝对坐标；block 为方块 type_id。",
+                may_have_external_side_effects=True,
+            ),
+        },
+    )
+
+
+def _build_place_block_agent(
+    side_effect_counter: dict[str, int] | None = None,
+    *,
+    policy_settings: Any | None = None,
+) -> Agent[_Deps, str | DeferredToolRequests]:
+    """与 _build_agent 同构，但挂载测试本地 place_block 工具。
+
+    公共工具体只允许在“直接调用”路径（plan_id 恢复分支之外的常规执行）
+    运行；plan_id 恢复路径必须绕过它，否则抛 AssertionError。
+    """
+    counter = side_effect_counter if side_effect_counter is not None else {}
+    policy = PolicyEngine.from_settings(policy_settings or _Settings())
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=policy)],
+    )
+
+    @agent.tool
+    async def place_block(
+        ctx: RunContext[_Deps],
+        pos: list[int],
+        block: str,
+        expect: str = "air",
+        states: dict[str, Any] | None = None,
+    ) -> str:
+        counter["place_block_public_body"] = counter.get("place_block_public_body", 0) + 1
+        raise AssertionError("public place_block body must not run (plan_id resume bypasses it)")
+
+    return agent
+
+
+async def _run_first_place_block_call(
+    agent: Agent[_Deps, str | DeferredToolRequests],
+    deps: _Deps,
+) -> tuple[str, str, list[ModelMessage]]:
+    """发起一次 place_block 调用并等待审批；返回 (tool_call_id, plan_id, messages)。"""
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="place_block",
+                    tool_call_id="tc-place-1",
+                    args={"pos": [1, 64, 1], "block": "stone", "expect": "air"},
+                )
+            ]
+        )
+
+    first = await agent.run("place stone", model=FunctionModel(model_fn), deps=deps)
+    assert isinstance(first.output, DeferredToolRequests)
+    call = first.output.approvals[0]
+    assert call.tool_name == "place_block"
+    meta = (first.output.metadata or {}).get(call.tool_call_id) or {}
+    assert isinstance(meta.get("plan_id"), str) and meta["plan_id"]
+    return call.tool_call_id, meta["plan_id"], first.all_messages()
 
 
 def _fallback_denial(
@@ -1255,3 +1345,174 @@ async def test_harness_cancelled_emits_tool_execution_cancelled(tmp_path):
         assert cancelled["attributes"]["tool_name"] == "list_available_providers"
     finally:
         set_trace_recorder(None)
+
+
+@pytest.mark.asyncio
+async def test_approval_resume_uses_plan_id_without_hidden_kwargs(
+    monkeypatch: pytest.MonkeyPatch, _block_tool_catalog
+) -> None:
+    """place_block 审批恢复只携带 plan_id；impl 只收到 pos/block/expect/states。"""
+    counter: dict[str, int] = {}
+    captured: dict[str, Any] = {}
+
+    async def fake_place_impl(
+        ctx: RunContext[_Deps],
+        *,
+        pos: list[int],
+        block: str,
+        expect: str = "air",
+        states: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        captured["kwargs"] = {"pos": pos, "block": block, "expect": expect, "states": states}
+        return ToolResult.ok(f"placed:{block}")
+
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.place_block_impl", fake_place_impl)
+
+    agent = _build_place_block_agent(counter)
+    deps = _Deps(settings=_Settings(), run_id="run-plan-id-1")
+    _set_supported_block_capability(str(deps.connection_id))
+
+    tool_call_id, plan_id, messages = await _run_first_place_block_call(agent, deps)
+
+    # 预检缓存只保存模型可见字段（states 是公共默认字段，可出现）
+    entry = get_preflight_cache().get_by_plan_id(plan_id)
+    assert entry is not None
+    assert entry.tool_name == "place_block"
+    assert {"pos", "block", "expect"} <= set(entry.canonical_args)
+    for hidden in ("locked_targets", "phase", "status"):
+        assert hidden not in entry.canonical_args
+        assert hidden not in entry.execute_args
+
+    results = DeferredToolResults()
+    results.approvals[tool_call_id] = ToolApproved(override_args={"plan_id": plan_id})
+    second = await agent.run(
+        message_history=messages, deferred_tool_results=results, deps=deps, model=TestModel()
+    )
+
+    assert not isinstance(second.output, DeferredToolRequests)
+    assert captured["kwargs"] == {"pos": [1, 64, 1], "block": "stone", "expect": "air", "states": None}
+    for hidden in ("locked_targets", "phase", "status"):
+        assert hidden not in captured["kwargs"]
+
+
+@pytest.mark.asyncio
+async def test_plan_id_resume_is_idempotent_and_missing_plan_is_state_unknown(
+    monkeypatch: pytest.MonkeyPatch, _block_tool_catalog
+) -> None:
+    """同一 plan_id 二次恢复不重复执行；缺失/过期 plan → STATE_UNKNOWN（无 TypeError）。"""
+    calls: dict[str, int] = {"count": 0}
+    captured: dict[str, Any] = {}
+
+    async def fake_place_impl(
+        ctx: RunContext[_Deps],
+        *,
+        pos: list[int],
+        block: str,
+        expect: str = "air",
+        states: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        calls["count"] += 1
+        captured["kwargs"] = {"pos": pos, "block": block, "expect": expect, "states": states}
+        return ToolResult.ok(f"placed:{block}")
+
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.place_block_impl", fake_place_impl)
+
+    agent = _build_place_block_agent()
+    deps = _Deps(settings=_Settings(), run_id="run-plan-id-2")
+    _set_supported_block_capability(str(deps.connection_id))
+
+    tool_call_id, plan_id, messages = await _run_first_place_block_call(agent, deps)
+
+    # 第一次恢复：执行一次
+    results = DeferredToolResults()
+    results.approvals[tool_call_id] = ToolApproved(override_args={"plan_id": plan_id})
+    second = await agent.run(
+        message_history=messages, deferred_tool_results=results, deps=deps, model=TestModel()
+    )
+    assert calls["count"] == 1
+    assert not isinstance(second.output, DeferredToolRequests)
+
+    # 清空幂等 store 后二次恢复仍不重复执行（plan 已执行标记兜底）
+    reset_idempotency_store()
+    results2 = DeferredToolResults()
+    results2.approvals[tool_call_id] = ToolApproved(override_args={"plan_id": plan_id})
+    third = await agent.run(
+        message_history=messages, deferred_tool_results=results2, deps=deps, model=TestModel()
+    )
+    assert calls["count"] == 1
+    assert not isinstance(third.output, DeferredToolRequests)
+
+    # 缺失 plan：STATE_UNKNOWN，不抛 TypeError
+    missing = DeferredToolResults()
+    missing.approvals[tool_call_id] = ToolApproved(override_args={"plan_id": "no-such-plan-1"})
+    fourth = await agent.run(
+        message_history=messages, deferred_tool_results=missing, deps=deps, model=TestModel()
+    )
+    assert calls["count"] == 1
+    assert "STATE_UNKNOWN" in str(fourth.output)
+
+    # 过期 plan：同 STATE_UNKNOWN
+    entry = get_preflight_cache().get_by_plan_id(plan_id)
+    assert entry is not None
+    entry.created_at = time.time() - 300  # 超过 DEFAULT_APPROVAL_TTL_SECONDS
+    expired = DeferredToolResults()
+    expired.approvals[tool_call_id] = ToolApproved(override_args={"plan_id": plan_id})
+    fifth = await agent.run(
+        message_history=messages, deferred_tool_results=expired, deps=deps, model=TestModel()
+    )
+    assert calls["count"] == 1
+    assert "STATE_UNKNOWN" in str(fifth.output)
+
+
+@pytest.mark.asyncio
+async def test_regression_status_kwarg_type_error_is_impossible(
+    monkeypatch: pytest.MonkeyPatch, _block_tool_catalog
+) -> None:
+    """2026-08-03 回归：恢复 payload 曾注入 status → TypeError。新路径结构性不可达。
+
+    即使上游 payload 被篡改塞入 status/phase/locked_targets，验证与执行层
+    也只看到 plan_id；缓存里的 canonical/execute args 本身不含隐藏字段。
+    """
+    captured: dict[str, Any] = {}
+
+    async def fake_place_impl(
+        ctx: RunContext[_Deps],
+        *,
+        pos: list[int],
+        block: str,
+        expect: str = "air",
+        states: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        captured["kwargs"] = {"pos": pos, "block": block, "expect": expect, "states": states}
+        return ToolResult.ok(f"placed:{block}")
+
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.place_block_impl", fake_place_impl)
+
+    agent = _build_place_block_agent()
+    deps = _Deps(settings=_Settings(), run_id="run-regression-status")
+    _set_supported_block_capability(str(deps.connection_id))
+
+    tool_call_id, plan_id, messages = await _run_first_place_block_call(agent, deps)
+
+    # 篡改的恢复 payload：plan_id 之外塞入 status/phase/locked_targets
+    tampered = DeferredToolResults()
+    tampered.approvals[tool_call_id] = ToolApproved(
+        override_args={
+            "plan_id": plan_id,
+            "status": "noop",
+            "phase": "execute",
+            "locked_targets": [],
+        }
+    )
+    second = await agent.run(
+        message_history=messages, deferred_tool_results=tampered, deps=deps, model=TestModel()
+    )
+    assert not isinstance(second.output, DeferredToolRequests)
+    assert captured["kwargs"] == {"pos": [1, 64, 1], "block": "stone", "expect": "air", "states": None}
+
+    # 结构性根因：预检缓存的 canonical/execute args 不含任何隐藏字段
+    entry = get_preflight_cache().get_by_plan_id(plan_id)
+    assert entry is not None
+    for key in ("status", "locked_targets", "phase"):
+        assert key not in entry.canonical_args
+        assert key not in entry.execute_args

@@ -1277,40 +1277,36 @@ class CommandHandlers:
         approvals_payload: dict[str, Any] = {}
         for item in completed_batch:
             if item.decision is True:
-                if item.tool_name in {"inspect_block", "edit_blocks"}:
-                    from services.agent.block_ops.tools_impl import project_block_execute_args
+                if item.tool_name in {"inspect_block", "place_block", "fill_block"}:
+                    # 恢复契约：只携带 plan_id；参数一致性由预检缓存校验
+                    from services.agent.block_ops.preflight_cache import get_preflight_cache
 
-                    try:
-                        expected_execute_args = project_block_execute_args(
-                            item.tool_name, item.authorized_args
-                        )
-                    except ValueError:
-                        msg = self.protocol.create_error_message("方块工具审批参数契约无效")
+                    plan_id = str(item.plan_id or "").strip()
+                    entry = get_preflight_cache().get_by_plan_id(plan_id) if plan_id else None
+                    if entry is None:
+                        msg = self.protocol.create_error_message("方块工具审批计划缺失或已过期")
                         await self._send_player_reply(
                             state, msg, source=source, player_name=player_name
                         )
                         return
-                    if expected_execute_args != item.execute_args:
-                        msg = self.protocol.create_error_message("方块工具审批参数不一致")
-                        await self._send_player_reply(
-                            state, msg, source=source, player_name=player_name
-                        )
-                        return
-                    actual_execute_hash = hash_normalized_args(
-                        normalize_tool_args(item.execute_args)
+                    actual_hash = hash_normalized_args(
+                        normalize_tool_args(entry.canonical_args)
                     )
                     if (
                         not item.execution_args_hash
-                        or item.execution_args_hash != actual_execute_hash
+                        or item.execution_args_hash != actual_hash
+                        or entry.tool_name != item.tool_name
+                        or entry.tool_call_id != item.tool_call_id
+                        or entry.run_id != item.run_id
                     ):
-                        msg = self.protocol.create_error_message("方块工具审批参数哈希不一致")
+                        msg = self.protocol.create_error_message("方块工具审批参数不一致")
                         await self._send_player_reply(
                             state, msg, source=source, player_name=player_name
                         )
                         return
                     approvals_payload[item.tool_call_id] = {
                         "kind": "tool-approved",
-                        "override_args": item.execute_args,
+                        "plan_id": plan_id,
                     }
                 else:
                     approvals_payload[item.tool_call_id] = True
