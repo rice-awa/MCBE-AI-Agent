@@ -14,16 +14,16 @@
     "deepseek": {
       "api_key": "${DEEPSEEK_API_KEY}",
       "base_url": "https://api.deepseek.com",
-      "model": "deepseek-chat"
+      "model": "deepseek-v4-flash"
     },
     "openai": {
       "api_key": null,
       "base_url": null,
-      "model": "gpt-4o"
+      "model": "gpt-5.6"
     },
     "anthropic": {
       "api_key": null,
-      "model": "claude-sonnet-4-20250514"
+      "model": "claude-sonnet-5"
     },
     "ollama": {
       "base_url": "http://localhost:11434",
@@ -117,6 +117,12 @@
         "aliases": ["AGENT conv", "AGENT conversation", "AI 对话", "AI conv"],
         "description": "管理对话",
         "usage": "<new/switch/clear/status/list/save/restore>"
+      },
+      "AGENT 连续模式": {
+        "type": "continuous_mode",
+        "aliases": ["AGENT 连续", "AGENT continuous", "AGENT auto"],
+        "description": "开启/关闭连续AI聊天模式（无需前缀自动触发AI）",
+        "usage": "<开启|关闭|状态>"
       },
       "AGENT 上下文": {
         "type": "context",

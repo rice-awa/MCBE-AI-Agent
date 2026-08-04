@@ -5,8 +5,8 @@
     "description": "Script bridge and in-game UI for MCBE AI Agent",
     "uuid": "60411f7f-774b-4269-b1cd-f58ebe702995",
     "version": [
-      1,
-      0,
+      2,
+      5,
       0
     ],
     "min_engine_version": [1, 21, 80]
@@ -18,8 +18,8 @@
       "type": "script",
       "uuid": "6b900207-0c01-4b9f-97a9-f3f170a35768",
       "version": [
-        1,
-        0,
+        2,
+        5,
         0
       ],
       "entry": "scripts/main.js"
@@ -40,7 +40,7 @@
     },
     {
       "uuid": "450332ea-6755-48b6-ab7f-36843065edd1",
-      "version": [1, 0, 0]
+      "version": [2, 5, 0]
     }
   ]
 }

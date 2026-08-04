@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 MCBE AI Agent 是一个 Minecraft Bedrock Edition AI 聊天机器人服务器，基于 PydanticAI 框架构建，采用现代化异步架构。
 
 - **Python**: 3.11+
-- **框架**: PydanticAI >= 1.0.0, Pydantic >= 2.0
+- **框架**: PydanticAI ~= 1.94.0, Pydantic >= 2.0
 - **主要依赖**: websockets, httpx, PyJWT, structlog, click, pydantic-settings
 
 ## Common Commands
@@ -78,7 +78,7 @@ MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多
 - `PromptManager` 的模板和变量按玩家分桶。
 - 断开连接时清理会话、bridge 循环、pending WS commands 与 addon client。
 
-参考：`claude_md/fix/MULTIPLAYER_SESSION_FIX.md`、`docs/addon-bridge-protocol.md`。
+参考：`docs/addon-bridge-protocol.md`。
 
 ## Working Guidelines
 
@@ -144,7 +144,7 @@ feature/* / fix/* / ...  →  dev  →  master
 | `services/agent/core.py` | PydanticAI Agent 核心 |
 | `services/agent/worker.py` | 消费队列；注入 SDK `AddonBridgeService` |
 | `services/agent/tools.py` | Agent Tools |
-| `mcbe-ws-sdk/` | 可编辑 path 依赖（gitignore；勿改源码除非另开 SDK PR） |
+| `mcbe-ws-sdk` | pip 依赖（`>=0.1.0`）；线协议与分片由 SDK 拥有，勿改 SDK 源码除非另开 SDK PR |
 | `docs/addon-bridge-protocol.md` | mcbews 桥协议说明 |
 
 ## Supported LLM Providers
@@ -161,7 +161,14 @@ feature/* / fix/* / ...  →  dev  →  master
 | `#登录 <密码>` | 用户认证 |
 | `AGENT 聊天 <消息>` | 与 AI 对话 |
 | `AGENT 脚本 <消息>` | 使用 ScriptEvent 发送 |
+| `AGENT 保存` | 保存当前对话历史 |
+| `AGENT 对话 <子命令>` | 管理对话（new/switch/clear/status/list/save/restore） |
+| `AGENT 连续模式 <开启/关闭/状态>` | 无需前缀自动触发 AI 聊天 |
 | `AGENT 上下文 <开启/关闭/状态>` | 管理对话上下文 |
+| `AGENT 模板 <模板名/list>` | 切换提示词模板 |
+| `AGENT 设置 <子命令>` | 变量 / 别名管理 |
+| `AGENT MCP <list/status/reload>` | MCP 服务器管理 |
+| `AGENT 广播 <子命令>` | AI 聊天广播策略管理 |
 | `AGENT 同意 [id|对话|永远]` | 同意待审批工具；省略 id 智能选当前批；`对话`/`永远` 开启自动同意 |
 | `AGENT 拒绝 [id|对话|永远]` | 拒绝待审批工具；`对话`/`永远` 关闭对应自动同意 |
 | `切换模型 <提供商>` | 切换 LLM 提供商 |

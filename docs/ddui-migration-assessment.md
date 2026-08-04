@@ -108,10 +108,10 @@ scripts/main.ts
 ```text
 Python Agent Tool
   -> AddonBridgeService
-  -> scriptevent mcbeai:bridge_request <json>
+  -> scriptevent mcbews:bridge_req <json>
   -> Addon scriptEventReceive
   -> capability handler
-  -> MCBEAI_TOOL 模拟玩家聊天分片
+  -> MCBEWS_BRIDGE 模拟玩家聊天分片
   -> WebSocket PlayerMessage
   -> Python 分片重组与 future 唤醒
 ```
@@ -302,7 +302,7 @@ DDUI 所需 beta 模块需要开启 `Beta APIs`。这会提高安装、联调和
 
 Script API 不一定能伪造真实玩家聊天消息并触发 Python WebSocket 的 `PlayerMessage` 链路。
 
-处理方式：第一阶段先验证最小路径。如果不可行，新增 UI 专用事件协议，例如 `mcbeai:ui_event`，由 Python 显式识别 UI 请求。
+处理方式：第一阶段先验证最小路径。如果不可行，UI 主动上行走现有 UI 聊天前缀 `MCBEWS|UI_CHAT`（见 `docs/addon-bridge-protocol.md`），不新增 ScriptEvent。
 
 ### 多玩家状态串扰
 

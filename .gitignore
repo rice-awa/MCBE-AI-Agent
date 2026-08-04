@@ -23,6 +23,9 @@ MCBE-AI-Agent-addon/node_modules/
 MCBE-AI-Agent-addon/dist/
 MCBE-AI-Agent-addon/GPTaddon.1.21.23(old)/
 
+# 根目录发布产物（release workflow 源码归档）
+dist/
+
 # tests
 test_logs/*
 

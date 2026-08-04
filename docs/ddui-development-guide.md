@@ -12,7 +12,7 @@
 
 - 把现有 `scripts/ui/` 下的稳定表单（ActionForm / ModalForm）平滑切换到 DDUI（CustomForm / MessageBox + Observable），保留全部已实现业务能力。
 - 让面板状态层（`bridgeStatus`、`lastPrompt`、`lastResponsePreview`、`history`、`settings`、`stats`）以**响应式**方式驱动 UI，免去手工重开表单刷新数据的步骤。
-- 不破坏现有 Python 与 addon 的 ScriptEvent 桥接协议（`mcbeai:bridge_request` / `mcbeai:ai_resp`）。
+- 不破坏现有 Python 与 addon 的 ScriptEvent 桥接协议（`mcbews:bridge_req` / `mcbews:text_resp`）。
 - 把 manifest、构建、测试矩阵区分为 **stable** 与 **beta** 两条产物线，避免互相污染。
 
 ### 1.2 非目标
@@ -78,7 +78,7 @@ export type ObservableLike<T> = {
 ### 2.4 响应同步链路
 
 `scripts/bridge/responseSync.ts` 的 `activeUiStates: Map<playerId, AgentUiState>`：
-- Python 推回 `mcbeai:ai_resp` 分片 → 重组 → `appendHistoryItem` + 更新 `bridgeStatus` / `lastResponsePreview`。
+- Python 推回 `mcbews:text_resp` 分片 → 重组 → `appendHistoryItem` + 更新 `bridgeStatus` / `lastResponsePreview`。
 - 这是 DDUI **响应式**最大受益点。stable 版本下，玩家必须重开面板才能看到新数据；DDUI 下用 `Observable.setData()` 可以实时刷新打开中的表单。
 
 ### 2.5 表单适配层
@@ -647,9 +647,9 @@ export async function confirm(player: Player, title: string, body: string, okTex
 
 ### 8.1 不变项
 
-- `mcbeai:bridge_request` / `mcbeai:ai_resp` ScriptEvent ID 不变。
+- `mcbews:bridge_req` / `mcbews:text_resp` ScriptEvent ID 与 SDK 的 mcbews v1 常量一致（已从旧的 `mcbeai:*` 迁移）。
 - `BRIDGE_MAX_CHUNK_CONTENT_LENGTH=256` 上行字符上限不变。
-- `MCBEAI_TOOL` 模拟玩家与 `tell @s` 命令链路不变。
+- `MCBEWS_BRIDGE` 模拟玩家与 `tell @s` 命令链路不变。
 - Python 侧 `flow_control.py` 的下行分片协议不变。
 
 ### 8.2 受益项
@@ -660,15 +660,15 @@ export async function confirm(player: Player, title: string, body: string, okTex
   - 统计面板的 `responseChunkCount` 自动 +1 并更新。
 - 玩家不再需要点「刷新」按钮，主面板的「刷新」按钮可以下线。
 
-### 8.3 新增可选事件
+### 8.3 UI 主动上行
 
-如果未来要让 UI 主动触发 Python 处理（例如 UI 端切换模型），考虑新增一条 ScriptEvent：
+UI 主动触发 Python 处理（例如 UI 端切换模型）走现有 UI 聊天上行通道，不新增 ScriptEvent：
 
 ```
-mcbeai:ui_event  payload={"type":"switch_provider","player":"<name>","provider":"deepseek"}
+聊天前缀: MCBEWS|UI_CHAT|<msg_id>|<index>/<total>|<payload_fragment>
 ```
 
-由 Python 侧识别并走 `MessageBroker`，避免污染现有 `mcbeai:bridge_request` 命名空间。该协议**不在本次 DDUI 改造范围内**，单独立计划。
+由 Python 侧识别并走 `MessageBroker`。该协议**不在本次 DDUI 改造范围内**，单独立计划。
 
 ---
 
@@ -843,7 +843,7 @@ A: 留着。命令链路与 UI 链路并行，`buildAgentChatCommand()` 已经�
 
 - 评估文档：`docs/ddui-migration-assessment.md`
 - 桥接协议：`docs/addon-bridge-protocol.md`
-- 多人会话隔离修复：`claude_md/fix/MULTIPLAYER_SESSION_FIX.md`
+- 多人会话隔离修复：见 `docs/addon-bridge-protocol.md`
 - 官方 DDUI 入门：<https://learn.microsoft.com/en-us/minecraft/creator/documents/scripting/intro-to-ddui>
 - `@minecraft/server-ui` API：<https://learn.microsoft.com/en-us/minecraft/creator/scriptapi/minecraft/server-ui/minecraft-server-ui>
 - `CustomForm` API（experimental）：<https://learn.microsoft.com/en-us/minecraft/creator/scriptapi/minecraft/server-ui/customform>
