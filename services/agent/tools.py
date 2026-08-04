@@ -1148,7 +1148,9 @@ def register_agent_tools(
                 长方体两角点 ``[[x1, y1, z1], [x2, y2, z2]]``。
                 所有坐标均为绝对世界坐标整数。
         """
-        return '{"ok": true, "block": "minecraft:air", "states": {}, "is_air": true}'
+        from services.agent.block_ops.tools_impl import inspect_block_impl
+
+        return await inspect_block_impl(ctx, target=target)
 
     @chat_agent.tool
     async def place_block(
@@ -1168,7 +1170,15 @@ def register_agent_tools(
                 ``"any"`` 允许覆写非空方块（需审批）
             states: 可选方块状态，如 ``{"facing": "north"}``
         """
-        return '{"ok": true, "status": "applied", "at": [0, 0, 0], "block": "minecraft:air"}'
+        from services.agent.block_ops.tools_impl import place_block_impl
+
+        return await place_block_impl(
+            ctx,
+            pos=pos,
+            block=block,
+            expect=expect,
+            states=states,
+        )
 
     @chat_agent.tool
     async def fill_block(
@@ -1191,7 +1201,16 @@ def register_agent_tools(
             expect: 前置条件，默认 ``"air"``
             states: 可选方块状态
         """
-        return '{"ok": true, "status": "applied", "changed": 0, "skipped": 0}'
+        from services.agent.block_ops.tools_impl import fill_block_impl
+
+        return await fill_block_impl(
+            ctx,
+            from_=from_,
+            to=to,
+            block=block,
+            expect=expect,
+            states=states,
+        )
 
     if _runtime_harness_schema_enabled(settings):
         _enhance_registered_tool_descriptions(chat_agent)

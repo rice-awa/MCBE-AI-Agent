@@ -53,9 +53,11 @@ from services.agent.block_ops.tools_impl import (
     check_bridge_command_line_budget,
     edit_blocks_impl,
     estimate_bridge_command_line_bytes,
+    fill_block_impl,
     inspect_block_impl,
     locked_targets_wire_limit_exceeded,
     merge_canonical_from_preflight,
+    place_block_impl,
     project_block_execute_args,
     run_block_preflight,
     should_omit_locked_targets_on_wire,
@@ -1654,16 +1656,15 @@ async def test_inspect_block_impl_absolute() -> None:
     ctx = SimpleNamespace(deps=deps)
     result = await inspect_block_impl(
         ctx,  # type: ignore[arg-type]
-        coordinate_mode="absolute",
-        dimension="minecraft:overworld",
-        position={"x": 3, "y": 64, "z": 4},
+        target=[3, 64, 4],
     )
     assert result.is_success
     assert any(c[0] == "inspect_block" for c in bridge.calls)
 
 
 @pytest.mark.asyncio
-async def test_inspect_block_validation_missing_position() -> None:
+async def test_inspect_block_impl_requires_target() -> None:
+    """A missing target is rejected as INVALID_ARGUMENT (never a TypeError)."""
     bridge = _FakeBridge()
     cid = str(uuid4())
     await ensure_block_capability(cid, bridge)
@@ -1671,8 +1672,7 @@ async def test_inspect_block_validation_missing_position() -> None:
     ctx = SimpleNamespace(deps=deps)
     result = await inspect_block_impl(
         ctx,  # type: ignore[arg-type]
-        coordinate_mode="absolute",
-        dimension="minecraft:overworld",
+        target=None,
     )
     assert not result.is_success
     body = json.loads(result.output)
@@ -1860,7 +1860,6 @@ async def test_inspect_block_impl_target_positions() -> None:
     result = await inspect_block_impl(
         ctx,  # type: ignore[arg-type]
         target={"positions": [{"x": 1, "y": 64, "z": 2}]},
-        dimension="minecraft:overworld",
     )
     assert result.is_success
     # Verify the bridge received the unified target shape.
@@ -1881,7 +1880,6 @@ async def test_inspect_block_impl_target_box() -> None:
     result = await inspect_block_impl(
         ctx,  # type: ignore[arg-type]
         target={"box": {"from": {"x": 0, "y": 64, "z": 0}, "to": {"x": 2, "y": 66, "z": 2}}},
-        dimension="minecraft:overworld",
     )
     assert result.is_success
     inspect_calls = [c for c in bridge.calls if c[0] == "inspect_block"]
@@ -1905,7 +1903,6 @@ async def test_inspect_block_impl_target_rejects_mixed_coords() -> None:
     result = await inspect_block_impl(
         ctx,  # type: ignore[arg-type]
         target={"positions": [{"x": 0, "y": 64, "z": 0}, {"forward": 1, "right": 0, "up": 0}]},
-        dimension="minecraft:overworld",
     )
     assert not result.is_success
     body = json.loads(result.output)
@@ -1925,7 +1922,6 @@ async def test_inspect_block_impl_target_rejects_both_shapes() -> None:
             "positions": [{"x": 0, "y": 64, "z": 0}],
             "box": {"from": {"x": 0, "y": 64, "z": 0}, "to": {"x": 1, "y": 64, "z": 1}},
         },
-        dimension="minecraft:overworld",
     )
     assert not result.is_success
     body = json.loads(result.output)
@@ -1945,7 +1941,6 @@ async def test_inspect_block_impl_target_box_volume_limit() -> None:
     result = await inspect_block_impl(
         ctx,  # type: ignore[arg-type]
         target={"box": {"from": {"x": 0, "y": 0, "z": 0}, "to": {"x": 199, "y": 199, "z": 199}}},
-        dimension="minecraft:overworld",
     )
     # Host rejects before bridge call.
     assert not result.is_success
@@ -2881,9 +2876,14 @@ async def test_relative_inspect_executes_frozen_public_projection_only() -> None
             "position": position, "positions": positions,
             "locked_targets": locked_targets, "phase": phase,
         })
+        # Task 2: impl takes the unified target only; translate legacy kwargs.
+        target: dict[str, Any] | None = None
+        if position is not None:
+            target = {"positions": [position]}
+        elif positions is not None:
+            target = {"positions": positions}
         return str(await inspect_block_impl(
-            ctx, coordinate_mode=coordinate_mode, dimension=dimension,
-            position=position, positions=positions, locked_targets=locked_targets, phase=phase,
+            ctx, target=target, locked_targets=locked_targets, phase=phase,
         ))
 
     calls = 0
@@ -3127,12 +3127,15 @@ async def test_harness_inspect_auto_allows_when_supported() -> None:
         locked_targets: list[dict[str, Any]] | None = None,
         phase: str | None = None,
     ) -> str:
+        # Task 2: impl takes the unified target only; translate legacy kwargs.
+        target: dict[str, Any] | None = None
+        if position is not None:
+            target = {"positions": [position]}
+        elif positions is not None:
+            target = {"positions": positions}
         return await inspect_block_impl(
             ctx,  # type: ignore[arg-type]
-            coordinate_mode=coordinate_mode,  # type: ignore[arg-type]
-            dimension=dimension,
-            position=position,
-            positions=positions,
+            target=target,
             locked_targets=locked_targets,
             phase=phase,
         )
@@ -3392,12 +3395,12 @@ def test_new_edit_contract_absolute_without_dimension_is_deferred_to_addon() -> 
     assert "dimension" not in _norm_first(norms).legacy
 
 
-def test_block_tool_schema_rejects_invalid_target_and_edit_shapes() -> None:
-    """The public schema constrains the new single-op contract."""
-    from pydantic import ValidationError
+def test_inspect_target_schema_exposes_point_or_box_union() -> None:
+    """The inspect_block target schema is a single-point or two-corner union.
 
-    # Verify the new types enforce coordinate constraints via Pydantic validation.
-    # BlockPosition requires exactly 3 ints.
+    Runtime rejection of invalid coordinates (non-int / wrong length) is
+    covered by the impl-level INVALID_COORDINATE tests, not by Pydantic here.
+    """
     from services.agent.tools import BlockPosition
 
     # Note: BlockPosition / InspectTarget are Annotated types used as function
@@ -4907,3 +4910,241 @@ async def test_grouped_edit_preflight_addon_returns_state_invalid_with_keys() ->
     assert failure is not None
     body = json.loads(failure.output)
     assert body["code"] == "STATE_INVALID"
+
+
+# ---------------------------------------------------------------------------
+# Task 2: single-op implementation layer (place_block_impl / fill_block_impl /
+#         inspect_block_impl) and Add-on frame mapping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_place_maps_to_mode_place_frame() -> None:
+    """place_block_impl builds a mode=place frame: normalized type_id, expect mapping.
+
+    expect=air → replace_any=False with no expected_previous; expect=any →
+    replace_any=True; expect="minecraft:stone" → expected_previous. No
+    ``dimension`` is sent: the Add-on defaults to the current player dimension.
+    """
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+
+    # Default expect=air: replace_any=False, no expected_previous, type_id normalized.
+    result = await place_block_impl(
+        ctx,  # type: ignore[arg-type]
+        pos=[1, 64, 2],
+        block="stone",
+        expect="air",
+    )
+    assert result.is_success
+    payload = [c for c in bridge.calls if c[0] == "edit_blocks"][-1][1]
+    assert payload["mode"] == "place"
+    assert payload["position"] == {"x": 1, "y": 64, "z": 2}
+    assert payload["type_id"] == "minecraft:stone"
+    assert payload["replace_any"] is False
+    assert "expected_previous" not in payload
+    assert "dimension" not in payload
+
+    # expect=any → replace_any=True.
+    result = await place_block_impl(
+        ctx,  # type: ignore[arg-type]
+        pos=[2, 64, 2],
+        block="minecraft:glass",
+        expect="any",
+    )
+    assert result.is_success
+    payload = [c for c in bridge.calls if c[0] == "edit_blocks"][-1][1]
+    assert payload["replace_any"] is True
+    assert "expected_previous" not in payload
+
+    # expect="minecraft:stone" → expected_previous.
+    result = await place_block_impl(
+        ctx,  # type: ignore[arg-type]
+        pos=[3, 64, 2],
+        block="glass",
+        expect="minecraft:stone",
+    )
+    assert result.is_success
+    payload = [c for c in bridge.calls if c[0] == "edit_blocks"][-1][1]
+    assert payload["replace_any"] is False
+    assert payload["expected_previous"] == {"type_id": "minecraft:stone"}
+    assert "dimension" not in payload
+
+
+@pytest.mark.asyncio
+async def test_fill_normalizes_corners_and_enforces_volume() -> None:
+    """fill_block_impl min/max-normalizes corners and enforces max_fill_volume.
+
+    Oversized AABBs are rejected host-side with LIMIT_EXCEEDED and a
+    shrink-direction hint; the request never reaches the bridge.
+    """
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+
+    # from=(10,10,10), to=(8,8,8) → from_pos=min, to_pos=max.
+    result = await fill_block_impl(
+        ctx,  # type: ignore[arg-type]
+        from_=[10, 10, 10],
+        to=[8, 8, 8],
+        block="oak_planks",
+    )
+    assert result.is_success
+    payload = [c for c in bridge.calls if c[0] == "edit_blocks"][-1][1]
+    assert payload["mode"] == "fill"
+    assert payload["from"] == {"x": 8, "y": 8, "z": 8}
+    assert payload["to"] == {"x": 10, "y": 10, "z": 10}
+    assert "dimension" not in payload
+
+    # Volume 51^3 = 132651 > default max_fill_volume 4096 → LIMIT_EXCEEDED.
+    edit_calls_before = len([c for c in bridge.calls if c[0] == "edit_blocks"])
+    result = await fill_block_impl(
+        ctx,  # type: ignore[arg-type]
+        from_=[0, 0, 0],
+        to=[50, 50, 50],
+        block="stone",
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "LIMIT_EXCEEDED"
+    assert "缩小" in body.get("hint", "")
+    assert body["volume"] == 51 * 51 * 51
+    edit_calls_after = len([c for c in bridge.calls if c[0] == "edit_blocks"])
+    assert edit_calls_after == edit_calls_before  # rejected before the bridge
+
+
+@pytest.mark.asyncio
+async def test_long_states_frame_hits_budget_defense() -> None:
+    """An oversized states frame trips the commandLine budget defense.
+
+    LIMIT_EXCEEDED with estimated_bytes/budget is returned and the request
+    never leaves the host (no edit_blocks bridge call).
+    """
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+
+    edit_calls_before = len([c for c in bridge.calls if c[0] == "edit_blocks"])
+    result = await place_block_impl(
+        ctx,  # type: ignore[arg-type]
+        pos=[1, 64, 1],
+        block="minecraft:oak_stairs",
+        expect="air",
+        states={"facing": "north" + "x" * 500},
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "LIMIT_EXCEEDED"
+    assert body["reason"] == "command_line_budget"
+    assert body["estimated_bytes"] >= body["budget"]
+    edit_calls_after = len([c for c in bridge.calls if c[0] == "edit_blocks"])
+    assert edit_calls_after == edit_calls_before  # request never left the host
+
+
+@pytest.mark.asyncio
+async def test_place_block_impl_rejects_invalid_coordinates() -> None:
+    """Non-int / wrong-length pos → structured INVALID_COORDINATE, no exception."""
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+    baseline = len([c for c in bridge.calls if c[0] == "edit_blocks"])
+
+    for bad_pos in ([1, 2], [1.5, 2, 3], [1, 2, 3, 4], ["a", 2, 3], [1, True, 3], "1,2,3"):
+        result = await place_block_impl(
+            ctx,  # type: ignore[arg-type]
+            pos=bad_pos,  # type: ignore[arg-type]
+            block="stone",
+        )
+        assert not result.is_success, bad_pos
+        body = json.loads(result.output)
+        assert body["code"] == "INVALID_COORDINATE", bad_pos
+        assert body["ok"] is False
+
+    assert len([c for c in bridge.calls if c[0] == "edit_blocks"]) == baseline
+
+
+@pytest.mark.asyncio
+async def test_fill_block_impl_rejects_invalid_corners() -> None:
+    """Non-int / wrong-length corners → structured INVALID_COORDINATE."""
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+
+    for bad_from, bad_to in (
+        ([1, 2], [3, 4, 5]),
+        ([1.5, 2, 3], [4, 5, 6]),
+        ([1, 2, 3], [4, 5]),
+    ):
+        result = await fill_block_impl(
+            ctx,  # type: ignore[arg-type]
+            from_=bad_from,  # type: ignore[arg-type]
+            to=bad_to,  # type: ignore[arg-type]
+            block="stone",
+        )
+        assert not result.is_success, (bad_from, bad_to)
+        body = json.loads(result.output)
+        assert body["code"] == "INVALID_COORDINATE", (bad_from, bad_to)
+
+
+@pytest.mark.asyncio
+async def test_inspect_block_impl_array_target() -> None:
+    """The array target maps to the Add-on unified target with no dimension.
+
+    Single point → target.positions; two corners → target.box with normalized
+    min/max corners.
+    """
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+
+    result = await inspect_block_impl(
+        ctx,  # type: ignore[arg-type]
+        target=[3, 64, 4],
+    )
+    assert result.is_success
+    payload = [c for c in bridge.calls if c[0] == "inspect_block"][-1][1]
+    assert payload["target"] == {"positions": [{"x": 3, "y": 64, "z": 4}]}
+    assert "dimension" not in payload
+
+    result = await inspect_block_impl(
+        ctx,  # type: ignore[arg-type]
+        target=[[10, 10, 10], [8, 8, 8]],
+    )
+    assert result.is_success
+    payload = [c for c in bridge.calls if c[0] == "inspect_block"][-1][1]
+    assert payload["target"] == {
+        "box": {"from": {"x": 8, "y": 8, "z": 8}, "to": {"x": 10, "y": 10, "z": 10}}
+    }
+    assert "dimension" not in payload
+
+
+@pytest.mark.asyncio
+async def test_inspect_block_impl_rejects_invalid_array_target() -> None:
+    """Non-int / wrong-length array targets → structured INVALID_COORDINATE."""
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+
+    for bad in ([1, 2], [1.5, 2, 3], [[1, 2, 3]], [[1, 2, 3], [4, 5]], "1,2,3"):
+        result = await inspect_block_impl(
+            ctx,  # type: ignore[arg-type]
+            target=bad,  # type: ignore[arg-type]
+        )
+        assert not result.is_success, bad
+        body = json.loads(result.output)
+        assert body["code"] == "INVALID_COORDINATE", bad

@@ -49,8 +49,7 @@ EditMode = Literal["place", "batch", "fill"]
 _BRIDGE_REQUEST_ID_PLACEHOLDER = f"addon-{'0' * 32}"
 _BRIDGE_REQ_PREFIX = "scriptevent mcbews:bridge_req "
 _COMMAND_LINE_BUDGET_HINT = (
-    "减小 batch.positions 数量或 fill AABB；继续使用 batch/fill，"
-    "禁止拆成大量 place（禁止 place 风暴）；勿用命令绕过审批。"
+    "缩小 fill AABB 或减少 states；禁止拆成大量 place；勿用命令绕过审批。"
 )
 _COMMAND_LINE_BUDGET_MESSAGE = "出站帧超出 MCBE commandLine 字节预算，请求未发送。"
 _AUDIT_EDIT_EVIDENCE_FIELDS = frozenset({
@@ -534,6 +533,83 @@ def _normalize_aabb_corners(
         )
     except (KeyError, TypeError, ValueError):
         return from_pos, to_pos
+
+
+def _normalize_position_array(
+    value: Any,
+    *,
+    field_name: str,
+) -> tuple[dict[str, Any] | None, ToolResult | None]:
+    """Normalize an ``[x, y, z]`` int array into an ``{x, y, z}`` dict.
+
+    Wrong-length / non-list / float / string / bool inputs yield a structured
+    INVALID_COORDINATE result (never a Python exception), matching the
+    int-only absolute-coordinate contract (spec §3.4).
+    """
+    if not isinstance(value, list) or len(value) != 3:
+        return None, _host_limit_error(
+            BlockErrorCode.INVALID_COORDINATE,
+            f"{field_name} 必须是恰好 3 个整数的坐标数组 [x, y, z]",
+        )
+    for i, item in enumerate(value):
+        if isinstance(item, bool) or not isinstance(item, int):
+            return None, _host_limit_error(
+                BlockErrorCode.INVALID_COORDINATE,
+                f"{field_name}[{i}] 必须是整数坐标",
+            )
+    return {"x": value[0], "y": value[1], "z": value[2]}, None
+
+
+def _normalize_single_op_block(
+    block: Any,
+    states: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any] | None, ToolResult | None]:
+    """Normalize ``block`` (+ optional separate ``states``) for single-op tools.
+
+    Returns ``(type_id, effective_states, error)``; ``error`` is a structured
+    INVALID_ARGUMENT result when no usable type_id is present.
+    """
+    block_info, _repairs = _normalize_block_input(block)
+    type_id = str(block_info.get("type_id") or "").strip()
+    if not type_id:
+        return "", None, _host_limit_error(
+            BlockErrorCode.INVALID_ARGUMENT,
+            "block.type_id 必填",
+        )
+    effective_states = states
+    if effective_states is None:
+        effective_states = block_info.get("states")
+    if effective_states is not None and not isinstance(effective_states, dict):
+        return "", None, _host_limit_error(
+            BlockErrorCode.INVALID_ARGUMENT,
+            "states 必须是对象",
+        )
+    return type_id, effective_states, None
+
+
+def _expect_to_legacy(
+    expect: Any,
+) -> tuple[bool, dict[str, Any] | None, ToolResult | None]:
+    """Map an ``expect`` value to ``(replace_any, expected_previous)``.
+
+    ``air`` (default) -> replace air only; ``any`` -> replace any block;
+    a type_id (or ``{type_id, states}``) -> expected_previous. An empty
+    type_id in the descriptor is rejected as INVALID_ARGUMENT.
+    """
+    expect_info = _normalize_expect(expect)
+    if expect_info["kind"] == "any":
+        return True, None, None
+    if expect_info["kind"] in {"type", "permutation"}:
+        type_id = expect_info.get("type_id") or ""
+        if not type_id:
+            return False, None, _host_limit_error(
+                BlockErrorCode.INVALID_ARGUMENT,
+                "expect.type_id 必填",
+            )
+        if expect_info["kind"] == "permutation":
+            return False, {"type_id": type_id, "states": expect_info.get("states")}, None
+        return False, {"type_id": type_id}, None
+    return False, None, None
 
 
 def _normalize_block_id(
@@ -2690,19 +2766,16 @@ async def run_block_preflight(
 async def inspect_block_impl(
     ctx: RunContext[AgentDependencies],
     *,
-    target: dict[str, Any] | None = None,
-    coordinate_mode: CoordinateMode = "absolute",
-    dimension: str | None = None,
-    position: dict[str, Any] | None = None,
-    positions: list[dict[str, Any]] | None = None,
+    target: Any,
+    phase: str = "execute",
     locked_targets: list[dict[str, Any]] | None = None,
-    phase: str | None = None,
 ) -> ToolResult:
-    """Query one or more block snapshots via addon bridge.
+    """Query one or more block snapshots via the addon bridge (spec §3.3).
 
-    The model-facing interface uses the unified ``target`` argument (positions
-    or box). Legacy ``position`` / ``positions`` are accepted for harness
-    recovery and internal callers but are not exposed in the model schema.
+    The model-facing ``target`` is a single point ``[x, y, z]``, two box
+    corners ``[[x1, y1, z1], [x2, y2, z2]]``, or the unified dict form
+    ``{positions: [...]}`` / ``{box: {from, to}}``. ``dimension`` is never
+    sent: the Add-on defaults to the current player dimension (spec §3.3).
     """
     deps = ctx.deps
     logger.info(
@@ -2712,12 +2785,17 @@ async def inspect_block_impl(
         run_id=deps.run_id,
         player_name=deps.player_name,
         has_target=target is not None,
-        coordinate_mode=coordinate_mode,
     )
 
     unsupported = await _require_supported(ctx)
     if unsupported is not None:
         return unsupported
+
+    if target is None:
+        return _host_limit_error(
+            BlockErrorCode.INVALID_ARGUMENT,
+            "target 必填",
+        )
 
     limits = get_block_tools_limits(deps.settings)
     limits_payload = {
@@ -2729,53 +2807,30 @@ async def inspect_block_impl(
         "inspect_sample_limit": limits.inspect_sample_limit,
     }
 
-    # Unified target path (issue 02): normalize then build payload.
-    if target is not None:
+    if isinstance(target, dict):
         normalized, validation = _validate_inspect_target(
             target,
-            dimension=dimension,
+            dimension=None,
             max_positions=limits.max_discrete_positions,
             max_fill_volume=limits.max_fill_volume,
         )
-        if validation is not None:
-            return validation
-        assert normalized is not None
-        from services.agent.block_ops.target import build_inspect_payload_from_target
+    else:
+        from services.agent.block_ops.target import normalize_array_target
 
-        payload = build_inspect_payload_from_target(
-            normalized,
-            dimension=dimension,
-            player_name=deps.player_name,
-            phase=phase or "execute",
-            locked_targets=locked_targets,
-            limits=limits_payload,
-        )
-        return await call_block_capability(deps.addon_bridge, "inspect_block", payload)
-
-    # Legacy path (harness recovery / internal callers).
-    validation = _validate_inspect_args(
-        coordinate_mode=coordinate_mode,
-        dimension=dimension,
-        position=position,
-        positions=positions,
-        max_positions=limits.max_discrete_positions,
-    )
+        normalized, validation = normalize_array_target(target)
     if validation is not None:
         return validation
+    assert normalized is not None
 
-    payload = build_inspect_payload(
-        coordinate_mode=coordinate_mode,
-        dimension=dimension,
-        position=position,
-        positions=positions,
+    from services.agent.block_ops.target import build_inspect_payload_from_target
+
+    payload = build_inspect_payload_from_target(
+        normalized,
+        dimension=None,
         player_name=deps.player_name,
         phase=phase or "execute",
         locked_targets=locked_targets,
-        limits={
-            "max_discrete_positions": limits.max_discrete_positions,
-            "max_fill_volume": limits.max_fill_volume,
-            "cells_per_tick": limits.cells_per_tick,
-        },
+        limits=limits_payload,
     )
     return await call_block_capability(deps.addon_bridge, "inspect_block", payload)
 
@@ -3306,4 +3361,189 @@ async def edit_blocks_impl(
         payload,
         mode=mode,
         authorized_bounds=authorized_bounds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 2: single-op implementations (place_block / fill_block)
+# ---------------------------------------------------------------------------
+
+
+async def place_block_impl(
+    ctx: RunContext[AgentDependencies],
+    *,
+    pos: Any,
+    block: Any,
+    expect: Any = "air",
+    states: dict[str, Any] | None = None,
+    phase: str = "execute",
+    locked_targets: list[dict[str, Any]] | None = None,
+) -> ToolResult:
+    """Write a block at a single absolute cell (spec §3.1).
+
+    Maps to a ``mode=place`` Add-on edit frame. ``dimension`` is intentionally
+    not sent: the Add-on defaults to the current player dimension (spec §3.3).
+    """
+    deps = ctx.deps
+    logger.info(
+        "agent_tool_call",
+        tool="place_block",
+        connection_id=_connection_id(deps),
+        run_id=deps.run_id,
+        player_name=deps.player_name,
+        pos=pos,
+    )
+
+    unsupported = await _require_supported(ctx)
+    if unsupported is not None:
+        return unsupported
+
+    position, error = _normalize_position_array(pos, field_name="pos")
+    if error is not None:
+        return error
+    assert position is not None
+
+    type_id, effective_states, error = _normalize_single_op_block(block, states)
+    if error is not None:
+        return error
+
+    replace_any, expected_previous, error = _expect_to_legacy(expect)
+    if error is not None:
+        return error
+
+    payload = build_edit_payload(
+        mode="place",
+        coordinate_mode="absolute",
+        dimension=None,
+        position=position,
+        positions=None,
+        from_pos=None,
+        to_pos=None,
+        type_id=type_id,
+        states=effective_states,
+        replace_any=replace_any,
+        expected_previous=expected_previous,
+        player_name=deps.player_name,
+        phase=phase or "execute",
+        locked_targets=locked_targets,
+    )
+
+    budget = get_command_line_byte_budget(deps.settings)
+    budget_fail = check_bridge_command_line_budget(
+        "edit_blocks",
+        payload,
+        budget=budget,
+        matched_count=1,
+    )
+    if budget_fail is not None:
+        return budget_fail
+
+    return await call_block_capability(
+        deps.addon_bridge,
+        "edit_blocks",
+        payload,
+        mode="place",
+    )
+
+
+async def fill_block_impl(
+    ctx: RunContext[AgentDependencies],
+    *,
+    from_: Any,
+    to: Any,
+    block: Any,
+    expect: Any = "air",
+    states: dict[str, Any] | None = None,
+    phase: str = "execute",
+    locked_targets: list[dict[str, Any]] | None = None,
+) -> ToolResult:
+    """Fill the AABB between two absolute corners (spec §3.2).
+
+    Corners are min/max-normalized before reaching the Add-on. The host
+    rejects oversized volumes (LIMIT_EXCEEDED with a shrink-direction hint)
+    before any bridge call. ``dimension`` is intentionally not sent: the
+    Add-on defaults to the current player dimension (spec §3.3).
+    """
+    deps = ctx.deps
+    logger.info(
+        "agent_tool_call",
+        tool="fill_block",
+        connection_id=_connection_id(deps),
+        run_id=deps.run_id,
+        player_name=deps.player_name,
+        from_pos=from_,
+        to_pos=to,
+    )
+
+    unsupported = await _require_supported(ctx)
+    if unsupported is not None:
+        return unsupported
+
+    from_raw, error = _normalize_position_array(from_, field_name="from_")
+    if error is not None:
+        return error
+    to_raw, error = _normalize_position_array(to, field_name="to")
+    if error is not None:
+        return error
+    assert from_raw is not None and to_raw is not None
+
+    from_pos, to_pos = _normalize_aabb_corners(from_raw, to_raw)
+
+    limits = get_block_tools_limits(deps.settings)
+    volume = _aabb_volume(from_pos, to_pos)
+    if volume is None:
+        return _host_limit_error(
+            BlockErrorCode.INVALID_COORDINATE,
+            "fill 角落坐标无法计算体积",
+        )
+    if volume > limits.max_fill_volume:
+        return _host_limit_error(
+            BlockErrorCode.LIMIT_EXCEEDED,
+            f"fill 体积 {volume} 超过上限 {limits.max_fill_volume}，请求未发送",
+            limit=limits.max_fill_volume,
+            volume=volume,
+            hint=_COMMAND_LINE_BUDGET_HINT,
+        )
+
+    type_id, effective_states, error = _normalize_single_op_block(block, states)
+    if error is not None:
+        return error
+
+    replace_any, expected_previous, error = _expect_to_legacy(expect)
+    if error is not None:
+        return error
+
+    payload = build_edit_payload(
+        mode="fill",
+        coordinate_mode="absolute",
+        dimension=None,
+        position=None,
+        positions=None,
+        from_pos=from_pos,
+        to_pos=to_pos,
+        type_id=type_id,
+        states=effective_states,
+        replace_any=replace_any,
+        expected_previous=expected_previous,
+        player_name=deps.player_name,
+        phase=phase or "execute",
+        locked_targets=locked_targets,
+    )
+
+    budget = get_command_line_byte_budget(deps.settings)
+    budget_fail = check_bridge_command_line_budget(
+        "edit_blocks",
+        payload,
+        budget=budget,
+        volume=volume,
+    )
+    if budget_fail is not None:
+        return budget_fail
+
+    return await call_block_capability(
+        deps.addon_bridge,
+        "edit_blocks",
+        payload,
+        mode="fill",
+        authorized_bounds={"from": from_pos, "to": to_pos, "volume": volume},
     )

@@ -19,8 +19,7 @@ from services.agent.tool_results import ToolResult
 logger = get_logger(__name__)
 
 _LIMIT_HINT = (
-    "减小 batch.positions 数量或 fill AABB；继续使用 batch/fill，"
-    "禁止拆成大量 place（禁止 place 风暴）；勿用命令绕过审批。"
+    "缩小 fill AABB 或减少 states；禁止拆成大量 place；勿用命令绕过审批。"
 )
 _LIMIT_MESSAGE = "出站帧超出 MCBE commandLine 字节预算，请求未发送。"
 _PRECONDITION_MESSAGE = "目标方块不满足 expect 前置条件。"
