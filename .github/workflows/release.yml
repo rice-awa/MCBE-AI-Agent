@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g., 0.1.0) - leave empty to use package.json version'
+        description: 'Release version override (e.g., 2.5.1) - leave empty to use _version.py'
         required: false
         default: ''
       prerelease:
@@ -66,15 +66,37 @@ jobs:
 
       - name: Determine version
         id: get_version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
           else
-            VERSION=$(node -p "require('./package.json').version")
+            # _version.py 在仓库根，defaults.run.working-directory 是 addon 目录，需先切回
+            cd "$GITHUB_WORKSPACE"
+            VERSION=$(python -c "from _version import __version__; print(__version__)")
+          fi
+          # 写入 GITHUB_OUTPUT 前做严格校验，防止输入注入
+          if [[ "$VERSION" == *$'\n'* ]] || [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "错误: 版本号格式无效: $VERSION（应为 MAJOR.MINOR.PATCH）" >&2
+            exit 1
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "tag_name=v$VERSION" >> $GITHUB_OUTPUT
           echo "Using version: $VERSION"
+
+      - name: Sync addon version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          if [ -n "$INPUT_VERSION" ]; then
+            # 手动 override：将 addon 同步到 release 版本，保证 .mcaddon 内 manifest 与 release 一致
+            bash scripts/sync-version.sh --addon-only "${{ steps.get_version.outputs.version }}"
+          else
+            # 默认路径：门禁校验，确保 manifest 与 _version.py 一致
+            bash scripts/sync-version.sh --check
+          fi
 
       - name: Build addon (production)
         run: pnpm build:production
@@ -101,23 +123,36 @@ jobs:
             echo "changes<<EOF" >> $GITHUB_OUTPUT
             echo "## Changes since $LAST_TAG" >> $GITHUB_OUTPUT
             echo "" >> $GITHUB_OUTPUT
-            git log --pretty=format:"- %s (%h)" "$LAST_TAG"..HEAD -- MCBE-AI-Agent-addon/ >> $GITHUB_OUTPUT
+            # 统计全仓库提交（与手工维护的 CHANGELOG.md 分工，release notes 自动生成）
+            git log --pretty=format:"- %s (%h)" "$LAST_TAG"..HEAD >> $GITHUB_OUTPUT
             echo "" >> $GITHUB_OUTPUT
             echo "EOF" >> $GITHUB_OUTPUT
           else
             echo "changes<<EOF" >> $GITHUB_OUTPUT
             echo "## Initial Release" >> $GITHUB_OUTPUT
             echo "" >> $GITHUB_OUTPUT
-            git log --pretty=format:"- %s (%h)" -- MCBE-AI-Agent-addon/ >> $GITHUB_OUTPUT
+            git log --pretty=format:"- %s (%h)" >> $GITHUB_OUTPUT
             echo "" >> $GITHUB_OUTPUT
             echo "EOF" >> $GITHUB_OUTPUT
           fi
+
+      - name: Archive repo source (release asset)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p dist/release
+          # 以工作树当前状态归档（Sync addon version 可能已改动未提交的 manifest），
+          # 保证 src.zip 与构建出的 .mcaddon 版本一致；git archive 只打包已跟踪文件，
+          # 天然排除 .git、node_modules、data/、logs/、.worktrees/ 等
+          git add -A
+          TREE=$(git write-tree)
+          git archive --format=zip --prefix=MCBE-AI-Agent-${{ steps.get_version.outputs.version }}/ \
+            -o dist/release/MCBE-AI-Agent-${{ steps.get_version.outputs.version }}-src.zip "$TREE"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.get_version.outputs.tag_name }}
-          name: MCBE AI Agent Addon v${{ steps.get_version.outputs.version }}
+          name: MCBE AI Agent v${{ steps.get_version.outputs.version }}
           body: |
             ${{ steps.changelog.outputs.changes }}
 
@@ -129,8 +164,10 @@ jobs:
 
             ## 文件
             - `MCBE-AI-Agent-v${{ steps.get_version.outputs.version }}.mcaddon` - 完整 Addon 包
+            - `MCBE-AI-Agent-${{ steps.get_version.outputs.version }}-src.zip` - 仓库源码归档
           files: |
             MCBE-AI-Agent-addon/dist/release/*.mcaddon
+            dist/release/*-src.zip
           draft: ${{ github.event.inputs.draft == 'true' }}
           prerelease: ${{ github.event.inputs.prerelease == 'true' }}
           generate_release_notes: true
@@ -143,4 +180,5 @@ jobs:
           name: release-v${{ steps.get_version.outputs.version }}
           path: |
             MCBE-AI-Agent-addon/dist/release/*.mcaddon
+            dist/release/*-src.zip
           retention-days: 90
