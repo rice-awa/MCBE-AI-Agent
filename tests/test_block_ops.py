@@ -2242,6 +2242,69 @@ async def test_execute_block_plan_concurrent_same_plan_executes_once(monkeypatch
     assert r1.output == r2.output
     assert entry.executed is True
     assert isinstance(entry.execution_result, ToolResult)
+
+
+@pytest.mark.asyncio
+async def test_auto_approved_fill_block_invokes_python_alias() -> None:
+    """Direct fill execution must project model-visible ``from`` to ``from_``."""
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    policy = PolicyEngine.from_settings(_Settings())
+    agent = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=str,
+        capabilities=[HarnessCapability(policy=policy)],
+    )
+    calls: list[tuple[list[int], list[int], str]] = []
+
+    @agent.tool
+    async def fill_block(
+        ctx: RunContext[_Deps],
+        from_: Annotated[list[int], Field(min_length=3, max_length=3, alias="from")],
+        to: Annotated[list[int], Field(min_length=3, max_length=3)],
+        block: str,
+        expect: str = "air",
+        states: dict[str, Any] | None = None,
+    ) -> str:
+        calls.append((from_, to, block))
+        return "filled"
+
+    model_calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls > 1:
+            return ModelResponse(parts=[TextPart(content="done")])
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="fill_block",
+                    tool_call_id="tc-fill-auto-approved",
+                    args={
+                        "from": [0, 64, 0],
+                        "to": [2, 64, 2],
+                        "block": "minecraft:stone",
+                    },
+                )
+            ]
+        )
+
+    deps = _Deps(
+        connection_id=cid,
+        addon_bridge=bridge,
+        settings=_Settings(),
+        run_id="run-fill-auto-approved",
+        auto_approve_tools=True,
+    )
+    result = await agent.run("fill area", model=FunctionModel(model_fn), deps=deps)
+
+    assert result.output == "done"
+    assert calls == [([0, 64, 0], [2, 64, 2], "minecraft:stone")]
+
+
 @pytest.mark.asyncio
 async def test_reverse_fill_block_approval_then_execute_once() -> None:
     """fill_block: 审批元数据保留原始参数；恢复后执行一次；重复恢复幂等。"""
@@ -2355,15 +2418,14 @@ async def test_reverse_fill_block_approval_then_execute_once() -> None:
     assert isinstance(first.output, DeferredToolRequests)
     approval = first.output.approvals[0]
     metadata = first.output.metadata[approval.tool_call_id]
-    # fill_block 的审批元数据只含模型可见参数（无 preflight 投影/隐藏字段）。
-    # canonical args 保持模型可见契约：pydantic-ai 经 alias="from" 校验后以
-    # 字段名传入 harness，run_block_preflight 统一转回别名键（from）。
+    # normalized approval args 保持模型可见契约；execute args 使用 Python 参数名。
     authorized_args = metadata["normalized_args"]
     assert authorized_args["from"] == [4, 64, 3]
     assert authorized_args["to"] == [2, 64, 1]
     assert authorized_args["block"] == "minecraft:stone"
     execute_args = metadata["execute_args"]
-    assert execute_args["from"] == [4, 64, 3]
+    assert execute_args["from_"] == [4, 64, 3]
+    assert "from" not in execute_args
     assert execute_args["to"] == [2, 64, 1]
     for hidden in ("locked_targets", "phase", "status", "repairs_applied"):
         assert hidden not in execute_args, hidden

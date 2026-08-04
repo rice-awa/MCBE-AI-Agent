@@ -1938,13 +1938,12 @@ def _duration_ms(start: float) -> int:
 def _python_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Build Python call args for the public block tool signatures.
 
-    Canonical args for the single-op tools are exactly the model-visible
-    fields: pos/block/expect/states for ``place_block``; from/to/block/
-    expect/states for ``fill_block``; target for ``inspect_block``. Fill's
-    canonical args store the from corner under the model-visible alias
-    ``from`` (never ``from_``) — run_block_preflight converts the Pydantic
-    field name back to the alias before storing the plan. Approval resume
-    goes through ``execute_block_plan`` with frozen canonical args, never
-    through this projection, so this is a pure passthrough.
+    Canonical fill args use the model-visible alias ``from`` for approval,
+    audit, and plan storage. The registered Python function instead accepts
+    ``from_`` because ``from`` is a reserved keyword, so restore the Python
+    parameter name only at this final invocation boundary.
     """
-    return dict(args or {})
+    projected = dict(args or {})
+    if tool_name == "fill_block" and "from" in projected and "from_" not in projected:
+        projected["from_"] = projected.pop("from")
+    return projected
