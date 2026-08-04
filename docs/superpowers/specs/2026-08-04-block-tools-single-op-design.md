@@ -50,7 +50,7 @@
 
 - 不修改 Add-on 桥接能力与 `commandLine` 预算。
 - 不做建筑 DSL（墙、屋顶、房间等高级抽象）。
-- 不实现多格方块（门、床等）放置。
+- 专用工具不实现多格方块（门、床等）放置；命令回退由 `setblock` / `fill` 承担（Bedrock 1.26.10+ 完整放置双格结构，见 `docs/sapi/block-operations.md` §5.5）。
 - 本轮不支持玩家相对坐标（`forward/right/up`）；如后续需要，以独立 `relative` 参数追加，不混入坐标数组。
 - 不自动把 `expect=air` 升级为 `any`，不绕过审批。
 - 不保留 `edit_blocks` 的模型可见入口（迁移策略见 §10）。
@@ -157,6 +157,8 @@ inspect_block(target: [x, y, z] | [[x1,y1,z1], [x2,y2,z2]])
 
 统一：`{schema_version, ok: false, code, message, retryable, fallback_allowed, hint}`；`LIMIT_EXCEEDED` 额外带 `estimated_bytes/budget`；`PRECONDITION_FAILED` 额外带 `actual_type_id`（仅首格）与坐标。不镜像 Add-on 原始 payload、堆栈或内部路径。
 
+`fallback_allowed` 按一元规则（`fallback_allowed_for_code`）计算：世界状态已知未变（`external_state_unknown == false`）即允许命令回退，唯一例外 `INTERNAL_ERROR`；`STATE_UNKNOWN` 保持拒绝。`UNSUPPORTED_BLOCK_PLACEMENT` 等多格方块写前失败码放行，模型可回退 `setblock`（1.26.10+ 完整放置）。
+
 ## 6. 提示词与 schema
 
 ### 6.1 `_BLOCK_TOOL_PRIORITY`（唯一长文，条目化）
@@ -199,7 +201,7 @@ inspect_block(target: [x, y, z] | [[x1,y1,z1], [x2,y2,z2]])
 1. 审批批量：同一轮 4 个并行 `fill_block` 合并为一批审批，一次 `AGENT 同意` 全部执行。
 2. 旧 12 离散点场景回归：模型只能表达为 4 个 fill 柱或 12 个 place，不再出现 `LIMIT_EXCEEDED`。
 3. 草地建房：`fill_block(expect=any)` 覆盖 grass 成功；`expect=air` 时返回可操作 `PRECONDITION_FAILED`。
-4. 命令回退仍被 `fallback_allowed=false` 拒绝。
+4. 命令回退按一元规则放行：写前失败码（`PRECONDITION_FAILED` / `UNSUPPORTED_BLOCK_PLACEMENT` 等）映射后 `fallback_allowed=true`，同 run 内 `setblock` / `fill` / `clone` 不被 `_block_command_fallback_denial` 拒绝；`STATE_UNKNOWN` / `INTERNAL_ERROR` 仍拒绝（回退命令仍需独立审批）。
 
 ### 8.3 手工验收（游戏内）
 
@@ -248,4 +250,5 @@ inspect_block(target: [x, y, z] | [[x1,y1,z1], [x2,y2,z2]])
 1. v1 只保留绝对坐标 `[x, y, z]`，移除玩家相对坐标；
 2. `expect` 默认 `air`，`states` 为可选对象参数；
 3. 审批采用「单工具单审批」+ 现有批量同意；
-4. 不暴露 `dimension`，默认当前玩家维度。
+4. 不暴露 `dimension`，默认当前玩家维度；
+5. 命令回退按一元规则放行（`fallback_allowed_for_code`），`STATE_UNKNOWN` / `INTERNAL_ERROR` 保持拒绝。
