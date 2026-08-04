@@ -117,17 +117,18 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.get_version.outputs.tag_name }}
-          name: MCBE AI Agent v${{ steps.get_version.outputs.version }}
+          name: MCBE AI Agent Addon v${{ steps.get_version.outputs.version }}
           body: |
             ${{ steps.changelog.outputs.changes }}
 
-            ## Installation
-            1. Download the `.mcaddon` file
-            2. Double-click to import into Minecraft Bedrock Edition
-            3. Enable the behavior pack and resource pack in your world settings
+            ## 安装说明
+            1. 下载 `.mcaddon` 文件。
+            2. 双击文件将其导入到 Minecraft Bedrock 版中。
+            3. 在世界设置中启用行为包和资源包。
+            4. 在**实验性玩法中启用测试版 API**。
 
-            ## Files
-            - `MCBE-AI-Agent-v${{ steps.get_version.outputs.version }}.mcaddon` - Full addon package
+            ## 文件
+            - `MCBE-AI-Agent-v${{ steps.get_version.outputs.version }}.mcaddon` - 完整 Addon 包
           files: |
             MCBE-AI-Agent-addon/dist/release/*.mcaddon
           draft: ${{ github.event.inputs.draft == 'true' }}
