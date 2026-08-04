@@ -13,10 +13,11 @@ export function handleGetCapabilities(_payload: Record<string, unknown> = {}): {
         place: boolean;
         batch: boolean;
         fill: boolean;
-        /** "unsupported": multiblock blocks (doors, beds, tall plants) are
-         * rejected as UNSUPPORTED_BLOCK_PLACEMENT until a full multi-cell
-         * placement + verification path exists (spec issue 05 §6). */
-        multiblock_placement: "unsupported";
+        /** "command_fallback": multiblock blocks (doors, beds, tall plants) cannot be
+         * written by the Script API single-cell path (setPermutation writes one half),
+         * but the command path (/setblock /fill) places the full double-block
+         * structure since Bedrock 1.26.10 (Microsoft Update1.26.10). */
+        multiblock_placement: "command_fallback";
       };
     };
   };
@@ -32,7 +33,7 @@ export function handleGetCapabilities(_payload: Record<string, unknown> = {}): {
           place: true,
           batch: true,
           fill: true,
-          multiblock_placement: "unsupported",
+          multiblock_placement: "command_fallback",
         },
       },
     },
