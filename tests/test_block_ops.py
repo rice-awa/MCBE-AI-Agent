@@ -349,7 +349,7 @@ def test_edit_bridge_frame_too_large_is_limit_not_unknown() -> None:
     assert body["code"] == "LIMIT_EXCEEDED"
     assert body["external_state_unknown"] is False
     assert body["retryable"] is True
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["reason"] == "command_line_budget"
     assert result.external_state_unknown is False
     assert "未发送" in body["message"] or "字节预算" in body["message"]
@@ -675,11 +675,11 @@ def test_bridge_response_without_boolean_ok_is_safe_internal_error(response: dic
     [
         ("ADDON_UNAVAILABLE", True),
         ("UNSUPPORTED_CAPABILITY", True),
-        ("PROTECTED_BLOCK", False),
+        ("PROTECTED_BLOCK", True),
         ("STATE_UNKNOWN", False),
     ],
 )
-def test_explicit_addon_errors_preserve_code_and_only_unavailable_allows_fallback(
+def test_explicit_addon_errors_preserve_code_and_fallback_one_rule(
     code: str, fallback_allowed: bool
 ) -> None:
     result = map_addon_bridge_result(
@@ -690,8 +690,38 @@ def test_explicit_addon_errors_preserve_code_and_only_unavailable_allows_fallbac
     assert body["code"] == code
     assert body["fallback_allowed"] is fallback_allowed
     assert "bridge-secret" not in result.output
-    if fallback_allowed:
+    # 通用回退路径（无特定分支的 code）消息才会追加「独立审批」提示；
+    # 特定分支（PROTECTED_BLOCK 等）保留各自诊断消息，fallback_allowed 字段即信号。
+    if code in {"ADDON_UNAVAILABLE", "UNSUPPORTED_CAPABILITY"}:
         assert "独立审批" in body["message"]
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("UNSUPPORTED_BLOCK_PLACEMENT", True),
+        ("PRECONDITION_FAILED", True),
+        ("PRECONDITION_CHANGED", True),
+        ("PROTECTED_BLOCK", True),
+        ("BLOCK_UNKNOWN", True),
+        ("STATE_INVALID", True),
+        ("LIMIT_EXCEEDED", True),
+        ("INVALID_ARGUMENT", True),
+        ("INVALID_COORDINATE", True),
+        ("UNLOADED_CHUNK", True),
+        ("OUT_OF_BOUNDS", True),
+        ("CONFLICTING_EDITS", True),
+        ("ADDON_UNAVAILABLE", True),
+        ("UNSUPPORTED_CAPABILITY", True),
+        ("STATE_UNKNOWN", False),
+        ("INTERNAL_ERROR", False),
+    ],
+)
+def test_fallback_allowed_for_code_full_table(code: str, expected: bool) -> None:
+    """fallback 一元规则全码表（spec §3.2）：14 true / 2 false。"""
+    from services.agent.block_ops.schema import BlockErrorCode, fallback_allowed_for_code
+
+    assert fallback_allowed_for_code(BlockErrorCode(code)) is expected
 
 
 @pytest.mark.parametrize(
@@ -757,7 +787,7 @@ def test_precondition_failed_projects_actual_target_and_hint() -> None:
     assert "expected_previous" not in body["hint"]
     assert "locked_targets" not in body["hint"]
     assert "phase" not in body["hint"]
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["retryable"] is False
     assert body["message"] == "目标方块不满足 expect 前置条件。"
     assert "hunter2" not in result.output
@@ -782,7 +812,7 @@ def test_precondition_changed_projects_decision_fields() -> None:
     assert body["actual_type_id"] == "minecraft:stone"
     assert body["target"] == {"x": 1, "y": 64, "z": 2}
     assert body["hint"]
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
 
 
 def test_limit_exceeded_addon_error_includes_place_ban_hint() -> None:
@@ -801,7 +831,7 @@ def test_limit_exceeded_addon_error_includes_place_ban_hint() -> None:
     body = json.loads(result.output)
     assert body["code"] == "LIMIT_EXCEEDED"
     assert body["retryable"] is True
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["external_state_unknown"] is False
     assert "place" in body["hint"].lower() or "禁止" in body["hint"]
     assert body["matched_count"] == 6
@@ -1074,6 +1104,35 @@ def test_state_unknown_response_has_fallback_allowed_false() -> None:
     assert body["code"] == "STATE_UNKNOWN"
     assert body["fallback_allowed"] is False
     assert body["retryable"] is False
+    assert body["external_state_unknown"] is True
+
+
+def test_host_limit_error_carries_fallback_allowed_true() -> None:
+    """宿主侧 INVALID_ARGUMENT / INVALID_COORDINATE / LIMIT 显式携带
+    fallback_allowed=true；否则 execution.py 读默认 false 会误拒命令回退。"""
+    from services.agent.block_ops.schema import BlockErrorCode, _host_limit_error
+
+    for code in (
+        BlockErrorCode.INVALID_ARGUMENT,
+        BlockErrorCode.INVALID_COORDINATE,
+        BlockErrorCode.LIMIT_EXCEEDED,
+    ):
+        result = _host_limit_error(code, "test message")
+        assert not result.is_success
+        body = json.loads(result.output)
+        assert body["code"] == code
+        assert body["fallback_allowed"] is True
+        assert body["external_state_unknown"] is False
+
+    # 显式传入的字段仍可覆盖默认值（内部错误语义）。
+    result = _host_limit_error(
+        BlockErrorCode.INVALID_ARGUMENT,
+        "test",
+        fallback_allowed=False,
+        external_state_unknown=True,
+    )
+    body = json.loads(result.output)
+    assert body["fallback_allowed"] is False
     assert body["external_state_unknown"] is True
 
 
@@ -3020,7 +3079,7 @@ def test_block_unknown_surfaces_candidates_from_addon() -> None:
     assert not result.is_success
     body = json.loads(result.output)
     assert body["code"] == "BLOCK_UNKNOWN"
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["type_id"] == "minecraft:stonx"
     assert body["candidates"] == ["minecraft:stone", "minecraft:ston"]
     assert "hint" in body
@@ -3079,7 +3138,7 @@ def test_state_invalid_surfaces_valid_state_keys() -> None:
     assert not result.is_success
     body = json.loads(result.output)
     assert body["code"] == "STATE_INVALID"
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["type_id"] == "minecraft:oak_stairs"
     assert body["valid_state_keys"] == [
         "minecraft:cardinal_direction",
@@ -3123,7 +3182,7 @@ def test_protected_block_envelope_includes_component_and_target() -> None:
     assert not result.is_success
     body = json.loads(result.output)
     assert body["code"] == "PROTECTED_BLOCK"
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["type_id"] == "minecraft:chest"
     assert body["component"] == "minecraft:inventory"
     assert body["target"] == {"x": 10, "y": 64, "z": 10}
@@ -3133,7 +3192,8 @@ def test_protected_block_envelope_includes_component_and_target() -> None:
 
 
 def test_unsupported_block_placement_preserves_multiblock_flag() -> None:
-    """UNSUPPORTED_BLOCK_PLACEMENT is a PERMANENT error with fallback_allowed=False
+    """UNSUPPORTED_BLOCK_PLACEMENT is a PERMANENT error with fallback_allowed=True
+    (command fallback via setblock/fill places the full structure on 1.26.10+)
     and carries the type_id + multiblock flag (spec issue 05 §6/§7)."""
     result = map_addon_bridge_result(
         {
@@ -3149,26 +3209,30 @@ def test_unsupported_block_placement_preserves_multiblock_flag() -> None:
     assert not result.is_success
     body = json.loads(result.output)
     assert body["code"] == "UNSUPPORTED_BLOCK_PLACEMENT"
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["retryable"] is False
     assert body["type_id"] == "minecraft:oak_door"
     assert body["multiblock"] is True
     assert "hint" in body
     assert "多格" in body["hint"]
+    assert "setblock" in body["hint"]
+    assert "1.26.10" in body["hint"]
 
 
 @pytest.mark.parametrize(
     ("code", "fallback_allowed"),
     [
-        ("BLOCK_UNKNOWN", False),
-        ("STATE_INVALID", False),
-        ("UNSUPPORTED_BLOCK_PLACEMENT", False),
+        ("BLOCK_UNKNOWN", True),
+        ("STATE_INVALID", True),
+        ("UNSUPPORTED_BLOCK_PLACEMENT", True),
+        ("STATE_UNKNOWN", False),
+        ("INTERNAL_ERROR", False),
     ],
 )
-def test_issue_05_error_codes_never_allow_fallback(
+def test_issue_05_error_codes_fallback_one_rule(
     code: str, fallback_allowed: bool
 ) -> None:
-    """All issue 05 error codes have fallback_allowed=False (spec §4.2/§4.3/§6)."""
+    """Issue 05 error codes allow fallback unless world state is unknown."""
     result = map_addon_bridge_result(
         {"ok": False, "payload": {"code": code, "message": "test"}}
     )
@@ -3703,7 +3767,7 @@ def test_limit_exceeded_addon_error_carries_estimated_bytes_and_budget() -> None
     assert body["estimated_bytes"] == 4128
     assert body["budget"] == 461
     assert body["retryable"] is True
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["schema_version"] == "1"
 
 
@@ -3820,7 +3884,7 @@ async def test_grass_house_fill_expect_any_succeeds_expect_air_precondition() ->
     """Task 7 Step 3: 草地上盖房子。
 
     ``expect=any`` 成功覆盖草方块；``expect=air`` 遇到草方块返回可操作的
-    PRECONDITION_FAILED（含 actual_type_counts 与坐标），fallback_allowed=False。
+    PRECONDITION_FAILED（含 actual_type_counts 与坐标），fallback_allowed=True。
     """
     async def grass_handler(cap: str, payload: dict[str, Any]) -> dict[str, Any]:
         if cap == "get_capabilities":
@@ -3892,7 +3956,7 @@ async def test_grass_house_fill_expect_any_succeeds_expect_air_precondition() ->
     assert body["code"] == "PRECONDITION_FAILED"
     assert body["actual_type_counts"] == {"minecraft:grass_block": 3}
     assert body["target"] == {"x": 1, "y": 64, "z": 1}
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["retryable"] is False
     assert "grass_block" in body.get("hint", "")
 

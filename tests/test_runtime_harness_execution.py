@@ -45,7 +45,7 @@ from services.agent.block_ops.capability import (
     get_block_capability_cache,
     reset_block_capability_cache,
 )
-from services.agent.block_ops.bridge import map_bridge_exception
+from services.agent.block_ops.bridge import map_addon_bridge_result, map_bridge_exception
 from services.agent.tool_results import ToolResult
 
 
@@ -371,6 +371,43 @@ def test_fallback_allowed_still_uses_independent_command_approval() -> None:
         "run_minecraft_command", {"command": "setblock ~ ~ ~ stone"}, player_name="Steve"
     )
     assert decision.action == PolicyDecisionKind.REQUIRE_APPROVAL
+
+
+def test_write_pre_mutation_failure_allows_command_fallback_link() -> None:
+    """写前失败码经 bridge 映射后 fallback_allowed=true → 回退不被拒绝。
+
+    PRECONDITION_FAILED 等写前失败码由宿主按一元规则重算
+    fallback_allowed=true，_block_command_fallback_denial 因此返回 None，
+    模型可回退 setblock（Bedrock 1.26.10+ 完整放置双格结构）。
+    """
+    _set_supported_block_capability("conn-1")
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "PRECONDITION_FAILED",
+                "message": "target is not air",
+                "target": {"x": 1, "y": 64, "z": 2},
+            },
+        }
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["fallback_allowed"] is True
+
+    _record_block_edit_fallback_outcome(
+        result,
+        connection_id="conn-1",
+        player_name="Steve",
+        run_id="run-1",
+    )
+    record = get_block_command_fallback_store().get("conn-1", "Steve", "run-1")
+    assert record is not None
+    assert record.fallback_allowed is True
+    assert record.code == "PRECONDITION_FAILED"
+
+    # 一元规则放行：不拒绝同 run 内 setblock 回退。
+    assert _fallback_denial() is None
 
 
 @pytest.mark.parametrize(

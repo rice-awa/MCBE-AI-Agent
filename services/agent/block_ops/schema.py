@@ -30,6 +30,19 @@ class BlockErrorCode(StrEnum):
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
+def fallback_allowed_for_code(code: BlockErrorCode | str) -> bool:
+    """一元规则：世界状态已知未变即允许命令回退。
+
+    仅 STATE_UNKNOWN（调用开始后结果未知，可能已写入）和
+    INTERNAL_ERROR（宿主 bug）保持拒绝；其余所有写前失败码均放行。
+    """
+    try:
+        stable = BlockErrorCode(str(code))
+    except ValueError:
+        stable = BlockErrorCode.INTERNAL_ERROR
+    return stable not in {BlockErrorCode.STATE_UNKNOWN, BlockErrorCode.INTERNAL_ERROR}
+
+
 def build_success_response(**fields: Any) -> dict[str, Any]:
     body: dict[str, Any] = {
         "schema_version": BLOCK_OPS_SCHEMA_VERSION,
@@ -105,8 +118,11 @@ def _host_limit_error(
     **fields: Any,
 ) -> ToolResult:
     """Host-side INVALID_ARGUMENT-style failure result for block tools."""
+    body = build_error_response(code, message, **fields)
+    body.setdefault("fallback_allowed", True)
+    body.setdefault("external_state_unknown", False)
     return ToolResult.failure(
-        dumps_payload(build_error_response(code, message, **fields)),
+        dumps_payload(body),
         error_kind="INVALID_ARGUMENT",
         retryable=False,
     )

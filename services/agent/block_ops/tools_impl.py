@@ -28,6 +28,7 @@ from services.agent.block_ops.schema import (
     build_error_response,
     build_state_unknown_response,
     dumps_payload,
+    fallback_allowed_for_code,
 )
 from services.agent.block_ops.target import (
     normalize_aabb_corners as _normalize_aabb_corners,
@@ -682,7 +683,7 @@ def command_line_budget_exceeded_result(
     fields: dict[str, Any] = {
         "retryable": True,
         "external_state_unknown": False,
-        "fallback_allowed": False,
+        "fallback_allowed": fallback_allowed_for_code(BlockErrorCode.LIMIT_EXCEEDED),
         "reason": "command_line_budget",
         "hint": _COMMAND_LINE_BUDGET_HINT,
         "estimated_bytes": estimated_bytes,
@@ -834,7 +835,7 @@ def locked_targets_wire_limit_exceeded(
         ),
         retryable=True,
         external_state_unknown=False,
-        fallback_allowed=False,
+        fallback_allowed=fallback_allowed_for_code(BlockErrorCode.LIMIT_EXCEEDED),
         reason="max_locked_targets_on_wire",
         hint=_COMMAND_LINE_BUDGET_HINT,
         suggested_max_discrete=max_locked_targets_on_wire,
