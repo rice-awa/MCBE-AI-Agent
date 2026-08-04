@@ -3155,6 +3155,7 @@ async def edit_blocks_impl(
     repairs_applied: list[Any] | None = None,
     phase: str | None = None,
     edits: list[dict[str, Any]] | None = None,
+    status: str | None = None,
 ) -> ToolResult:
     """Mutate blocks via place | batch | fill after approval.
 
@@ -3162,6 +3163,10 @@ async def edit_blocks_impl(
     03); the legacy flat kwargs remain for harness recovery of previously
     approved operations. When ``edits`` is supplied it is mapped to the legacy
     shape internally.
+
+    ``status`` is a harness-only bookkeeping marker (e.g. ``noop`` for an
+    all-noop group); it is stripped from the model schema and never sent to the
+    Add-on.
     """
     deps = ctx.deps
 

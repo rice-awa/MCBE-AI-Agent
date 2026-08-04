@@ -20,7 +20,7 @@ from pydantic_ai.toolsets import AbstractToolset, ToolsetTool
 from pydantic_ai.toolsets.wrapper import WrapperToolset
 
 from config.logging import get_logger
-from config.redaction import redact_exception
+from config.redaction import redact_exception, truncate_for_log
 from services.agent.harness.audit import (
     audit_enabled,
     build_audit_record,
@@ -187,6 +187,7 @@ class BlockCommandFallbackRecord:
     fallback_allowed: bool
     created_at: float
     code: str | None = None
+    summary: str | None = None
 
 
 class BlockCommandFallbackStore:
@@ -229,6 +230,7 @@ class BlockCommandFallbackStore:
         *,
         fallback_allowed: bool,
         code: str | None = None,
+        summary: str | None = None,
     ) -> None:
         key = self.make_key(connection_id, player_name, run_id)
         with self._lock:
@@ -237,6 +239,7 @@ class BlockCommandFallbackStore:
                 fallback_allowed=bool(fallback_allowed),
                 created_at=time.time(),
                 code=code,
+                summary=summary,
             )
             self._items.move_to_end(key)
             while len(self._items) > self._max_entries:
@@ -635,8 +638,12 @@ def classify_tool_exception(
             dumps_payload,
         )
 
+        body = build_state_unknown_response(
+            error_type=exc.__class__.__name__,
+            diagnostic=truncate_for_log(diagnostic_summary, 200),
+        )
         return ToolResult.failure(
-            dumps_payload(build_state_unknown_response()),
+            dumps_payload(body),
             error_kind="PERMANENT",
             retryable=False,
             external_state_unknown=True,
@@ -755,8 +762,19 @@ def clear_block_command_fallback_for_connection(connection_id: str) -> int:
     return _GLOBAL_BLOCK_COMMAND_FALLBACK.clear_connection(connection_id)
 
 
-def _structured_block_edit_outcome(result: Any) -> tuple[bool, bool, str | None] | None:
-    """Return ``(failed, fallback_allowed, code)`` for structured edit results.
+def _safe_block_error_summary(body: dict[str, Any]) -> str | None:
+    """Return a bounded, already-sanitized diagnostic/message summary."""
+    for key in ("diagnostic", "message"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return truncate_for_log(value.strip(), 160)
+    return None
+
+
+def _structured_block_edit_outcome(
+    result: Any,
+) -> tuple[bool, bool, str | None, str | None] | None:
+    """Return ``(failed, fallback_allowed, code, summary)`` for structured edit results.
 
     Registered production tools stringify ``ToolResult`` before this wrapper can
     observe it, while direct test/toolset use can still return ``ToolResult``.
@@ -772,11 +790,16 @@ def _structured_block_edit_outcome(result: Any) -> tuple[bool, bool, str | None]
             body = None
         if isinstance(body, dict) and isinstance(body.get("ok"), bool):
             if body["ok"]:
-                return (False, False, None)
+                return (False, False, None, None)
             code = body.get("code")
-            return (True, bool(body.get("fallback_allowed", False)), str(code) if code else None)
+            return (
+                True,
+                bool(body.get("fallback_allowed", False)),
+                str(code) if code else None,
+                _safe_block_error_summary(body),
+            )
     if tool_result is not None:
-        return (not tool_result.is_success, False, None)
+        return (not tool_result.is_success, False, None, None)
     return None
 
 
@@ -791,7 +814,7 @@ def _record_block_edit_fallback_outcome(
     outcome = _structured_block_edit_outcome(result)
     if outcome is None:
         return
-    failed, fallback_allowed, code = outcome
+    failed, fallback_allowed, code, summary = outcome
     target = store if store is not None else get_block_command_fallback_store()
     if failed:
         target.put(
@@ -800,6 +823,7 @@ def _record_block_edit_fallback_outcome(
             run_id,
             fallback_allowed=fallback_allowed,
             code=code,
+            summary=summary,
         )
     else:
         target.clear_run(connection_id, player_name, run_id)
@@ -891,12 +915,21 @@ def _block_command_fallback_denial(
     record = target.get(connection_id, player_name, run_id)
     if record is None or record.fallback_allowed:
         return None
+    code_text = f"（{record.code}）" if record.code else ""
+    if record.summary:
+        reason = (
+            f"专用方块编辑刚刚失败{code_text}且不允许命令回退；"
+            f"诊断: {record.summary}。"
+            "请根据结构化错误修正 edit_blocks 参数，或等待明确允许回退的结果。"
+        )
+    else:
+        reason = (
+            f"专用方块编辑刚刚失败{code_text}且不允许命令回退；"
+            "请根据结构化错误修正 edit_blocks 参数，或等待明确允许回退的结果。"
+        )
     return PolicyDecision(
         action=PolicyDecisionKind.DENY,
-        reason=(
-            "专用方块编辑刚刚失败且不允许命令回退；请根据结构化错误修正 edit_blocks "
-            "参数，或等待明确允许回退的结果。"
-        ),
+        reason=reason,
         metadata={"fallback_code": record.code, "command_count": len(commands)},
     )
 
@@ -1700,7 +1733,7 @@ def _duration_ms(start: float) -> int:
 # Model-facing tool schema must not advertise recovery-only fields.
 _BLOCK_INTERNAL_SCHEMA_KEYS = frozenset({
     "locked_targets", "locked_targets_by_edit", "noop_edit_indices",
-    "repairs_applied", "phase",
+    "repairs_applied", "phase", "status",
 })
 
 

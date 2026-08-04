@@ -243,6 +243,28 @@ def test_denies_automatic_direct_block_command_after_nonfallback_edit_failure() 
     denial = _fallback_denial()
     assert denial is not None
     assert denial.action == PolicyDecisionKind.DENY
+    # The model/operator needs the structured code in the denial message,
+    # not just a generic "please fix edit_blocks parameters" sentence.
+    assert "PRECONDITION_FAILED" in denial.reason
+
+
+def test_fallback_denial_includes_structured_diagnostic_summary() -> None:
+    _set_supported_block_capability("conn-1")
+    _record_block_edit_fallback_outcome(
+        (
+            '{"ok":false,"code":"STATE_UNKNOWN","fallback_allowed":false,'
+            '"diagnostic":"TypeError: edit_blocks() got an unexpected keyword '
+            "argument 'status'\"}"
+        ),
+        connection_id="conn-1",
+        player_name="Steve",
+        run_id="run-1",
+    )
+
+    denial = _fallback_denial()
+    assert denial is not None
+    assert "STATE_UNKNOWN" in denial.reason
+    assert "unexpected keyword argument 'status'" in denial.reason
 
 
 def test_fallback_allowed_still_uses_independent_command_approval() -> None:
@@ -375,25 +397,30 @@ def test_policy_low_risk_allows_and_hard_deny_blocks() -> None:
     assert "op" in deny.reason
 
 
-def test_edit_invocation_exception_returns_unknown_state_without_exception_detail() -> None:
+def test_edit_invocation_exception_returns_unknown_state_with_redacted_diagnostic() -> None:
     result = classify_tool_exception(
         RuntimeError("edit_blocks_impl leaked token=bridge-secret"),
         tool_name="edit_blocks",
         execution_stage="invocation",
     )
 
-    assert json.loads(result.output) == {
-        "schema_version": "1",
-        "ok": False,
-        "code": "STATE_UNKNOWN",
-        "message": "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。",
-        "retryable": False,
-        "external_state_unknown": True,
-        "fallback_allowed": False,
-    }
+    body = json.loads(result.output)
+    assert body["schema_version"] == "1"
+    assert body["ok"] is False
+    assert body["code"] == "STATE_UNKNOWN"
+    assert body["message"] == "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。"
+    assert body["retryable"] is False
+    assert body["external_state_unknown"] is True
+    assert body["fallback_allowed"] is False
+    # Host-side invocation errors surface a bounded, redacted diagnostic so
+    # operators (and the model) can distinguish a harness bug from a world
+    # precondition failure.
+    assert body["error_type"] == "RuntimeError"
+    assert "RuntimeError" in body["diagnostic"]
+    assert "edit_blocks_impl" in body["diagnostic"]
+    assert "bridge-secret" not in body["diagnostic"]
     assert result.retryable is False
     assert result.external_state_unknown is True
-    assert "RuntimeError" not in result.output
     assert "bridge-secret" not in result.output
 
 

@@ -3648,6 +3648,99 @@ async def test_auto_approved_fill_uses_execution_projection_idempotency_key() ->
 
 
 @pytest.mark.asyncio
+async def test_auto_approved_fill_preflight_status_field_does_not_break_execution() -> None:
+    """A real Add-on preflight with ``status=applied`` must not crash invocation.
+
+    Regression for the 2026-08-03 runtime log where every ``edit_blocks`` call
+    failed with ``TypeError: edit_blocks() got an unexpected keyword argument
+    'status'`` after a successful preflight. ``status`` is a preflight
+    bookkeeping field and must not leak into the Add-on execute payload.
+    """
+    locked_targets = [
+        {"dimension": "minecraft:overworld", "x": x, "y": 64, "z": z}
+        for x in range(1, 3)
+        for z in range(1, 3)
+    ]
+    preflight_payload = {
+        "schema_version": "1",
+        "ok": True,
+        "phase": "preflight",
+        "mode": "fill",
+        "type_id": "minecraft:oak_planks",
+        "coordinate_mode": "absolute",
+        "dimension": "minecraft:overworld",
+        "status": "applied",
+        "from": {"x": 1, "y": 64, "z": 1},
+        "to": {"x": 2, "y": 64, "z": 2},
+        "locked_targets": locked_targets,
+        "repairs_applied": [],
+    }
+
+    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if capability == "get_capabilities":
+            return {
+                "ok": True,
+                "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}},
+            }
+        if capability == "edit_blocks" and payload.get("phase") == "preflight":
+            return {"ok": True, "payload": preflight_payload}
+        if capability == "edit_blocks" and payload.get("phase") == "execute":
+            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": 4}}
+        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+
+    bridge = _FakeBridge(bridge_handler)
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    agent: Agent[_Deps, str] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=str,
+        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+    )
+    register_agent_tools(agent)
+    original_args = {
+        "edits": [{
+            "target": {"box": {"from": {"x": 2, "y": 64, "z": 2}, "to": {"x": 1, "y": 64, "z": 1}}},
+            "block": "oak_planks",
+            "expect": "any",
+        }],
+        "dimension": "minecraft:overworld",
+    }
+    model_calls = 0
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls > 1:
+            return ModelResponse(parts=[TextPart(content="done")])
+        return ModelResponse(parts=[ToolCallPart(
+            tool_name="edit_blocks", tool_call_id="tc-status-applied", args=original_args,
+        )])
+
+    deps = _Deps(
+        connection_id=cid,
+        addon_bridge=bridge,
+        settings=_Settings(),
+        run_id="run-status-applied",
+        auto_approve_tools=True,
+    )
+    result = await agent.run("fill", model=FunctionModel(model_fn), deps=deps)
+
+    assert result.output == "done"
+    phases = [
+        payload["phase"]
+        for capability, payload in bridge.calls
+        if capability == "edit_blocks"
+    ]
+    assert phases == ["preflight", "execute"]
+    assert not any(
+        payload.get("phase") == "execute" and payload.get("status")
+        for capability, payload in bridge.calls
+        if capability == "edit_blocks"
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("args", "mutate"),
     [
@@ -4448,6 +4541,7 @@ def test_model_visible_edit_blocks_schema_exposes_only_edits_contract() -> None:
     # locked_targets / phase are harness-only (present in raw, stripped for model).
     assert "locked_targets" in raw_props
     assert "phase" in raw_props
+    assert "status" in raw_props
 
     stripped = strip_block_internal_tool_schema(
         ToolDefinition(
@@ -4464,6 +4558,7 @@ def test_model_visible_edit_blocks_schema_exposes_only_edits_contract() -> None:
         "noop_edit_indices",
         "repairs_applied",
         "phase",
+        "status",
     } & stripped_props
 
     schema_bytes = len(

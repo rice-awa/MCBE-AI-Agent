@@ -1249,6 +1249,7 @@ def register_agent_tools(
         noop_edit_indices: list[int] | None = None,
         repairs_applied: list[Any] | None = None,
         phase: str | None = None,
+        status: str | None = None,
     ) -> str:
         """按统一 `edits` 契约写入当前小而完整的施工阶段。
 
@@ -1280,6 +1281,7 @@ def register_agent_tools(
             noop_edit_indices=noop_edit_indices,
             repairs_applied=repairs_applied,
             phase=phase,
+            status=status,
         )
 
     if _runtime_harness_schema_enabled(settings):
