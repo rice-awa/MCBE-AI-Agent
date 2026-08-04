@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass, field
@@ -2622,6 +2623,53 @@ async def test_harness_resume_with_unknown_plan_is_state_unknown_without_bridge_
         capability in {"edit_blocks", "inspect_block", "place_block", "fill_block"}
         for capability, _payload in bridge.calls
     )
+
+
+@pytest.mark.asyncio
+async def test_execute_block_plan_concurrent_same_plan_executes_once(monkeypatch) -> None:
+    """同一 plan_id 并发恢复只执行一次 impl（executed 读写原子化，无竞态）。
+
+    Reviewer finding (Important 1)：executed/execution_result 曾在缓存锁之外
+    读写，两个并发 execute_block_plan 都会看到 executed=False 并各自执行
+    impl（双重写入）。per-plan asyncio.Lock 串行化 + 缓存锁内读-查-写修复。
+    """
+    from services.agent.block_ops.tools_impl import execute_block_plan
+
+    calls: dict[str, int] = {"count": 0}
+    gate = asyncio.Event()
+
+    async def fake_place_impl(ctx, *, pos, block, expect="air", states=None):
+        calls["count"] += 1
+        await gate.wait()  # 拉大竞态窗口：两个协程都能在释放前看到 executed=False
+        return ToolResult.ok("placed")
+
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.place_block_impl", fake_place_impl)
+
+    cache = get_preflight_cache()
+    entry = cache.put(
+        run_id="run-race",
+        tool_call_id="tc-race",
+        original_args_hash="race-hash",
+        canonical_args={"pos": [1, 64, 1], "block": "minecraft:stone", "expect": "air", "states": None},
+        execute_args={"pos": [1, 64, 1], "block": "minecraft:stone", "expect": "air", "states": None},
+        connection_id="conn-race",
+        plan_id="race-plan-1",
+        tool_name="place_block",
+    )
+    ctx = SimpleNamespace(deps=_Deps(run_id="run-race", connection_id="conn-race"))
+
+    first = asyncio.ensure_future(execute_block_plan(entry.plan_id, ctx))
+    second = asyncio.ensure_future(execute_block_plan(entry.plan_id, ctx))
+    await asyncio.sleep(0.05)  # 让两个协程都推进到 impl 检查点
+    assert calls["count"] == 1  # 串行化：同一时刻只有一个 impl 在飞行
+    gate.set()
+    r1, r2 = await asyncio.gather(first, second)
+
+    assert calls["count"] == 1  # 第二个协程拿到锁后命中 executed → 返回缓存结果
+    assert r1.is_success and r2.is_success
+    assert r1.output == r2.output
+    assert entry.executed is True
+    assert isinstance(entry.execution_result, ToolResult)
 @pytest.mark.asyncio
 async def test_reverse_fill_edit_blocks_resumes_with_raw_arguments() -> None:
     """edit_blocks 移出 harness 后：恢复使用原始参数，无 preflight 归一化。"""

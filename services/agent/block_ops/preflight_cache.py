@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import threading
 import time
@@ -141,7 +142,42 @@ def get_preflight_cache() -> PreflightCache:
 
 def reset_preflight_cache() -> None:
     _GLOBAL_PREFLIGHT.clear()
+    with _plan_execution_locks_guard:
+        _plan_execution_locks.clear()
 
 
 def clear_preflight_for_connection(connection_id: str) -> int:
     return _GLOBAL_PREFLIGHT.clear_connection(connection_id)
+
+
+# --- Per-plan execution serialization ---------------------------------------
+#
+# ``execute_block_plan`` 的幂等（``executed`` / ``execution_result`` 读-查-写）
+# 不能靠 ``PreflightCache._lock``（threading.RLock）跨 ``await`` 持锁：同一事件
+# 循环里另一个协程会在 ``lock.acquire()`` 上阻塞整个循环（死锁）。每个 plan_id
+# 一把 asyncio.Lock，让并发恢复串行化，第二个协程在拿到锁后重新检查
+# ``executed`` 并直接返回缓存结果。
+
+_PLAN_EXECUTION_LOCKS_MAX = 4096
+_plan_execution_locks: dict[str, asyncio.Lock] = {}
+_plan_execution_locks_guard = threading.Lock()
+
+
+def get_plan_execution_lock(plan_id: str) -> asyncio.Lock:
+    """Return the per-plan asyncio lock serializing plan execution.
+
+    Bounded registry: when the cap is reached only dead locks (no holder and no
+    waiters — ``locked()`` is False) are evicted, so eviction can never race an
+    in-flight execution.
+    """
+    pid = str(plan_id or "").strip()
+    with _plan_execution_locks_guard:
+        lock = _plan_execution_locks.get(pid)
+        if lock is None:
+            if len(_plan_execution_locks) >= _PLAN_EXECUTION_LOCKS_MAX:
+                dead = [k for k, v in _plan_execution_locks.items() if not v.locked()]
+                for key in dead:
+                    del _plan_execution_locks[key]
+            lock = asyncio.Lock()
+            _plan_execution_locks[pid] = lock
+        return lock

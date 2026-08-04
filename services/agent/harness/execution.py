@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Literal
 
+from pydantic import ValidationError
 from pydantic_ai import ApprovalRequired, RunContext, ToolDenied
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ToolCallPart
@@ -1885,6 +1886,13 @@ class HarnessCapability(AbstractCapability[Any]):
         args 上运行（缺失/过期 → 跳过校验，由 call_tool 的 plan_id 分支返回
         STATE_UNKNOWN）。隐藏字段（status/phase/locked_targets）结构性不可达：
         校验与执行都只接触 plan_id / canonical args。
+
+        恢复载荷不能直接交给 ``handler``：公共参数 schema 不含 ``plan_id``
+        （``additionalProperties: false``），``{"plan_id": X}`` 本身就无法通过
+        schema 校验。因此这里对原始载荷做结构性校验：恢复契约只允许恰好
+        ``{"plan_id": <非空字符串>}``，任何额外键都是畸形载荷，必须在校验
+        边界拒绝，而不是静默归一化放行（例如
+        ``{"plan_id": "missing", "malicious_extra": true}``）。
         """
         plan_id = args.get("plan_id") if isinstance(args, dict) else None
         if (
@@ -1893,6 +1901,19 @@ class HarnessCapability(AbstractCapability[Any]):
             and isinstance(plan_id, str)
             and plan_id.strip()
         ):
+            if set(args.keys()) != {"plan_id"}:
+                raise ValidationError.from_exception_data(
+                    tool_def.name,
+                    [
+                        {
+                            "type": "extra_forbidden",
+                            "loc": (str(key),),
+                            "msg": "plan_id 恢复载荷只能包含 plan_id 字段",
+                            "input": args[key],
+                        }
+                        for key in sorted(set(args.keys()) - {"plan_id"})
+                    ],
+                )
             entry = get_preflight_cache().get_by_plan_id(plan_id.strip())
             if entry is not None and entry.tool_name == tool_def.name:
                 # 校验 frozen canonical args；校验结果丢弃，只回传 plan_id
@@ -1989,4 +2010,8 @@ def _python_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
                 "target", "locked_targets", "phase",
             }
         }
+    # NOTE: place_block / fill_block never reach this projection on the plan_id
+    # resume path — resume goes through execute_block_plan with frozen canonical
+    # args (pos/block/expect/states / from_/to), so keep this a pure passthrough;
+    # do not add field filtering back for place/fill here.
     return dict(args or {})

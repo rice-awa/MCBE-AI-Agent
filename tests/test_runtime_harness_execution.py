@@ -1470,8 +1470,9 @@ async def test_regression_status_kwarg_type_error_is_impossible(
 ) -> None:
     """2026-08-03 回归：恢复 payload 曾注入 status → TypeError。新路径结构性不可达。
 
-    即使上游 payload 被篡改塞入 status/phase/locked_targets，验证与执行层
-    也只看到 plan_id；缓存里的 canonical/execute args 本身不含隐藏字段。
+    恢复载荷契约只允许恰好 {plan_id}；被篡改塞入 status/phase/locked_targets
+    的载荷现在在校验边界被拒绝（不会执行、不会静默归一化、不会 TypeError）。
+    缓存里的 canonical/execute args 本身也不含隐藏字段。
     """
     captured: dict[str, Any] = {}
 
@@ -1494,7 +1495,8 @@ async def test_regression_status_kwarg_type_error_is_impossible(
 
     tool_call_id, plan_id, messages = await _run_first_place_block_call(agent, deps)
 
-    # 篡改的恢复 payload：plan_id 之外塞入 status/phase/locked_targets
+    # 篡改的恢复 payload：plan_id 之外塞入 status/phase/locked_targets →
+    # 校验边界拒绝，impl 绝不执行，也不会把隐藏 kwargs 透传给任何执行层
     tampered = DeferredToolResults()
     tampered.approvals[tool_call_id] = ToolApproved(
         override_args={
@@ -1507,8 +1509,9 @@ async def test_regression_status_kwarg_type_error_is_impossible(
     second = await agent.run(
         message_history=messages, deferred_tool_results=tampered, deps=deps, model=TestModel()
     )
-    assert not isinstance(second.output, DeferredToolRequests)
-    assert captured["kwargs"] == {"pos": [1, 64, 1], "block": "stone", "expect": "air", "states": None}
+    assert "kwargs" not in captured  # impl 未被调用
+    # 拒绝发生在验证边界：调用不会执行，重新进入待审批（非静默透传）
+    assert isinstance(second.output, DeferredToolRequests)
 
     # 结构性根因：预检缓存的 canonical/execute args 不含任何隐藏字段
     entry = get_preflight_cache().get_by_plan_id(plan_id)
@@ -1516,3 +1519,50 @@ async def test_regression_status_kwarg_type_error_is_impossible(
     for key in ("status", "locked_targets", "phase"):
         assert key not in entry.canonical_args
         assert key not in entry.execute_args
+
+
+@pytest.mark.asyncio
+async def test_plan_id_resume_malformed_payload_rejected_at_validation(
+    monkeypatch: pytest.MonkeyPatch, _block_tool_catalog
+) -> None:
+    """畸形恢复载荷（plan_id 之外的额外键）在校验边界被拒绝，不静默透传。
+
+    Reviewer finding (Important 2)：cache miss 时 wrap_tool_validate 曾直接返回
+    {plan_id} 而不做任何载荷校验；``{"plan_id": "missing", "malicious_extra": true}``
+    会静默通过验证边界。现在恢复契约强制载荷恰好为 {plan_id}，额外键 → 拒绝。
+    """
+    calls: dict[str, int] = {"count": 0}
+    captured: dict[str, Any] = {}
+
+    async def fake_place_impl(
+        ctx: RunContext[_Deps],
+        *,
+        pos: list[int],
+        block: str,
+        expect: str = "air",
+        states: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        calls["count"] += 1
+        captured["kwargs"] = {"pos": pos, "block": block, "expect": expect, "states": states}
+        return ToolResult.ok(f"placed:{block}")
+
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.place_block_impl", fake_place_impl)
+
+    agent = _build_place_block_agent()
+    deps = _Deps(settings=_Settings(), run_id="run-malformed-payload")
+    _set_supported_block_capability(str(deps.connection_id))
+
+    tool_call_id, _plan_id, messages = await _run_first_place_block_call(agent, deps)
+
+    # 缺失 plan + 额外恶意键：验证边界拒绝（不执行、不静默透传为 STATE_UNKNOWN）
+    malformed = DeferredToolResults()
+    malformed.approvals[tool_call_id] = ToolApproved(
+        override_args={"plan_id": "no-such-plan", "malicious_extra": True}
+    )
+    rejected = await agent.run(
+        message_history=messages, deferred_tool_results=malformed, deps=deps, model=TestModel()
+    )
+    assert calls["count"] == 0
+    assert "kwargs" not in captured
+    # 拒绝：重新进入待审批，而不是静默通过验证边界
+    assert isinstance(rejected.output, DeferredToolRequests)

@@ -2803,44 +2803,62 @@ async def execute_block_plan(plan_id: str, ctx: RunContext[AgentDependencies]) -
     从预检缓存取 frozen canonical args，直接调用对应 impl；同一 plan 只执行
     一次（成功写入已执行标记 + 结果缓存）。缓存缺失/过期/工具不支持返回
     ``STATE_UNKNOWN``。
+
+    幂等性由两层组成：harness 的 (run_id, tool_call_id) 幂等 store 处理同轮
+    恢复；这里的 ``executed`` 标记是第二道防线。``executed`` /
+    ``execution_result`` 的读-查-写必须在缓存锁下进行，且并发恢复必须按
+    plan_id 串行化（per-plan asyncio.Lock）——缓存锁是 threading.RLock，不能
+    跨 ``await`` 持有（会阻塞同一事件循环里的其他协程）。
     """
-    from services.agent.block_ops.preflight_cache import get_preflight_cache
+    from services.agent.block_ops.preflight_cache import (
+        get_plan_execution_lock,
+        get_preflight_cache,
+    )
 
     pid = str(plan_id or "").strip()
-    entry = get_preflight_cache().get_by_plan_id(pid)
-    if entry is None:
-        return _state_unknown_result(pid)
+    cache = get_preflight_cache()
+    # 快路径：锁外先确认 plan 存在且未执行，避免为伪造/过期 plan_id 创建锁。
+    with cache._lock:
+        entry = cache.get_by_plan_id(pid)
+        if entry is None:
+            return _state_unknown_result(pid)
+        if entry.executed and isinstance(entry.execution_result, ToolResult):
+            return entry.execution_result
 
-    if entry.executed and isinstance(entry.execution_result, ToolResult):
-        return entry.execution_result
+    # 并发恢复串行化：等待期间另一个协程可能已完成本 plan。
+    async with get_plan_execution_lock(pid):
+        with cache._lock:
+            if entry.executed and isinstance(entry.execution_result, ToolResult):
+                return entry.execution_result
 
-    tool_name = entry.tool_name
-    canonical = entry.canonical_args
-    if tool_name == "place_block":
-        result = await place_block_impl(
-            ctx,
-            pos=canonical.get("pos"),
-            block=canonical.get("block"),
-            expect=str(canonical.get("expect") or "air"),
-            states=canonical.get("states"),
-        )
-    elif tool_name == "fill_block":
-        result = await fill_block_impl(
-            ctx,
-            from_=canonical.get("from_", canonical.get("from")),
-            to=canonical.get("to"),
-            block=canonical.get("block"),
-            expect=str(canonical.get("expect") or "air"),
-            states=canonical.get("states"),
-        )
-    else:
-        return _state_unknown_result(pid, reason="unsupported-tool")
+        tool_name = entry.tool_name
+        canonical = entry.canonical_args
+        if tool_name == "place_block":
+            result = await place_block_impl(
+                ctx,
+                pos=canonical.get("pos"),
+                block=canonical.get("block"),
+                expect=str(canonical.get("expect") or "air"),
+                states=canonical.get("states"),
+            )
+        elif tool_name == "fill_block":
+            result = await fill_block_impl(
+                ctx,
+                from_=canonical.get("from_", canonical.get("from")),
+                to=canonical.get("to"),
+                block=canonical.get("block"),
+                expect=str(canonical.get("expect") or "air"),
+                states=canonical.get("states"),
+            )
+        else:
+            return _state_unknown_result(pid, reason="unsupported-tool")
 
-    # 幂等：成功才落 executed 标记 + 结果缓存；失败允许重新恢复重试。
-    if result.is_success:
-        entry.executed = True
-        entry.execution_result = result
-    return result
+        # 幂等：成功才落 executed 标记 + 结果缓存；失败允许重新恢复重试。
+        with cache._lock:
+            if result.is_success:
+                entry.executed = True
+                entry.execution_result = result
+        return result
 
 
 async def inspect_block_impl(
