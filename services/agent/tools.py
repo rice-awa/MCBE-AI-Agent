@@ -85,11 +85,7 @@ def _enhance_registered_tool_descriptions(chat_agent: Agent[AgentDependencies, s
         description = tool.description or ""
         if description.startswith("[运行时 Harness]"):
             continue
-        try:
-            tool.description = render_schema_description_prefix(tool_name) + description.strip()
-        except KeyError:
-            # 工具尚未在 catalog 中注册；保留原始 description
-            pass
+        tool.description = render_schema_description_prefix(tool_name) + description.strip()
 
 
 def _stringify_tool_results(chat_agent: Agent[AgentDependencies, str]) -> None:

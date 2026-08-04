@@ -124,6 +124,32 @@ def test_registered_tool_description_can_skip_runtime_harness_prefix() -> None:
     assert "执行 Minecraft 命令" in description
 
 
+def test_schema_description_prefix_covers_all_block_tools() -> None:
+    place = render_schema_description_prefix("place_block")
+    assert "[运行时 Harness]" in place
+    assert "意图: 改变世界" in place
+    assert "风险: 高" in place
+
+    fill = render_schema_description_prefix("fill_block")
+    assert "意图: 改变世界" in fill
+    assert "风险: 高" in fill
+
+    inspect = render_schema_description_prefix("inspect_block")
+    assert "意图: 查询世界" in inspect
+    assert "风险: 低" in inspect
+
+
+def test_block_tool_descriptions_get_prefix_without_keyerror_guard() -> None:
+    """Every registered block tool resolves a catalog entry (guard removed)."""
+    agent = Agent("test", deps_type=AgentDependencies, output_type=str)
+    register_agent_tools(agent, settings=Settings())
+
+    for name in ("place_block", "fill_block", "inspect_block"):
+        description = _tool(agent, name).description
+        assert description is not None
+        assert description.startswith("[运行时 Harness]"), name
+
+
 class _FakeResponse:
     def __init__(self, payload: dict):
         self._payload = payload

@@ -787,19 +787,17 @@ async def test_worker_audits_validation_retry_and_later_success_without_executio
     worker = AgentWorker(broker, settings)
 
     bad_args = {
-        "edits": [{
-            "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-            "block": "minecraft:stone",
-        }],
-        "dimension": "minecraft:overworld",
+        "from": [4, 64, 3],
+        "to": [2, 64, 1],
+        "block": "minecraft:stone",
+        "expect": "air",
         "api_key": "do-not-record",
     }
     good_args = {
-        "edits": [{
-            "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-            "block": "minecraft:stone",
-        }],
-        "dimension": "minecraft:overworld",
+        "from_": [4, 64, 3],
+        "to": [2, 64, 1],
+        "block": "minecraft:stone",
+        "expect": "air",
     }
     retry_at = datetime(2026, 8, 2, 15, 0, 0, tzinfo=UTC)
     retry = RetryPromptPart(
@@ -809,38 +807,38 @@ async def test_worker_audits_validation_retry_and_later_success_without_executio
             "msg": "Invalid JSON: validation-secret",
             "input": "validation-secret",
         }],
-        tool_name="edit_blocks",
+        tool_name="fill_block",
         tool_call_id="tc-invalid",
         timestamp=retry_at,
     )
     messages = [
         ModelResponse(parts=[ToolCallPart(
-            tool_name="edit_blocks",
+            tool_name="fill_block",
             args=bad_args,
             tool_call_id="tc-invalid",
         )]),
         ModelRequest(parts=[retry]),
         ModelResponse(parts=[ToolCallPart(
-            tool_name="edit_blocks",
+            tool_name="fill_block",
             args=good_args,
             tool_call_id="tc-corrected",
         )]),
         ModelRequest(parts=[ToolReturnPart(
-            tool_name="edit_blocks",
+            tool_name="fill_block",
             content="ok",
             tool_call_id="tc-corrected",
         )]),
         ModelResponse(parts=[TextPart(content="修正成功")]),
     ]
 
-    async def corrected_tool(ctx, edits, dimension):  # noqa: ARG001
+    async def corrected_tool(ctx, from_, to, block, expect="air"):  # noqa: ARG001
         return ToolResult.success("ok")
 
     writer = AuditWriter()
     set_audit_writer(writer)
     start_audit_writer()
     try:
-        corrected = wrap_tool_function("edit_blocks", corrected_tool, settings)
+        corrected = wrap_tool_function("fill_block", corrected_tool, settings)
 
         async def fake_stream_chat(_prompt, deps, *_args, **_kwargs):
             await corrected(
@@ -849,10 +847,10 @@ async def test_worker_audits_validation_retry_and_later_success_without_executio
             )
             yield StreamEvent(
                 event_type="tool_call",
-                content="edit_blocks",
+                content="fill_block",
                 sequence=0,
                 metadata={
-                    "tool_name": "edit_blocks",
+                    "tool_name": "fill_block",
                     "tool_call_id": "tc-invalid",
                     "args": bad_args,
                 },
@@ -914,12 +912,12 @@ async def test_worker_audits_validation_retry_and_later_success_without_executio
         successes = [r for r in records if r["status"] == "success"]
         assert len(failures) == 1
         assert len(successes) == 1
-        assert failures[0]["tool_name"] == "edit_blocks"
+        assert failures[0]["tool_name"] == "fill_block"
         assert failures[0]["error_kind"] == "INVALID_ARGUMENT"
         assert failures[0]["result"]["failure_reason"] == "json_invalid"
         assert failures[0]["result"]["execution_stage"] == "validation"
         assert failures[0]["result"]["external_state_unknown"] == "false"
-        assert failures[0]["parameters"]["dimension"] == "minecraft:overworld"
+        assert failures[0]["parameters"]["from"] == [4, 64, 3]
         assert failures[0]["parameters"]["api_key"] == "[REDACTED]"
         assert "validation-secret" not in json.dumps(failures[0], ensure_ascii=False)
         assert not any(
