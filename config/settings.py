@@ -7,7 +7,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from _version import __version__
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 from pydantic_settings.sources import JsonConfigSettingsSource
@@ -182,7 +181,7 @@ class MinecraftConfig(BaseModel):
     def get_command_description(self, cmd_type: str) -> tuple[str, str | None]:
         """获取命令描述和用法"""
         # 从 commands 中查找
-        for prefix, cmd in self.commands.items():
+        for _prefix, cmd in self.commands.items():
             if isinstance(cmd, dict) and cmd.get("type") == cmd_type:
                 return cmd.get("description", ""), cmd.get("usage")
             if isinstance(cmd, str) and cmd == cmd_type:
@@ -680,10 +679,24 @@ class AddonProtocolConfig(BaseModel):
     ai_resp_message_id: str = "mcbews:text_resp"
 
 
+class AddonBlockToolsConfig(BaseModel):
+    """Dedicated block-tool workload limits (clamped to hard maximums)."""
+
+    max_discrete_positions: int = Field(default=256, ge=1, le=1024)
+    max_fill_volume: int = Field(default=4096, ge=1, le=16384)
+    cells_per_tick: int = Field(default=128, ge=1, le=512)
+    # 0 = absolute execute omits locked_targets on the wire (preferred).
+    # >0 caps locked list only on non-omit paths (player_relative / incomplete geometry).
+    max_locked_targets_on_wire: int = Field(default=0, ge=0, le=1024)
+    inspect_summary_threshold: int = Field(default=8, ge=1, le=64)
+    inspect_sample_limit: int = Field(default=8, ge=1, le=32)
+
+
 class AddonConfig(BaseModel):
     """Addon 桥接配置"""
 
     protocol: AddonProtocolConfig = Field(default_factory=AddonProtocolConfig)
+    block_tools: AddonBlockToolsConfig = Field(default_factory=AddonBlockToolsConfig)
 
 
 class LoggingFilesConfig(BaseModel):

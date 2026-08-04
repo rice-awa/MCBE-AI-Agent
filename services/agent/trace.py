@@ -22,6 +22,9 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from config.logging import get_logger
+from config.redaction import is_sensitive_key, truncate_for_log
+from services.agent.harness.audit import preview_parameters, sanitize_validation_content
+from services.agent.harness.catalog import get_tool_entry
 
 logger = get_logger(__name__)
 
@@ -111,6 +114,50 @@ class TraceEvent(BaseModel):
 # system-prompt 超过该长度时只保留预览 + hash，避免 journal 被静态提示词撑爆。
 _SYSTEM_PROMPT_FULL_MAX_CHARS = 256
 _SYSTEM_PROMPT_PREVIEW_CHARS = 120
+_TRACE_ARGUMENT_MAX_ITEMS = 32
+_TRACE_ARGUMENT_MAX_CHARS = 120
+
+
+def _bounded_redacted_value(value: Any) -> Any:
+    """递归生成无目录工具参数的 bounded、脱敏投影。"""
+    if isinstance(value, str):
+        return truncate_for_log(value, _TRACE_ARGUMENT_MAX_CHARS)
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= _TRACE_ARGUMENT_MAX_ITEMS:
+                break
+            key_text = str(key)
+            result[key_text] = (
+                "[REDACTED]"
+                if is_sensitive_key(key_text)
+                else _bounded_redacted_value(item)
+            )
+        return result
+    if isinstance(value, (list, tuple)):
+        return [
+            _bounded_redacted_value(item)
+            for item in value[:_TRACE_ARGUMENT_MAX_ITEMS]
+        ]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return truncate_for_log(value, _TRACE_ARGUMENT_MAX_CHARS)
+
+
+def _safe_tool_arguments(tool_name: str, value: Any) -> Any:
+    """将工具参数限制到目录 preview 或通用 bounded 脱敏形状。"""
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {"_redacted": True}
+        value = parsed
+    if not isinstance(value, Mapping):
+        return {"_redacted": True} if value is not None else None
+    parameters = dict(value)
+    if get_tool_entry(tool_name) is not None:
+        return preview_parameters(tool_name, parameters)
+    return _bounded_redacted_value(parameters)
 
 
 def serialize_trace_payload(
@@ -165,7 +212,25 @@ def _compact_message_part(part: Any) -> Any:
     if not isinstance(part, Mapping):
         return _json_safe(part)
     part_out = {str(k): _json_safe(v) for k, v in part.items()}
-    if part_out.get("part_kind") != "system-prompt":
+    part_kind = part_out.get("part_kind")
+    if part_kind == "tool-call":
+        tool_name = str(part_out.get("tool_name") or "unknown")
+        for args_key in ("args", "arguments"):
+            if args_key in part_out:
+                part_out[args_key] = _safe_tool_arguments(
+                    tool_name,
+                    part_out.get(args_key),
+                )
+        return part_out
+    if part_kind == "retry-prompt" and part_out.get("tool_name") is not None:
+        content = part_out.get("content")
+        tool_name = str(part_out.get("tool_name") or "unknown")
+        if isinstance(content, (list, tuple)):
+            part_out["content"] = sanitize_validation_content(tool_name, content)
+        elif isinstance(content, str):
+            part_out["content"] = "[REDACTED]"
+        return part_out
+    if part_kind != "system-prompt":
         return part_out
     content = part_out.get("content")
     if not isinstance(content, str) or len(content) <= _SYSTEM_PROMPT_FULL_MAX_CHARS:
@@ -418,6 +483,17 @@ class TraceRecorder:
             attrs.setdefault("provider", provider)
         if model_name is not None:
             attrs.setdefault("model_name", model_name)
+        elif messages:
+            # Prefer explicit arg; otherwise lift model_name from a response-kind dict.
+            for msg in messages:
+                if not isinstance(msg, Mapping):
+                    continue
+                if msg.get("kind") != "response":
+                    continue
+                extracted = msg.get("model_name")
+                if extracted is not None:
+                    attrs.setdefault("model_name", extracted)
+                    break
         if finish_reason is not None:
             attrs.setdefault("finish_reason", finish_reason)
         if usage is not None:
@@ -456,7 +532,9 @@ class TraceRecorder:
         args = parameters if parameters is not None else tool_args
         payload: dict[str, Any] | None = None
         if args is not None:
-            payload = {"tool_args": args, "parameters": args}
+            # Write only the canonical key; keep `parameters` as input alias and
+            # in _PAYLOAD_ALLOWED_KEYS for reading old journals.
+            payload = {"tool_args": _safe_tool_arguments(tool_name, args)}
         self.emit(
             event_name,
             context,
@@ -500,7 +578,8 @@ class TraceRecorder:
             attrs.setdefault("tool_call_id", tool_call_id)
         payload: dict[str, Any] | None = None
         if result is not None:
-            payload = {"tool_result": result, "result": result}
+            # Write only the canonical key; keep `result` in allowlist for old journals.
+            payload = {"tool_result": result}
         self.emit(
             event_name,
             context,
@@ -534,8 +613,8 @@ class TraceRecorder:
     ) -> None:
         """记录终态与用户可见最终答复（正文仅 content 门控）。"""
         attrs = dict(attributes or {})
+        # Write only the canonical key; keep `content` in allowlist for old journals.
         payload = {
-            "content": content,
             "final_response": content,
         }
         self.emit(

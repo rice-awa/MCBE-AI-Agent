@@ -9,6 +9,7 @@ ContextBuilder 在每次模型请求前裁剪 message_history：
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
@@ -17,6 +18,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
     ToolCallPart,
     ToolReturnPart,
 )
@@ -73,6 +75,128 @@ class ContextBudget:
 
 class ContextOversizedError(ValueError):
     """单条消息或预留项已超过可用上下文窗口，硬拒绝。"""
+
+
+def _is_tool_response_part(part: Any) -> bool:
+    """判断 part 是否属于需要和 ToolCallPart 配对的工具级响应。"""
+    return isinstance(part, ToolReturnPart) or (
+        isinstance(part, RetryPromptPart) and part.tool_name is not None
+    )
+
+
+def _is_tool_part(part: Any) -> bool:
+    return isinstance(part, ToolCallPart) or _is_tool_response_part(part)
+
+
+def _tool_call_id(part: Any) -> str | None:
+    """返回可用于配对的工具调用 ID；缺失或空白 ID 不可配对。"""
+    raw_call_id = getattr(part, "tool_call_id", None)
+    if raw_call_id is None:
+        return None
+    call_id = str(raw_call_id)
+    return call_id if call_id.strip() else None
+
+
+def ensure_tool_message_pairs(
+    messages: list[ModelMessage],
+    *,
+    preserve_call_ids: set[str] | None = None,
+) -> list[ModelMessage]:
+    """清理工具消息，按历史顺序建立一对一的 call/response 配对。
+
+    普通历史要求每个工具级响应都匹配此前唯一未配对的调用，且每个调用
+    都必须有响应。``preserve_call_ids`` 只供审批恢复使用：其中明确列出
+    且在最终 ModelResponse 中唯一、尚未有响应的调用可以暂时保留，等待
+    DeferredToolResults 消费；不在集合内或存在歧义的孤儿仍会被删除。该函数
+    只构造新消息，不修改输入对象。
+    """
+    preserved_ids = {
+        str(call_id)
+        for call_id in (preserve_call_ids or set())
+        if str(call_id).strip()
+    }
+    resumable_response_index = next(
+        (
+            message_index
+            for message_index in range(len(messages) - 1, -1, -1)
+            if isinstance(messages[message_index], ModelResponse)
+        ),
+        None,
+    )
+    pending_calls: dict[str, deque[tuple[int, int]]] = {}
+    removed_positions: set[tuple[int, int]] = set()
+
+    # Flatten the protocol parts in message order. A response can only consume
+    # a call that appeared before it; duplicate IDs consume one occurrence at a
+    # time instead of being accepted by a global set comparison.
+    for message_index, message in enumerate(messages):
+        for part_index, part in enumerate(getattr(message, "parts", []) or []):
+            if isinstance(part, ToolCallPart):
+                call_id = _tool_call_id(part)
+                if call_id is None:
+                    removed_positions.add((message_index, part_index))
+                    continue
+                pending_calls.setdefault(call_id, deque()).append(
+                    (message_index, part_index)
+                )
+                continue
+
+            if not _is_tool_response_part(part):
+                continue
+            call_id = _tool_call_id(part)
+            if call_id is None:
+                removed_positions.add((message_index, part_index))
+                continue
+            calls = pending_calls.get(call_id)
+            if not calls:
+                # Response-before-call and excess duplicate responses are both
+                # invalid; a later call cannot retroactively make this valid.
+                removed_positions.add((message_index, part_index))
+                continue
+            calls.popleft()
+
+    # All remaining calls are unmatched. PydanticAI resumes DeferredToolResults
+    # from the final ModelResponse, so an explicitly deferred ID is safe to keep
+    # only when exactly one unmatched occurrence belongs to that response.
+    # Otherwise remove every occurrence and let resume fail closed rather than
+    # falling back to an older call with the same ID.
+    for call_id, calls in pending_calls.items():
+        positions = list(calls)
+        resumable_positions = [
+            position
+            for position in positions
+            if call_id in preserved_ids and position[0] == resumable_response_index
+        ]
+        kept_position = (
+            resumable_positions[0] if len(resumable_positions) == 1 else None
+        )
+        removed_positions.update(
+            position for position in positions if position != kept_position
+        )
+
+    if not removed_positions:
+        return list(messages)
+
+    result: list[ModelMessage] = []
+    for message_index, message in enumerate(messages):
+        parts = list(getattr(message, "parts", []) or [])
+        kept = [
+            part
+            for part_index, part in enumerate(parts)
+            if (message_index, part_index) not in removed_positions
+        ]
+        if not kept and parts and all(_is_tool_part(part) for part in parts):
+            if not (
+                preserved_ids
+                and message_index == resumable_response_index
+                and isinstance(message, ModelResponse)
+            ):
+                continue
+        if isinstance(message, (ModelRequest, ModelResponse)):
+            result.append(replace(message, parts=kept))
+        else:
+            result.append(message)
+    return result
 
 
 def estimate_tokens(text: str | None) -> int:
@@ -368,7 +492,7 @@ class ContextBuilder:
             result = self._keep_recent_turns(result, max_turns)
 
         # 最终保证 tool pair 完整
-        result = self._ensure_tool_pairs(result)
+        result = ensure_tool_message_pairs(result)
 
         # missing context_window：裁剪后若历史仍超过 fallback 预算，硬拒绝而非静默放行。
         # 策略说明：无限预算永不使用；元数据缺失时用 8192 fallback 裁剪，
@@ -570,54 +694,16 @@ class ContextBuilder:
         return list(messages[start:])
 
     def _ensure_tool_pairs(self, messages: list[ModelMessage]) -> list[ModelMessage]:
-        """保证不会留下孤立的 tool-call 或 tool-return。"""
-        call_ids: set[str] = set()
-        return_ids: set[str] = set()
-        for message in messages:
-            for part in getattr(message, "parts", []) or []:
-                kind = getattr(part, "part_kind", None)
-                call_id = getattr(part, "tool_call_id", None)
-                if not call_id:
-                    continue
-                if kind == "tool-call":
-                    call_ids.add(str(call_id))
-                elif kind == "tool-return":
-                    return_ids.add(str(call_id))
+        """保证不会留下孤立的 tool-call 或工具级响应。"""
+        return ensure_tool_message_pairs(messages)
 
-        unpaired_calls = call_ids - return_ids
-        unpaired_returns = return_ids - call_ids
-        if not unpaired_calls and not unpaired_returns:
-            return messages
+    @staticmethod
+    def _is_tool_response_part(part: Any) -> bool:
+        return _is_tool_response_part(part)
 
-        result: list[ModelMessage] = []
-        for message in messages:
-            parts = list(getattr(message, "parts", []) or [])
-            kept: list[Any] = []
-            for part in parts:
-                kind = getattr(part, "part_kind", None)
-                call_id = getattr(part, "tool_call_id", None)
-                if kind == "tool-call" and call_id and str(call_id) in unpaired_calls:
-                    continue
-                if kind == "tool-return" and call_id and str(call_id) in unpaired_returns:
-                    continue
-                kept.append(part)
-            if not kept:
-                # 若去掉 tool 部分后消息为空，丢弃
-                if any(
-                    getattr(p, "part_kind", None) in {"tool-call", "tool-return"}
-                    for p in parts
-                ) and not any(
-                    getattr(p, "part_kind", None) not in {"tool-call", "tool-return"}
-                    for p in parts
-                ):
-                    continue
-            if isinstance(message, ModelRequest):
-                result.append(ModelRequest(parts=kept) if kept != parts else message)
-            elif isinstance(message, ModelResponse):
-                result.append(ModelResponse(parts=kept) if kept != parts else message)
-            else:
-                result.append(message)
-        return result
+    @staticmethod
+    def _is_tool_part(part: Any) -> bool:
+        return _is_tool_part(part)
 
 
 def build_context_history_processor(settings: Any | None = None) -> ContextBuilder:

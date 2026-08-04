@@ -78,6 +78,33 @@ AgentWorker / CommandHandlers
   - `payload`: object
   - `v`: 2
 
+## 专用方块能力（`block_ops` v1）
+
+连接建立后，Python 宿主通过 `get_capabilities` 读取 Add-on 能力。当前行为包返回：
+
+```json
+{
+  "schema_version": "1",
+  "capabilities": {
+    "block_ops": {
+      "version": 1,
+      "inspect": true,
+      "place": true,
+      "batch": true,
+      "fill": true,
+      "multiblock_placement": "unsupported"
+    }
+  }
+}
+```
+
+- `block_ops.inspect=true` 时，宿主向模型公开 `inspect_block`、`place_block` 与 `fill_block`；缺失或为 `false` 时返回 `UNSUPPORTED_CAPABILITY`。
+- 模型只看到 `inspect_block(target)`、`place_block(pos, block, expect?, states?)` 与 `fill_block(from, to, block, expect?, states?)` 契约；`mode`、`edits`、`dimension`、以及 `locked_targets`、`phase` 等恢复字段均不在模型 schema 中。宿主把这些工具映射到既有 wire capability（`capability=edit_blocks` 的 `mode=place` / `mode=fill` 帧、`capability=inspect_block`），线协议字段不变。
+- `place_block` / `fill_block` 的失败结果必须含稳定 `code` 和 `fallback_allowed`。仅 `ADDON_UNAVAILABLE`、`UNSUPPORTED_CAPABILITY` 可为 `true`；其余失败为 `false`。宿主只会对 `setblock`、`fill`、`clone` 自动回退执行此结论，且允许的原始命令仍要单独审批。
+- `multiblock_placement="unsupported"` 表示门、床等多格方块会返回 `UNSUPPORTED_BLOCK_PLACEMENT`，不会假称只写入一格即完成。
+
+`config.json` 的 `addon.block_tools` 可调整有界工作量：`max_discrete_positions`、`max_fill_volume`、`cells_per_tick`、`max_locked_targets_on_wire`、`inspect_summary_threshold`、`inspect_sample_limit`。默认值见 `config.example.json`；所有值均由宿主硬上限夹紧。
+
 ## 响应分片格式（Addon → Python）
 
 聊天消息：

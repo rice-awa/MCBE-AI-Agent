@@ -48,7 +48,7 @@
     "mcwiki_base_url": "https://mcwiki.rice-awa.top",
     "dedup_external_messages": true,
     "tool_response_verbose": false,
-    "request_limit": 50,
+    "request_limit": 30,
     "tool_calls_limit": 50,
     "input_tokens_limit": null,
     "output_tokens_limit": null,
@@ -201,6 +201,14 @@
       "ui_chat_prefix": "MCBEWS|UI_CHAT",
       "bridge_tool_player_name": "MCBEWS_BRIDGE",
       "ai_resp_message_id": "mcbews:text_resp"
+    },
+    "block_tools": {
+      "max_discrete_positions": 256,
+      "max_fill_volume": 4096,
+      "cells_per_tick": 128,
+      "max_locked_targets_on_wire": 0,
+      "inspect_summary_threshold": 8,
+      "inspect_sample_limit": 8
     }
   },
   "logging": {

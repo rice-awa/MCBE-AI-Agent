@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 ErrorKind = Literal[
     "INVALID_ARGUMENT",
@@ -104,8 +104,11 @@ class ToolResult:
     retryable: bool = False
     external_state_unknown: bool = False
     diagnostic_summary: str | None = None
+    error_type: str | None = None
     # 兼容旧字段名（审计/测试）
     failure_reason: str | None = None
+    # 仅供运行时 Harness 审计使用的有界执行证据，不会发送给模型。
+    audit_evidence: dict[str, Any] | None = None
 
     @classmethod
     def ok(cls, text: str) -> ToolResult:
@@ -125,6 +128,7 @@ class ToolResult:
         retryable: bool = False,
         external_state_unknown: bool = False,
         diagnostic_summary: str | None = None,
+        error_type: str | None = None,
         failure_reason: str | None = None,
     ) -> ToolResult:
         reason = failure_reason or text
@@ -135,6 +139,7 @@ class ToolResult:
             retryable=retryable,
             external_state_unknown=external_state_unknown,
             diagnostic_summary=diagnostic_summary or reason,
+            error_type=error_type,
             failure_reason=reason,
         )
 

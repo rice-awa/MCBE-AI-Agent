@@ -19,10 +19,13 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Protocol
 
+from pydantic_ai.messages import RetryPromptPart, ToolCallPart
+
 from config.logging import get_logger
 from config.redaction import (
     DEFAULT_EXCEPTION_MAX,
     DEFAULT_PARAM_MAX,
+    is_sensitive_key,
     redact_exception,
     redact_mapping,
     truncate_for_log,
@@ -68,6 +71,9 @@ _DEFAULT_AUDIT_PATH = "logs/runtime_harness_tools.jsonl"
 _DEFAULT_MAX_RECORDS = 5000
 _QUEUE_MAXSIZE = 10_000
 _STOP = object()
+_MAX_PREVIEW_ITEMS = 32
+_MAX_VALIDATION_ERRORS = 8
+_MAX_VALIDATION_LOCATION_LENGTH = 96
 
 
 class _FlushRequest:
@@ -95,26 +101,296 @@ def preview_parameters(
     entry = get_tool_entry(tool_name)
     policy = entry.preview if entry is not None else ParameterPreviewPolicy()
     preview: dict[str, Any] = {}
-    for key in policy.include:
+    for key in policy.include[:_MAX_PREVIEW_ITEMS]:
         if key not in parameters:
             continue
         if key in policy.sensitive:
             preview[key] = "[REDACTED]"
             continue
         preview[key] = _truncate_value(parameters[key], policy.max_length)
-    for key in policy.sensitive:
+    for key in policy.sensitive[:_MAX_PREVIEW_ITEMS]:
         if key in parameters and key not in preview:
             preview[key] = "[REDACTED]"
     # 对 include 之外但明显敏感的字段也打码（防御性）
     for key, value in parameters.items():
+        if len(preview) >= _MAX_PREVIEW_ITEMS:
+            break
         if key in preview:
             continue
         # 仅对敏感 key 额外暴露为 REDACTED，避免记录完整玩家内容
-        from config.redaction import is_sensitive_key
-
         if is_sensitive_key(key):
             preview[str(key)] = "[REDACTED]"
     return preview
+
+
+def extract_tool_validation_failures(
+    messages: list[Any] | tuple[Any, ...] | None,
+    *,
+    run_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """从一批模型消息提取工具参数校验失败。
+
+    Pydantic AI 在进入工具包装层前，会把参数解析/校验错误写成工具级
+    ``RetryPromptPart``。这个函数只读消息，不写日志、不写盘，也不从日志文本
+    推断错误；调用方可将返回值分别交给审计和 Trace。相同
+    ``(run_id, tool_call_id, retry timestamp)`` 只保留一条。
+    """
+    if not messages:
+        return []
+
+    tool_calls: dict[str, Any] = {}
+    for message in messages:
+        for part in _message_parts(message):
+            if not _is_tool_call_part(part):
+                continue
+            call_id = _normalise_tool_call_id(_part_value(part, "tool_call_id"))
+            if call_id is not None:
+                tool_calls.setdefault(call_id, part)
+
+    failures: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    run_key = str(run_id or "")
+    for message in messages:
+        for part in _message_parts(message):
+            if not _is_tool_retry_part(part):
+                continue
+            call_id = _normalise_tool_call_id(_part_value(part, "tool_call_id"))
+            if call_id is None or call_id not in tool_calls:
+                continue
+
+            content = _part_value(part, "content")
+            # A string RetryPromptPart is also used for ModelRetry/output retry;
+            # list content is the Pydantic ValidationError shape for tool args.
+            if not isinstance(content, (list, tuple)):
+                continue
+
+            retry_timestamp = _retry_timestamp_key(_part_value(part, "timestamp"))
+            dedup_key = (run_key, call_id, retry_timestamp)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+
+            call = tool_calls[call_id]
+            tool_name = str(_part_value(call, "tool_name") or "unknown")
+            error_type, error_locations = _summarize_validation_errors(content)
+            failures.append(
+                {
+                    "tool_name": tool_name,
+                    "tool_call_id": call_id,
+                    "retry_timestamp": retry_timestamp,
+                    "error_type": error_type,
+                    "error_locations": error_locations,
+                    "parameters": _preview_tool_call_parameters(tool_name, call),
+                    # Only the Trace content path may consume this field; audit
+                    # builders intentionally ignore it.
+                    "validation_content": sanitize_validation_content(tool_name, content),
+                }
+            )
+
+    return failures
+
+
+def build_validation_failure_audit_record(
+    *,
+    failure: dict[str, Any],
+    ctx: Any | None,
+    run_id: str | None = None,
+) -> AuditRecord:
+    """Build the bounded audit projection for a validation-only failure."""
+    tool_name = str(failure.get("tool_name") or "unknown")
+    parameters = failure.get("parameters")
+    if not isinstance(parameters, dict):
+        parameters = {}
+    tool_call_id = _normalise_tool_call_id(failure.get("tool_call_id"))
+    error_type = _bounded_validation_type(failure.get("error_type"))
+    locations = _bounded_validation_locations(failure.get("error_locations"))
+
+    record = build_audit_record(
+        tool_name=tool_name,
+        parameters=parameters,
+        ctx=ctx,
+        status="failure",
+        duration_ms=0,
+        tool_call_id=tool_call_id,
+        run_id=run_id,
+    )
+    record["status"] = "failure"
+    record["error_kind"] = "INVALID_ARGUMENT"
+    record["result"] = {
+        "success": "failure",
+        "result_preview": None,
+        "failure_reason": error_type,
+        "error_kind": "INVALID_ARGUMENT",
+        "external_state_unknown": "false",
+        "execution_stage": "validation",
+    }
+    record["validation_error"] = {
+        "type": error_type,
+        "locations": locations,
+    }
+    return record
+
+
+def enqueue_validation_failure_audit(
+    failure: dict[str, Any],
+    *,
+    settings: AuditSettings | None,
+    ctx: Any | None,
+    run_id: str | None = None,
+) -> None:
+    """Enqueue one validation failure without affecting the agent path."""
+    if not audit_enabled(settings):
+        return
+    record = build_validation_failure_audit_record(
+        failure=failure,
+        ctx=ctx,
+        run_id=run_id,
+    )
+    audit_path = getattr(settings, "runtime_harness_audit_path", _DEFAULT_AUDIT_PATH)
+    max_records = getattr(settings, "runtime_harness_audit_max_records", _DEFAULT_MAX_RECORDS)
+    enqueue_audit_record(record, audit_path, max_records)
+
+
+def _message_parts(message: Any) -> list[Any]:
+    parts = message.get("parts") if isinstance(message, dict) else getattr(message, "parts", None)
+    return list(parts) if isinstance(parts, (list, tuple)) else []
+
+
+def _part_value(part: Any, name: str) -> Any:
+    if isinstance(part, dict):
+        return part.get(name)
+    return getattr(part, name, None)
+
+
+def _is_tool_call_part(part: Any) -> bool:
+    return isinstance(part, ToolCallPart) or (
+        isinstance(part, dict) and part.get("part_kind") == "tool-call"
+    )
+
+
+def _is_tool_retry_part(part: Any) -> bool:
+    return isinstance(part, RetryPromptPart) or (
+        isinstance(part, dict) and part.get("part_kind") == "retry-prompt"
+    )
+
+
+def _normalise_tool_call_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text.strip() else None
+
+
+def _retry_timestamp_key(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value) if value is not None else ""
+
+
+def _preview_tool_call_parameters(tool_name: str, call: Any) -> dict[str, Any]:
+    raw_args = _part_value(call, "args")
+    if isinstance(raw_args, dict):
+        parameters = raw_args
+    elif isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args)
+        except (TypeError, ValueError):
+            parsed = None
+        parameters = parsed if isinstance(parsed, dict) else {}
+    else:
+        parameters = {}
+    return preview_parameters(tool_name, parameters)
+
+
+def _summarize_validation_errors(content: list[Any] | tuple[Any, ...]) -> tuple[str, list[str]]:
+    error_type = "validation_error"
+    locations: list[str] = []
+    for detail in content[:_MAX_VALIDATION_ERRORS]:
+        if not isinstance(detail, dict):
+            continue
+        if error_type == "validation_error" and detail.get("type"):
+            error_type = _bounded_validation_type(detail.get("type"))
+        location = _format_validation_location(detail.get("loc"))
+        if location not in locations:
+            locations.append(location)
+    return error_type, locations
+
+
+def _format_validation_location(location: Any) -> str:
+    if isinstance(location, (list, tuple)):
+        if not location:
+            return "<root>"
+        text = ".".join(str(item) for item in location)
+    elif location is None:
+        text = "<root>"
+    else:
+        text = str(location)
+    return truncate_for_log(text, _MAX_VALIDATION_LOCATION_LENGTH)
+
+
+def _bounded_validation_type(value: Any) -> str:
+    text = str(value or "validation_error")
+    return truncate_for_log(text, 64)
+
+
+def _bounded_validation_locations(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[str] = []
+    for item in value[:_MAX_VALIDATION_ERRORS]:
+        text = truncate_for_log(item, _MAX_VALIDATION_LOCATION_LENGTH)
+        if text not in result:
+            result.append(text)
+    return result
+
+
+def sanitize_validation_content(
+    tool_name: str,
+    content: list[Any] | tuple[Any, ...],
+) -> list[dict[str, Any]]:
+    """返回可供 Trace 正文使用的 bounded、目录感知校验摘要。
+
+    Pydantic 的 ``input`` 和 ``msg`` 可能包含整段 malformed 参数或密钥。
+    结构化参数只经过工具目录的 preview policy 投影；非结构化输入和自由文
+    本不回写，避免 content-enabled Trace 变成原始输入转储。
+    """
+    sanitized: list[dict[str, Any]] = []
+    for detail in content[:_MAX_VALIDATION_ERRORS]:
+        if not isinstance(detail, dict):
+            sanitized.append({"type": "validation_error"})
+            continue
+
+        error_type = _bounded_validation_type(detail.get("type"))
+        item: dict[str, Any] = {"type": error_type}
+        if "loc" in detail:
+            item["loc"] = _sanitize_validation_location(detail.get("loc"))
+        if "input" in detail:
+            item["input"] = _sanitize_validation_input(tool_name, detail.get("input"))
+        sanitized.append(item)
+    return sanitized
+
+
+def _sanitize_validation_location(value: Any) -> str | list[str]:
+    if isinstance(value, (list, tuple)):
+        return [
+            truncate_for_log(item, _MAX_VALIDATION_LOCATION_LENGTH)
+            for item in value[:_MAX_VALIDATION_ERRORS]
+        ]
+    return truncate_for_log(value, _MAX_VALIDATION_LOCATION_LENGTH)
+
+
+def _sanitize_validation_input(tool_name: str, value: Any) -> Any:
+    if isinstance(value, dict):
+        return preview_parameters(tool_name, value)
+    # Raw malformed JSON is unstructured by definition; even a bounded copy
+    # could contain an arbitrary secret-like value, so keep only its shape.
+    if isinstance(value, str):
+        return "[REDACTED]"
+    if isinstance(value, list):
+        return {"kind": "list", "items": min(len(value), _MAX_PREVIEW_ITEMS)}
+    if value is None or isinstance(value, (bool, int, float)):
+        return {"kind": type(value).__name__}
+    return {"kind": type(value).__name__}
 
 
 def build_audit_record(
@@ -129,6 +405,8 @@ def build_audit_record(
     tool_call_id: str | None = None,
     policy_version: str | None = None,
     run_id: str | None = None,
+    authorized_args: dict[str, Any] | None = None,
+    approval_evidence: dict[str, Any] | None = None,
 ) -> AuditRecord:
     entry = get_tool_entry(tool_name)
     deps = getattr(ctx, "deps", None)
@@ -173,7 +451,45 @@ def build_audit_record(
         "result": result_summary,
         "error_kind": result_summary.get("error_kind"),
     }
+    if authorized_args is not None:
+        record["authorized_parameters"] = preview_parameters(tool_name, authorized_args)
+    if approval_evidence is not None:
+        record["approval_evidence"] = _summarize_approval_evidence(approval_evidence)
+    if isinstance(result, ToolResult) and isinstance(result.audit_evidence, dict):
+        record["execution_evidence"] = _summarize_execution_evidence(
+            result.audit_evidence
+        )
     return record
+
+
+def _summarize_approval_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Keep bounded approval evidence without recording payloads or locked targets."""
+    excluded = {"locked_targets", "payload", "raw_payload", "bridge_payload"}
+    return redact_mapping(
+        {key: value for key, value in evidence.items() if str(key).lower() not in excluded},
+        max_length=DEFAULT_PARAM_MAX,
+    )
+
+
+def _summarize_execution_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Keep before/after/verification evidence bounded and free of bridge metadata."""
+    edits = evidence.get("edits")
+    if not isinstance(edits, list):
+        return {}
+    allowed = {
+        "index", "code", "before", "after", "before_samples", "after_samples",
+        "verification", "verification_summary", "rollback", "failed_index", "written_count",
+    }
+    return {
+        "edits": [
+            redact_mapping(
+                {key: value for key, value in edit.items() if key in allowed},
+                max_length=DEFAULT_PARAM_MAX,
+            )
+            for edit in edits[:64]
+            if isinstance(edit, dict)
+        ]
+    }
 
 
 def summarize_result(
@@ -191,18 +507,36 @@ def summarize_result(
         }
 
     if isinstance(result, ToolResult):
+        structured_failure: dict[str, Any] | None = None
+        if result.is_success:
+            try:
+                payload = json.loads(result.output)
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict) and payload.get("ok") is False:
+                structured_failure = payload
+        if structured_failure is not None:
+            status = str(structured_failure.get("status") or "failed")
+            unknown = result.external_state_unknown or status == "unknown"
+            return {
+                "success": "failure",
+                "result_preview": None,
+                "failure_reason": str(structured_failure.get("code") or status),
+                "error_kind": "TRANSIENT" if unknown else "PERMANENT",
+                "external_state_unknown": "true" if unknown else "false",
+            }
         return {
             "success": result.status,
             "result_preview": None,
             "failure_reason": (
-                truncate_for_log(result.failure_reason, DEFAULT_EXCEPTION_MAX)
+                redact_exception(result.failure_reason, DEFAULT_EXCEPTION_MAX)
                 if not result.is_success and result.failure_reason
                 else None
             ),
             "error_kind": result.error_kind,
             "external_state_unknown": "true" if result.external_state_unknown else "false",
             "diagnostic_summary": (
-                truncate_for_log(result.diagnostic_summary, DEFAULT_EXCEPTION_MAX)
+                redact_exception(result.diagnostic_summary, DEFAULT_EXCEPTION_MAX)
                 if not result.is_success and result.diagnostic_summary
                 else None
             ),
@@ -583,11 +917,22 @@ def _truncate_value(value: Any, max_length: int) -> Any:
     if isinstance(value, str):
         return truncate_for_log(value, max_length)
     if isinstance(value, list):
-        return [_truncate_value(item, max_length) for item in value]
+        return [
+            _truncate_value(item, max_length)
+            for item in value[:_MAX_PREVIEW_ITEMS]
+        ]
     if isinstance(value, tuple):
-        return [_truncate_value(item, max_length) for item in value]
+        return [
+            _truncate_value(item, max_length)
+            for item in value[:_MAX_PREVIEW_ITEMS]
+        ]
     if isinstance(value, dict):
-        return redact_mapping(value, max_length=max_length or DEFAULT_PARAM_MAX)
+        bounded: dict[Any, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= _MAX_PREVIEW_ITEMS:
+                break
+            bounded[key] = _truncate_value(item, max_length)
+        return redact_mapping(bounded, max_length=max_length or DEFAULT_PARAM_MAX)
     return value
 
 

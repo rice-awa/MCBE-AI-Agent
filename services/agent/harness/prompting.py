@@ -3,12 +3,31 @@
 from services.agent.harness.catalog import ToolIntent, get_tool_entry, group_tools_by_intent
 
 _INTENT_GUIDANCE: dict[ToolIntent, str] = {
-    ToolIntent.CHANGE_WORLD: "玩家明确要求执行命令、修改世界或改变实体状态时使用。",
+    ToolIntent.CHANGE_WORLD: (
+        "玩家明确要求执行命令、修改世界或改变实体状态时使用；"
+        "优先选择契约最贴近玩家目标的专用工具。"
+        "命令与方块/物品 ID 一律使用基岩版命名空间（minecraft:）与基岩版命令语法。"
+    ),
     ToolIntent.NOTIFY_DISPLAY: "玩家要求在游戏中展示消息、标题、actionbar 或脚本事件时使用。",
-    ToolIntent.QUERY_WORLD: "玩家要求查询当前玩家、背包、实体或世界状态时使用。",
+    ToolIntent.QUERY_WORLD: (
+        "玩家要求查询当前玩家、背包、实体或世界状态时使用。"
+        "方块状态查询优先使用 inspect_block，不要用命令试探。"
+    ),
     ToolIntent.QUERY_KNOWLEDGE: "玩家要求查询 Minecraft Wiki 或受控知识资料时使用。",
     ToolIntent.SYSTEM_INFO: "玩家询问可用 provider 等系统状态时使用。",
 }
+
+
+_BLOCK_TOOL_PRIORITY = (
+    "方块操作编排规则：\n"
+    "- 连续区域（地板/墙体/屋顶）用 fill_block；单格用 place_block。\n"
+    "- inspect_block 只在需要确认世界状态时调用，不要机械地在每次编辑前先查一遍。\n"
+    "- expect 默认 air（仅替换空气）；要覆盖非空方块用 expect=any（需再审批）。\n"
+    "- 失败时只读 code 与 hint；仅 fallback_allowed=true 时才能考虑命令回退。\n"
+    "- 同一轮可以并行发出多个相互独立的 fill/place。\n"
+    "- 方块 type_id 与 states 键名一律用基岩版命名空间：如 \"minecraft:stone\"、"
+    "{\"minecraft:cardinal_direction\":\"north\"}，不要用 Java 的 facing/half。"
+)
 
 
 def render_tool_decision_tree() -> str:
@@ -35,6 +54,7 @@ def render_runtime_harness_prompt() -> str:
     return "\n\n".join(
         (
             "你可以使用工具与 MCBE 交互。先判断玩家意图，再选择风险最低且能完成目标的工具。",
+            _BLOCK_TOOL_PRIORITY,
             render_tool_decision_tree(),
             render_tool_cards(),
         )

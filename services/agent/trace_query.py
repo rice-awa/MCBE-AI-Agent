@@ -1,10 +1,13 @@
-"""Tolerant read-only aggregation over the agent_traces JSONL journal.
+"""Tolerant aggregation over the agent_traces JSONL journal.
 
 Reads line-by-line, skips malformed lines (counted in health), sorts events by
 ``(sequence, event_id)``, and derives summary status from the last terminal
 trace event. Traces without a terminal event are reported as ``running`` when
 their last event is younger than ``ABANDONED_AFTER_SECONDS``, otherwise
 ``abandoned``. Payloads are exposed exactly as recorded — never fabricated.
+
+Also provides local journal mutations (``delete_trace`` / ``clear_journal``)
+for the audit workbench; mutations use atomic replace.
 """
 
 from __future__ import annotations
@@ -18,6 +21,9 @@ from typing import Any
 # Traces without a terminal event older than this are shown as abandoned.
 # Documented threshold for query-layer inference only (does not rewrite journal).
 ABANDONED_AFTER_SECONDS = 30 * 60  # 30 minutes
+
+# Derived model card previews (query-layer only; does not rewrite journal events).
+_PREVIEW_MAX_CHARS = 80
 
 _TERMINAL_EVENT_NAMES = frozenset(
     {
@@ -83,8 +89,160 @@ def _attr(event: dict[str, Any], key: str, default: Any = None) -> Any:
     return default
 
 
+def _truncate_preview(text: str, max_len: int = _PREVIEW_MAX_CHARS) -> str:
+    """Truncate text for list/timeline previews (~80 chars)."""
+    if max_len <= 0:
+        return ""
+    if len(text) <= max_len:
+        return text
+    if max_len == 1:
+        return text[:1]
+    return text[: max_len - 1] + "…"
+
+
+def _content_as_preview_text(content: Any) -> str | None:
+    """Normalize part content to a string for previews; prefer plain str."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                chunks.append(item)
+            elif isinstance(item, dict):
+                if isinstance(item.get("text"), str):
+                    chunks.append(item["text"])
+                elif isinstance(item.get("content"), str):
+                    chunks.append(item["content"])
+        if chunks:
+            return "".join(chunks)
+    return None
+
+
+def _derive_model_previews(
+    payload: dict[str, Any] | None,
+) -> tuple[str | None, str | None, list[str] | None]:
+    """Extract user/assistant previews and tool names from a model payload.
+
+    Returns ``(user_preview, assistant_preview, tool_names)``. When there is no
+    ``payload.messages`` array, all three are ``None`` (content mode off or
+    metadata-only event). With messages present, ``tool_names`` is always a
+    list (possibly empty).
+    """
+    if not isinstance(payload, dict):
+        return None, None, None
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return None, None, None
+
+    user_preview: str | None = None
+    assistant_preview: str | None = None
+    tool_names: list[str] = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        parts = msg.get("parts")
+        if not isinstance(parts, list):
+            continue
+        kind = msg.get("kind")
+        is_response = kind == "response"
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            part_kind = part.get("part_kind")
+            if part_kind == "user-prompt" and user_preview is None:
+                text = _content_as_preview_text(part.get("content"))
+                if text is not None:
+                    user_preview = _truncate_preview(text)
+            if not is_response:
+                continue
+            if part_kind == "text" and assistant_preview is None:
+                text = _content_as_preview_text(part.get("content"))
+                if text is not None:
+                    assistant_preview = _truncate_preview(text)
+            if part_kind == "tool-call":
+                tool_name = part.get("tool_name")
+                if isinstance(tool_name, str) and tool_name:
+                    tool_names.append(tool_name)
+
+    return user_preview, assistant_preview, tool_names
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Atomic replace; prefer TraceRecorder helper when importable."""
+    try:
+        from services.agent.trace import _atomic_write_text as _write
+    except Exception:  # noqa: BLE001 — fall back to local implementation
+        import tempfile
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        ) as tmp:
+            tmp.write(content)
+            tmp.flush()
+            tmp_path = Path(tmp.name)
+        tmp_path.replace(path)
+        return
+    _write(path, content)
+
+
+def delete_trace(path: Path | str, trace_id: str) -> int:
+    """Rewrite JSONL without lines matching ``trace_id``.
+
+    Returns removed event count. Malformed lines are kept. Atomic write
+    (temp + replace). Missing file or unknown ``trace_id`` returns ``0``.
+    """
+    path = Path(path)
+    if not path.exists() or not path.is_file():
+        return 0
+
+    removed = 0
+    kept: list[str] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw_line in fh:
+                line = raw_line.rstrip("\n\r")
+                if not line.strip():
+                    # Preserve blank lines as empty kept entries (optional noise).
+                    kept.append(line)
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    kept.append(line)
+                    continue
+                if isinstance(obj, dict) and obj.get("trace_id") == trace_id:
+                    removed += 1
+                    continue
+                kept.append(line)
+    except OSError:
+        return 0
+
+    if removed == 0:
+        # No rewrite needed when nothing matched (still ok to no-op).
+        return 0
+
+    content = ("\n".join(kept) + "\n") if kept else ""
+    _atomic_write_text(path, content)
+    return removed
+
+
+def clear_journal(path: Path | str) -> None:
+    """Atomically write an empty journal; preserve parent directory."""
+    path = Path(path)
+    _atomic_write_text(path, "")
+
+
 class TraceQuery:
-    """Synchronous, read-only journal query over a JSONL path."""
+    """Synchronous journal query over a JSONL path (read + local mutations)."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -317,6 +475,7 @@ class TraceQuery:
                 continue
             attrs = event.get("attributes") if isinstance(event.get("attributes"), dict) else {}
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else None
+            user_preview, assistant_preview, tool_names = _derive_model_previews(payload)
             models.append(
                 {
                     "event_id": event.get("event_id"),
@@ -330,6 +489,9 @@ class TraceQuery:
                     "finish_reason": attrs.get("finish_reason")
                     or (payload or {}).get("finish_reason"),
                     "usage": attrs.get("usage") or (payload or {}).get("usage"),
+                    "user_preview": user_preview,
+                    "assistant_preview": assistant_preview,
+                    "tool_names": tool_names,
                     "span_id": event.get("span_id"),
                     "parent_span_id": event.get("parent_span_id"),
                     "attempt_id": event.get("attempt_id"),
@@ -340,7 +502,12 @@ class TraceQuery:
         return models
 
     def _group_tools(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Aggregate tool lifecycle events; order by first appearance."""
+        """Aggregate tool lifecycle events; order by first appearance.
+
+        Canonical keys: ``tool_args`` (prefer over ``parameters``) and
+        ``tool_result`` (prefer over ``result``). Legacy keys are still
+        exposed for debug when present in the payload.
+        """
         by_key: dict[str, dict[str, Any]] = {}
         order: list[str] = []
 
@@ -383,14 +550,18 @@ class TraceQuery:
                 entry["status"] = event.get("status")
             if isinstance(event.get("payload"), dict):
                 entry["payloads"].append(event["payload"])
-                # Surface latest args/result for convenience
+                # Surface latest args/result for convenience (canonical keys).
                 payload = event["payload"]
                 if "tool_args" in payload:
                     entry["tool_args"] = payload["tool_args"]
+                elif "parameters" in payload:
+                    entry["tool_args"] = payload["parameters"]
                 if "parameters" in payload:
                     entry["parameters"] = payload["parameters"]
                 if "tool_result" in payload:
                     entry["tool_result"] = payload["tool_result"]
+                elif "result" in payload:
+                    entry["tool_result"] = payload["result"]
                 if "result" in payload:
                     entry["result"] = payload["result"]
             if event.get("duration_ms") is not None:
@@ -534,8 +705,24 @@ class TraceQuery:
             "recorder": recorder_health,
         }
 
+    def delete_trace(self, trace_id: str) -> int:
+        """Delete all journal lines for ``trace_id``; invalidate in-memory cache."""
+        with self._lock:
+            removed = delete_trace(self.path, trace_id)
+            # Invalidate so next read reloads from disk.
+            self._reset_stats()
+            return removed
+
+    def clear_journal(self) -> None:
+        """Empty the journal file; invalidate in-memory cache."""
+        with self._lock:
+            clear_journal(self.path)
+            self._reset_stats()
+
 
 __all__ = [
     "ABANDONED_AFTER_SECONDS",
     "TraceQuery",
+    "clear_journal",
+    "delete_trace",
 ]

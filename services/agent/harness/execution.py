@@ -9,17 +9,21 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Literal
 
+from pydantic import ValidationError
 from pydantic_ai import ApprovalRequired, RunContext, ToolDenied
 from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.messages import ToolCallPart
+from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, ToolsetTool
 from pydantic_ai.toolsets.wrapper import WrapperToolset
-from pydantic_ai.tools import ToolDefinition
 
 from config.logging import get_logger
+from config.redaction import redact_exception, truncate_for_log
+from services.agent.block_ops.preflight_cache import get_preflight_cache
 from services.agent.harness.audit import (
     audit_enabled,
     build_audit_record,
@@ -28,13 +32,14 @@ from services.agent.harness.audit import (
 from services.agent.harness.catalog import (
     POLICY_VERSION,
     ToolRisk,
-    ToolSource,
     get_tool_entry,
     list_tool_names,
 )
 from services.agent.tool_results import ToolResult
 
 logger = get_logger(__name__)
+
+_BLOCK_OPS_TOOLS: frozenset[str] = frozenset({"inspect_block", "place_block", "fill_block"})
 
 DEFAULT_HARD_DENY_COMMAND_ROOTS: frozenset[str] = frozenset(
     {"op", "deop", "stop", "whitelist", "permission", "wsserver"}
@@ -59,6 +64,24 @@ DEFAULT_IDEMPOTENCY_MAX_ENTRIES = 2048
 
 _COMMAND_APPROVAL_TOOLS: frozenset[str] = frozenset(
     {"run_minecraft_command", "run_minecraft_commands"}
+)
+
+_BLOCK_COMMAND_FALLBACK_TOOLS: frozenset[str] = frozenset(
+    {"run_minecraft_command", "run_minecraft_commands", "run_world_command"}
+)
+_BLOCK_COMMAND_FALLBACK_ROOTS: frozenset[str] = frozenset({"setblock", "fill", "clone"})
+DEFAULT_BLOCK_COMMAND_FALLBACK_TTL_SECONDS = 600.0
+DEFAULT_BLOCK_COMMAND_FALLBACK_MAX_ENTRIES = 2048
+_PROMPT_NEGATION_RE = re.compile(
+    r"(?:不要|别(?:再|用|执行)?|禁止|不(?:要|用|执行)|无需|不要再)"
+    r"|\b(?:do\s+not|don't|dont)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_COMMAND_ACTION_RE = re.compile(
+    r"(?:执行(?:\s*(?:这个|该|以下))?\s*命令|运行(?:\s*(?:这个|该|以下))?\s*命令|"
+    r"原始命令|直接执行|请执行|(?:使用|用)(?:\s+\S+){0,12}\s+命令|"
+    r"\b(?:execute|run|use)\s+(?:the\s+)?(?:raw\s+)?command\b)",
+    re.IGNORECASE,
 )
 
 # 省略 target 时的已知工具默认目标（与 tools.py 签名默认值对齐）。
@@ -156,6 +179,96 @@ class IdempotencyStore:
     def _purge_unlocked(self, now: float | None = None) -> None:
         current = now if now is not None else time.time()
         expired = [k for k, v in self._items.items() if current - v.created_at >= self._ttl]
+        for key in expired:
+            del self._items[key]
+
+
+@dataclass(frozen=True)
+class BlockCommandFallbackRecord:
+    """最近一次方块工具（``place_block`` / ``fill_block`` / ``inspect_block``）的结构化回退结论。"""
+
+    fallback_allowed: bool
+    created_at: float
+    code: str | None = None
+    summary: str | None = None
+
+
+class BlockCommandFallbackStore:
+    """按连接、玩家和 run 隔离的有界 TTL 方块命令回退状态。"""
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = DEFAULT_BLOCK_COMMAND_FALLBACK_TTL_SECONDS,
+        max_entries: int = DEFAULT_BLOCK_COMMAND_FALLBACK_MAX_ENTRIES,
+    ) -> None:
+        self._ttl = float(ttl_seconds)
+        self._max_entries = max(1, int(max_entries))
+        self._items: OrderedDict[tuple[str, str, str], BlockCommandFallbackRecord] = OrderedDict()
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def make_key(connection_id: str, player_name: str | None, run_id: str) -> tuple[str, str, str]:
+        return (str(connection_id or ""), str(player_name or ""), str(run_id or ""))
+
+    def get(
+        self,
+        connection_id: str,
+        player_name: str | None,
+        run_id: str,
+    ) -> BlockCommandFallbackRecord | None:
+        key = self.make_key(connection_id, player_name, run_id)
+        with self._lock:
+            self._purge_unlocked()
+            record = self._items.get(key)
+            if record is not None:
+                self._items.move_to_end(key)
+            return record
+
+    def put(
+        self,
+        connection_id: str,
+        player_name: str | None,
+        run_id: str,
+        *,
+        fallback_allowed: bool,
+        code: str | None = None,
+        summary: str | None = None,
+    ) -> None:
+        key = self.make_key(connection_id, player_name, run_id)
+        with self._lock:
+            self._purge_unlocked()
+            self._items[key] = BlockCommandFallbackRecord(
+                fallback_allowed=bool(fallback_allowed),
+                created_at=time.time(),
+                code=code,
+                summary=summary,
+            )
+            self._items.move_to_end(key)
+            while len(self._items) > self._max_entries:
+                self._items.popitem(last=False)
+
+    def clear_run(self, connection_id: str, player_name: str | None, run_id: str) -> bool:
+        key = self.make_key(connection_id, player_name, run_id)
+        with self._lock:
+            return self._items.pop(key, None) is not None
+
+    def clear_connection(self, connection_id: str) -> int:
+        cid = str(connection_id or "")
+        with self._lock:
+            self._purge_unlocked()
+            keys = [key for key in self._items if key[0] == cid]
+            for key in keys:
+                del self._items[key]
+            return len(keys)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+    def _purge_unlocked(self, now: float | None = None) -> None:
+        current = now if now is not None else time.time()
+        expired = [key for key, record in self._items.items() if current - record.created_at >= self._ttl]
         for key in expired:
             del self._items[key]
 
@@ -384,10 +497,35 @@ class PolicyEngine:
             metadata={"risk": str(risk)},
         )
 
-    def is_tool_exposed(self, tool_name: str) -> bool:
+    def is_tool_exposed(self, tool_name: str, *, ctx: Any | None = None) -> bool:
+        if tool_name in _BLOCK_OPS_TOOLS:
+            return self._is_block_tool_exposed(tool_name, ctx)
         if tool_name in list_tool_names():
             return True
         return tool_name in self.mcp_tool_allowlist
+
+    def _is_block_tool_exposed(self, tool_name: str, ctx: Any | None) -> bool:
+        """Only expose dedicated block tools when connection capability is SUPPORTED."""
+        if tool_name not in list_tool_names():
+            return False
+        if ctx is None:
+            return False
+        deps = getattr(ctx, "deps", None)
+        if deps is None:
+            return False
+        connection_id = getattr(deps, "connection_id", None)
+        if connection_id is None:
+            return False
+        from services.agent.block_ops.capability import (
+            BlockCapabilityStatus,
+            get_block_capability_cache,
+        )
+
+        record = get_block_capability_cache().get(str(connection_id))
+        if record is None:
+            # Lazy sync view: hide until async probe completes via prepare_tools/get_tools.
+            return False
+        return record.status == BlockCapabilityStatus.SUPPORTED
 
     @staticmethod
     def _find_command_root(
@@ -451,9 +589,7 @@ class PolicyEngine:
             return True
 
         # 无 target 概念的其它 MEDIUM 工具（send_script_event 等）
-        if tool_name in _MEDIUM_SAFE_AUTO_ALLOW_NO_TARGET:
-            return True
-        return False
+        return tool_name in _MEDIUM_SAFE_AUTO_ALLOW_NO_TARGET
 
     @staticmethod
     def _target_selector_is_current_player(
@@ -473,9 +609,32 @@ class PolicyEngine:
         return bool(player_name) and target_text == player_name
 
 
-def classify_tool_exception(exc: BaseException, *, tool_name: str) -> ToolResult:
+def classify_tool_exception(
+    exc: BaseException,
+    *,
+    tool_name: str,
+    execution_stage: Literal["projection", "invocation"] | None = None,
+) -> ToolResult:
+    """Map tool-boundary exceptions without exposing implementation details."""
     text = str(exc) or exc.__class__.__name__
+    diagnostic_summary = redact_exception(exc) or exc.__class__.__name__
     lower = text.lower()
+    stage = execution_stage or (
+        "projection" if "execution contract" in lower else "invocation"
+    )
+    if tool_name in _BLOCK_OPS_TOOLS and stage == "projection":
+        from services.agent.block_ops.schema import (
+            build_internal_error_response,
+            dumps_payload,
+        )
+
+        return ToolResult.failure(
+            dumps_payload(build_internal_error_response()),
+            error_kind="INTERNAL",
+            retryable=False,
+            diagnostic_summary=diagnostic_summary,
+            error_type=exc.__class__.__name__,
+        )
     if "timeout" in lower or "deadline" in lower:
         entry = get_tool_entry(tool_name)
         side_effect = bool(entry.may_have_external_side_effects) if entry is not None else True
@@ -484,14 +643,57 @@ def classify_tool_exception(exc: BaseException, *, tool_name: str) -> ToolResult
             error_kind="TRANSIENT",
             retryable=not side_effect and (entry is not None and entry.risk == ToolRisk.LOW),
             external_state_unknown=side_effect,
-            diagnostic_summary=text,
+            diagnostic_summary=diagnostic_summary,
+            error_type=exc.__class__.__name__,
         )
     return ToolResult.failure(
         f"工具执行失败: {tool_name}",
         error_kind="INTERNAL",
         retryable=False,
-        diagnostic_summary=text,
+        diagnostic_summary=diagnostic_summary,
+        error_type=exc.__class__.__name__,
     )
+
+
+def log_tool_execution_failed(
+    *,
+    tool_name: str,
+    ctx: Any,
+    result: ToolResult,
+    execution_stage: Literal["projection", "invocation"],
+    error_type: str | None = None,
+) -> None:
+    """Emit a correlation-safe failure event for tool boundary failures."""
+    deps = getattr(ctx, "deps", None)
+    connection_id = str(getattr(deps, "connection_id", "") or "")
+    logger.error(
+        "tool_execution_failed",
+        tool_name=tool_name,
+        run_id=getattr(deps, "run_id", None) or getattr(ctx, "run_id", None) or "",
+        tool_call_id=getattr(ctx, "tool_call_id", None) or "",
+        connection_id_short=connection_id[-8:] if connection_id else "",
+        player_name=getattr(deps, "player_name", None),
+        error_kind=result.error_kind,
+        error_type=result.error_type or error_type or type(result).__name__,
+        diagnostic_summary=result.diagnostic_summary or "tool execution failed",
+        external_state_unknown=result.external_state_unknown,
+        execution_stage=execution_stage,
+    )
+
+
+def _projection_failure(ctx: Any, tool_name: str, exc: BaseException) -> ToolResult:
+    """Classify and log an invalid block execution projection once."""
+    classified = classify_tool_exception(
+        exc, tool_name=tool_name, execution_stage="projection"
+    )
+    log_tool_execution_failed(
+        tool_name=tool_name,
+        ctx=ctx,
+        result=classified,
+        execution_stage="projection",
+        error_type=exc.__class__.__name__,
+    )
+    return classified
 
 
 def materialize_tool_result(result: Any) -> Any:
@@ -501,7 +703,27 @@ def materialize_tool_result(result: Any) -> Any:
     return result
 
 
+def _block_result_observability_status(result: ToolResult) -> tuple[bool, bool]:
+    """Classify a cached block group result for audit and tracing.
+
+    A grouped edit with an execution failure remains a successful ``ToolResult``
+    so the harness can cache it and prevent duplicate side effects. Its JSON
+    body is nevertheless an operation failure and must not be audited or traced
+    as a successful edit group.
+    """
+    success = result.is_success
+    unknown = result.external_state_unknown
+    try:
+        body = json.loads(result.output)
+    except (TypeError, ValueError):
+        return success, unknown
+    if not isinstance(body, dict) or body.get("ok") is not False:
+        return success, unknown
+    return False, unknown or body.get("status") == "unknown"
+
+
 _GLOBAL_IDEMPOTENCY = IdempotencyStore()
+_GLOBAL_BLOCK_COMMAND_FALLBACK = BlockCommandFallbackStore()
 
 
 def get_idempotency_store() -> IdempotencyStore:
@@ -512,19 +734,210 @@ def reset_idempotency_store() -> None:
     _GLOBAL_IDEMPOTENCY.clear()
 
 
+def get_block_command_fallback_store() -> BlockCommandFallbackStore:
+    return _GLOBAL_BLOCK_COMMAND_FALLBACK
+
+
+def reset_block_command_fallback_store() -> None:
+    _GLOBAL_BLOCK_COMMAND_FALLBACK.clear()
+
+
+def clear_block_command_fallback_for_connection(connection_id: str) -> int:
+    """清理断开连接遗留的方块命令回退状态。"""
+    return _GLOBAL_BLOCK_COMMAND_FALLBACK.clear_connection(connection_id)
+
+
+def _safe_block_error_summary(body: dict[str, Any]) -> str | None:
+    """Return a bounded, already-sanitized diagnostic/message summary."""
+    for key in ("diagnostic", "message"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return truncate_for_log(value.strip(), 160)
+    return None
+
+
+def _structured_block_edit_outcome(
+    result: Any,
+) -> tuple[bool, bool, str | None, str | None] | None:
+    """Return ``(failed, fallback_allowed, code, summary)`` for structured edit results.
+
+    Registered production tools stringify ``ToolResult`` before this wrapper can
+    observe it, while direct test/toolset use can still return ``ToolResult``.
+    Treat both representations identically and fail closed for an unstructured
+    failed ``ToolResult``.
+    """
+    tool_result = result if isinstance(result, ToolResult) else None
+    payload = tool_result.output if tool_result is not None else result
+    if isinstance(payload, str):
+        try:
+            body = json.loads(payload)
+        except (TypeError, ValueError):
+            body = None
+        if isinstance(body, dict) and isinstance(body.get("ok"), bool):
+            if body["ok"]:
+                return (False, False, None, None)
+            code = body.get("code")
+            return (
+                True,
+                bool(body.get("fallback_allowed", False)),
+                str(code) if code else None,
+                _safe_block_error_summary(body),
+            )
+    if tool_result is not None:
+        return (not tool_result.is_success, False, None, None)
+    return None
+
+
+def _record_block_edit_fallback_outcome(
+    result: Any,
+    *,
+    connection_id: str,
+    player_name: str | None,
+    run_id: str,
+    store: BlockCommandFallbackStore | None = None,
+) -> None:
+    outcome = _structured_block_edit_outcome(result)
+    if outcome is None:
+        return
+    failed, fallback_allowed, code, summary = outcome
+    target = store if store is not None else get_block_command_fallback_store()
+    if failed:
+        target.put(
+            connection_id,
+            player_name,
+            run_id,
+            fallback_allowed=fallback_allowed,
+            code=code,
+            summary=summary,
+        )
+    else:
+        target.clear_run(connection_id, player_name, run_id)
+
+
+def _command_may_be_block_fallback(command: Any) -> bool:
+    """Identify direct and ``execute … run`` block mutations.
+
+    Opaque ``function`` and ``schedule`` commands are not raw block commands;
+    their existing command-tool risk policy remains responsible for them.
+    """
+    if not isinstance(command, str):
+        return False
+    text = command.strip()
+    if text.startswith("/"):
+        text = text[1:].lstrip()
+    if not text:
+        return False
+    root = extract_command_root(text)
+    if root in _BLOCK_COMMAND_FALLBACK_ROOTS:
+        return True
+    if root != "execute":
+        return False
+    nested = re.search(r"\brun\s+(.+)$", text, flags=re.IGNORECASE)
+    return bool(nested and _command_may_be_block_fallback(nested.group(1)))
+
+
+def _fallback_commands(tool_name: str, normalized_args: dict[str, Any]) -> list[str]:
+    if tool_name in {"run_minecraft_command", "run_world_command"}:
+        command = normalized_args.get("command")
+        return [command] if isinstance(command, str) and _command_may_be_block_fallback(command) else []
+    if tool_name == "run_minecraft_commands":
+        commands = normalized_args.get("commands")
+        if not isinstance(commands, list):
+            return []
+        return [command for command in commands if _command_may_be_block_fallback(command)]
+    return []
+
+
+def _is_explicit_raw_command_prompt(ctx: RunContext[Any], commands: list[str]) -> bool:
+    """Allow only an exact command quoted in the current, non-negative prompt."""
+    prompt = getattr(ctx, "prompt", None)
+    if not isinstance(prompt, str) or not prompt:
+        return False
+    normalized_prompt = " ".join(prompt.casefold().split())
+    if _PROMPT_NEGATION_RE.search(normalized_prompt):
+        return False
+    has_action = (
+        normalized_prompt.startswith("/")
+        or bool(_EXPLICIT_COMMAND_ACTION_RE.search(normalized_prompt))
+        or bool(re.search(r"(?:执行|运行)(?:\s*(?:这个|该|以下))?\s*/", normalized_prompt))
+    )
+    if not has_action:
+        return False
+    normalized_commands = [
+        " ".join(command.lstrip("/").casefold().split()) for command in commands
+    ]
+    return bool(normalized_commands) and all(
+        command and command in normalized_prompt for command in normalized_commands
+    )
+
+
+def _block_command_fallback_denial(
+    *,
+    tool_name: str,
+    normalized_args: dict[str, Any],
+    ctx: RunContext[Any],
+    connection_id: str,
+    player_name: str | None,
+    run_id: str,
+    store: BlockCommandFallbackStore | None = None,
+) -> PolicyDecision | None:
+    """Return a denial for an automatic raw-command fallback, if applicable."""
+    if tool_name not in _BLOCK_COMMAND_FALLBACK_TOOLS or getattr(ctx, "tool_call_approved", False):
+        return None
+    commands = _fallback_commands(tool_name, normalized_args)
+    if not commands or _is_explicit_raw_command_prompt(ctx, commands):
+        return None
+
+    from services.agent.block_ops.capability import (
+        BlockCapabilityStatus,
+        get_block_capability_cache,
+    )
+
+    capability = get_block_capability_cache().get(connection_id)
+    if capability is None or capability.status != BlockCapabilityStatus.SUPPORTED:
+        return None
+    target = store if store is not None else get_block_command_fallback_store()
+    record = target.get(connection_id, player_name, run_id)
+    if record is None or record.fallback_allowed:
+        return None
+    code_text = f"（{record.code}）" if record.code else ""
+    if record.summary:
+        reason = (
+            f"专用方块编辑刚刚失败{code_text}且不允许命令回退；"
+            f"诊断: {record.summary}。"
+            "请根据结构化错误修正 place_block / fill_block 参数，"
+            "或等待明确允许回退的结果。"
+        )
+    else:
+        reason = (
+            f"专用方块编辑刚刚失败{code_text}且不允许命令回退；"
+            "请根据结构化错误修正 place_block / fill_block 参数，"
+            "或等待明确允许回退的结果。"
+        )
+    return PolicyDecision(
+        action=PolicyDecisionKind.DENY,
+        reason=reason,
+        metadata={"fallback_code": record.code, "command_count": len(commands)},
+    )
+
+
 @dataclass
 class HarnessToolset(WrapperToolset[Any]):
     """统一策略/审批/幂等/审计包装层。"""
 
     policy: PolicyEngine = field(default_factory=PolicyEngine)
     idempotency: IdempotencyStore = field(default_factory=get_idempotency_store)
+    fallback_store: BlockCommandFallbackStore = field(
+        default_factory=get_block_command_fallback_store
+    )
 
     async def get_tools(self, ctx: RunContext[Any]) -> dict[str, ToolsetTool[Any]]:
+        await self._ensure_block_capability(ctx)
         tools = await self.wrapped.get_tools(ctx)
         return {
             name: tool
             for name, tool in tools.items()
-            if self.policy.is_tool_exposed(name)
+            if self.policy.is_tool_exposed(name, ctx=ctx)
         }
 
     async def call_tool(
@@ -535,8 +948,9 @@ class HarnessToolset(WrapperToolset[Any]):
         tool: ToolsetTool[Any],
     ) -> Any:
         start = time.perf_counter()
-        normalized = normalize_tool_args(tool_args)
-        args_hash = hash_normalized_args(normalized)
+        effective_args = dict(tool_args or {})
+        original_normalized = normalize_tool_args(effective_args)
+        original_args_hash = hash_normalized_args(original_normalized)
         deps = getattr(ctx, "deps", None)
         player_name = getattr(deps, "player_name", None)
         run_id = getattr(deps, "run_id", None) or getattr(ctx, "run_id", None) or ""
@@ -545,6 +959,7 @@ class HarnessToolset(WrapperToolset[Any]):
         entry = get_tool_entry(name)
         trace_context = getattr(deps, "trace_context", None)
         trace_recorder = getattr(deps, "trace_recorder", None)
+        connection_id = str(getattr(deps, "connection_id", "") or "")
 
         # tool.proposed at the boundary (fail-soft)
         self._trace_tool_proposed(
@@ -552,12 +967,139 @@ class HarnessToolset(WrapperToolset[Any]):
             trace_context,
             tool_name=name,
             tool_call_id=str(tool_call_id) if tool_call_id else None,
-            tool_args=normalized,
+            tool_args=original_normalized,
         )
 
-        # 1) 幂等命中
+        # 0.1) Approved plan_id resume: block ops recovery without hidden kwargs.
+        # 恢复负载只有 {plan_id}；执行走 execute_block_plan（frozen canonical
+        # args），不再 super().call_tool 注入 status/phase/locked_targets。
+        # 仅 tool_call_approved 时生效：新鲜调用即使伪造 plan_id 也不可复用。
+        plan_id = effective_args.get("plan_id")
+        if (
+            name in _BLOCK_OPS_TOOLS
+            and bool(getattr(ctx, "tool_call_approved", False))
+            and isinstance(plan_id, str)
+            and plan_id.strip()
+        ):
+            return await self._resume_approved_block_plan(
+                name=name,
+                plan_id=plan_id.strip(),
+                ctx=ctx,
+                settings=settings,
+                player_name=player_name,
+                run_id=str(run_id),
+                tool_call_id=str(tool_call_id),
+                connection_id=connection_id,
+                trace_recorder=trace_recorder,
+                trace_context=trace_context,
+                start=start,
+            )
+
+        # 0) Block tools: preflight / relative resolution BEFORE policy & approval.
+        # Preflight plans separate authorization, execution projection, and evidence.
+        preflight_plan = None
+        if name in _BLOCK_OPS_TOOLS:
+            preflight_failure, preflight_plan = await self._preflight_block_tool(
+                name=name,
+                tool_args=effective_args,
+                original_args_hash=original_args_hash,
+                ctx=ctx,
+                run_id=str(run_id),
+                tool_call_id=str(tool_call_id),
+                connection_id=connection_id,
+            )
+            if preflight_failure is not None:
+                if name in _BLOCK_OPS_TOOLS:
+                    _record_block_edit_fallback_outcome(
+                        preflight_failure,
+                        connection_id=connection_id,
+                        player_name=player_name,
+                        run_id=str(run_id),
+                        store=self.fallback_store,
+                    )
+                self._audit(
+                    settings=settings,
+                    tool_name=name,
+                    parameters=original_normalized,
+                    ctx=ctx,
+                    status="failure",
+                    duration_ms=_duration_ms(start),
+                    result=preflight_failure,
+                )
+                return materialize_tool_result(preflight_failure)
+            if preflight_plan is not None:
+                effective_args = preflight_plan.authorized_args
+
+        normalized = normalize_tool_args(effective_args)
+        args_hash = hash_normalized_args(normalized)
+        execute_args = (
+            dict(preflight_plan.execute_args) if preflight_plan is not None else None
+        )
+        idempotency_args_hash = (
+            hash_normalized_args(normalize_tool_args(execute_args))
+            if name in _BLOCK_OPS_TOOLS and execute_args is not None
+            else args_hash
+        )
+
+        # 回退限制必须早于幂等缓存：同一 call-id 的旧命令结果不能绕过
+        # 当前任务中新出现的 ``fallback_allowed=false`` 方块编辑失败。
+        fallback_denial = _block_command_fallback_denial(
+            tool_name=name,
+            normalized_args=normalized,
+            ctx=ctx,
+            connection_id=connection_id,
+            player_name=player_name,
+            run_id=str(run_id),
+            store=self.fallback_store,
+        )
+        if fallback_denial is not None:
+            denied = ToolResult.failure(
+                fallback_denial.reason,
+                error_kind="DENIED",
+                retryable=False,
+                diagnostic_summary=fallback_denial.reason,
+            )
+            self._audit(
+                settings=settings,
+                tool_name=name,
+                parameters=normalized,
+                ctx=ctx,
+                status="failure",
+                duration_ms=_duration_ms(start),
+                result=denied,
+            )
+            self._trace_policy_decided(
+                trace_recorder,
+                trace_context,
+                tool_name=name,
+                tool_call_id=str(tool_call_id) if tool_call_id else None,
+                decision=fallback_denial,
+                already_approved=False,
+            )
+            self._trace_tool_result(
+                trace_recorder,
+                trace_context,
+                tool_name=name,
+                tool_call_id=str(tool_call_id) if tool_call_id else None,
+                result=fallback_denial.reason,
+                status="denied",
+                duration_ms=_duration_ms(start),
+                attributes={"policy_action": str(fallback_denial.action)},
+            )
+            return ToolDenied(message=fallback_denial.reason)
+
+        # 1) 方块工具只按实际执行投影幂等；非方块工具保持原参数哈希兼容。
         if run_id and tool_call_id:
-            cached = self.idempotency.get(str(run_id), str(tool_call_id), args_hash)
+            cached = self.idempotency.get(
+                str(run_id), str(tool_call_id), idempotency_args_hash
+            )
+            if name not in _BLOCK_OPS_TOOLS:
+                for legacy_hash in (args_hash, original_args_hash):
+                    if cached is not None or legacy_hash == idempotency_args_hash:
+                        continue
+                    cached = self.idempotency.get(
+                        str(run_id), str(tool_call_id), legacy_hash
+                    )
             if cached is not None:
                 logger.info(
                     "tool_idempotent_hit",
@@ -635,7 +1177,37 @@ class HarnessToolset(WrapperToolset[Any]):
             return ToolDenied(message=decision.reason)
 
         if decision.action == PolicyDecisionKind.REQUIRE_APPROVAL:
+            try:
+                execute_args = execute_args or _python_tool_args(name, effective_args)
+            except (TypeError, ValueError, KeyError) as exc:
+                classified = classify_tool_exception(
+                    exc, tool_name=name, execution_stage="projection"
+                )
+                log_tool_execution_failed(
+                    tool_name=name,
+                    ctx=ctx,
+                    result=classified,
+                    execution_stage="projection",
+                    error_type=exc.__class__.__name__,
+                )
+                self._audit(
+                    settings=settings, tool_name=name, parameters=normalized, ctx=ctx,
+                    status="failure", duration_ms=_duration_ms(start), result=classified,
+                )
+                return materialize_tool_result(classified)
             summary = summarize_args_for_player(name, normalized)
+            self._audit(
+                settings=settings,
+                tool_name=name,
+                parameters=normalized,
+                authorized_args=normalized,
+                approval_evidence=(
+                    preflight_plan.approval_metadata if preflight_plan is not None else {}
+                ),
+                ctx=ctx,
+                status="approval_required",
+                duration_ms=_duration_ms(start),
+            )
             # 审批挂起：记 not_executed，真正 approval.requested 由 Worker 写
             not_exec_attrs: dict[str, Any] = {
                 "policy_action": str(decision.action),
@@ -659,6 +1231,15 @@ class HarnessToolset(WrapperToolset[Any]):
                     "tool_name": name,
                     "normalized_args": normalized,
                     "args_hash": args_hash,
+                    "execute_args": (
+                        preflight_plan.execute_args if preflight_plan is not None else execute_args
+                    ),
+                    "execution_args_hash": idempotency_args_hash,
+                    "approval_metadata": (
+                        preflight_plan.approval_metadata if preflight_plan is not None else {}
+                    ),
+                    "original_args_hash": original_args_hash,
+                    "plan_id": preflight_plan.plan_id if preflight_plan is not None else "",
                     "args_summary": summary,
                     "policy_version": decision.policy_version,
                     "reason": decision.reason,
@@ -669,7 +1250,7 @@ class HarnessToolset(WrapperToolset[Any]):
                 }
             )
 
-        # 3) 执行
+        # 3) 执行（使用 canonical args；映射 fill 的 from/to → from_pos/to_pos）
         self._trace_tool_started(
             trace_recorder,
             trace_context,
@@ -677,7 +1258,25 @@ class HarnessToolset(WrapperToolset[Any]):
             tool_call_id=str(tool_call_id) if tool_call_id else None,
         )
         try:
-            raw_result = await super().call_tool(name, tool_args, ctx, tool)
+            execute_args = execute_args or _python_tool_args(name, effective_args)
+        except (TypeError, ValueError, KeyError) as exc:
+            classified = classify_tool_exception(
+                exc, tool_name=name, execution_stage="projection"
+            )
+            log_tool_execution_failed(
+                tool_name=name,
+                ctx=ctx,
+                result=classified,
+                execution_stage="projection",
+                error_type=exc.__class__.__name__,
+            )
+            self._audit(
+                settings=settings, tool_name=name, parameters=normalized, ctx=ctx,
+                status="failure", duration_ms=_duration_ms(start), result=classified,
+            )
+            return materialize_tool_result(classified)
+        try:
+            raw_result = await super().call_tool(name, execute_args, ctx, tool)
         except ApprovalRequired:
             raise
         except asyncio.CancelledError:
@@ -695,7 +1294,24 @@ class HarnessToolset(WrapperToolset[Any]):
             )
             raise
         except Exception as exc:
-            classified = classify_tool_exception(exc, tool_name=name)
+            classified = classify_tool_exception(
+                exc, tool_name=name, execution_stage="invocation"
+            )
+            if name in _BLOCK_OPS_TOOLS:
+                _record_block_edit_fallback_outcome(
+                    classified,
+                    connection_id=connection_id,
+                    player_name=player_name,
+                    run_id=str(run_id),
+                    store=self.fallback_store,
+                )
+            log_tool_execution_failed(
+                tool_name=name,
+                ctx=ctx,
+                result=classified,
+                execution_stage="invocation",
+                error_type=exc.__class__.__name__,
+            )
             self._audit(
                 settings=settings,
                 tool_name=name,
@@ -722,17 +1338,36 @@ class HarnessToolset(WrapperToolset[Any]):
 
         # 4) 结果分类与幂等写入
         result_for_model = materialize_tool_result(raw_result)
+        if name in _BLOCK_OPS_TOOLS:
+            _record_block_edit_fallback_outcome(
+                raw_result,
+                connection_id=connection_id,
+                player_name=player_name,
+                run_id=str(run_id),
+                store=self.fallback_store,
+            )
         external_unknown = False
         success = True
         if isinstance(raw_result, ToolResult):
-            success = raw_result.is_success
-            external_unknown = raw_result.external_state_unknown
+            if name in _BLOCK_OPS_TOOLS:
+                success, external_unknown = _block_result_observability_status(raw_result)
+            else:
+                success = raw_result.is_success
+                external_unknown = raw_result.external_state_unknown
+            if not raw_result.is_success and name in _BLOCK_OPS_TOOLS:
+                log_tool_execution_failed(
+                    tool_name=name,
+                    ctx=ctx,
+                    result=raw_result,
+                    execution_stage="invocation",
+                    error_type=raw_result.error_type,
+                )
             # 状态未知的副作用：不写入可重放成功缓存之外的自动重试语义
             if raw_result.is_success and run_id and tool_call_id:
                 self.idempotency.put(
                     str(run_id),
                     str(tool_call_id),
-                    args_hash,
+                    idempotency_args_hash,
                     raw_result,
                     external_state_unknown=False,
                 )
@@ -750,7 +1385,7 @@ class HarnessToolset(WrapperToolset[Any]):
                 self.idempotency.put(
                     str(run_id),
                     str(tool_call_id),
-                    args_hash,
+                    idempotency_args_hash,
                     result_for_model,
                     external_state_unknown=False,
                 )
@@ -902,6 +1537,263 @@ class HarnessToolset(WrapperToolset[Any]):
         except Exception as exc:  # noqa: BLE001
             logger.debug("trace_tool_result_failed", error=str(exc))
 
+    async def _ensure_block_capability(self, ctx: RunContext[Any]) -> None:
+        deps = getattr(ctx, "deps", None)
+        if deps is None:
+            return
+        connection_id = getattr(deps, "connection_id", None)
+        if connection_id is None:
+            return
+        from services.agent.block_ops.capability import ensure_block_capability
+
+        await ensure_block_capability(
+            str(connection_id),
+            getattr(deps, "addon_bridge", None),
+        )
+
+    async def _preflight_block_tool(
+        self,
+        *,
+        name: str,
+        tool_args: dict[str, Any],
+        original_args_hash: str,
+        ctx: RunContext[Any],
+        run_id: str,
+        tool_call_id: str,
+        connection_id: str,
+    ) -> tuple[ToolResult | None, Any | None]:
+        """Run block-ops preflight; return (failure, separated plan)."""
+        from services.agent.block_ops.tools_impl import BlockPreflightPlan, run_block_preflight
+
+        # Reuse cached canonical args on approval recovery (same original hash).
+        cache = get_preflight_cache()
+        if run_id and tool_call_id:
+            cached = cache.get(run_id, tool_call_id, original_args_hash)
+            if cached is not None:
+                return None, BlockPreflightPlan(
+                    dict(cached.canonical_args),
+                    dict(cached.execute_args),
+                    dict(cached.approval_metadata),
+                    plan_id=cached.plan_id,
+                )
+
+        try:
+            plan_or_args, failure = await run_block_preflight(ctx, name, tool_args)
+        except Exception as exc:
+            classified = classify_tool_exception(
+                exc, tool_name=name, execution_stage="projection"
+            )
+            log_tool_execution_failed(
+                tool_name=name,
+                ctx=ctx,
+                result=classified,
+                execution_stage="projection",
+                error_type=exc.__class__.__name__,
+            )
+            return classified, None
+
+        if failure is not None:
+            return failure, None
+
+        if plan_or_args is None:
+            try:
+                execute_args = _python_tool_args(name, tool_args)
+            except (TypeError, ValueError, KeyError) as exc:
+                return _projection_failure(ctx, name, exc), None
+            return None, BlockPreflightPlan(dict(tool_args), execute_args, {})
+
+        if isinstance(plan_or_args, BlockPreflightPlan):
+            plan = plan_or_args
+        else:
+            canonical = dict(plan_or_args)
+            try:
+                execute_args = _python_tool_args(name, canonical)
+            except (TypeError, ValueError, KeyError) as exc:
+                return _projection_failure(ctx, name, exc), None
+            plan = BlockPreflightPlan(canonical, execute_args, {})
+
+        if run_id and tool_call_id:
+            entry = cache.put(
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+                original_args_hash=original_args_hash,
+                canonical_args=plan.authorized_args,
+                execute_args=plan.execute_args,
+                approval_metadata=plan.approval_metadata,
+                preflight_payload=plan.approval_metadata,
+                connection_id=connection_id or None,
+                tool_name=name,
+                plan_id=plan.plan_id,
+            )
+            if not plan.plan_id:
+                # plan 未自带 plan_id（dict/None 直通分支）：用缓存生成的 plan_id 回填
+                plan = replace(plan, plan_id=entry.plan_id)
+        return None, plan
+
+    async def _resume_approved_block_plan(
+        self,
+        *,
+        name: str,
+        plan_id: str,
+        ctx: RunContext[Any],
+        settings: Any,
+        player_name: str | None,
+        run_id: str,
+        tool_call_id: str,
+        connection_id: str,
+        trace_recorder: Any,
+        trace_context: Any,
+        start: float,
+    ) -> Any:
+        """Approved plan_id 恢复：幂等 → execute_block_plan → 分类/审计/追踪。
+
+        镜像主路径 step 1/3/4：同 run+call 同参数只执行一次；成功写入幂等
+        缓存；审计 parameters/authorized_args 从缓存 canonical args 还原，
+        绝不包含隐藏 kwargs。
+        """
+        from services.agent.block_ops.tools_impl import _state_unknown_result, execute_block_plan
+
+        entry = get_preflight_cache().get_by_plan_id(plan_id)
+        if entry is None:
+            result = _state_unknown_result(plan_id)
+            self._audit(
+                settings=settings,
+                tool_name=name,
+                parameters={"plan_id": plan_id},
+                ctx=ctx,
+                status="failure",
+                duration_ms=_duration_ms(start),
+                result=result,
+            )
+            self._trace_tool_result(
+                trace_recorder,
+                trace_context,
+                tool_name=name,
+                tool_call_id=tool_call_id or None,
+                result=result,
+                status="timeout_unknown",
+                duration_ms=_duration_ms(start),
+            )
+            return materialize_tool_result(result)
+        if entry.tool_name and entry.tool_name != name:
+            result = _state_unknown_result(plan_id, reason="tool-mismatch")
+            self._audit(
+                settings=settings,
+                tool_name=name,
+                parameters={"plan_id": plan_id},
+                ctx=ctx,
+                status="failure",
+                duration_ms=_duration_ms(start),
+                result=result,
+            )
+            self._trace_tool_result(
+                trace_recorder,
+                trace_context,
+                tool_name=name,
+                tool_call_id=tool_call_id or None,
+                result=result,
+                status="timeout_unknown",
+                duration_ms=_duration_ms(start),
+            )
+            return materialize_tool_result(result)
+
+        canonical = dict(entry.canonical_args)
+        idempotency_args_hash = hash_normalized_args(normalize_tool_args(canonical))
+
+        # 幂等（同主路径 step 1）：同 run+call 同参数只执行一次
+        if run_id and tool_call_id:
+            cached = self.idempotency.get(
+                str(run_id), str(tool_call_id), idempotency_args_hash
+            )
+            if cached is not None:
+                logger.info(
+                    "tool_idempotent_hit",
+                    tool=name,
+                    run_id=run_id,
+                    tool_call_id=tool_call_id,
+                )
+                self._audit(
+                    settings=settings,
+                    tool_name=name,
+                    parameters=canonical,
+                    ctx=ctx,
+                    status="success",
+                    duration_ms=_duration_ms(start),
+                    result=cached.result,
+                    authorized_args=canonical,
+                )
+                self._trace_tool_result(
+                    trace_recorder,
+                    trace_context,
+                    tool_name=name,
+                    tool_call_id=tool_call_id or None,
+                    result=cached.result,
+                    status="succeeded",
+                    duration_ms=_duration_ms(start),
+                    attributes={"idempotent_hit": True},
+                )
+                return materialize_tool_result(cached.result)
+
+        self._trace_tool_started(
+            trace_recorder,
+            trace_context,
+            tool_name=name,
+            tool_call_id=tool_call_id or None,
+        )
+        raw_result = await execute_block_plan(plan_id, ctx)
+
+        # 步骤 4 镜像：结果分类 / 幂等写入 / 审计 / 追踪
+        result_for_model = materialize_tool_result(raw_result)
+        success = True
+        external_unknown = False
+        if isinstance(raw_result, ToolResult):
+            success, external_unknown = _block_result_observability_status(raw_result)
+            if raw_result.is_success and run_id and tool_call_id:
+                self.idempotency.put(
+                    str(run_id),
+                    str(tool_call_id),
+                    idempotency_args_hash,
+                    raw_result,
+                    external_state_unknown=False,
+                )
+        else:
+            if run_id and tool_call_id:
+                self.idempotency.put(
+                    str(run_id),
+                    str(tool_call_id),
+                    idempotency_args_hash,
+                    result_for_model,
+                    external_state_unknown=False,
+                )
+
+        self._audit(
+            settings=settings,
+            tool_name=name,
+            parameters=canonical,
+            ctx=ctx,
+            status="success" if success else "failure",
+            duration_ms=_duration_ms(start),
+            result=raw_result if isinstance(raw_result, ToolResult) else result_for_model,
+            authorized_args=canonical,
+        )
+
+        if external_unknown:
+            exec_status = "timeout_unknown"
+        elif success:
+            exec_status = "succeeded"
+        else:
+            exec_status = "failed"
+        self._trace_tool_result(
+            trace_recorder,
+            trace_context,
+            tool_name=name,
+            tool_call_id=tool_call_id or None,
+            result=raw_result if isinstance(raw_result, ToolResult) else result_for_model,
+            status=exec_status,
+            duration_ms=_duration_ms(start),
+        )
+        return result_for_model
+
     def _audit(
         self,
         *,
@@ -913,6 +1805,8 @@ class HarnessToolset(WrapperToolset[Any]):
         duration_ms: int,
         result: Any = None,
         exception: BaseException | None = None,
+        authorized_args: dict[str, Any] | None = None,
+        approval_evidence: dict[str, Any] | None = None,
     ) -> None:
         effective = settings or getattr(getattr(ctx, "deps", None), "settings", None)
         if not audit_enabled(effective):
@@ -931,6 +1825,8 @@ class HarnessToolset(WrapperToolset[Any]):
                 entry.policy_version if entry is not None else self.policy.policy_version
             ),
             run_id=getattr(getattr(ctx, "deps", None), "run_id", None),
+            authorized_args=authorized_args,
+            approval_evidence=approval_evidence,
         )
         path = getattr(effective, "runtime_harness_audit_path", "logs/runtime_harness_tools.jsonl")
         max_records = getattr(effective, "runtime_harness_audit_max_records", 5000)
@@ -943,17 +1839,92 @@ class HarnessCapability(AbstractCapability[Any]):
 
     policy: PolicyEngine = field(default_factory=PolicyEngine)
     idempotency: IdempotencyStore | None = None
+    fallback_store: BlockCommandFallbackStore | None = None
 
     def get_wrapper_toolset(self, toolset: AbstractToolset[Any]) -> AbstractToolset[Any]:
         store = self.idempotency if self.idempotency is not None else get_idempotency_store()
-        return HarnessToolset(wrapped=toolset, policy=self.policy, idempotency=store)
+        fallback_store = (
+            self.fallback_store
+            if self.fallback_store is not None
+            else get_block_command_fallback_store()
+        )
+        return HarnessToolset(
+            wrapped=toolset,
+            policy=self.policy,
+            idempotency=store,
+            fallback_store=fallback_store,
+        )
+
+    async def wrap_tool_validate(
+        self,
+        ctx: RunContext[Any],
+        *,
+        call: ToolCallPart,
+        tool_def: ToolDefinition,
+        args: Any,
+        handler: Any,
+    ) -> Any:
+        """Approved block-ops recovery: rewrite {plan_id} → frozen canonical args.
+
+        plan_id 恢复负载只含 {plan_id}，公共参数校验必须在 frozen canonical
+        args 上运行（缺失/过期 → 跳过校验，由 call_tool 的 plan_id 分支返回
+        STATE_UNKNOWN）。隐藏字段（status/phase/locked_targets）结构性不可达：
+        校验与执行都只接触 plan_id / canonical args。
+
+        恢复载荷不能直接交给 ``handler``：公共参数 schema 不含 ``plan_id``
+        （``additionalProperties: false``），``{"plan_id": X}`` 本身就无法通过
+        schema 校验。因此这里对原始载荷做结构性校验：恢复契约只允许恰好
+        ``{"plan_id": <非空字符串>}``，任何额外键都是畸形载荷，必须在校验
+        边界拒绝，而不是静默归一化放行（例如
+        ``{"plan_id": "missing", "malicious_extra": true}``）。
+        """
+        plan_id = args.get("plan_id") if isinstance(args, dict) else None
+        if (
+            tool_def.name in _BLOCK_OPS_TOOLS
+            and bool(getattr(ctx, "tool_call_approved", False))
+            and isinstance(plan_id, str)
+            and plan_id.strip()
+        ):
+            if set(args.keys()) != {"plan_id"}:
+                raise ValidationError.from_exception_data(
+                    tool_def.name,
+                    [
+                        {
+                            "type": "extra_forbidden",
+                            "loc": (str(key),),
+                            "msg": "plan_id 恢复载荷只能包含 plan_id 字段",
+                            "input": args[key],
+                        }
+                        for key in sorted(set(args.keys()) - {"plan_id"})
+                    ],
+                )
+            entry = get_preflight_cache().get_by_plan_id(plan_id.strip())
+            if entry is not None and entry.tool_name == tool_def.name:
+                # 校验 frozen canonical args；校验结果丢弃，只回传 plan_id
+                await handler(dict(entry.canonical_args))
+            return {"plan_id": plan_id.strip()}
+        return await handler(args)
 
     async def prepare_tools(
         self,
         ctx: RunContext[Any],
         tool_defs: list[ToolDefinition],
     ) -> list[ToolDefinition]:
-        return [td for td in tool_defs if self.policy.is_tool_exposed(td.name)]
+        # Probe capability once so block tools can be filtered correctly.
+        deps = getattr(ctx, "deps", None)
+        if deps is not None:
+            connection_id = getattr(deps, "connection_id", None)
+            if connection_id is not None:
+                from services.agent.block_ops.capability import ensure_block_capability
+
+                await ensure_block_capability(
+                    str(connection_id),
+                    getattr(deps, "addon_bridge", None),
+                )
+        exposed = [td for td in tool_defs if self.policy.is_tool_exposed(td.name, ctx=ctx)]
+        # The single-op block tools already expose only model-visible fields in
+        # their public schemas; no internal-key stripping is needed here.
+        return exposed
 
 
 def build_harness_capability(settings: Any | None = None) -> HarnessCapability:
@@ -962,3 +1933,17 @@ def build_harness_capability(settings: Any | None = None) -> HarnessCapability:
 
 def _duration_ms(start: float) -> int:
     return max(0, round((time.perf_counter() - start) * 1000))
+
+
+def _python_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Build Python call args for the public block tool signatures.
+
+    Canonical fill args use the model-visible alias ``from`` for approval,
+    audit, and plan storage. The registered Python function instead accepts
+    ``from_`` because ``from`` is a reserved keyword, so restore the Python
+    parameter name only at this final invocation boundary.
+    """
+    projected = dict(args or {})
+    if tool_name == "fill_block" and "from" in projected and "from_" not in projected:
+        projected["from_"] = projected.pop("from")
+    return projected

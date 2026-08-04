@@ -14,7 +14,12 @@ from services.agent.trace import (
     TraceRecorder,
     set_trace_recorder,
 )
-from services.agent.trace_query import ABANDONED_AFTER_SECONDS, TraceQuery
+from services.agent.trace_query import (
+    ABANDONED_AFTER_SECONDS,
+    TraceQuery,
+    clear_journal,
+    delete_trace,
+)
 
 
 def _event(
@@ -542,3 +547,201 @@ def test_attempts_models_approvals_delivery_groups(tmp_path: Path) -> None:
     assert len(detail["delivery"]) == 1
     assert detail["delivery"][0]["chunk_count"] == 2
     assert detail["summary"]["status"] == "completed"
+
+
+def test_model_previews_from_user_prompt_text_and_tool_call(tmp_path: Path) -> None:
+    """Pair with user-prompt + text + tool-call yields previews and tool_names."""
+    path = tmp_path / "agent_traces.jsonl"
+    long_user = "现在呢" + ("请再查一次背包" * 10)  # force truncation past ~80
+    messages = [
+        {
+            "kind": "request",
+            "parts": [
+                {"part_kind": "system-prompt", "content": "you are helpful"},
+                {"part_kind": "user-prompt", "content": long_user},
+            ],
+        },
+        {
+            "kind": "response",
+            "parts": [
+                {
+                    "part_kind": "text",
+                    "content": "你是指再查一次背包吗？我可以帮你调用工具。",
+                },
+                {
+                    "part_kind": "tool-call",
+                    "tool_name": "get_inventory_snapshot",
+                    "args": {"player": "alex"},
+                },
+                {
+                    "part_kind": "tool-call",
+                    "tool_name": "mcwiki_search",
+                    "args": {"q": "creeper"},
+                },
+            ],
+            "finish_reason": "tool_calls",
+        },
+    ]
+    event = _event(
+        event_name="model.request.completed",
+        sequence=0,
+        status="completed",
+        attributes={
+            "player_name": "alex",
+            "provider": "deepseek",
+            "model_name": "deepseek-chat",
+            "finish_reason": "tool_calls",
+        },
+        payload={"messages": messages},
+    )
+    path.write_text(json.dumps(event, ensure_ascii=False) + "\n", encoding="utf-8")
+    detail = TraceQuery(path).get_trace("trace-1")
+    assert detail is not None
+    model = detail["models"][0]
+    assert model["user_preview"] is not None
+    assert model["user_preview"].startswith("现在呢")
+    assert len(model["user_preview"]) <= 80
+    assert model["assistant_preview"] is not None
+    assert "背包" in model["assistant_preview"]
+    assert model["tool_names"] == ["get_inventory_snapshot", "mcwiki_search"]
+    # Original payload/events untouched
+    assert detail["events"][0]["payload"]["messages"][0]["parts"][1]["content"] == long_user
+    assert "user_preview" not in detail["events"][0]
+
+
+def test_model_previews_null_without_payload_messages(tmp_path: Path) -> None:
+    """Content mode off / no messages → preview fields are null."""
+    path = tmp_path / "agent_traces.jsonl"
+    event = _event(
+        event_name="model.request.completed",
+        sequence=0,
+        status="completed",
+        attributes={"provider": "deepseek", "model_name": "deepseek-chat"},
+        # no payload
+    )
+    path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+    detail = TraceQuery(path).get_trace("trace-1")
+    assert detail is not None
+    model = detail["models"][0]
+    assert model["user_preview"] is None
+    assert model["assistant_preview"] is None
+    assert model["tool_names"] is None
+    assert model["provider"] == "deepseek"
+    assert model["model_name"] == "deepseek-chat"
+
+
+def test_tool_group_falls_back_to_parameters_and_result(tmp_path: Path) -> None:
+    """Old journal with only parameters/result still surfaces via canonical keys."""
+    path = tmp_path / "agent_traces.jsonl"
+    lines = [
+        _event(
+            event_name="tool.proposed",
+            sequence=0,
+            status="info",
+            tool_call_id="tc-old",
+            attributes={"tool_name": "run_command"},
+            payload={"parameters": {"command": "say hi"}},
+        ),
+        _event(
+            event_name="tool.execution.completed",
+            sequence=1,
+            status="succeeded",
+            tool_call_id="tc-old",
+            attributes={"tool_name": "run_command", "execution_status": "succeeded"},
+            payload={"result": {"ok": True}},
+        ),
+    ]
+    path.write_text("\n".join(json.dumps(e) for e in lines) + "\n", encoding="utf-8")
+    detail = TraceQuery(path).get_trace("trace-1")
+    assert detail is not None
+    tool = detail["tools"][0]
+    assert tool["tool_args"] == {"command": "say hi"}
+    assert tool["tool_result"] == {"ok": True}
+    # Legacy keys still exposed for debug
+    assert tool["parameters"] == {"command": "say hi"}
+    assert tool["result"] == {"ok": True}
+
+
+def test_delete_trace_removes_only_matching_and_keeps_malformed(tmp_path: Path) -> None:
+    path = tmp_path / "agent_traces.jsonl"
+    base = datetime(2026, 7, 22, 15, 0, 0, tzinfo=UTC)
+    keep = _event(
+        event_name="trace.completed",
+        trace_id="keep-me",
+        sequence=0,
+        status="completed",
+        timestamp=base.isoformat().replace("+00:00", "Z"),
+    )
+    drop_a = _event(
+        event_name="trace.started",
+        trace_id="drop-me",
+        sequence=0,
+        status="started",
+        timestamp=(base + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+    )
+    drop_b = _event(
+        event_name="trace.completed",
+        trace_id="drop-me",
+        sequence=1,
+        status="completed",
+        timestamp=(base + timedelta(seconds=2)).isoformat().replace("+00:00", "Z"),
+    )
+    malformed = '{"not": "valid json"'
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps(keep),
+                json.dumps(drop_a),
+                malformed,
+                json.dumps(drop_b),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    q = TraceQuery(path)
+    removed = q.delete_trace("drop-me")
+    assert removed == 2
+    # Other traces remain
+    assert q.get_trace("drop-me") is None
+    remaining = q.get_trace("keep-me")
+    assert remaining is not None
+    assert remaining["summary"]["status"] == "completed"
+    # Malformed line kept on disk
+    raw = path.read_text(encoding="utf-8")
+    assert malformed in raw
+    assert "keep-me" in raw
+    assert "drop-me" not in raw
+    # Module-level helper on missing id returns 0
+    assert delete_trace(path, "never-existed") == 0
+
+
+def test_clear_journal_empties_list_traces(tmp_path: Path) -> None:
+    path = tmp_path / "agent_traces.jsonl"
+    lines = [
+        _event(
+            event_name="trace.completed",
+            trace_id="t1",
+            sequence=0,
+            status="completed",
+        ),
+        _event(
+            event_name="trace.completed",
+            trace_id="t2",
+            sequence=0,
+            status="completed",
+        ),
+    ]
+    path.write_text("\n".join(json.dumps(e) for e in lines) + "\n", encoding="utf-8")
+    q = TraceQuery(path)
+    assert len(q.list_traces(limit=50)) == 2
+    q.clear_journal()
+    assert q.list_traces(limit=50) == []
+    assert q.get_trace("t1") is None
+    # File exists and is empty (or only whitespace)
+    assert path.exists()
+    assert path.read_text(encoding="utf-8").strip() == ""
+    # Module-level helper also works
+    path.write_text(json.dumps(lines[0]) + "\n", encoding="utf-8")
+    clear_journal(path)
+    assert path.read_text(encoding="utf-8") == ""

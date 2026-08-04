@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import ast
+import json
+import re
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -14,7 +17,7 @@ DEFAULT_BODY_MAX = 2_000
 DEFAULT_EXCEPTION_MAX = 300
 DEFAULT_PARAM_MAX = 120
 
-_SENSITIVE_KEY_FRAGMENTS = (
+_SENSITIVE_KEYS = frozenset({
     "password",
     "passwd",
     "secret",
@@ -29,6 +32,10 @@ _SENSITIVE_KEY_FRAGMENTS = (
     "access_key",
     "private_key",
     "credential",
+})
+_SENSITIVE_KEY_PATTERN = "|".join(
+    r"[-_]?".join(re.escape(part) for part in key.replace("-", "_").split("_"))
+    for key in _SENSITIVE_KEYS
 )
 
 _SENSITIVE_QUERY_KEYS = frozenset(
@@ -50,7 +57,7 @@ _SENSITIVE_QUERY_KEYS = frozenset(
 
 def is_sensitive_key(key: Any) -> bool:
     text = str(key).lower().replace("-", "_")
-    return any(fragment in text for fragment in _SENSITIVE_KEY_FRAGMENTS)
+    return any(fragment.replace("-", "_") in text for fragment in _SENSITIVE_KEYS)
 
 
 def truncate_for_log(
@@ -79,10 +86,65 @@ def redact_exception(exc: BaseException | str | None, max_length: int = DEFAULT_
     if exc is None:
         return None
     if isinstance(exc, BaseException):
-        text = f"{type(exc).__name__}: {exc}"
+        prefix = f"{type(exc).__name__}: "
+        raw_text = str(exc)
     else:
-        text = str(exc)
+        prefix = ""
+        raw_text = str(exc)
+    try:
+        parsed = json.loads(raw_text)
+    except (TypeError, ValueError):
+        try:
+            parsed = ast.literal_eval(raw_text)
+        except (TypeError, ValueError, SyntaxError):
+            text = prefix + _redact_exception_text(raw_text)
+        else:
+            text = prefix + _stable_redacted_exception_value(parsed, max_length)
+    else:
+        text = prefix + _stable_redacted_exception_value(parsed, max_length)
     return truncate_for_log(text, max_length)
+
+
+def _stable_redacted_exception_value(value: Any, max_length: int) -> str:
+    return json.dumps(
+        _redact_exception_value(value, max_length),
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _redact_exception_value(value: Any, max_length: int) -> Any:
+    if isinstance(value, str):
+        return truncate_for_log(_redact_exception_text(value), max_length)
+    if isinstance(value, dict):
+        return {
+            str(key): "[REDACTED]" if is_sensitive_key(key)
+            else _redact_exception_value(item, max_length)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_redact_exception_value(item, max_length) for item in value]
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    return truncate_for_log(_redact_exception_text(str(value)), max_length)
+
+
+def _redact_exception_text(text: str) -> str:
+    text = re.sub(
+        rf"(?i)(['\"]?(?:{_SENSITIVE_KEY_PATTERN})['\"]?\s*:\s*)"
+        r"(['\"])(?:bearer\s+)?[^'\"]*\2",
+        r"\1\2[REDACTED]\2",
+        text,
+    )
+    text = re.sub(
+        rf"(?i)\b({_SENSITIVE_KEY_PATTERN})\b\s*[=:]\s*"
+        r"(?:bearer\s+)?[^,\s)\]}]+",
+        r"\1=[REDACTED]",
+        text,
+    )
+    text = re.sub(r"(?i)\bbearer\s+[^,\s)\]}]+", "Bearer [REDACTED]", text)
+    return text
 
 
 def redact_mapping(

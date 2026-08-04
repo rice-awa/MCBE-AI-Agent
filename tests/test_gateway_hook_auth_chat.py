@@ -241,12 +241,33 @@ async def test_approval_resume_keeps_trace_and_uses_new_attempt():
         batch_id="batch-1",
         messages=[],
         tool_name="run_minecraft_command",
+        sibling_approval_ids=["ap-1"],
+        requests=SimpleNamespace(
+            approvals=[
+                SimpleNamespace(
+                    tool_call_id="tc1",
+                    tool_name="run_minecraft_command",
+                )
+            ],
+            calls=[],
+        ),
     )
     completed_item = SimpleNamespace(
+        approval_id="ap-1",
         tool_call_id="tc1",
+        expected_tool_call_id="tc1",
         tool_name="run_minecraft_command",
         decision=True,
+        connection_id=str(cid),
+        player_name="alex",
+        conversation_id="default",
+        batch_id="batch-1",
+        run_id="trace-original",
+        authorized_args={"command": "say hi"},
+        execute_args={"command": "say hi"},
+        execution_args_hash="",
     )
+    completed_item.is_expired = lambda: False
 
     await handlers._resume_from_completed_batch(
         state,

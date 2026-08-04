@@ -4,15 +4,30 @@ import asyncio
 import copy
 import dataclasses
 import time
+from types import SimpleNamespace
+from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart, ThinkingPart
-from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDenied
-
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    RetryPromptPart,
+    TextPart,
+    ThinkingPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 from core.queue import MessageBroker
 from services.agent.core import stream_chat, _extract_exception_details, player_facing_error, classify_run_exception
+from services.agent.context import ensure_tool_message_pairs
 from services.agent.harness.approvals import PendingApproval
+from services.agent.harness.audit import (
+    enqueue_validation_failure_audit,
+    extract_tool_validation_failures,
+)
 from services.agent.harness.execution import summarize_args_for_player
 from services.agent.providers import ProviderRegistry
 from services.agent.runtime import get_agent_runtime
@@ -278,6 +293,89 @@ class AgentWorker:
         except Exception as exc:  # noqa: BLE001
             logger.debug("trace_model_pairs_failed", error=str(exc))
 
+    def _record_validation_failures_from_messages(
+        self,
+        *,
+        messages: list | None,
+        run_id: str,
+        deps: AgentDependencies,
+        trace_context: TraceContext | None,
+        recorder: Any,
+        seen: set[tuple[str, str, str]],
+    ) -> None:
+        """审计并 Trace 当前 run 的工具参数校验失败。
+
+        该入口同时服务成功终态和 salvage error；消息级 extractor 保持纯函数，
+        这里负责把结果投影到两个有副作用的观察面。失败发生在工具执行前，
+        因此绝不补发 execution.started 或 external_state_unknown。
+        """
+        if not messages:
+            return
+        try:
+            failures = extract_tool_validation_failures(messages, run_id=run_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("tool_validation_failure_extract_failed", error=str(exc))
+            return
+
+        for failure in failures:
+            key = (
+                run_id,
+                str(failure.get("tool_call_id") or ""),
+                str(failure.get("retry_timestamp") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            tool_call_id = str(failure.get("tool_call_id") or "") or None
+            audit_ctx = SimpleNamespace(deps=deps, tool_call_id=tool_call_id)
+            enqueue_validation_failure_audit(
+                failure,
+                settings=self.settings,
+                ctx=audit_ctx,
+                run_id=run_id,
+            )
+            self._emit_validation_failure_trace(
+                recorder,
+                trace_context,
+                failure,
+            )
+
+    def _emit_validation_failure_trace(
+        self,
+        recorder: Any,
+        context: TraceContext | None,
+        failure: dict,
+    ) -> None:
+        if recorder is None or context is None:
+            return
+        try:
+            attributes = {
+                "tool_name": str(failure.get("tool_name") or "unknown"),
+                "tool_call_id": str(failure.get("tool_call_id") or ""),
+                "error_kind": "INVALID_ARGUMENT",
+                "execution_stage": "validation",
+                "validation_error_type": str(
+                    failure.get("error_type") or "validation_error"
+                ),
+                "validation_error_locations": list(
+                    failure.get("error_locations") or []
+                ),
+                "parameters": dict(failure.get("parameters") or {}),
+            }
+            payload = None
+            if getattr(recorder, "include_content", False):
+                payload = {"error_message": failure.get("validation_content")}
+            recorder.emit(
+                "tool.validation.failed",
+                context,
+                status="failed",
+                tool_call_id=str(failure.get("tool_call_id") or "") or None,
+                attributes=attributes,
+                payload=payload,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("trace_tool_validation_failed", error=str(exc))
+
     async def _process_request_locked(
         self,
         request: ChatRequest,
@@ -306,6 +404,7 @@ class AgentWorker:
         )
         recorder = get_trace_recorder(self.settings)
         terminal_emitted = False
+        validation_failures_seen: set[tuple[str, str, str]] = set()
 
         # queue.dequeued + agent.attempt.started / resumed
         dequeue_ms = None
@@ -353,6 +452,7 @@ class AgentWorker:
         message_history: list[ModelMessage] | None = None
         deferred_tool_results: DeferredToolResults | None = None
         resume_prompt: str | None = request.content
+        cleared_count = 0
 
         if request.resume_approval_id and request.deferred_tool_results is not None:
             # 审批恢复：使用原 messages，不把批准文本作为新 prompt
@@ -364,7 +464,39 @@ class AgentWorker:
             raw_history = self.broker.get_conversation_history(
                 connection_id, request.player_name, request.conversation_id
             )
-            message_history, cleared_count = self._strip_reasoning_content(raw_history)
+            message_history, cleared_count = self._sanitize_loaded_history(
+                connection_id=connection_id,
+                request=request,
+                raw_history=raw_history,
+                run_id=run_id,
+                conversation_invalidation_epoch=conversation_invalidation_epoch,
+            )
+        if (
+            message_history is not None
+            and request.resume_approval_id
+            and request.deferred_tool_results is not None
+        ):
+            deferred_call_ids = self._deferred_tool_result_call_ids(
+                deferred_tool_results
+            )
+            message_history, removed_calls, removed_responses = self._sanitize_tool_history(
+                message_history,
+                preserve_call_ids=deferred_call_ids,
+            )
+            if removed_calls or removed_responses:
+                logger.info(
+                    "chat_history_orphan_tool_parts_removed",
+                    worker_id=self.worker_id,
+                    connection_id=str(connection_id),
+                    player=request.player_name,
+                    conversation_id=request.conversation_id,
+                    run_id=run_id,
+                    removed_orphan_tool_calls=removed_calls,
+                    removed_orphan_tool_responses=removed_responses,
+                )
+        else:
+            removed_calls = removed_responses = 0
+        if message_history is not None and request.use_context:
             logger.debug(
                 "chat_history_loaded",
                 worker_id=self.worker_id,
@@ -451,7 +583,13 @@ class AgentWorker:
                 raw_history = self.broker.get_conversation_history(
                     connection_id, request.player_name, request.conversation_id
                 )
-                message_history, cleared_count = self._strip_reasoning_content(raw_history)
+                message_history, cleared_count = self._sanitize_loaded_history(
+                    connection_id=connection_id,
+                    request=request,
+                    raw_history=raw_history,
+                    run_id=run_id,
+                    conversation_invalidation_epoch=conversation_invalidation_epoch,
+                )
                 await self.broker.send_response(
                     connection_id,
                     SystemNotification(
@@ -615,6 +753,27 @@ class AgentWorker:
                         sequence += 1
 
                 elif event.event_type == "approval_required":
+                    validation_messages = (
+                        event.metadata.get("new_messages")
+                        if event.metadata
+                        else None
+                    )
+                    if not isinstance(validation_messages, list):
+                        validation_messages = (
+                            event.metadata.get("all_messages")
+                            if event.metadata
+                            else None
+                        )
+                    self._record_validation_failures_from_messages(
+                        messages=validation_messages
+                        if isinstance(validation_messages, list)
+                        else None,
+                        run_id=run_id,
+                        deps=deps,
+                        trace_context=resolved_context,
+                        recorder=recorder,
+                        seen=validation_failures_seen,
+                    )
                     # Flush model pairs for this attempt before suspend so the
                     # model leg is present even when tools never execute.
                     if resolved_context is not None and event.metadata:
@@ -651,6 +810,19 @@ class AgentWorker:
                     return
 
                 if event.metadata and event.metadata.get("is_complete"):
+                    validation_messages = event.metadata.get("new_messages")
+                    if not isinstance(validation_messages, list):
+                        validation_messages = event.metadata.get("all_messages")
+                    self._record_validation_failures_from_messages(
+                        messages=validation_messages
+                        if isinstance(validation_messages, list)
+                        else None,
+                        run_id=run_id,
+                        deps=deps,
+                        trace_context=resolved_context,
+                        recorder=recorder,
+                        seen=validation_failures_seen,
+                    )
                     all_messages = event.metadata.get("all_messages")
                     if isinstance(all_messages, list):
                         if self.broker.get_response_queue(connection_id) is not None:
@@ -811,6 +983,20 @@ class AgentWorker:
                         salvaged=bool(
                             event.metadata and event.metadata.get("all_messages")
                         ),
+                    )
+
+                    validation_messages = event.metadata.get("new_messages")
+                    if not isinstance(validation_messages, list):
+                        validation_messages = event.metadata.get("all_messages")
+                    self._record_validation_failures_from_messages(
+                        messages=validation_messages
+                        if isinstance(validation_messages, list)
+                        else None,
+                        run_id=run_id,
+                        deps=deps,
+                        trace_context=resolved_context,
+                        recorder=recorder,
+                        seen=validation_failures_seen,
                     )
 
                     # mid-run 失败：尽量落盘已产生的工具/模型消息 + 错误说明，
@@ -1119,7 +1305,9 @@ class AgentWorker:
         if not all_messages:
             return
 
-        history = list(all_messages)
+        history, removed_calls, removed_responses = self._sanitize_tool_history(
+            list(all_messages)
+        )
         note = (player_error_text or "").strip()
         if note:
             # 避免与已有尾部 assistant 文本重复
@@ -1145,6 +1333,13 @@ class AgentWorker:
 
         trimmed_history = self._trim_history(history, self.settings.max_history_turns)
         trimmed_history, cleared_count = self._strip_reasoning_content(trimmed_history)
+        (
+            trimmed_history,
+            trimmed_removed_calls,
+            trimmed_removed_responses,
+        ) = self._sanitize_tool_history(trimmed_history)
+        removed_calls += trimmed_removed_calls
+        removed_responses += trimmed_removed_responses
         try:
             history_updated = self.broker.set_conversation_history(
                 connection_id,
@@ -1171,6 +1366,8 @@ class AgentWorker:
                 conversation_id=request.conversation_id,
                 history_message_count=len(trimmed_history),
                 cleared_reasoning_content_count=cleared_count,
+                removed_orphan_tool_calls=removed_calls,
+                removed_orphan_tool_responses=removed_responses,
             )
             # 失败路径也做一次压缩检查（与成功路径一致），避免超大 partial 历史
             try:
@@ -1216,6 +1413,100 @@ class AgentWorker:
                 player=request.player_name,
                 conversation_id=request.conversation_id,
             )
+
+    def _sanitize_loaded_history(
+        self,
+        *,
+        connection_id: UUID,
+        request: ChatRequest,
+        raw_history: list[ModelMessage],
+        run_id: str,
+        conversation_invalidation_epoch: int | None,
+    ) -> tuple[list[ModelMessage], int]:
+        """清理已存历史，并在当前 epoch 下回写清洗结果。"""
+        message_history, cleared_count = self._strip_reasoning_content(raw_history)
+        message_history, removed_calls, removed_responses = self._sanitize_tool_history(
+            message_history
+        )
+        if not removed_calls and not removed_responses:
+            return message_history, cleared_count
+
+        logger.info(
+            "chat_history_orphan_tool_parts_removed",
+            worker_id=self.worker_id,
+            connection_id=str(connection_id),
+            player=request.player_name,
+            conversation_id=request.conversation_id,
+            run_id=run_id,
+            removed_orphan_tool_calls=removed_calls,
+            removed_orphan_tool_responses=removed_responses,
+        )
+        history_updated = self.broker.set_conversation_history(
+            connection_id,
+            request.player_name,
+            message_history,
+            request.conversation_id,
+            expected_invalidation_epoch=conversation_invalidation_epoch,
+        )
+        if not history_updated:
+            logger.info(
+                "chat_history_orphan_tool_parts_stale_write_skipped",
+                worker_id=self.worker_id,
+                connection_id=str(connection_id),
+                player=request.player_name,
+                conversation_id=request.conversation_id,
+                run_id=run_id,
+                removed_orphan_tool_calls=removed_calls,
+                removed_orphan_tool_responses=removed_responses,
+            )
+        return message_history, cleared_count
+
+    @staticmethod
+    def _sanitize_tool_history(
+        messages: list[ModelMessage],
+        *,
+        preserve_call_ids: set[str] | None = None,
+    ) -> tuple[list[ModelMessage], int, int]:
+        """清理工具级孤立 part，并返回移除的 call/response 数量。"""
+
+        def count_parts(history: list[ModelMessage]) -> tuple[int, int]:
+            calls = 0
+            responses = 0
+            for message in history:
+                for part in getattr(message, "parts", []) or []:
+                    if isinstance(part, ToolCallPart):
+                        calls += 1
+                    elif isinstance(part, ToolReturnPart) or (
+                        isinstance(part, RetryPromptPart) and part.tool_name is not None
+                    ):
+                        responses += 1
+            return calls, responses
+
+        before_calls, before_responses = count_parts(messages)
+        cleaned = ensure_tool_message_pairs(
+            messages,
+            preserve_call_ids=preserve_call_ids,
+        )
+        after_calls, after_responses = count_parts(cleaned)
+        return cleaned, before_calls - after_calls, before_responses - after_responses
+
+    @staticmethod
+    def _deferred_tool_result_call_ids(
+        deferred_tool_results: DeferredToolResults | None,
+    ) -> set[str]:
+        """返回当前 resume 结果明确引用的 call IDs，不扩张为全部历史孤儿。"""
+        if deferred_tool_results is None:
+            return set()
+        result: set[str] = set()
+        for field_name in ("approvals", "calls"):
+            values = getattr(deferred_tool_results, field_name, None)
+            if not isinstance(values, dict):
+                continue
+            for call_id in values:
+                normalized = str(call_id)
+                if normalized.strip():
+                    result.add(normalized)
+        return result
 
     @staticmethod
     def _trim_history(
@@ -1456,7 +1747,8 @@ class AgentWorker:
         or hosts without addon tooling). Runtime ``cli.py serve`` always injects
         the shared service from ``HostGatewayServer``.
 
-        Addon 层仍消费字符串结果；从 CommandResult 映射。
+        Addon 层仍消费字符串结果；从 CommandResult 映射。发送侧失败（帧过大等）
+        必须抛出，避免 SDK 侧空等 bridge timeout 并被误映射为 STATE_UNKNOWN。
         """
         if self._addon is None:
             return None
@@ -1465,9 +1757,28 @@ class AgentWorker:
             result = await self._create_command_callback(connection_id)(command)
             if result.is_success:
                 return result.output
+
+            diagnostic = result.diagnostic_summary or result.output or result.status
+            # Pre-mutation host failures: raise so map_bridge_exception can classify
+            # as LIMIT_EXCEEDED instead of waiting for a bridge response that never
+            # comes (and then reporting STATE_UNKNOWN).
+            text = result.output or ""
+            if result.status == "failed" and (
+                "raw command too long" in text
+                or "FrameTooLarge" in text
+                or ("commandLine" in text and "too long" in text)
+                or "bridge request never left host" in text
+            ):
+                raise RuntimeError(
+                    f"bridge request never left host: {diagnostic}"
+                ) from None
             if result.status == "connection_unavailable":
-                return f"命令执行失败: {result.output}"
+                raise ConnectionError(
+                    f"bridge outbound failed before send: {diagnostic}"
+                ) from None
             if result.status == "timeout_unknown":
+                # WS commandResponse timeout is distinct from bridge RESP timeout;
+                # still unknown because the game may have accepted the scriptevent.
                 return f"命令执行超时: {result.output}"
             return f"命令执行失败: {result.output}"
 
@@ -1528,6 +1839,18 @@ class AgentWorker:
                     results.approvals[tool_call_id] = ToolDenied(
                         message=str(value.get("message") or "已拒绝")
                     )
+                elif isinstance(value, dict) and value.get("kind") == "tool-approved":
+                    plan_id = value.get("plan_id")
+                    override_args = value.get("override_args")
+                    if isinstance(plan_id, str) and plan_id.strip():
+                        # 恢复契约：只携带 plan_id；验证与执行都从预检缓存还原
+                        results.approvals[tool_call_id] = ToolApproved(
+                            override_args={"plan_id": plan_id.strip()}
+                        )
+                    elif isinstance(override_args, dict):
+                        results.approvals[tool_call_id] = ToolApproved(override_args=override_args)
+                    else:
+                        raise ValueError("tool-approved requires plan_id or override_args")
                 else:
                     results.approvals[tool_call_id] = value
         if isinstance(calls, dict):
@@ -1592,6 +1915,33 @@ class AgentWorker:
         preassigned_ids = [store.generate_approval_id() for _ in pending_calls]
         sibling_ids = list(preassigned_ids)
 
+        # Fail closed before any store write: block tools need plan_id (recovery contract).
+        for call in pending_calls:
+            if call.tool_name not in {"inspect_block", "place_block", "fill_block"}:
+                continue
+            meta = deferred.metadata.get(call.tool_call_id, {}) if deferred.metadata else {}
+            plan_id = meta.get("plan_id") if isinstance(meta, dict) else None
+            if not isinstance(plan_id, str) or not plan_id.strip():
+                logger.error(
+                    "block_approval_missing_plan_id",
+                    tool_name=call.tool_name,
+                    tool_call_id=call.tool_call_id,
+                    run_id=request.run_id,
+                    player_name=player_name,
+                )
+                await self._send_error_chunk(
+                    connection_id,
+                    request.player_name,
+                    "方块工具审批参数契约无效，未进入审批队列",
+                    sequence,
+                    target=stream_target,
+                    error_kind="INTERNAL",
+                    run_id=request.run_id,
+                    trace_id=request.trace_id or request.run_id,
+                    attempt_id=request.attempt_id,
+                )
+                return
+
         for approval_id, call in zip(preassigned_ids, pending_calls):
             meta = deferred.metadata.get(call.tool_call_id, {}) if deferred.metadata else {}
             normalized_args = meta.get("normalized_args")
@@ -1599,6 +1949,12 @@ class AgentWorker:
                 args = call.args if isinstance(call.args, dict) else {}
                 normalized_args = args
             args_hash = str(meta.get("args_hash") or "")
+            execute_args = meta.get("execute_args")
+            if call.tool_name not in {"inspect_block", "place_block", "fill_block"} and not isinstance(
+                execute_args, dict
+            ):
+                execute_args = normalized_args
+            execution_args_hash = str(meta.get("execution_args_hash") or "")
             args_summary = str(
                 meta.get("args_summary")
                 or summarize_args_for_player(call.tool_name, normalized_args)
@@ -1611,10 +1967,14 @@ class AgentWorker:
                 conversation_id=request.conversation_id,
                 run_id=request.run_id or str(metadata.get("run_id") or ""),
                 tool_call_id=call.tool_call_id,
+                expected_tool_call_id=call.tool_call_id,
                 tool_name=call.tool_name,
                 normalized_args=normalized_args,
+                execute_args=execute_args,
                 args_summary=args_summary,
                 args_hash=args_hash,
+                execution_args_hash=execution_args_hash,
+                plan_id=str(meta.get("plan_id") or "") if isinstance(meta, dict) else "",
                 policy_version=policy_version,
                 messages=list(messages),
                 requests=deferred,
@@ -1632,6 +1992,7 @@ class AgentWorker:
                     "trace_id": (trace_context.trace_id if trace_context else request.trace_id),
                     "attempt_id": (trace_context.attempt_id if trace_context else request.attempt_id),
                     "message_id": (trace_context.message_id if trace_context else str(request.id)),
+                    "approval_metadata": meta.get("approval_metadata", {}),
                 },
             )
             store.put(pending)

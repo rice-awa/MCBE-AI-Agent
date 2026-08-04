@@ -104,6 +104,23 @@ class _ApiClient:
             headers = {k.lower(): v for k, v in exc.headers.items()} if exc.headers else {}
             return _Response(exc.code, body, headers)
 
+    def delete(self, path: str, payload: dict[str, Any] | None = None) -> "_Response":
+        url = self.base + path
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="DELETE")
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Content-Length", str(len(data)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                body = resp.read()
+                headers = {k.lower(): v for k, v in resp.headers.items()}
+                return _Response(resp.status, body, headers)
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            headers = {k.lower(): v for k, v in exc.headers.items()} if exc.headers else {}
+            return _Response(exc.code, body, headers)
+
 
 class _Response:
     def __init__(self, status: int, body: bytes, headers: dict[str, str]) -> None:
@@ -202,7 +219,9 @@ def test_api_health_and_config(api_bundle) -> None:
 
     config = client.get("/api/config")
     assert config.status == 200
-    assert config.json["read_only"] is True
+    assert config.json["read_only"] is False
+    assert config.json["mutations_enabled"] is True
+    assert config.json["mutations"] == ["delete_trace", "clear_journal"]
     assert "agent_trace_enabled" in config.json
     assert "agent_trace_include_content" in config.json
 
@@ -270,6 +289,9 @@ def test_api_rejects_post(api_bundle) -> None:
         assert exc.code == 405
         body = json.loads(exc.read().decode("utf-8"))
         assert body["error"] == "method_not_allowed"
+        allow = (exc.headers.get("Allow") or "") if exc.headers else ""
+        assert "GET" in allow
+        assert "DELETE" in allow
     assert raised
 
 
@@ -280,3 +302,85 @@ def test_api_list_all(api_bundle) -> None:
     assert response.json["count"] == 2
     # newest-first: t-ok ends later
     assert response.json["traces"][0]["trace_id"] == "t-ok"
+
+
+def test_api_delete_trace_without_confirm_400(api_bundle) -> None:
+    client, *_ = api_bundle
+    response = client.delete("/api/traces/t-ok", {"confirm": False})
+    assert response.status == 400
+    assert response.json["error"] == "confirm_required"
+
+    empty = client.delete("/api/traces/t-ok")
+    assert empty.status == 400
+    assert empty.json["error"] == "confirm_required"
+
+    wrong = client.delete("/api/traces/t-ok", {"confirm": "yes"})
+    assert wrong.status == 400
+    assert wrong.json["error"] == "confirm_required"
+
+
+def test_api_delete_trace_success_and_subsequent_get_404(api_bundle) -> None:
+    client, *_ = api_bundle
+    before = client.get("/api/traces/t-ok")
+    assert before.status == 200
+
+    response = client.delete("/api/traces/t-ok", {"confirm": True})
+    assert response.status == 200
+    assert response.json["ok"] is True
+    assert response.json["trace_id"] == "t-ok"
+    assert response.json["removed_events"] >= 1
+
+    after = client.get("/api/traces/t-ok")
+    assert after.status == 404
+    assert after.json["error"] == "not_found"
+    assert after.json["trace_id"] == "t-ok"
+
+    listed = client.get("/api/traces?limit=50")
+    assert listed.status == 200
+    assert listed.json["count"] == 1
+    assert listed.json["traces"][0]["trace_id"] == "t-failed"
+
+
+def test_api_delete_unknown_trace_404(api_bundle) -> None:
+    client, *_ = api_bundle
+    response = client.delete("/api/traces/does-not-exist", {"confirm": True})
+    assert response.status == 404
+    assert response.json["error"] == "not_found"
+    assert response.json["trace_id"] == "does-not-exist"
+
+
+def test_api_delete_path_traversal_404(api_bundle) -> None:
+    client, *_ = api_bundle
+    response = client.delete("/api/traces/../etc/passwd", {"confirm": True})
+    assert response.status == 404
+    assert response.json["error"] == "not_found"
+
+
+def test_api_clear_journal_requires_clear_all(api_bundle) -> None:
+    client, *_ = api_bundle
+    wrong = client.delete("/api/traces", {"confirm": True})
+    assert wrong.status == 400
+    assert wrong.json["error"] == "confirm_required"
+
+    empty = client.delete("/api/traces")
+    assert empty.status == 400
+    assert empty.json["error"] == "confirm_required"
+
+    still_there = client.get("/api/traces?limit=50")
+    assert still_there.status == 200
+    assert still_there.json["count"] == 2
+
+
+def test_api_clear_journal_success(api_bundle) -> None:
+    client, *_ = api_bundle
+    response = client.delete("/api/traces", {"confirm": "CLEAR_ALL"})
+    assert response.status == 200
+    assert response.json["ok"] is True
+    assert response.json["cleared"] is True
+
+    listed = client.get("/api/traces?limit=50")
+    assert listed.status == 200
+    assert listed.json["count"] == 0
+
+    missing = client.get("/api/traces/t-ok")
+    assert missing.status == 404

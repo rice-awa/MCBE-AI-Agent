@@ -1,5 +1,6 @@
 """上下文预算与信任边界不变量测试。"""
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -7,6 +8,8 @@ import pytest
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
+    RequestUsage,
+    RetryPromptPart,
     TextPart,
     ToolCallPart,
     ToolReturnPart,
@@ -15,10 +18,10 @@ from pydantic_ai.messages import (
 
 from config.settings import Settings
 from services.agent.context import (
-    ContextBuilder,
-    ContextOversizedError,
     TRUNCATED_TOOL_MARKER,
     UNTRUSTED_HISTORY_MARKER,
+    ContextBuilder,
+    ContextOversizedError,
     estimate_tokens,
     wrap_untrusted_history_material,
 )
@@ -63,6 +66,521 @@ def _tool_pair(call_id: str, tool_name: str, result: str) -> list:
             parts=[ToolReturnPart(tool_name=tool_name, content=result, tool_call_id=call_id)]
         ),
     ]
+
+
+def _find_part(messages, part_kind: str, tool_call_id: str):
+    return next(
+        (
+            part
+            for message in messages
+            for part in message.parts
+            if getattr(part, "part_kind", None) == part_kind
+            and getattr(part, "tool_call_id", None) == tool_call_id
+        ),
+        None,
+    )
+
+
+def _large_context_builder(settings=None) -> ContextBuilder:
+    return ContextBuilder(
+        settings or _Settings(context_window=8192),
+        system_reserve_tokens=100,
+        tool_schema_reserve_tokens=100,
+        current_input_reserve_tokens=50,
+    )
+
+
+def test_context_preserves_tool_call_with_validation_retry():
+    builder = _large_context_builder()
+    messages = [
+        ModelRequest(parts=[UserPromptPart("go")]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "place_block",
+                    '{"edits": [',
+                    tool_call_id="call-bad",
+                )
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    "invalid JSON",
+                    tool_name="place_block",
+                    tool_call_id="call-bad",
+                )
+            ]
+        ),
+    ]
+
+    processed = builder.process_history(messages, budget=builder.compute_budget(provider_name="test"))
+
+    assert _find_part(processed, "tool-call", "call-bad")
+    assert _find_part(processed, "retry-prompt", "call-bad")
+
+
+def test_context_removes_orphan_tool_validation_retry():
+    builder = _large_context_builder()
+    messages = [
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    "invalid JSON",
+                    tool_name="place_block",
+                    tool_call_id="orphan-retry",
+                )
+            ]
+        )
+    ]
+
+    processed = builder.process_history(messages, budget=builder.compute_budget(provider_name="test"))
+
+    assert _find_part(processed, "retry-prompt", "orphan-retry") is None
+
+
+def test_context_removes_orphan_tool_return():
+    builder = _large_context_builder()
+    messages = [
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="place_block",
+                    content="unexpected result",
+                    tool_call_id="orphan-return",
+                )
+            ]
+        )
+    ]
+
+    processed = builder.process_history(messages, budget=builder.compute_budget(provider_name="test"))
+
+    assert _find_part(processed, "tool-return", "orphan-return") is None
+
+
+def test_context_removes_orphan_tool_call():
+    builder = _large_context_builder()
+    messages = [
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "place_block",
+                    '{"edits": []}',
+                    tool_call_id="orphan-call",
+                )
+            ]
+        )
+    ]
+
+    processed = builder.process_history(messages, budget=builder.compute_budget(provider_name="test"))
+
+    assert _find_part(processed, "tool-call", "orphan-call") is None
+
+
+@pytest.mark.parametrize(
+    ("message", "part_kind"),
+    [
+        (
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "place_block",
+                        '{"edits": []}',
+                        tool_call_id="",
+                    )
+                ]
+            ),
+            "tool-call",
+        ),
+        (
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="place_block",
+                        content="orphan",
+                        tool_call_id="",
+                    )
+                ]
+            ),
+            "tool-return",
+        ),
+        (
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        "invalid JSON",
+                        tool_name="place_block",
+                        tool_call_id="",
+                    )
+                ]
+            ),
+            "retry-prompt",
+        ),
+    ],
+)
+def test_context_removes_orphan_tool_parts_with_empty_tool_call_id(message, part_kind):
+    builder = _large_context_builder()
+
+    processed = builder.process_history(
+        [message],
+        budget=builder.compute_budget(provider_name="test"),
+    )
+
+    assert _find_part(processed, part_kind, "") is None
+
+
+def test_context_preserves_output_retry_without_tool_name():
+    builder = _large_context_builder()
+    messages = [
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    "invalid structured output",
+                    tool_call_id="output-retry",
+                )
+            ]
+        )
+    ]
+
+    processed = builder.process_history(messages, budget=builder.compute_budget(provider_name="test"))
+
+    retry = _find_part(processed, "retry-prompt", "output-retry")
+    assert retry is not None
+    assert retry.tool_name is None
+
+
+def test_context_removes_orphan_call_but_preserves_assistant_text():
+    builder = _large_context_builder()
+    messages = [
+        ModelResponse(
+            parts=[
+                TextPart(content="visible answer"),
+                ToolCallPart(
+                    "place_block",
+                    '{"edits": []}',
+                    tool_call_id="orphan-call-with-text",
+                ),
+            ]
+        )
+    ]
+
+    processed = builder.process_history(messages, budget=builder.compute_budget(provider_name="test"))
+
+    assert _find_part(processed, "tool-call", "orphan-call-with-text") is None
+    assert any(
+        getattr(part, "part_kind", None) == "text"
+        and getattr(part, "content", None) == "visible answer"
+        for message in processed
+        for part in message.parts
+    )
+
+
+def test_context_removes_orphan_retry_but_preserves_user_prompt():
+    builder = _large_context_builder()
+    messages = [
+        ModelRequest(
+            parts=[
+                UserPromptPart("keep this input"),
+                RetryPromptPart(
+                    "invalid JSON",
+                    tool_name="place_block",
+                    tool_call_id="orphan-retry-with-user",
+                ),
+            ]
+        )
+    ]
+
+    processed = builder.process_history(messages, budget=builder.compute_budget(provider_name="test"))
+
+    assert _find_part(processed, "retry-prompt", "orphan-retry-with-user") is None
+    assert any(
+        getattr(part, "part_kind", None) == "user-prompt"
+        and getattr(part, "content", None) == "keep this input"
+        for message in processed
+        for part in message.parts
+    )
+
+
+def test_context_keeps_complete_pair_and_removes_orphan_parallel_call():
+    builder = _large_context_builder()
+    messages = [
+        ModelRequest(parts=[UserPromptPart("build it")]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "place_block",
+                    '{"edits": []}',
+                    tool_call_id="parallel-complete",
+                ),
+                ToolCallPart(
+                    "place_block",
+                    '{"edits": []}',
+                    tool_call_id="parallel-orphan",
+                ),
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="place_block",
+                    content="complete",
+                    tool_call_id="parallel-complete",
+                )
+            ]
+        ),
+    ]
+
+    processed = builder.process_history(messages, budget=builder.compute_budget(provider_name="test"))
+
+    assert _find_part(processed, "tool-call", "parallel-complete")
+    assert _find_part(processed, "tool-return", "parallel-complete")
+    assert _find_part(processed, "tool-call", "parallel-orphan") is None
+
+
+def test_context_keeps_same_id_pair_when_recent_turn_cropping_runs():
+    settings = _Settings(context_window=8192)
+    settings.max_history_turns = 1
+    builder = _large_context_builder(settings)
+    messages = [
+        ModelRequest(parts=[UserPromptPart("old input")]),
+        ModelResponse(parts=[TextPart(content="old answer")]),
+        ModelRequest(parts=[UserPromptPart("current input")]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "place_block",
+                    '{"edits": [',
+                    tool_call_id="cropped-pair",
+                )
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    "invalid JSON",
+                    tool_name="place_block",
+                    tool_call_id="cropped-pair",
+                )
+            ]
+        ),
+    ]
+
+    processed = builder.process_history(messages, budget=builder.compute_budget(provider_name="test"))
+
+    assert _find_part(processed, "tool-call", "cropped-pair")
+    assert _find_part(processed, "retry-prompt", "cropped-pair")
+
+
+def test_context_pairs_tool_parts_in_order_one_to_one_without_mutating_mixed_messages():
+    """响应必须匹配此前唯一未配对的 call，重复 ID 不能扩大成多对。"""
+    builder = _large_context_builder()
+    response_before_call = ToolReturnPart(
+        tool_name="place_block",
+        content="response before call",
+        tool_call_id="duplicate-id",
+    )
+    first_call = ToolCallPart(
+        "place_block",
+        {"edits": []},
+        tool_call_id="duplicate-id",
+    )
+    duplicate_call = ToolCallPart(
+        "place_block",
+        {"edits": [{"unexpected": "duplicate"}]},
+        tool_call_id="duplicate-id",
+    )
+    valid_response = ToolReturnPart(
+        tool_name="place_block",
+        content="valid response",
+        tool_call_id="duplicate-id",
+    )
+    messages = [
+        ModelRequest(
+            parts=[UserPromptPart("keep request"), response_before_call],
+            metadata={"source": "request"},
+        ),
+        ModelResponse(
+            parts=[TextPart("keep assistant text"), first_call, duplicate_call],
+            metadata={"source": "response"},
+        ),
+        ModelRequest(
+            parts=[valid_response, UserPromptPart("keep trailing input")],
+            metadata={"source": "return"},
+        ),
+    ]
+
+    processed = builder.process_history(
+        messages,
+        budget=builder.compute_budget(provider_name="test"),
+    )
+
+    calls = [
+        part
+        for message in processed
+        for part in message.parts
+        if getattr(part, "part_kind", None) == "tool-call"
+    ]
+    responses = [
+        part
+        for message in processed
+        for part in message.parts
+        if getattr(part, "part_kind", None) == "tool-return"
+    ]
+    assert len(calls) == 1
+    assert len(responses) == 1
+    assert calls[0].tool_call_id == responses[0].tool_call_id == "duplicate-id"
+    assert responses[0].content == "valid response"
+    assert all(
+        getattr(part, "content", None) != "response before call"
+        for message in processed
+        for part in message.parts
+    )
+    assert any(
+        isinstance(part, TextPart) and part.content == "keep assistant text"
+        for message in processed
+        for part in message.parts
+    )
+    assert any(
+        isinstance(part, UserPromptPart) and part.content == "keep request"
+        for message in processed
+        for part in message.parts
+    )
+    assert any(
+        isinstance(part, UserPromptPart) and part.content == "keep trailing input"
+        for message in processed
+        for part in message.parts
+    )
+
+    processed_request = next(
+        message
+        for message in processed
+        if isinstance(message, ModelRequest) and message.metadata == {"source": "request"}
+    )
+    processed_response = next(
+        message
+        for message in processed
+        if isinstance(message, ModelResponse) and message.metadata == {"source": "response"}
+    )
+    assert processed_request.metadata == {"source": "request"}
+    assert processed_response.metadata == {"source": "response"}
+
+    # Cleaning returns new messages and leaves the provider history untouched.
+    assert messages[0].parts[1] is response_before_call
+    assert messages[1].parts[1] is first_call
+    assert len(messages[1].parts) == 3
+    assert messages[2].parts[0] is valid_response
+
+
+def test_context_cleans_pair_half_left_by_recent_turn_cropping():
+    settings = _Settings(context_window=8192)
+    settings.max_history_turns = 1
+    builder = _large_context_builder(settings)
+    messages = [
+        ModelRequest(parts=[UserPromptPart("old input")]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "place_block",
+                    '{"edits": []}',
+                    tool_call_id="cropped-half",
+                )
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                UserPromptPart("current input"),
+                ToolReturnPart(
+                    tool_name="place_block",
+                    content="return after cropped call",
+                    tool_call_id="cropped-half",
+                ),
+            ]
+        ),
+    ]
+
+    processed = builder.process_history(
+        messages,
+        budget=builder.compute_budget(provider_name="test"),
+    )
+
+    assert _find_part(processed, "tool-call", "cropped-half") is None
+    assert _find_part(processed, "tool-return", "cropped-half") is None
+    assert any(
+        getattr(part, "part_kind", None) == "user-prompt"
+        and getattr(part, "content", None) == "current input"
+        for message in processed
+        for part in message.parts
+    )
+    assert not any(
+        getattr(part, "part_kind", None) == "user-prompt"
+        and getattr(part, "content", None) == "old input"
+        for message in processed
+        for part in message.parts
+    )
+
+
+def test_context_preserves_request_and_response_metadata_when_cleaning_parts():
+    builder = _large_context_builder()
+    request_timestamp = datetime(2025, 1, 2, 3, 4, 5, tzinfo=UTC)
+    response_timestamp = datetime(2025, 1, 2, 3, 4, 6, tzinfo=UTC)
+    request = ModelRequest(
+        parts=[
+            UserPromptPart("keep request prompt"),
+            RetryPromptPart(
+                "invalid JSON",
+                tool_name="place_block",
+                tool_call_id="metadata-request-orphan",
+            ),
+        ],
+        timestamp=request_timestamp,
+        instructions="request instructions",
+        run_id="request-run",
+        conversation_id="metadata-conversation",
+        metadata={"request_source": "test"},
+    )
+    response = ModelResponse(
+        parts=[
+            TextPart(content="keep response text"),
+            ToolCallPart(
+                "place_block",
+                '{"edits": []}',
+                tool_call_id="metadata-response-orphan",
+            ),
+        ],
+        usage=RequestUsage(input_tokens=11, output_tokens=7),
+        model_name="metadata-model",
+        timestamp=response_timestamp,
+        provider_name="metadata-provider",
+        provider_url="https://provider.invalid",
+        provider_details={"region": "test"},
+        provider_response_id="provider-response-id",
+        run_id="response-run",
+        conversation_id="metadata-conversation",
+        metadata={"response_source": "test"},
+    )
+
+    processed = builder.process_history(
+        [request, response],
+        budget=builder.compute_budget(provider_name="test"),
+    )
+
+    processed_request = next(message for message in processed if isinstance(message, ModelRequest))
+    processed_response = next(message for message in processed if isinstance(message, ModelResponse))
+    assert processed_request.timestamp == request_timestamp
+    assert processed_request.instructions == "request instructions"
+    assert processed_request.run_id == "request-run"
+    assert processed_request.conversation_id == "metadata-conversation"
+    assert processed_request.metadata == {"request_source": "test"}
+    assert processed_response.usage == RequestUsage(input_tokens=11, output_tokens=7)
+    assert processed_response.model_name == "metadata-model"
+    assert processed_response.timestamp == response_timestamp
+    assert processed_response.provider_name == "metadata-provider"
+    assert processed_response.provider_url == "https://provider.invalid"
+    assert processed_response.provider_details == {"region": "test"}
+    assert processed_response.provider_response_id == "provider-response-id"
+    assert processed_response.run_id == "response-run"
+    assert processed_response.conversation_id == "metadata-conversation"
+    assert processed_response.metadata == {"response_source": "test"}
 
 
 def test_oversized_single_message_hard_refused_or_truncated():
@@ -203,8 +721,9 @@ def test_missing_context_window_does_not_use_unlimited_budget():
 
 def test_summary_not_rewrapped_on_repeated_normalize():
     """同一摘要消息经 ContextBuilder 两次处理后，不可信容器只出现一次（不嵌套）。"""
-    from core.conversation import ConversationCompressor
     from unittest.mock import MagicMock
+
+    from core.conversation import ConversationCompressor
 
     raw_summary = "事实: 玩家在森林里建了木屋"
     compressor = ConversationCompressor(settings=MagicMock())
