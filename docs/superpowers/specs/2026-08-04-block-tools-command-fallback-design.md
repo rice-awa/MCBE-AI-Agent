@@ -11,8 +11,8 @@
 
 2026-08-04 两次「放个门」请求（run `9c905f69-...` / `81ef66b3-...`，`logs/app.log`）：
 
-1. 模型调用 `place_block(block=minecraft:oak_door, ...)` → Add-on 返回 `UNSUPPORTED_BLOCK_PLACEMENT`（`fallback_allowed: false`），`external_state_unknown: false`；
-2. 模型改用 `run_minecraft_command: setblock <pos> minecraft:oak_door` → 被运行时 Harness 拒绝：
+1. 模型调用 `place_block(block=minecraft:wooden_door, ...)` → Add-on 返回 `UNSUPPORTED_BLOCK_PLACEMENT`（`fallback_allowed: false`），`external_state_unknown: false`；
+2. 模型改用 `run_minecraft_command: setblock <pos> minecraft:wooden_door` → 被运行时 Harness 拒绝：
    > `ToolDenied("专用方块编辑刚刚失败（UNSUPPORTED_BLOCK_PLACEMENT）且不允许命令回退；诊断: 多格方块放置暂不支持，未发送到 Add-on。")`
 
 模型在两个工具之间空转，目标无法达成。
@@ -40,7 +40,7 @@ Microsoft 官方更新说明（`creator/Documents/Update1.26.10.md`）：
 - Add-on 拒绝多格方块的逻辑**本身仍然正确**（它只约束 Script API 单格写入路径）；
 - 命令回退路径在 1.26.10+ **可以正确放置完整门**，旧注释「fallback_allowed=false so the model does not fall back to a single setblock (which has the same single-cell problem)」已过时。
 
-补充查证（bedrock.dev 官方 BlockStates 表）：Bedrock 门的状态为 `minecraft:cardinal_direction`（north/south/east/west）、`upper_block_bit`（0=下半 / 1=上半）、`open_bit`、`door_hinge_bit`；`setblock` 状态语法为 `["state":value]`（如 `minecraft:oak_door ["minecraft:cardinal_direction":"south"]`）。Java 的 `[facing=south,half=lower]` 语法在 Bedrock 不合法；无状态 `setblock <pos> minecraft:oak_door` 即可。
+补充查证（bedrock.dev 官方 BlockStates 表）：Bedrock 门的状态为 `minecraft:cardinal_direction`（north/south/east/west）、`upper_block_bit`（0=下半 / 1=上半）、`open_bit`、`door_hinge_bit`；`setblock` 状态语法为 `["state":value]`（如 `minecraft:wooden_door ["minecraft:cardinal_direction":"south"]`）。Java 的 `[facing=south,half=lower]` 语法在 Bedrock 不合法；无状态 `setblock <pos> minecraft:wooden_door` 即可。
 
 ### 1.4 宿主与 Add-on 的职责边界（本设计的依据）
 
@@ -162,7 +162,7 @@ multiblock_placement: "command_fallback";
 要点：
 
 - 明确「专用工具不支持」与「命令可回退」的边界；
-- 引导无状态 `setblock <pos> minecraft:oak_door`（避免模型沿用 Java 语法 `[facing=south,half=lower]`）；
+- 引导无状态 `setblock <pos> minecraft:wooden_door`（避免模型沿用 Java 语法 `[facing=south,half=lower]`）；
 - `_BLOCK_TOOL_PRIORITY`（prompting.py）不改，仍由 `fallback_allowed` 字段驱动决策。
 
 ## 7. 文档更新
@@ -200,7 +200,7 @@ multiblock_placement: "command_fallback";
 
 ### 8.4 手工验收（游戏内，需 Bedrock ≥ 1.26.10）
 
-1. 「放个门」：`place_block` 门 → `UNSUPPORTED_BLOCK_PLACEMENT`（`fallback_allowed: true`）→ 模型 `run_minecraft_command: setblock <pos> minecraft:oak_door` → 出现完整门（上下两半）。
+1. 「放个门」：`place_block` 门 → `UNSUPPORTED_BLOCK_PLACEMENT`（`fallback_allowed: true`）→ 模型 `run_minecraft_command: setblock <pos> minecraft:wooden_door` → 出现完整门（上下两半）。
 2. 回归：正常 fill / place 不受影响；超时场景（`STATE_UNKNOWN`）回退仍被拒；命令回退仍需玩家审批。
 
 ## 9. 分阶段实施

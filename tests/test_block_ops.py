@@ -3201,7 +3201,7 @@ def test_unsupported_block_placement_preserves_multiblock_flag() -> None:
             "payload": {
                 "code": "UNSUPPORTED_BLOCK_PLACEMENT",
                 "message": "multiblock block requires multi-cell placement",
-                "type_id": "minecraft:oak_door",
+                "type_id": "minecraft:wooden_door",
                 "multiblock": True,
             },
         }
@@ -3211,7 +3211,7 @@ def test_unsupported_block_placement_preserves_multiblock_flag() -> None:
     assert body["code"] == "UNSUPPORTED_BLOCK_PLACEMENT"
     assert body["fallback_allowed"] is True
     assert body["retryable"] is False
-    assert body["type_id"] == "minecraft:oak_door"
+    assert body["type_id"] == "minecraft:wooden_door"
     assert body["multiblock"] is True
     assert "hint" in body
     assert "多格" in body["hint"]

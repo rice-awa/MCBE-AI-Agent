@@ -6,6 +6,7 @@ _INTENT_GUIDANCE: dict[ToolIntent, str] = {
     ToolIntent.CHANGE_WORLD: (
         "玩家明确要求执行命令、修改世界或改变实体状态时使用；"
         "优先选择契约最贴近玩家目标的专用工具。"
+        "命令与方块/物品 ID 一律使用基岩版命名空间（minecraft:）与基岩版命令语法。"
     ),
     ToolIntent.NOTIFY_DISPLAY: "玩家要求在游戏中展示消息、标题、actionbar 或脚本事件时使用。",
     ToolIntent.QUERY_WORLD: (
@@ -23,7 +24,9 @@ _BLOCK_TOOL_PRIORITY = (
     "- inspect_block 只在需要确认世界状态时调用，不要机械地在每次编辑前先查一遍。\n"
     "- expect 默认 air（仅替换空气）；要覆盖非空方块用 expect=any（需再审批）。\n"
     "- 失败时只读 code 与 hint；仅 fallback_allowed=true 时才能考虑命令回退。\n"
-    "- 同一轮可以并行发出多个相互独立的 fill/place。"
+    "- 同一轮可以并行发出多个相互独立的 fill/place。\n"
+    "- 方块 type_id 与 states 键名一律用基岩版命名空间：如 \"minecraft:stone\"、"
+    "{\"minecraft:cardinal_direction\":\"north\"}，不要用 Java 的 facing/half。"
 )
 
 

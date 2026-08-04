@@ -84,7 +84,7 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         ToolRisk.HIGH,
         "玩家明确要求执行单条 Minecraft 命令或进行一次确定的世界修改时使用。",
         "不要用于闲聊、知识问答、不确定命令或需要多步确认的批量操作。",
-        "command 不带前导斜杠；只传单条命令。",
+        "command 不带前导斜杠；只传单条命令；必须使用基岩版命令语法，ID 一律带 minecraft: 命名空间。",
         preview=ParameterPreviewPolicy(include=("command",)),
         may_have_external_side_effects=True,
     ),
@@ -94,7 +94,7 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         ToolRisk.DANGEROUS,
         "玩家明确要求连续执行多条命令，且每条命令都具体可见时使用。",
         "不要用于试探性操作、未知副作用命令或可以用单条命令完成的任务。",
-        "commands 中每项不带前导斜杠；保持顺序；避免包含空命令。",
+        "commands 中每项不带前导斜杠；保持顺序；避免包含空命令；全部使用基岩版命令语法与 minecraft: 命名空间。",
         preview=ParameterPreviewPolicy(include=("commands",)),
         may_have_external_side_effects=True,
     ),
@@ -261,7 +261,7 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         ToolRisk.HIGH,
         "需要通过 Addon 桥接受控执行世界命令，且普通命令工具不可用时使用。",
         "不要作为 run_minecraft_command 的默认替代，也不要用于查询或展示消息。",
-        "command 不带前导斜杠；只传单条世界命令。",
+        "command 不带前导斜杠；只传单条世界命令；必须使用基岩版命令语法，ID 一律带 minecraft: 命名空间。",
         preview=ParameterPreviewPolicy(include=("command",)),
         may_have_external_side_effects=True,
     ),
@@ -285,9 +285,9 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         ToolRisk.HIGH,
         "在单个格子上写入方块时使用；连续区域优先用 fill_block。",
         "不要用于查询；不要拆成多个单格来填充连续区域；不要用于覆盖保护数据。",
-        "pos 为 [x,y,z] 绝对坐标；block 为 type_id 字符串（如 \"minecraft:stone\"）；"
+        "pos 为 [x,y,z] 绝对坐标；block 为 type_id 字符串，使用基岩版命名空间（如 \"minecraft:stone\"，缺失前缀自动补 minecraft:）；"
         "expect 默认 air（仅替换空气），可选 any（需再审批）/ type_id；"
-        "states 为可选的方块状态字典。",
+        "states 为可选的方块状态字典，键名使用基岩版状态名（如 {\"minecraft:cardinal_direction\":\"north\"}，不要用 Java 的 facing）。",
         preview=ParameterPreviewPolicy(
             include=("pos", "block", "expect", "states")
         ),
@@ -299,9 +299,10 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         ToolRisk.HIGH,
         "填充连续区域（地板/墙体/屋顶等）时使用；单格用 place_block。",
         "不要用于查询；不要用多个 place_block 模拟连续区域；不要用于覆盖保护数据。",
-        "from 与 to 为两个绝对角点 [x,y,z]（自动归一化）；block 为 type_id 字符串"
-        "（如 \"minecraft:stone\"）；expect 默认 air（仅替换空气），可选 any（需再审批）/ type_id；"
-        "states 为可选的方块状态字典。",
+        "from 与 to 为两个绝对角点 [x,y,z]（自动归一化）；block 为 type_id 字符串，"
+        "使用基岩版命名空间（如 \"minecraft:stone\"，缺失前缀自动补 minecraft:）；"
+        "expect 默认 air（仅替换空气），可选 any（需再审批）/ type_id；"
+        "states 为可选的方块状态字典，键名使用基岩版状态名（如 {\"minecraft:cardinal_direction\":\"north\"}，不要用 Java 的 facing）。",
         preview=ParameterPreviewPolicy(
             include=("from", "to", "block", "expect", "states")
         ),

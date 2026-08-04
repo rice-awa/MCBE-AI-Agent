@@ -182,7 +182,14 @@ def register_agent_tools(
         command: str,
     ) -> str:
         """
-        执行 Minecraft 命令
+        执行 Minecraft 命令（Bedrock 基岩版命令语法）。
+
+        命令必须使用基岩版（Bedrock Edition）命令格式，不能用 Java 版语法：
+        - 方块/物品/实体 ID 一律带 ``minecraft:`` 命名空间，如 ``minecraft:wooden_door``；
+        - 不支持 Java 版的 NBT ``{...}`` 数据标签；
+        - ``setblock`` / ``fill`` 的方块状态用 ``["状态名":"值"]`` 语法，如
+          ``setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction":"south"]``，
+          不要用 Java 的 ``[facing=south,half=lower]``。
 
         Args:
             ctx: 运行上下文
@@ -222,7 +229,13 @@ def register_agent_tools(
         commands: list[str],
     ) -> str:
         """
-        批量执行 Minecraft 命令，注意一定要遵循MCBE的语法。
+        批量执行 Minecraft 命令，必须遵循基岩版（Bedrock Edition）命令语法。
+        命令格式要求：
+        - 方块/物品/实体 ID 一律带 ``minecraft:`` 命名空间，如 ``minecraft:wooden_door``；
+        - 不支持 Java 版的 NBT ``{...}`` 数据标签；
+        - ``setblock`` / ``fill`` 的方块状态用 ``["状态名":"值"]`` 语法，如
+          ``setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction":"south"]``，
+          不要用 Java 的 ``[facing=south,half=lower]``。
         每次最多 20 条命令，超出请拆分为多次调用。
         一次 run 最多 16 次工具调用，请合理规划，避免超限被拒后反复重试。
 
@@ -1109,7 +1122,10 @@ def register_agent_tools(
         ctx: RunContext[AgentDependencies],
         command: str,
     ) -> str:
-        """通过 addon 桥接受控执行世界命令。(仅当run_minecraft_command工具无法使用才用)"""
+        """通过 addon 桥接受控执行世界命令。(仅当run_minecraft_command工具无法使用才用)
+        命令必须使用基岩版（Bedrock Edition）命令语法，ID 一律带 ``minecraft:`` 命名空间；
+        不支持 Java 版 NBT ``{...}`` 数据标签与 ``[state=value]`` 状态语法。
+        """
         from services.agent.block_ops.bridge import (
             map_addon_bridge_result,
             map_bridge_exception,
@@ -1158,6 +1174,13 @@ def register_agent_tools(
     ) -> str:
         """在单个格子上写入方块。
 
+        方块 type_id 使用基岩版（Bedrock Edition）命名空间，必须带 ``minecraft:``
+        前缀，如 ``"minecraft:stone"`` / ``"minecraft:oak_planks"``；不要使用 Java 版
+        独有 ID。缺失前缀时宿主会自动补 ``minecraft:``。
+        states 键名同样用基岩版状态名（带 ``minecraft:`` 前缀），如
+        ``{"minecraft:cardinal_direction": "north"}``，不要用 Java 的 ``facing``/``half``。
+        expect 默认 ``"air"``（仅替换空气）；``"any"`` 允许覆写非空方块（需审批）。
+
         成功返回 ``{ok, status, at: [x, y, z], block, was?}``；
         ``was`` 仅在替换了非空气方块时出现。
 
@@ -1167,7 +1190,7 @@ def register_agent_tools(
             block: 方块 type_id，如 ``"minecraft:stone"``
             expect: 前置条件，默认 ``"air"``（仅替换空气）；
                 ``"any"`` 允许覆写非空方块（需审批）
-            states: 可选方块状态，如 ``{"facing": "north"}``
+            states: 键名用基岩版状态名
         """
         from services.agent.block_ops.tools_impl import place_block_impl
 
@@ -1190,6 +1213,13 @@ def register_agent_tools(
     ) -> str:
         """在长方体区域内写入方块。
 
+        方块 type_id 使用基岩版（Bedrock Edition）命名空间，必须带 ``minecraft:``
+        前缀，如 ``"minecraft:stone"`` / ``"minecraft:oak_planks"``；不要使用 Java 版
+        独有 ID。缺失前缀时宿主会自动补 ``minecraft:``。
+        states 键名同样用基岩版状态名（带 ``minecraft:`` 前缀），如
+        ``{"minecraft:cardinal_direction": "north"}``，不要用 Java 的 ``facing``/``half``。
+        expect 默认 ``"air"``（仅替换空气）；``"any"`` 允许覆写非空方块（需审批）。
+
         角点自动 min/max 归一化。expect=air 时非空气格跳过。
         成功返回 ``{ok, status, changed, skipped, type_counts?, bounds}``；
         ``type_counts`` 仅统计被替换的非空气方块。
@@ -1200,7 +1230,7 @@ def register_agent_tools(
             to: 区域另一角 ``[x, y, z]``（绝对世界坐标整数）
             block: 方块 type_id
             expect: 前置条件，默认 ``"air"``
-            states: 可选方块状态
+            states: 键名用基岩版状态名
         """
         from services.agent.block_ops.tools_impl import fill_block_impl
 
