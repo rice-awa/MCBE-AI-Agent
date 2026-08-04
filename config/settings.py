@@ -781,7 +781,7 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3"
 
     # Agent 配置
-    system_prompt: str = "请始终保持积极和专业的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown，不要生成任何emoji"
+    system_prompt: str = "你是一个MCBE助手，请始终保持积极友好的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown，不要生成任何emoji"
     enable_reasoning_output: bool = True
     max_history_turns: int = 50
     agent_retries: int = Field(default=3, ge=0)

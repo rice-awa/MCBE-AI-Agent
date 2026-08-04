@@ -1,140 +1,64 @@
-# MCBE AI Agent v2.0 - 现代化重构
+# MCBE AI Agent v2.5.0
 
-## 概述
-
-这是 [MCBE WebSocket GPT](https://github.com/rice-awa/MCBE_WebSocket_gpt) 项目的完全重构版本，采用现代化异步架构，基于 PydanticAI 框架，支持多种 LLM 提供商，实现了 WebSocket 和 LLM 请求的完全解耦。
+基于 **PydanticAI** 的 Minecraft Bedrock Edition AI 聊天机器人服务器。这是 [MCBE WebSocket GPT](https://github.com/rice-awa/MCBE_WebSocket_gpt) 项目的完全重构版本：现代化异步架构，WebSocket 连接与 LLM 请求完全解耦，支持多 LLM 提供商、多人会话隔离、Addon 桥接与完整的游戏内命令系统。
 
 ## 核心特性
 
 ### 🚀 现代化架构
-- **异步非阻塞**: WebSocket 通信与 LLM 请求完全分离
-- **消息队列**: 使用 `asyncio.Queue` 实现生产者-消费者模式
-- **类型安全**: 全面使用 Pydantic 进行数据验证
-- **结构化日志**: 基于 structlog 的现代日志系统
+- **异步非阻塞**: WebSocket 通信与 LLM 请求完全分离，LLM 延迟不影响 MC 连接
+- **消息队列**: `asyncio.Queue` 生产者-消费者模式，`MessageBroker` 解耦 WS 与 Agent
+- **类型安全**: 全面使用 Pydantic 数据验证
+- **结构化日志**: 基于 structlog 的现代日志系统，支持原始报文与 LLM 日志开关
 
 ### 🤖 AI Agent 能力
 - **PydanticAI 框架**: 类型安全的 AI Agent 实现
-- **流式响应**: 支持实时流式输出，按完整句子发送
-- **Agent Tools**: 内置 Minecraft 命令执行、MCWiki 搜索等工具
-- **动态系统提示词**: 根据玩家信息动态调整
+- **流式响应**: 实时流式输出，按完整句子发送
+- **Agent Tools**: 内置 Minecraft 命令执行、MCWiki 搜索、Addon 能力（玩家快照 / 背包 / 实体 / 方块操作）等工具
+- **MCP 扩展**: 支持通过 MCP (Model Context Protocol) 接入外部工具服务器，运行时热重载
+- **Runtime Harness**: 高风险工具审批/拒绝、命令回退策略、隐私友好审计
 - **模型预热**: 启动时自动预热 LLM 模型，提高首次响应速度
-- **命令响应回传**: Agent 执行命令后自动回传 commandResponse，工具调用更流畅
-- **MCP 扩展**: 支持通过 MCP (Model Context Protocol) 接入外部工具服务器，动态扩展 Agent 能力
-- **AI 聊天广播控制**: 支持将 AI 回复从私聊切换为全服广播，或指定特定玩家广播
+- **对话管理**: 多对话新建/切换/保存/恢复，上下文开关，历史自动压缩
+- **动态系统提示词**: 根据玩家信息与模板动态调整
 
 ### 🔌 多 LLM 支持
-- **DeepSeek**: deepseek-reasoner (支持思维链)
-- **OpenAI**: GPT-5 等模型
-- **Anthropic**: Claude Sonnet 4.5
-- **Ollama**: 本地模型支持
+- **DeepSeek**: `deepseek-chat`（默认）
+- **OpenAI**: `gpt-4o` 等模型
+- **Anthropic**: `claude-sonnet-4-20250514`
+- **Ollama**: 本地模型（如 `llama3`）
 
 ### 🎮 用户友好
-- **非阻塞通信**: LLM 请求不影响 MC 连接
-- **实时切换模型**: 游戏内动态切换 LLM
-- **上下文管理**: 灵活的对话历史控制
-- **多人会话隔离**: 同一 `/wsserver` 连接下按玩家隔离历史、上下文、模型、模板和变量，避免多人串扰
+- **多人会话隔离**: 同一 `/wsserver` 连接下按玩家隔离历史、上下文、模型、模板和变量，避免串扰
+- **实时切换模型**: 游戏内 `切换模型` 命令动态切换 LLM
+- **AI 聊天广播**: 私聊回复可切换为全服广播或指定玩家广播
 - **JWT 认证**: 安全的令牌认证机制
-- **ScriptEvent 支持**: 支持发送 scriptevent，方便后续对接SAPI
+- **ScriptEvent 支持**: 支持 scriptevent 发送方式
+- **Addon UI 面板**: 游戏内聊天面板（命令方块触发）
 
 ## 项目结构
 
 ```
 MCBE-AI-Agent/
-├── config/                 # 配置管理
-│   ├── settings.py        # Pydantic Settings
-│   └── logging.py         # 日志配置
-├── models/                # 数据模型
-│   ├── messages.py        # WebSocket 消息
-│   ├── minecraft.py       # MC 协议模型
-│   └── agent.py           # Agent 相关模型
-├── core/                  # 核心模块
-│   ├── queue.py           # 消息队列 (MessageBroker)
-│   ├── events.py          # 事件系统
-│   └── exceptions.py      # 自定义异常
-├── services/              # 服务层
-│   ├── agent/            # AI Agent 服务
-│   │   ├── core.py       # PydanticAI Agent
-│   │   ├── providers.py  # LLM Provider 注册表
-│   │   ├── worker.py     # Agent Worker
-│   │   ├── tools.py      # Agent 工具定义
-│   │   └── mcwiki.py     # MCWiki 搜索工具
-│   ├── websocket/        # WebSocket 服务
-│   │   ├── server.py     # WS 服务器
-│   │   ├── connection.py # 连接管理
-│   │   └── minecraft.py  # MC 协议处理
-│   └── auth/             # 认证服务
-│       └── jwt_handler.py
-├── storage/               # 存储层 (TODO)
-├── tests/                 # 测试用例
-├── docs/                  # 文档
-├── data/                  # 数据文件
-├── cli.py                 # 应用入口与 CLI 工具
-└── pyproject.toml        # 项目配置
+├── cli.py                  # 应用入口与 CLI 工具（serve/init/info/trace/runtime-harness 等）
+├── config/                 # Pydantic Settings、日志、脱敏
+├── core/                   # MessageBroker 队列、会话、对话压缩/存储
+├── models/                 # 常量与 Pydantic 模型
+├── services/
+│   ├── agent/             # PydanticAI Agent、Worker、Tools、Provider 注册表、Runtime Harness、Trace
+│   ├── gateway/           # SDK 适配层：HostGatewayServer、Hook、命令、出站桥
+│   ├── auth/              # 认证服务
+│   └── addon/             # Addon 相关
+├── web/trace/              # Agent Trace 静态审计工作台（由 trace serve 托管）
+├── MCBE-AI-Agent-addon/    # Minecraft 行为包 + 资源包工程
+├── tests/                  # 测试用例
+├── docs/                   # 协议、部署、开发文档
+├── data/                   # 对话历史、token 统计等运行数据
+├── _version.py             # 版本唯一真源
+└── config.example.json     # 配置模板
 ```
-
-## 架构设计
-
-### 消息流转
-
-```
-┌─────────────┐          ┌──────────────┐         ┌─────────────┐
-│  Minecraft  │          │   Message    │         │   Agent     │
-│   Client    │◀────────▶│   Broker     │◀───────▶│   Worker    │
-│             │          │              │         │             │
-│ WebSocket   │          │  Request Q   │         │ PydanticAI  │
-│  Handler    │          │ Response Q   │         │   Stream    │
-└─────────────┘          └──────────────┘         └─────────────┘
-     │                         │                         │
-     │  非阻塞提交请求           │                         │
-     ├────────────────────────▶│                         │
-     │                         │   Worker 消费请求        │ 
-     │                         ├────────────────────────▶│
-     │                         │                         │
-     │                         │  ◀───── 流式响应 ─────── │
-     │  ◀────── 响应队列 ────── │                         │
-     │  独立发送协程             │                         │
-     └────────────────────────▶MC (tellraw)
-```
-
-### 核心优势
-
-1. **非阻塞设计**
-   - WebSocket Handler 提交请求后立即返回
-   - 独立的响应发送协程处理 LLM 输出
-   - MC 客户端 ping/pong 不受 LLM 延迟影响
-
-2. **类型安全**
-   ```python
-   class ChatRequest(BaseMessage):
-       type: Literal["chat"] = "chat"
-       content: str
-       player_name: str | None = None
-       use_context: bool = True
-   ```
-
-3. **多人会话隔离**
-   - MCBE 单个 `/wsserver` 连接可承载多个玩家
-   - 对话历史、会话锁按 `(connection_id, player_name, conversation_id)` 分桶；上下文开关、当前模型、模板和自定义变量按 `(connection_id, player_name)` 分桶
-   - `ConnectionState.player_name` 仅表示最近发言者，处理聊天、UI、上下文、设置和切换模型时必须使用本次事件的 `sender`
-   - 同一玩家请求串行处理，不同玩家可并行处理，避免上下文串扰和 UI 响应推给错人
-
-4. **依赖注入**
-   ```python
-   @dataclass
-   class AgentDependencies:
-       connection_id: UUID
-       player_name: str
-       settings: Settings
-       http_client: httpx.AsyncClient
-       send_to_game: Callable
-       run_command: Callable
-   ```
 
 ## 快速开始
 
-### 1. 准备环境 (推荐)
-
-强烈建议在 Python 虚拟环境中运行项目，以避免依赖冲突：
+### 1. 准备环境（推荐虚拟环境）
 
 **Windows:**
 ```powershell
@@ -148,17 +72,11 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-**Termux (Android):**
-```bash
-pkg install python -y
-python -m venv venv
-source venv/bin/activate
-```
+**Termux (Android):** 见 [docs/termux.md](docs/termux.md)。
 
 ### 2. 安装依赖
 
 ```bash
-cd MCBE-AI-Agent
 pip install -r requirements.txt
 ```
 
@@ -168,10 +86,10 @@ pip install -r requirements.txt
 python cli.py init
 ```
 
-这会创建两个本地配置文件：
+这会创建两个本地配置文件（均不提交到 Git）：
 
-- `.env`：只保存密钥、密码等敏感内容，不提交到 Git。
-- `config.json`：保存普通应用配置，不提交到 Git；模板来自 `config.example.json`。
+- `.env`：只保存密钥、密码等敏感内容。
+- `config.json`：普通应用配置，模板来自 `config.example.json`。
 
 先编辑 `.env` 填入密钥：
 
@@ -217,310 +135,22 @@ python cli.py serve
 
 ### 开发模式
 
-开发模式适用于本地开发和调试，启用后会跳过身份验证步骤。
-
-**启用方式：**
-
-方式一：命令行参数
-```bash
-python cli.py serve --dev
-```
-
-方式二：配置文件
-```json
-{
-  "dev_mode": true
-}
-```
-
-**开发模式特性：**
-- 跳过 WebSocket 连接的身份验证
-- 连接时自动认证，无需执行 `#登录` 命令
-- 启动时显示明确的警告信息
-- 日志中标记 `dev_mode=true`
-
-**⚠️ 安全警告：**
-- 开发模式**仅用于本地开发和调试**
-- **切勿在生产环境中启用**，否则任何人都可以连接服务器
-- 启用时会在控制台和日志中显示警告信息
-
-## Runtime Harness 审计工具
-
-Runtime Harness 会在 Agent 工具调用时写入隐私友好的 JSONL 摘要，用于定位重复失败、高风险工具调用和高耗时工具，并通过 CLI 生成反馈建议。
-
-### 配置审计
-
-审计配置位于 `config.json` 的 `agent.runtime_harness` 下，默认随 `config.example.json` 启用：
-
-```json
-{
-  "agent": {
-    "runtime_harness": {
-      "enabled": true,
-      "audit_enabled": true,
-      "audit_path": "logs/runtime_harness_tools.jsonl",
-      "audit_max_records": 5000
-    }
-  }
-}
-```
-
-- `enabled`：运行时 Harness 总开关；关闭后提示词、schema 增强和审计都会停止。
-- `audit_enabled`：只控制工具审计写入。
-- `audit_path`：JSONL 审计文件路径。
-- `audit_max_records`：保留最近 N 条记录，超出后自动轮转。
-
-### 查看审计文件
-
-每行是一条工具调用摘要，包含工具名、用途、风险等级、调用状态、耗时、有限会话标识、参数预览和结果摘要。审计不会记录玩家原始消息，也不会记录完整工具返回内容；参数只按工具目录声明的白名单预览，敏感字段会被脱敏。
-
-```bash
-tail -n 20 logs/runtime_harness_tools.jsonl
-```
-
-### 分析审计记录
-
-输出文本报告：
-
-```bash
-python cli.py runtime-harness analyze
-```
-
-常用选项：
-
-```bash
-python cli.py runtime-harness analyze --recent 200
-python cli.py runtime-harness analyze --json
-python cli.py runtime-harness analyze --no-llm
-```
-
-- `--recent N`：分析最近 N 条审计记录；默认使用 `audit_max_records`。
-- `--json`：输出机器可读 JSON，便于脚本或 CI 收集。
-- `--no-llm`：跳过默认 Provider 的 LLM 建议，只输出规则聚合建议。
-
-默认模式会使用当前 `providers.default` 对聚合统计生成 2-4 条中文改进建议。发送给 LLM 的内容只包含总量、失败率、平均耗时、风险分布、重点问题工具和规则建议；如果默认 Provider 不可用，CLI 会保留规则建议并显示回退原因。
-
-## Agent Trace 审计
-
-完整 Agent 运行追踪写入独立的 append-only JSONL journal（默认 `logs/agent_traces.jsonl`），与 Runtime Harness 工具摘要审计分离。
-
-### 启用
-
-在 `config.json` 的 `agent` 下配置：
-
-```json
-{
-  "agent": {
-    "agent_trace_enabled": true,
-    "agent_trace_include_content": false,
-    "agent_trace_path": "logs/agent_traces.jsonl",
-    "agent_trace_max_records": 10000,
-    "agent_trace_api_host": "127.0.0.1",
-    "agent_trace_api_port": 8787
-  }
-}
-```
-
-- `agent_trace_enabled`：是否记录 trace 事件（默认 `false`）。
-- `agent_trace_include_content`：是否持久化完整正文（默认 `false`，仅在 trace 开启时生效）；完整内容为 opt-in。
-- `agent_trace_path`：journal 路径。
-- `agent_trace_api_host` / `agent_trace_api_port`：本地只读 API 默认绑定。
-
-### 本地查询与只读 API
-
-```bash
-python cli.py trace serve
-# open http://127.0.0.1:8787
-python cli.py trace list --recent 20
-python cli.py trace list --status failed --player alex
-python cli.py trace show <trace_id>
-python cli.py trace show <trace_id> --json
-python cli.py trace health
-```
-
-- API 为**本地只读**（GET），不修改 journal。
-- 完整正文仅在 `agent_trace_include_content=true` 时写入；默认只有元数据与摘要字段。
-- WebSocket 原始报文日志（`enable_ws_raw_log`）与本 journal **相互独立**，不会互相替代。
-- 静态审计工作台：`web/trace/`（无构建步骤，由 `trace serve` 按仓库根路径托管，不依赖进程 CWD）。
-- journal 轮转会重写文件以保留最近 N 条记录（`agent_trace_max_records`），按设计面向本地/开发体量，不适合超大生产写入。
-- 离线验收夹具矩阵见 `tests/test_trace_integration.py`（no-tool / single-tool / approval / deny / failure / cancel / multiplayer / privacy）。
-
-## Addon Bridge 桥接
-
-当前仓库已经接入一条可用的 Python <-> Addon <-> 游戏桥接链路，用于让 Agent 通过 Addon 获取更稳定的游戏内上下文，如玩家背包，实体信息等。打包好的 Addon 可在[release](https://github.com/rice-awa/MCBE-AI-Agent/release)获取
-
-### Python 服务启动
+开发模式适用于本地开发和调试，启用后跳过身份验证。
 
 ```bash
 python cli.py serve --dev
 ```
 
-如需验证配置是否已生效，可先执行：
+或在 `config.json` 中设置 `"dev_mode": true`。
 
-```bash
-python cli.py info
-```
-
-### Addon 安装、构建与部署
-
-Addon 工程位于 `MCBE-AI-Agent-addon/`，本地调试前至少执行一次依赖安装、测试、构建和本地部署。
-
-```bash
-cd MCBE-AI-Agent-addon
-npm install
-npm test
-npm run build
-npm run local-deploy
-```
-
-说明：
-- `npm install`：安装 `@minecraft/server`、`@minecraft/server-ui` 与构建依赖。
-- `npm test`：运行桥接协议、路由与 UI 状态容器相关测试。
-- `npm run build`：构建行为包脚本。
-- `npm run local-deploy`：将本地构建结果部署到 Minecraft 本地开发目录。
-
-### 调试步骤
-
-1. 启动 Python 服务：`python cli.py serve --dev`。
-2. 在 `MCBE-AI-Agent-addon/` 下执行 `npm run local-deploy`，确保最新脚本已部署。
-3. 进入启用了对应开发包的世界，等待 Addon 初始化。
-4. 在游戏内确认模拟玩家 `MCBEAI_TOOL` 已生成。
-5. 使用 `/wsserver <服务器IP>:8080` 连接 Python 服务；开发模式下会自动跳过 `#登录`。
-6. 执行一次正常聊天命令，例如 `AGENT 聊天 读取一下我当前附近的实体`，观察 Python 日志与游戏内行为。
-7. 手持原版命令方块 `minecraft:command_block` 并使用，确认游戏内聊天面板可以打开。
-8. 在面板中发送一条消息，确认本地历史、统计信息和设置保存行为正常；如果 Python 未收到 UI 消息，请按面板提示在聊天框手动发送等价的 `AGENT 聊天 <消息>`。
-
-### 如何验证桥接链路
-
-当前桥接方向是 `Python -> scriptevent -> Addon -> 模拟玩家聊天分片 -> Python`。建议按下面的方式确认链路完整：
-
-1. 先确认 `MCBEAI_TOOL` 存在。
-2. 触发一个会调用 Addon 能力的 Agent 请求，例如：
-
-```text
-AGENT 聊天 请读取我的玩家状态并告诉我当前位置
-```
-
-3. Python 侧应向游戏发送 `scriptevent mcbews:bridge_req <json>`。
-4. Addon 侧处理后，会驱动 `MCBEAI_TOOL` 以聊天分片形式回传 `MCBEAI|RESP|...`。
-5. Python 侧会在 WebSocket `PlayerMessage` 事件流中拦截这些分片并完成重组，最终把工具结果继续交给 Agent。
-
-如果第 3 步已发出但最终超时，通常表示：
-- Addon 未正确部署或世界未启用最新行为包。
-- `MCBEAI_TOOL` 未生成或被移除。
-- 聊天分片没有成功回到 Python 所连接的 WebSocket 事件流。
-
-### 当前桥接能力
-
-- `get_player_snapshot`：获取目标玩家基础快照，包括位置、维度、朝向和基础状态。
-- `get_look_block`：获取目标玩家视线射线命中的方块（`getBlockFromViewDirection`），默认当前对话玩家。
-- `get_inventory_snapshot`：获取目标玩家背包槽位与物品快照。
-- `find_entities`：按类型、名称、标签、距离等条件查找实体。
-- `run_world_command`：由 Addon 在世界侧执行命令并返回结果。
-
-### 聊天命令与 UI 共存说明
-
-当前 UI 实现为第一阶段游戏内聊天面板，不替代现有聊天命令入口。也就是说：
-- 现有 `AGENT 聊天`、`AGENT 上下文`、`切换模型`、`运行命令` 等聊天命令仍然是主入口。
-- 面板入口绑定为使用原版命令方块物品 `minecraft:command_block`，避免抢占聊天监听。
-- 面板支持发送消息、本地聊天记录、设置保存和统计信息；发送消息会记录本地历史，并提示等价的 `AGENT 聊天 <消息>`。
-- 当前本地 `@minecraft/server-ui` 类型只暴露 `ActionFormData` / `ModalFormData`，暂不能直接使用官方 DDUI `CustomForm` / `Observable`。
-- 后续如果类型和运行时支持真正 DDUI，可在 Addon 的表单适配层中替换实现，而不重写业务状态。
-
-### 当前限制
-
-- Addon -> Python 的响应回传依赖模拟玩家 `MCBEAI_TOOL` 发送聊天分片，不是独立的回传通道。
-- Python 侧通过 WebSocket `PlayerMessage` 事件流拦截桥接分片，因此桥接能力依赖聊天事件正常上送。
-- `run_world_command` 在当前本地依赖版本下基于同步 `runCommand` 实现，不是异步命令管线。
-- 第一阶段 UI 不新增 Addon -> Python 专用上行协议，也不伪造真实玩家聊天事件；如果 UI 消息没有进入 Python，请按面板提示手动发送等价聊天命令。
-- 响应同步尚未启用，统计中的响应片段数会保持为 0；后续可通过 `scriptevent mcbews:text_resp <json>` 接入 Python -> Addon UI 同步。
-
-## Termux 部署指南
-
-### 1. 准备工作
-
-在 Termux 中安装必要的包：
-
-```bash
-# 更换清华源（可选）
-termux-change-repo
-
-# 更新包管理器
-pkg update && pkg upgrade -y
-
-# 安装基础工具
-pkg install python git wget curl -y
-
-```
-
-### 2. 获取项目
-
-```bash
-# 克隆项目(如无法使用git克隆可直接下载压缩包到本地，解压使用)
-git clone https://github.com/rice-awa/MCBE-AI-Agent
-cd MCBE-AI-Agent
-
-# 创建虚拟环境
-python -m venv venv
-source venv/bin/activate
-```
-
-### 3. 安装依赖
-
-```bash
-# 安装项目依赖
-pip install -r requirements.txt
-```
-
-### 4. Termux 特定配置
-
-由于 Termux 的特殊环境，可能需要调整一些配置：
-
-```json
-// 1. 确保 config.json 中主机设置为 0.0.0.0 而不是 localhost
-{
-  "server": {
-    "host": "0.0.0.0",
-    "port": 8080
-  }
-}
-```
-
-```bash
-# 2. 获取 Termux 的 IP 地址
-ifconfig | grep inet
-
-# 3. 确保 Termux 可以监听端口
-# 可能需要允许 Termux 的网络访问权限
-```
-
-### 5. 启动服务
-
-```bash
-# 启动服务器
-python cli.py serve
-
-# 或使用守护进程方式（使用 tmux 或 screen）
-pkg install tmux -y
-tmux new -s mcbe_agent
-source venv/bin/activate
-python cli.py serve
-# 按 Ctrl+B 然后按 D 分离会话
-```
-
-### 6. Minecraft 连接
-
-在 MCBE 中使用 Termux 的 IP 地址或本地回环地址：
-
-```
-/wsserver localhost:8080
-```
+**⚠️ 安全警告**: 开发模式**仅用于本地开发和调试**，**切勿在生产环境启用**——启用时任何人连接服务器都会自动通过认证。
 
 ## 游戏内使用
 
 ### 1. 连接服务器
 
 在 Minecraft 聊天框输入：
+
 ```
 /wsserver <服务器IP>:8080
 ```
@@ -537,7 +167,30 @@ python cli.py serve
 AGENT 聊天 你好，请介绍一下自己
 ```
 
-### 4. 其他命令
+### 4. 命令大全
+
+所有命令均可通过游戏内 `帮助` 查看。命令前缀与别名定义见 `config.example.json` 的 `minecraft.commands`：
+
+| 命令 | 说明 | 用法 |
+|------|------|------|
+| `#登录 <密码>` | 用户认证 | `<密码>` |
+| `AGENT 聊天 <内容>` | 与 AI 对话 | `<内容>` |
+| `AGENT 脚本 <内容>` | 使用 ScriptEvent 发送 | `<内容>` |
+| `AGENT 保存` | 保存当前对话历史 | - |
+| `AGENT 对话 <子命令>` | 管理对话 | `<new/switch/clear/status/list/save/restore>` |
+| `AGENT 连续模式 <开启/关闭/状态>` | 无需前缀自动触发 AI 聊天 | `<开启\|关闭\|状态>` |
+| `AGENT 上下文 <启用/关闭/状态>` | 管理上下文开关 | `<启用\|关闭\|状态>` |
+| `AGENT 模板 <模板名/list>` | 切换提示词模板 | `<模板名/list>` |
+| `AGENT 设置 <子命令>` | 变量 / 别名管理 | `<变量/别名> <子命令>` |
+| `AGENT MCP <list/status/reload>` | MCP 服务器管理 | `<list/status/reload>` |
+| `AGENT 广播 <子命令>` | AI 聊天广播策略管理 | `<状态\|关闭\|全服 开启\|关闭\|玩家 <名> 开启\|关闭>` |
+| `AGENT 同意 [id\|对话\|永远]` | 同意待审批高风险工具 | `[approval_id\|对话\|永远]` |
+| `AGENT 拒绝 [id\|对话\|永远]` | 拒绝待审批高风险工具 | `[approval_id\|对话\|永远]` |
+| `运行命令 <MC命令>` | 执行 Minecraft 命令 | `<命令>` |
+| `切换模型 <provider>` | 切换 LLM 提供商 | `<provider>` |
+| `帮助` | 显示帮助信息 | - |
+
+命令示例：
 
 ```
 AGENT 对话 new 建筑规划     # 新建并切换到一个对话
@@ -545,127 +198,52 @@ AGENT 对话 switch default  # 切换到指定对话
 AGENT 对话 clear           # 清除当前对话历史
 AGENT 对话 list            # 查看当前连接内的对话
 AGENT 上下文 启用          # 启用携带当前对话历史
-AGENT 上下文 关闭          # 关闭携带历史但不清除对话
-AGENT 上下文 状态          # 查看上下文开关与当前对话状态
-AGENT 广播 状态           # 查看 AI 聊天广播策略（默认全服开启，见 config minecraft.ai_broadcast_default）
-AGENT 广播 全服 关闭      # 关闭 AI 全服广播
-AGENT 广播 全服 开启      # 开启 AI 全服广播
-AGENT 广播 玩家 <名> 开启 # 指定玩家开启广播
-AGENT 广播 关闭           # 关闭全服并清空指定玩家名单
-切换模型 openai          # 切换到 OpenAI
-切换模型 deepseek        # 切换回 DeepSeek
-帮助                     # 显示帮助信息
-运行命令 time set day    # 执行游戏命令
+AGENT 广播 全服 开启       # 开启 AI 全服广播
+AGENT 广播 玩家 <名> 开启  # 指定玩家开启广播
+切换模型 openai            # 切换到 OpenAI
+运行命令 time set day      # 执行游戏命令
 ```
 
 ### 多人会话说明
 
-MCBE 世界通常只会通过 `/wsserver` 建立一条 WebSocket 连接，所有玩家的聊天框命令和 Addon UI 消息都会复用这条连接。后端不会再把 `connection_id` 视为单个玩家会话，而是使用 `(connection_id, player_name)` 区分真实玩家会话，并在玩家内使用 `conversation_id` 区分不同对话。
+MCBE 世界通常只通过 `/wsserver` 建立一条 WebSocket 连接，所有玩家的聊天框命令和 Addon UI 消息复用这条连接。后端以 `(connection_id, player_name)` 区分真实玩家会话，并在玩家内用 `conversation_id` 区分不同对话：
 
 - 玩家 A 和玩家 B 的对话历史互不读取；同一玩家的不同对话也互不读取。
-- `AGENT 对话` 负责新建、切换、清除、保存和恢复对话。
-- `AGENT 上下文` 只负责是否在请求中携带当前对话历史，不再清除或保存对话。
+- `AGENT 对话` 负责新建、切换、清除、保存和恢复对话；`AGENT 上下文` 只控制是否携带历史。
 - `切换模型`、模板和变量设置只影响发起命令的玩家。
-- Agent Worker 对同一玩家保持串行处理，但不同玩家请求可以并发执行。
-- UI 响应同步使用当前消息的真实 `player_name`，避免响应写入其他玩家面板。
-- 连接断开或注销时会清理该连接下所有玩家会话。
+- Agent Worker 对同一玩家串行处理，不同玩家请求可并发执行。
+- UI 响应同步使用当前消息的真实 `player_name`，避免写入其他玩家面板。
 
-详细根因分析与修复记录见 `claude_md/report/MULTIPLAYER_BUG_REPORT.md` 和 `claude_md/fix/MULTIPLAYER_SESSION_FIX.md`。
-
-## Termux 常见问题
-
-### 1. 端口无法访问
-
-**解决方案**:
-```bash
-# 检查 Termux 是否具有必要权限
-termux-setup-storage
-
-# 使用 ngrok 绕过防火墙
-ngrok http 8080
-```
-
-### 2. Python 包安装失败
-**解决方案**:
-```bash
-# 更新 pip 和 setuptools
-pip install --upgrade pip setuptools wheel
-
-# 使用清华源加速
-pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
-```
-
-### 3. 内存不足
-
-**解决方案**:
-```json
-// config.json
-{
-  "queue": {
-    "llm_worker_count": 1
-  }
-}
-```
-
-```bash
-# 优化虚拟内存
-pkg install tur-repo -y
-pkg install zram -y
-```
-
-### 4. 后台运行
-
-**使用 tmux**:
-```bash
-# 安装 tmux
-pkg install tmux -y
-
-# 创建新会话
-tmux new -s mcbe_agent
-
-# 在会话中启动
-cd ~/MCBE-AI-Agent
-source venv/bin/activate
-python cli.py serve
-
-# 分离会话: Ctrl+B, 然后按 D
-# 重新连接: tmux attach -t mcbe_agent
-```
-
-**使用 nohup**:
-```bash
-nohup python cli.py serve > mcbe.log 2>&1 &
-```
-
-## 配置说明
+## 配置
 
 ### `config.json` 普通配置
 
-普通应用配置写入 `config.json`，敏感内容只保留在 `.env`。常用配置路径如下：
+普通应用配置写入 `config.json`（模板 `config.example.json`）。常用配置路径：
 
 | 配置路径 | 说明 | 默认值 |
 |--------|------|--------|
-| `server.host` | 服务器地址 | `0.0.0.0` |
-| `server.port` | 服务器端口 | `8080` |
+| `server.host` / `server.port` | 服务器地址 / 端口 | `0.0.0.0` / `8080` |
+| `auth.*` | JWT 密钥、过期时间、默认密码 | - |
 | `providers.default` | 默认 LLM | `deepseek` |
-| `providers.<name>.model` | Provider 使用的模型 | 取决于 provider |
-| `providers.<name>.base_url` | Provider API 地址 | 取决于 provider |
-| `providers.<name>.api_key` | API Key 引用，通常写 `${DEEPSEEK_API_KEY}` 等 | - |
-| `queue.llm_worker_count` | Agent Worker 数量 | `2` |
-| `queue.max_size` | 请求队列大小 | `100` |
-| `stream_sentence_mode` | true=流式按句输出，false=关闭流式并在完成后按句子分批输出 | `true` |
-| `logging.level` | 日志级别 | `INFO` |
-| `logging.enable_ws_raw_log` | WebSocket 原始日志开关 | `true` |
-| `logging.enable_llm_raw_log` | LLM 原始日志开关 | `true` |
-| `mcp.enabled` | MCP 功能总开关 | `false` |
-| `mcp.servers` | MCP 服务器配置（支持官方 / 简写格式） | `{}` |
+| `providers.<name>.model` / `.base_url` / `.api_key` | Provider 配置；api_key 通常写 `${DEEPSEEK_API_KEY}` 等 | 取决于 provider |
+| `agent.system_prompt` | 系统提示词 | 见 `config.example.json` |
+| `agent.runtime_harness.*` | 高风险工具审批/拒绝与审计 | 默认启用 |
+| `agent.agent_trace_*` | Agent Trace journal 与只读 API | 默认关闭 |
+| `queue.llm_worker_count` / `queue.max_size` | Worker 数 / 队列大小 | `2` / `100` |
+| `minecraft.commands` | 游戏内命令定义（前缀/类型/别名/用法） | 见 `config.example.json` |
+| `minecraft.ai_broadcast_default` | 新连接默认 AI 全服广播 | `true` |
+| `mcp.enabled` / `mcp.servers` | MCP 功能开关与服务器配置 | `false` / `{}` |
+| `flow_control.*` | 出站长文本分片流控（tellraw/scriptevent/text_resp） | 见 `config.example.json` |
+| `addon.protocol.*` | 桥协议文档镜像（运行时强制 mcbews v1） | - |
+| `logging.*` | 日志级别、文件、原始日志开关 | `INFO`；raw log 默认 `false` |
+| `storage.*` | 对话历史与 token 统计路径 | `data/` 下 |
 | `dev_mode` | 开发模式（跳过身份验证） | `false` |
 
-`.env` 仅用于敏感变量，例如 `SECRET_KEY`、`WEBSOCKET_PASSWORD`、`DEEPSEEK_API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`。
+### `.env` 敏感配置
 
-### Settings 配置
+仅保留敏感变量：`SECRET_KEY`、`WEBSOCKET_PASSWORD`、`DEEPSEEK_API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`。不要提交 `.env` 到版本控制。
 
-在代码中可以通过 `Settings` 类访问所有配置：
+### 代码中访问配置
 
 ```python
 from config import get_settings
@@ -675,243 +253,96 @@ print(settings.default_provider)
 print(settings.list_available_providers())
 ```
 
-## 架构亮点
-
-### 1. MessageBroker - 消息队列
-
-```python
-class MessageBroker:
-    """消息代理 - WS 和 Agent 解耦的核心"""
-
-    async def submit_request(self, connection_id, payload, priority=0):
-        """非阻塞提交请求"""
-
-    async def send_response(self, connection_id, response):
-        """发送响应到指定连接"""
-```
-
-**关键特性**:
-- 优先级队列支持紧急请求
-- 每连接独立响应队列
-- 对话历史和会话锁按 `(connection_id, player_name)` 隔离
-- 注销连接时清理该连接下全部玩家会话
-- 支持多 Worker 并发消费
-
-### 2. ProviderRegistry - LLM 抽象
-
-```python
-class ProviderRegistry:
-    @classmethod
-    def get_model(cls, config: LLMProviderConfig) -> Model:
-        """统一的 LLM 创建接口"""
-```
-
-**支持的提供商**:
-- DeepSeek (OpenAI-compatible)
-- OpenAI
-- Anthropic (Claude)
-- Ollama (本地模型)
-
-### 3. ConnectionManager - 连接管理
-
-```python
-class ConnectionState:
-    def get_player_session(self, player_name: str | None) -> PlayerSession:
-        """获取指定玩家在当前连接下的独立会话状态"""
-
-class ConnectionManager:
-    async def _response_sender(self, state: ConnectionState):
-        """独立的响应发送协程 - 不阻塞主循环"""
-```
-
-**设计优势**:
-- 每个连接独立的发送协程
-- 每名玩家独立保存上下文开关、当前模型、模板、变量和当前活动对话
-- `state.player_name` 仅作为最近发言者指针，不能作为多人会话身份来源
-- 超时机制避免永久阻塞
-- 优雅的错误处理
-
-### 4. PydanticAI Agent
-
-```python
-@chat_agent.tool
-async def run_minecraft_command(ctx: RunContext, command: str) -> str:
-    """Agent 可以执行 MC 命令"""
-    await ctx.deps.run_command(command)
-    return f"已执行命令: /{command}"
-```
-
-**Agent 能力**:
-- 类型安全的工具定义 (独立 `tools.py` 模块)
-- 动态系统提示词
-- 流式响应支持 (按完整句子发送)
-- 依赖注入
-- MCWiki 搜索工具集成
-
-## 性能优化
-
-### 非阻塞架构
-
-**旧架构问题**:
-```python
-# 阻塞式 - LLM 请求阻塞 WS 消息处理
-async for chunk in conversation.call_gpt(prompt):
-    await websocket.send(chunk)  # WS 被阻塞
-```
-
-**新架构解决方案**:
-```python
-# 非阻塞 - 提交后立即返回
-await broker.submit_request(connection_id, chat_req)
-
-# 独立协程处理响应
-async def _response_sender():
-    while True:
-        response = await queue.get()
-        await websocket.send(response)
-```
-
-### Worker 池
-
-- 多个 Agent Worker 并发处理请求
-- 可通过 `config.json` 的 `queue.llm_worker_count` 配置 Worker 数量
-- 自动负载均衡
-
-## 与旧版对比
-
-| 特性 | 旧版本 | v2.0 |
-|------|--------|------|
-| 架构 | 同步阻塞 | 异步非阻塞 |
-| LLM 支持 | 单一 (硬编码) | 多提供商 (可扩展) |
-| 类型安全 | 字典 | Pydantic 模型 |
-| 消息队列 | 无 | MessageBroker |
-| Agent 框架 | 自定义 | PydanticAI |
-| 配置管理 | JSON 配置 + Pydantic Settings | Pydantic Settings |
-| 日志系统 | print/基础 logging | structlog |
-| 代码组织 | 单文件 | 模块化分层 |
-
-## Termux 优化建议
-
-### 1. 网络配置
+## CLI 工具
 
 ```bash
-# 使用 zerotier 创建虚拟局域网
-pkg install zerotier-one -y
-zerotier-one -d
-zerotier-cli join <network_id>
-
-# 或使用 tailscale
-pkg install tailscale -y
-tailscale up
+python cli.py init                 # 初始化配置
+python cli.py info                 # 查看配置信息
+python cli.py test-provider <name> # 测试 LLM 连接
+python cli.py serve                # 启动服务器（--dev 开发模式）
 ```
 
-### 2. 性能优化
+### Runtime Harness 审计
+
+Runtime Harness 在 Agent 工具调用时写入隐私友好的 JSONL 摘要（默认 `logs/runtime_harness_tools.jsonl`），用于定位重复失败、高风险工具调用和高耗时工具：
 
 ```bash
-# 安装性能监控工具
-pkg install htop proot-distro -y
-
-# 使用轻量级系统
-proot-distro install ubuntu
-proot-distro login ubuntu
+tail -n 20 logs/runtime_harness_tools.jsonl   # 查看审计文件
+python cli.py runtime-harness analyze         # 输出文本报告
+python cli.py runtime-harness analyze --recent 200
+python cli.py runtime-harness analyze --json
+python cli.py runtime-harness analyze --no-llm
 ```
 
-### 3. 存储优化
+- 审计不记录玩家原始消息与完整工具返回；参数按工具目录白名单预览，敏感字段脱敏。
+- 默认模式使用 `providers.default` 生成 2-4 条中文改进建议；Provider 不可用时保留规则建议并回退。
 
-```bash
-# 清理缓存
-pkg clean
-pip cache purge
+### Agent Trace
 
-# 使用外部存储
-termux-setup-storage
-ln -s /storage/emulated/0/Download/mcbe_data ./data
-```
+完整 Agent 运行追踪写入独立的 append-only JSONL journal（默认 `logs/agent_traces.jsonl`），与 Runtime Harness 审计分离。在 `config.json` 的 `agent.agent_trace_*` 下启用：
 
-### 4. 自动化脚本
-
-创建 `termux_start.sh`:
-```bash
-#!/data/data/com.termux/files/usr/bin/bash
-
-# 激活虚拟环境
-source ~/MCBE-AI-Agent/venv/bin/activate
-
-# 启动服务
-cd ~/MCBE-AI-Agent
-python cli.py serve
-
-# 设置可执行权限
-chmod +x termux_start.sh
-```
-
-## 开发指南
-
-### 添加新的 LLM Provider
-
-1. 在 `providers.py` 添加创建方法：
-
-```python
-@classmethod
-def _create_custom_model(cls, config: LLMProviderConfig) -> Model:
-    from custom_provider import CustomModel
-    return CustomModel(config.model, api_key=config.api_key)
-```
-
-2. 在 `get_model` 中注册：
-
-```python
-elif provider_name == "custom":
-    return cls._create_custom_model(config)
-```
-
-### 添加新的 Agent Tool
-
-在 `services/agent/tools.py` 中添加：
-
-```python
-async def your_tool(ctx: RunContext[AgentDependencies], param: str) -> str:
-    """工具描述"""
-    # 实现逻辑
-    return "结果"
-```
-
-然后在 `services/agent/core.py` 中注册：
-
-```python
-from .tools import your_tool
-
-chat_agent.tool(your_tool)
-```
-
-### 自定义命令
-
-在 `config.json` 的 `minecraft.commands`（及默认命令配置）中添加：
-
-```python
-COMMANDS = {
-    "自定义命令": "custom_cmd",
+```json
+{
+  "agent": {
+    "agent_trace_enabled": true,
+    "agent_trace_include_content": false,
+    "agent_trace_path": "logs/agent_traces.jsonl",
+    "agent_trace_max_records": 10000,
+    "agent_trace_api_host": "127.0.0.1",
+    "agent_trace_api_port": 8787
+  }
 }
 ```
 
-然后在 `server.py` 中实现处理器：
-
-```python
-async def handle_command(self, state, cmd_type, content):
-    if cmd_type == "custom_cmd":
-        await self.handle_custom(state, content)
+```bash
+python cli.py trace serve        # 启动本地只读 API + 静态工作台，open http://127.0.0.1:8787
+python cli.py trace list --recent 20
+python cli.py trace list --status failed --player alex
+python cli.py trace show <trace_id> [--json]
+python cli.py trace health
 ```
+
+- API 为**本地只读**（GET），不修改 journal；完整正文仅在 `agent_trace_include_content=true` 时持久化（opt-in）。
+- 静态审计工作台位于 `web/trace/`，无构建步骤。
+- journal 轮转会保留最近 N 条记录，面向本地/开发体量。
+
+## Addon Bridge
+
+仓库内置一条 Python ↔ Addon ↔ 游戏桥接链路，让 Agent 通过 Addon 获取稳定的游戏内上下文（玩家快照、背包、实体、方块操作等）。线协议为 **mcbews v1**（`mcbews:bridge_req` / `mcbews:text_resp` / `MCBEWS|*`），由 `mcbe-ws-sdk` 拥有；完整协议、构建与调试步骤见 [docs/addon-bridge-protocol.md](docs/addon-bridge-protocol.md)。
+
+快速上手：
+
+```bash
+python cli.py serve --dev        # 1. 启动 Python 服务（开发模式跳过登录）
+cd MCBE-AI-Agent-addon
+npm install && npm test && npm run build && npm run local-deploy  # 2. 构建并部署 Addon
+```
+
+进入世界后确认模拟玩家 `MCBEWS_BRIDGE` 已生成，`/wsserver <IP>:8080` 连接后即可对话触发 Addon 能力。
+
+## 部署
+
+### Termux（Android）
+
+完整的 Termux 部署指南（依赖安装、特定配置、后台运行、常见问题与优化建议）见 [docs/termux.md](docs/termux.md)。
+
+### 其他平台
+
+项目为纯 Python 服务 + Minecraft Addon，支持 Windows / Linux / macOS。部署三步：
+
+1. 初始化配置：`python cli.py init` 并填写 `.env` / `config.json`
+2. 安装依赖：`pip install -r requirements.txt`
+3. 启动：`python cli.py serve`
+
+生产环境建议使用反向代理 + HTTPS 接入 WebSocket（见下节安全建议）。
 
 ## 故障排查
 
-### 1. Termux 连接失败
+### 1. 连接失败
 
 ```bash
 # 检查端口监听
 netstat -tulpn | grep 8080
-
-# 检查防火墙
-iptables -L
 
 # 测试本地连接
 curl http://localhost:8080/health
@@ -919,28 +350,17 @@ curl http://localhost:8080/health
 
 ### 2. LLM 请求失败
 
-测试提供商连接：
 ```bash
-python cli.py test-provider deepseek
+python cli.py test-provider deepseek   # 测试提供商连接
+tail -f logs/MCBE-AI-Agent.log        # 查看日志
 ```
 
-检查日志：
-```bash
-tail -f logs/MCBE-AI-Agent.log
-```
-
-### 3. 内存问题
-
+### 3. 内存不足
 ```json
-// config.json
 {
   "queue": {
-    "llm_worker_count": 1
-  },
-  "providers": {
-    "deepseek": {
-      "model": "deepseek-chat"
-    }
+    "llm_worker_count": 1,
+    "max_size": 50
   }
 }
 ```
@@ -948,90 +368,38 @@ tail -f logs/MCBE-AI-Agent.log
 ### 4. Python 依赖问题
 
 ```bash
-# 重新安装依赖
-pip uninstall -r requirements.txt -y
-pip install --no-cache-dir -r requirements.txt
-
-# 使用预编译包
-pip install --prefer-binary -r requirements.txt
+pip install --prefer-binary -r requirements.txt   # 使用预编译包
+pip uninstall -r requirements.txt -y && pip install -r requirements.txt  # 重装
 ```
 
-## 扩展性
-
-### 水平扩展
-
-当前架构使用 `asyncio.Queue`，单进程足够。如需分布式：
-
-1. 替换 `MessageBroker` 为 Redis Streams
-2. 实现 Pub/Sub 响应分发
-3. 使用共享存储（Redis/PostgreSQL）
-
-### 添加持久化
-
-在 `storage/` 目录实现：
-- `conversation.py`: 对话历史存储
-- `session.py`: 会话管理
-- `metrics.py`: 使用统计
+更多 Termux 专项排查见 [docs/termux.md](docs/termux.md)。
 
 ## 安全建议
 
-1. **生产环境配置**
-   - 更改 `SECRET_KEY` 为强随机值
-   - 设置复杂的 `WEBSOCKET_PASSWORD`
-   - 使用 HTTPS（通过反向代理）
+1. **生产环境**: 更改 `SECRET_KEY` 为强随机值；设置复杂的 `WEBSOCKET_PASSWORD`；通过反向代理启用 HTTPS。
+2. **API 密钥管理**: 不要提交 `.env` 到版本控制；密钥只写入 `.env`，`config.json` 用 `${VAR}` 引用。
+3. **Runtime Harness**: 高风险命令默认要求玩家审批，`hard_deny_*` 列表内置 `op`/`stop` 等敏感命令根；新增命令工具时接入审批策略，不要绕过。
+4. **开发模式**: 仅本地调试使用，生产环境禁用。
 
-2. **API 密钥管理**
-   - 不要提交 `.env` 到版本控制
-   - 使用密钥管理服务（如 AWS Secrets Manager）
+## 技术栈与致谢
 
-3. **Termux 特定安全**
-   - 定期更新 Termux 包
-   - 使用强密码保护设备
-   - 仅在有需要时开放端口
+- **Python 3.11+** / **PydanticAI** / **Pydantic** / **WebSockets** / **httpx** / **PyJWT** / **structlog** / **Click**
+- **mcbe-ws-sdk**: Minecraft Bedrock WebSocket SDK（mcbews v1 线协议、出站流控与分片）
+- 原项目: [rice-awa/MCBE_WebSocket_gpt](https://github.com/rice-awa/MCBE_WebSocket_gpt)
+- PydanticAI: [pydantic/pydantic-ai](https://github.com/pydantic/pydantic-ai)
+- Termux: [termux/termux-app](https://github.com/termux/termux-app)
 
-4. **速率限制**
-   - 在 `MessageBroker` 实现请求速率限制
-   - 防止单用户滥用
+## 更新日志
 
-更新日志见 [CHANGELOG.md](CHANGELOG.md)。
-
-## 未来计划
-
-- [ ] 对话历史持久化
-- [ ] Token 使用统计
-- [ ] Web 管理界面
-- [ ] 支持更多 Agent Tools
-- [ ] 插件系统
-- [ ] 多语言支持
-- [ ] Docker 容器化
-- [ ] Kubernetes 部署示例
-- [ ] Termux 优化包
-
-## 技术栈
-
-- **Python 3.11+**
-- **PydanticAI**: AI Agent 框架
-- **Pydantic**: 数据验证
-- **WebSockets**: 实时通信
-- **httpx**: 异步 HTTP 客户端
-- **PyJWT**: JWT 认证
-- **structlog**: 结构化日志
-- **Click**: CLI 工具
-- **Termux**: Android 终端环境
+见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 许可证
 
 [MIT](./LICENSE)
 
-## 来源及参考
-
-- 原项目: [rice-awa/MCBE_WebSocket_gpt](https://github.com/rice-awa/MCBE_WebSocket_gpt)
-- PydanticAI: [pydantic/pydantic-ai](https://github.com/pydantic/pydantic-ai)
-- Termux: [termux/termux-app](https://github.com/termux/termux-app)
-
 ---
 
-**版本**: 2.4.0
-**最后更新**: 2026-06-19
+**版本**: 2.5.0
+**最后更新**: 2026-08-04
 **架构**: 现代化异步 + PydanticAI
 **平台支持**: Windows, Linux, macOS, Termux (Android)

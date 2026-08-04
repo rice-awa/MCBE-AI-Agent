@@ -133,6 +133,76 @@ MCBEWS|UI_CHAT|<msg_id>|<index>/<total>|<payload_fragment>
 | 宿主 Addon 常量 | `MCBE-AI-Agent-addon/scripts/bridge/constants.ts` |
 | 推荐 SDK Addon 参考 | `mcbe-ws-sdk/addon/scripts/bridge/` |
 
+## 安装、构建与本地部署
+
+Addon 工程位于 `MCBE-AI-Agent-addon/`，本地调试前至少执行一次依赖安装、测试、构建和本地部署：
+
+```bash
+cd MCBE-AI-Agent-addon
+npm install        # 安装 @minecraft/server、@minecraft/server-ui 与构建依赖
+npm test           # 运行桥接协议、路由与 UI 状态容器相关测试
+npm run build      # 构建行为包脚本
+npm run local-deploy  # 部署到 Minecraft 本地开发目录
+```
+
+打包好的 Addon 也可在 [GitHub Releases](https://github.com/rice-awa/MCBE-AI-Agent/releases) 获取。
+
+## 调试步骤
+
+1. 启动 Python 服务：`python cli.py serve --dev`（开发模式跳过 `#登录`；可先 `python cli.py info` 验证配置）。
+2. 在 `MCBE-AI-Agent-addon/` 下执行 `npm run local-deploy`，确保最新脚本已部署。
+3. 进入启用了对应开发包的世界，等待 Addon 初始化。
+4. 在游戏内确认模拟玩家 `MCBEWS_BRIDGE` 已生成。
+5. 使用 `/wsserver <服务器IP>:8080` 连接 Python 服务。
+6. 执行一次正常聊天命令，例如 `AGENT 聊天 读取一下我当前附近的实体`，观察 Python 日志与游戏内行为。
+7. 手持原版命令方块 `minecraft:command_block` 并使用，确认游戏内聊天面板可以打开。
+8. 在面板中发送一条消息，确认本地历史、统计信息和设置保存行为正常；如果 Python 未收到 UI 消息，请按面板提示在聊天框手动发送等价的 `AGENT 聊天 <消息>`。
+
+## 验证桥接链路
+
+当前桥接方向是 `Python -> scriptevent -> Addon -> 模拟玩家聊天分片 -> Python`。按下面的方式确认链路完整：
+
+1. 先确认 `MCBEWS_BRIDGE` 存在。
+2. 触发一个会调用 Addon 能力的 Agent 请求，例如：
+
+```text
+AGENT 聊天 请读取我的玩家状态并告诉我当前位置
+```
+
+3. Python 侧应向游戏发送 `scriptevent mcbews:bridge_req <json>`。
+4. Addon 侧处理后，会驱动 `MCBEWS_BRIDGE` 以聊天分片形式回传 `MCBEWS|BRIDGE|...`。
+5. Python 侧会在 WebSocket `PlayerMessage` 事件流中拦截这些分片并完成重组，最终把工具结果继续交给 Agent。
+
+如果第 3 步已发出但最终超时，通常表示：
+
+- Addon 未正确部署或世界未启用最新行为包。
+- `MCBEWS_BRIDGE` 未生成或被移除。
+- 聊天分片没有成功回到 Python 所连接的 WebSocket 事件流。
+
+## 当前桥接能力
+
+- `get_player_snapshot`：获取目标玩家基础快照，包括位置、维度、朝向和基础状态。
+- `get_look_block`：获取目标玩家视线射线命中的方块（`getBlockFromViewDirection`），默认当前对话玩家。
+- `get_inventory_snapshot`：获取目标玩家背包槽位与物品快照。
+- `find_entities`：按类型、名称、标签、距离等条件查找实体。
+- `run_world_command`：由 Addon 在世界侧执行命令并返回结果。
+
+## 聊天命令与 UI 共存说明
+
+当前 UI 实现为第一阶段游戏内聊天面板，不替代现有聊天命令入口：
+
+- 现有 `AGENT 聊天`、`AGENT 上下文`、`切换模型`、`运行命令` 等聊天命令仍然是主入口。
+- 面板入口绑定为使用原版命令方块物品 `minecraft:command_block`，避免抢占聊天监听。
+- 面板支持发送消息、本地聊天记录、设置保存和统计信息；发送消息会记录本地历史，并提示等价的 `AGENT 聊天 <消息>`。
+- 当前本地 `@minecraft/server-ui` 类型只暴露 `ActionFormData` / `ModalFormData`，暂不能直接使用官方 DDUI `CustomForm` / `Observable`。
+- 后续如果类型和运行时支持真正 DDUI，可在 Addon 的表单适配层中替换实现，而不重写业务状态。
+
+## 当前限制
+
+- Addon -> Python 的响应回传依赖模拟玩家 `MCBEWS_BRIDGE` 发送聊天分片，不是独立的回传通道。
+- Python 侧通过 WebSocket `PlayerMessage` 事件流拦截桥接分片，因此桥接能力依赖聊天事件正常上送。
+- `run_world_command` 在当前本地依赖版本下基于同步 `runCommand` 实现，不是异步命令管线。
+
 ## 破坏性说明
 
 旧世界若仍装 **mcbeai** 行为包，桥会超时。必须：

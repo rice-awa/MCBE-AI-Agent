@@ -118,6 +118,12 @@
         "description": "管理对话",
         "usage": "<new/switch/clear/status/list/save/restore>"
       },
+      "AGENT 连续模式": {
+        "type": "continuous_mode",
+        "aliases": ["AGENT 连续", "AGENT continuous", "AGENT auto"],
+        "description": "开启/关闭连续AI聊天模式（无需前缀自动触发AI）",
+        "usage": "<开启|关闭|状态>"
+      },
       "AGENT 上下文": {
         "type": "context",
         "aliases": ["AGENT context", "AI 上下文", "AI context"],
