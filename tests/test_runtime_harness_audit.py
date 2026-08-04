@@ -223,7 +223,7 @@ def test_validation_failure_audit_record_is_validation_only_and_bounded():
     deps = DummyDeps(settings, run_id="run-invalid")
     ctx = SimpleNamespace(deps=deps, tool_call_id="tc-invalid")
     failure = {
-        "tool_name": "edit_blocks",
+        "tool_name": "place_block",
         "tool_call_id": "tc-invalid",
         "retry_timestamp": "2026-08-02T15:00:00+00:00",
         "error_type": "json_invalid",
@@ -243,7 +243,7 @@ def test_validation_failure_audit_record_is_validation_only_and_bounded():
         run_id="run-invalid",
     )
 
-    assert record["tool_name"] == "edit_blocks"
+    assert record["tool_name"] == "place_block"
     assert record["tool_call_id"] == "tc-invalid"
     assert record["status"] == "failure"
     assert record["error_kind"] == "INVALID_ARGUMENT"
@@ -376,7 +376,7 @@ def test_audit_record_keeps_bounded_group_execution_evidence() -> None:
     )
 
     record = build_audit_record(
-        tool_name="edit_blocks",
+        tool_name="place_block",
         parameters={},
         ctx=ctx,
         status="success",
@@ -530,7 +530,7 @@ def test_audit_exception_redacts_sensitive_values_but_keeps_correlation() -> Non
     settings = Settings()
     ctx = SimpleNamespace(deps=DummyDeps(settings, run_id="run-exception"), tool_call_id="tc-exception")
     record = build_audit_record(
-        tool_name="edit_blocks",
+        tool_name="place_block",
         parameters={},
         ctx=ctx,
         status="failure",
@@ -548,7 +548,7 @@ def test_audit_exception_redacts_sensitive_values_but_keeps_correlation() -> Non
     assert "Bearer abcdef" not in dumped
 
     tool_failure = build_audit_record(
-        tool_name="edit_blocks",
+        tool_name="place_block",
         parameters={},
         ctx=ctx,
         status="failure",

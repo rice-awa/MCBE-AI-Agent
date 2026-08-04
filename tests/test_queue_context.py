@@ -411,7 +411,7 @@ def test_worker_self_heals_orphan_tool_history_before_model_request(monkeypatch)
                 parts=[
                     RetryPromptPart(
                         "invalid JSON",
-                        tool_name="edit_blocks",
+                        tool_name="place_block",
                         tool_call_id="call-bad",
                     )
                 ]

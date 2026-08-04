@@ -281,7 +281,7 @@ def test_edit_failure_store_accepts_preflight_exception_toolresult_and_string_js
     assert store.get("conn", "Steve", "run").fallback_allowed is False  # type: ignore[union-attr]
 
     _record_block_edit_fallback_outcome(
-        classify_tool_exception(RuntimeError("bridge error"), tool_name="edit_blocks"),
+        map_bridge_exception(RuntimeError("bridge error"), tool_name="place_block"),
         connection_id="conn",
         player_name="Steve",
         run_id="run",
@@ -334,7 +334,7 @@ def test_denies_automatic_direct_block_command_after_nonfallback_edit_failure() 
     assert denial is not None
     assert denial.action == PolicyDecisionKind.DENY
     # The model/operator needs the structured code in the denial message,
-    # not just a generic "please fix edit_blocks parameters" sentence.
+    # not just a generic "please fix place_block parameters" sentence.
     assert "PRECONDITION_FAILED" in denial.reason
 
 
@@ -343,7 +343,7 @@ def test_fallback_denial_includes_structured_diagnostic_summary() -> None:
     _record_block_edit_fallback_outcome(
         (
             '{"ok":false,"code":"STATE_UNKNOWN","fallback_allowed":false,'
-            '"diagnostic":"TypeError: edit_blocks() got an unexpected keyword '
+            '"diagnostic":"TypeError: place_block() got an unexpected keyword '
             "argument 'status'\"}"
         ),
         connection_id="conn-1",
@@ -488,27 +488,26 @@ def test_policy_low_risk_allows_and_hard_deny_blocks() -> None:
 
 
 def test_edit_invocation_exception_returns_unknown_state_with_redacted_diagnostic() -> None:
-    result = classify_tool_exception(
-        RuntimeError("edit_blocks_impl leaked token=bridge-secret"),
-        tool_name="edit_blocks",
-        execution_stage="invocation",
+    result = map_bridge_exception(
+        RuntimeError("place_block_impl leaked token=bridge-secret"),
+        tool_name="place_block",
     )
 
     body = json.loads(result.output)
     assert body["schema_version"] == "1"
     assert body["ok"] is False
     assert body["code"] == "STATE_UNKNOWN"
-    assert body["message"] == "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。"
+    assert "外部状态未知，请勿自动重试或回退命令" in body["message"]
     assert body["retryable"] is False
     assert body["external_state_unknown"] is True
     assert body["fallback_allowed"] is False
     # Host-side invocation errors surface a bounded, redacted diagnostic so
     # operators (and the model) can distinguish a harness bug from a world
     # precondition failure.
-    assert body["error_type"] == "RuntimeError"
-    assert "RuntimeError" in body["diagnostic"]
-    assert "edit_blocks_impl" in body["diagnostic"]
-    assert "bridge-secret" not in body["diagnostic"]
+    assert result.error_type == "RuntimeError"
+    assert "RuntimeError" in result.diagnostic_summary
+    assert "place_block_impl" in result.diagnostic_summary
+    assert "bridge-secret" not in result.diagnostic_summary
     assert result.retryable is False
     assert result.external_state_unknown is True
     assert "bridge-secret" not in result.output
@@ -517,7 +516,7 @@ def test_edit_invocation_exception_returns_unknown_state_with_redacted_diagnosti
 def test_projection_failure_keeps_redacted_internal_diagnostic() -> None:
     result = classify_tool_exception(
         ValueError("block preflight execution contract token=bridge-secret"),
-        tool_name="edit_blocks",
+        tool_name="place_block",
         execution_stage="projection",
     )
 
@@ -531,7 +530,7 @@ def test_projection_failure_keeps_redacted_internal_diagnostic() -> None:
 def test_block_projection_failure_is_safe_and_definitely_not_sent() -> None:
     result = classify_tool_exception(
         ValueError("block preflight execution contract token=bridge-secret"),
-        tool_name="edit_blocks",
+        tool_name="place_block",
         execution_stage="projection",
     )
 
@@ -559,14 +558,13 @@ def test_block_failure_log_is_correlated_and_omits_exception_text(monkeypatch) -
         "Context",
         (), {"deps": _Deps(run_id="run-log", player_name="Alex"), "tool_call_id": "tc-log"},
     )()
-    result = classify_tool_exception(
+    result = map_bridge_exception(
         RuntimeError("token=bridge-secret"),
-        tool_name="edit_blocks",
-        execution_stage="invocation",
+        tool_name="place_block",
     )
 
     log_tool_execution_failed(
-        tool_name="edit_blocks",
+        tool_name="place_block",
         ctx=ctx,
         result=result,
         execution_stage="invocation",
@@ -574,7 +572,7 @@ def test_block_failure_log_is_correlated_and_omits_exception_text(monkeypatch) -
     )
 
     assert captured["event"] == "tool_execution_failed"
-    assert captured["tool_name"] == "edit_blocks"
+    assert captured["tool_name"] == "place_block"
     assert captured["run_id"] == "run-log"
     assert captured["tool_call_id"] == "tc-log"
     assert captured["connection_id_short"] == str(ctx.deps.connection_id)[-8:]
@@ -600,11 +598,11 @@ def test_mapped_bridge_failure_log_uses_original_exception_type(monkeypatch) -> 
         (), {"deps": _Deps(run_id="run-bridge", player_name="Alex"), "tool_call_id": "tc-bridge"},
     )()
     result = map_bridge_exception(
-        TimeoutError("token=bridge-secret timed out"), tool_name="edit_blocks"
+        TimeoutError("token=bridge-secret timed out"), tool_name="place_block"
     )
 
     log_tool_execution_failed(
-        tool_name="edit_blocks",
+        tool_name="place_block",
         ctx=ctx,
         result=result,
         execution_stage="invocation",
@@ -1670,7 +1668,7 @@ async def test_new_tool_failure_denies_command_fallback_in_same_run() -> None:
 def test_recorded_outcome_from_new_tool_failure_gates_direct_fallback() -> None:
     """Task 7 Step 4: 直接记录的新工具失败结果同样进入回退门控。
 
-    与旧 ``edit_blocks`` 失败等价的 place_block 失败结果（经桥接映射的
+    与旧契约失败形态等价的 place_block 失败结果（经桥接映射的
     ToolResult）写入 fallback store 后，``_block_command_fallback_denial``
     对 setblock 命令返回 DENY，且原因含结构化 code。
     """

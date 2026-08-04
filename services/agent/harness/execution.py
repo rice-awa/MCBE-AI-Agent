@@ -185,7 +185,7 @@ class IdempotencyStore:
 
 @dataclass(frozen=True)
 class BlockCommandFallbackRecord:
-    """最近一次 ``edit_blocks`` 的结构化回退结论。"""
+    """最近一次方块工具（``place_block`` / ``fill_block`` / ``inspect_block``）的结构化回退结论。"""
 
     fallback_allowed: bool
     created_at: float
@@ -622,7 +622,7 @@ def classify_tool_exception(
     stage = execution_stage or (
         "projection" if "execution contract" in lower else "invocation"
     )
-    if (tool_name in _BLOCK_OPS_TOOLS or tool_name == "edit_blocks") and stage == "projection":
+    if tool_name in _BLOCK_OPS_TOOLS and stage == "projection":
         from services.agent.block_ops.schema import (
             build_internal_error_response,
             dumps_payload,
@@ -632,24 +632,6 @@ def classify_tool_exception(
             dumps_payload(build_internal_error_response()),
             error_kind="INTERNAL",
             retryable=False,
-            diagnostic_summary=diagnostic_summary,
-            error_type=exc.__class__.__name__,
-        )
-    if tool_name == "edit_blocks" and stage == "invocation":
-        from services.agent.block_ops.schema import (
-            build_state_unknown_response,
-            dumps_payload,
-        )
-
-        body = build_state_unknown_response(
-            error_type=exc.__class__.__name__,
-            diagnostic=truncate_for_log(diagnostic_summary, 200),
-        )
-        return ToolResult.failure(
-            dumps_payload(body),
-            error_kind="PERMANENT",
-            retryable=False,
-            external_state_unknown=True,
             diagnostic_summary=diagnostic_summary,
             error_type=exc.__class__.__name__,
         )
