@@ -1158,6 +1158,9 @@ def register_agent_tools(
     ) -> str:
         """在单个格子上写入方块。
 
+        成功返回 ``{ok, status, at: [x, y, z], block, was?}``；
+        ``was`` 仅在替换了非空气方块时出现。
+
         Args:
             ctx: 运行上下文
             pos: 目标坐标 ``[x, y, z]``（绝对世界坐标整数）
@@ -1188,6 +1191,8 @@ def register_agent_tools(
         """在长方体区域内写入方块。
 
         角点自动 min/max 归一化。expect=air 时非空气格跳过。
+        成功返回 ``{ok, status, changed, skipped, type_counts?, bounds}``；
+        ``type_counts`` 仅统计被替换的非空气方块。
 
         Args:
             ctx: 运行上下文

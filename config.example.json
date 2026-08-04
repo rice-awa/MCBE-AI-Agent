@@ -208,9 +208,7 @@
       "cells_per_tick": 128,
       "max_locked_targets_on_wire": 0,
       "inspect_summary_threshold": 8,
-      "inspect_sample_limit": 8,
-      "max_edits_per_group": 16,
-      "max_total_targets_per_group": 4096
+      "inspect_sample_limit": 8
     }
   },
   "logging": {

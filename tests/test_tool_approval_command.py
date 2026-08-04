@@ -516,24 +516,16 @@ def test_expired_block_approval_is_not_resumable() -> None:
     """过期方块审批不得从 store 取出并静默用原始参数重新预检执行。"""
     store = PendingApprovalStore(default_ttl_seconds=0.01)
     block = _make_pending(approval_id="b", tool_call_id="tc-block", ttl=0.01)
-    block.tool_name = "edit_blocks"
+    block.tool_name = "place_block"
     block.normalized_args = {
-        "type_id": "minecraft:stone",
-        "mode": "place",
-        "coordinate_mode": "absolute",
-        "dimension": "minecraft:overworld",
-        "position": {"x": 1, "y": 64, "z": 1},
-        "locked_targets": [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}],
-        "phase": "execute",
+        "pos": [1, 64, 1],
+        "block": "minecraft:stone",
+        "expect": "air",
     }
     block.execute_args = {
-        "type_id": "minecraft:stone",
-        "mode": "place",
-        "coordinate_mode": "absolute",
-        "dimension": "minecraft:overworld",
-        "position": {"x": 1, "y": 64, "z": 1},
-        "locked_targets": [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}],
-        "phase": "execute",
+        "pos": [1, 64, 1],
+        "block": "minecraft:stone",
+        "expect": "air",
     }
     block.execution_args_hash = hash_normalized_args(normalize_tool_args(block.execute_args))
     store.put(block)

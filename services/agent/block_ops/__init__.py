@@ -43,11 +43,9 @@ from services.agent.block_ops.tools_impl import (
     BlockPreflightPlan,
     build_block_preflight_plan,
     check_bridge_command_line_budget,
-    edit_blocks_impl,
     estimate_bridge_command_line_bytes,
     inspect_block_impl,
     merge_canonical_from_preflight,
-    project_block_execute_args,
     run_block_preflight,
 )
 
@@ -74,7 +72,6 @@ __all__ = [
     "dumps_error",
     "dumps_payload",
     "dumps_success",
-    "edit_blocks_impl",
     "ensure_block_capability",
     "estimate_bridge_command_line_bytes",
     "get_block_capability_cache",
@@ -85,7 +82,6 @@ __all__ = [
     "map_addon_bridge_result",
     "map_bridge_exception",
     "merge_canonical_from_preflight",
-    "project_block_execute_args",
     "project_block_result_for_model",
     "reset_block_capability_cache",
     "reset_preflight_cache",

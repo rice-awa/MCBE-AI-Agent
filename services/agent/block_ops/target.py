@@ -21,11 +21,27 @@ from __future__ import annotations
 
 from typing import Any
 
-from services.agent.block_ops.schema import BlockErrorCode
-from services.agent.block_ops.tools_impl import _host_limit_error
+from services.agent.block_ops.schema import BlockErrorCode, _host_limit_error
 
 _ABSOLUTE_KEYS = frozenset({"x", "y", "z"})
 _RELATIVE_KEYS = frozenset({"forward", "right", "up"})
+
+
+def normalize_aabb_corners(
+    from_pos: dict[str, Any],
+    to_pos: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return min/max ordered corners for stable fill authorization."""
+    try:
+        xs = sorted((int(from_pos["x"]), int(to_pos["x"])))
+        ys = sorted((int(from_pos["y"]), int(to_pos["y"])))
+        zs = sorted((int(from_pos["z"]), int(to_pos["z"])))
+        return (
+            {"x": xs[0], "y": ys[0], "z": zs[0]},
+            {"x": xs[1], "y": ys[1], "z": zs[1]},
+        )
+    except (KeyError, TypeError, ValueError):
+        return from_pos, to_pos
 
 
 def _is_absolute_coord(value: Any) -> bool:
@@ -227,9 +243,7 @@ def normalize_array_target(
                 BlockErrorCode.INVALID_COORDINATE,
                 "target 两角点必须是恰好 3 个整数的坐标数组",
             )
-        from services.agent.block_ops.tools_impl import _normalize_aabb_corners
-
-        from_pos, to_pos = _normalize_aabb_corners(from_cell, to_cell)
+        from_pos, to_pos = normalize_aabb_corners(from_cell, to_cell)
         return (
             NormalizedTarget(
                 shape="box",

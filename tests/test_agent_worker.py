@@ -50,14 +50,10 @@ def test_worker_coerces_block_tool_approval_override_args() -> None:
 
     worker = AgentWorker(MagicMock(), _make_settings())
     execute_args = {
-        "type_id": "minecraft:stone",
-        "mode": "fill",
-        "coordinate_mode": "absolute",
-        "dimension": "minecraft:overworld",
-        "from_pos": {"x": 2, "y": 64, "z": 1},
-        "to_pos": {"x": 4, "y": 64, "z": 3},
-        "locked_targets": [{"x": 2, "y": 64, "z": 1}],
-        "phase": "execute",
+        "from": [2, 64, 1],
+        "to": [4, 64, 3],
+        "block": "minecraft:stone",
+        "expect": "air",
     }
 
     results = worker._coerce_deferred_tool_results(
@@ -433,8 +429,8 @@ async def test_error_event_persists_partial_run_history(monkeypatch):
         ModelResponse(
             parts=[
                 ToolCallPart(
-                    tool_name="edit_blocks",
-                    args={"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:torch"}]},
+                    tool_name="place_block",
+                    args={"pos": [1, 64, 1], "block": "minecraft:torch", "expect": "air"},
                     tool_call_id="tc-1",
                 )
             ]
@@ -442,7 +438,7 @@ async def test_error_event_persists_partial_run_history(monkeypatch):
         ModelRequest(
             parts=[
                 ToolReturnPart(
-                    tool_name="edit_blocks",
+                    tool_name="place_block",
                     content='{"ok": true}',
                     tool_call_id="tc-1",
                 )
@@ -453,19 +449,19 @@ async def test_error_event_persists_partial_run_history(monkeypatch):
     async def fake_stream_chat(*_args, **_kwargs):
         yield StreamEvent(
             event_type="tool_call",
-            content="edit_blocks",
+            content="place_block",
             sequence=0,
             metadata={
-                "tool_name": "edit_blocks",
+                "tool_name": "place_block",
                 "tool_call_id": "tc-1",
-                "args": {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:torch"}]},
+                "args": {"pos": [1, 64, 1], "block": "minecraft:torch", "expect": "air"},
             },
         )
         yield StreamEvent(
             event_type="tool_result",
             content='{"ok": true}',
             sequence=1,
-            metadata={"tool_name": "edit_blocks", "tool_call_id": "tc-1"},
+            metadata={"tool_name": "place_block", "tool_call_id": "tc-1"},
         )
         yield StreamEvent(
             event_type="error",
@@ -1148,7 +1144,7 @@ async def test_partial_history_persistence_drops_orphan_retry_and_keeps_visible_
             parts=[
                 RetryPromptPart(
                     "invalid JSON",
-                    tool_name="edit_blocks",
+                    tool_name="place_block",
                     tool_call_id="call-bad",
                 )
             ]
@@ -1587,7 +1583,7 @@ async def test_validation_failure_trace_is_gated_and_does_not_start_execution(
         retry_content = [
             {
                 "type": "json_invalid",
-                "loc": ("edits",),
+                "loc": ("pos",),
                 "msg": "Invalid JSON: TRACE-VALIDATION-SECRET",
                 "input": "TRACE-VALIDATION-SECRET",
             }
@@ -1596,10 +1592,12 @@ async def test_validation_failure_trace_is_gated_and_does_not_start_execution(
             ModelResponse(
                 parts=[
                     ToolCallPart(
-                        tool_name="edit_blocks",
+                        tool_name="place_block",
                         tool_call_id="tc-trace-invalid",
                         args={
-                            "dimension": "minecraft:overworld",
+                            "pos": [1, 64, 1],
+                            "block": "minecraft:stone",
+                            "expect": "air",
                             "api_key": "TRACE-VALIDATION-SECRET",
                         },
                     )
@@ -1609,7 +1607,7 @@ async def test_validation_failure_trace_is_gated_and_does_not_start_execution(
                 parts=[
                     RetryPromptPart(
                         retry_content,
-                        tool_name="edit_blocks",
+                        tool_name="place_block",
                         tool_call_id="tc-trace-invalid",
                         timestamp=datetime(2026, 8, 2, 12, 0, tzinfo=UTC),
                     )
@@ -1669,7 +1667,7 @@ async def test_validation_failure_trace_is_gated_and_does_not_start_execution(
         assert event["attributes"]["error_kind"] == "INVALID_ARGUMENT"
         assert event["attributes"]["execution_stage"] == "validation"
         assert event["attributes"]["validation_error_type"] == "json_invalid"
-        assert event["attributes"]["validation_error_locations"] == ["edits"]
+        assert event["attributes"]["validation_error_locations"] == ["pos"]
         assert event["attributes"]["parameters"]["api_key"] == "[REDACTED]"
         assert not any(
             item["event_name"] == "tool.execution.started" for item in events

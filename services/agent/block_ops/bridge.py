@@ -32,9 +32,9 @@ _SENSITIVE_MESSAGE_RE = re.compile(
     re.IGNORECASE,
 )
 _BLOCK_CAPABILITIES = frozenset({"edit_blocks", "inspect_block"})
-# Public world-mutating tools (single-op place/fill + legacy edit_blocks) all
-# map bridge failures after send to STATE_UNKNOWN with no fallback.
-_WORLD_MUTATION_TOOL_NAMES = frozenset({"place_block", "fill_block", "edit_blocks"})
+# Public world-mutating tools (single-op place/fill) map bridge failures after
+# send to STATE_UNKNOWN with no fallback.
+_WORLD_MUTATION_TOOL_NAMES = frozenset({"place_block", "fill_block"})
 
 
 class _BridgeClient(Protocol):

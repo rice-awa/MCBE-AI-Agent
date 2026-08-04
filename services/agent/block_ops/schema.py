@@ -6,6 +6,8 @@ import json
 from enum import StrEnum
 from typing import Any
 
+from services.agent.tool_results import ToolResult
+
 BLOCK_OPS_SCHEMA_VERSION = "1"
 
 
@@ -95,3 +97,16 @@ def dumps_error(code: BlockErrorCode | str, message: str, **fields: Any) -> str:
 
 def dumps_payload(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _host_limit_error(
+    code: BlockErrorCode,
+    message: str,
+    **fields: Any,
+) -> ToolResult:
+    """Host-side INVALID_ARGUMENT-style failure result for block tools."""
+    return ToolResult.failure(
+        dumps_payload(build_error_response(code, message, **fields)),
+        error_kind="INVALID_ARGUMENT",
+        retryable=False,
+    )

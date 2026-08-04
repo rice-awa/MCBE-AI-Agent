@@ -923,12 +923,14 @@ def _block_command_fallback_denial(
         reason = (
             f"专用方块编辑刚刚失败{code_text}且不允许命令回退；"
             f"诊断: {record.summary}。"
-            "请根据结构化错误修正 edit_blocks 参数，或等待明确允许回退的结果。"
+            "请根据结构化错误修正 place_block / fill_block 参数，"
+            "或等待明确允许回退的结果。"
         )
     else:
         reason = (
             f"专用方块编辑刚刚失败{code_text}且不允许命令回退；"
-            "请根据结构化错误修正 edit_blocks 参数，或等待明确允许回退的结果。"
+            "请根据结构化错误修正 place_block / fill_block 参数，"
+            "或等待明确允许回退的结果。"
         )
     return PolicyDecision(
         action=PolicyDecisionKind.DENY,
@@ -1938,9 +1940,9 @@ class HarnessCapability(AbstractCapability[Any]):
                     getattr(deps, "addon_bridge", None),
                 )
         exposed = [td for td in tool_defs if self.policy.is_tool_exposed(td.name, ctx=ctx)]
-        # Hide harness-only recovery fields from the model-facing schema.
-        # Approval resume / override_args still inject locked_targets + phase=execute.
-        return [strip_block_internal_tool_schema(td) for td in exposed]
+        # The single-op block tools already expose only model-visible fields in
+        # their public schemas; no internal-key stripping is needed here.
+        return exposed
 
 
 def build_harness_capability(settings: Any | None = None) -> HarnessCapability:
@@ -1951,67 +1953,16 @@ def _duration_ms(start: float) -> int:
     return max(0, round((time.perf_counter() - start) * 1000))
 
 
-# Model-facing tool schema must not advertise recovery-only fields.
-_BLOCK_INTERNAL_SCHEMA_KEYS = frozenset({
-    "locked_targets", "locked_targets_by_edit", "noop_edit_indices",
-    "repairs_applied", "phase", "status",
-})
-
-
-def strip_block_internal_tool_schema(tool_def: ToolDefinition) -> ToolDefinition:
-    """Remove locked_targets/phase from public ToolDefinition parameters.
-
-    Function implementations and harness recovery still accept these kwargs;
-    only the schema shown to the model is stripped.
-    """
-    if tool_def.name not in _BLOCK_OPS_TOOLS:
-        return tool_def
-    schema = tool_def.parameters_json_schema
-    if not isinstance(schema, dict):
-        return tool_def
-    properties = schema.get("properties")
-    if not isinstance(properties, dict):
-        return tool_def
-    if not _BLOCK_INTERNAL_SCHEMA_KEYS.intersection(properties):
-        return tool_def
-
-    new_properties = {
-        key: value
-        for key, value in properties.items()
-        if key not in _BLOCK_INTERNAL_SCHEMA_KEYS
-    }
-    new_schema = dict(schema)
-    new_schema["properties"] = new_properties
-    required = schema.get("required")
-    if isinstance(required, list):
-        new_schema["required"] = [
-            item for item in required if item not in _BLOCK_INTERNAL_SCHEMA_KEYS
-        ]
-    return replace(
-        tool_def,
-        parameters_json_schema=new_schema,  # type: ignore[arg-type]
-    )
-
-
 def _python_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Build Python call args for the public block tool signatures.
 
-    place/fill 的 canonical args 即模型可见字段（pos/block/expect/states /
-    from_/to），直接透传；恢复路径只经 execute_block_plan，不在这里投影。
-    inspect 非执行阶段仍按预检白名单过滤（legacy 内部调用方兼容）。
+    Canonical args for the single-op tools are exactly the model-visible
+    fields: pos/block/expect/states for ``place_block``; from/to/block/
+    expect/states for ``fill_block``; target for ``inspect_block``. Fill's
+    canonical args store the from corner under the model-visible alias
+    ``from`` (never ``from_``) — run_block_preflight converts the Pydantic
+    field name back to the alias before storing the plan. Approval resume
+    goes through ``execute_block_plan`` with frozen canonical args, never
+    through this projection, so this is a pure passthrough.
     """
-    if tool_name not in _BLOCK_OPS_TOOLS:
-        return dict(args or {})
-    if tool_name == "inspect_block" and args.get("phase") != "execute":
-        return {
-            key: value for key, value in dict(args or {}).items()
-            if key in {
-                "coordinate_mode", "dimension", "position", "positions",
-                "target", "locked_targets", "phase",
-            }
-        }
-    # NOTE: place_block / fill_block never reach this projection on the plan_id
-    # resume path — resume goes through execute_block_plan with frozen canonical
-    # args (pos/block/expect/states / from_/to), so keep this a pure passthrough;
-    # do not add field filtering back for place/fill here.
     return dict(args or {})
