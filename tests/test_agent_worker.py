@@ -50,14 +50,10 @@ def test_worker_coerces_block_tool_approval_override_args() -> None:
 
     worker = AgentWorker(MagicMock(), _make_settings())
     execute_args = {
-        "type_id": "minecraft:stone",
-        "mode": "fill",
-        "coordinate_mode": "absolute",
-        "dimension": "minecraft:overworld",
-        "from_pos": {"x": 2, "y": 64, "z": 1},
-        "to_pos": {"x": 4, "y": 64, "z": 3},
-        "locked_targets": [{"x": 2, "y": 64, "z": 1}],
-        "phase": "execute",
+        "from": [2, 64, 1],
+        "to": [4, 64, 3],
+        "block": "minecraft:stone",
+        "expect": "air",
     }
 
     results = worker._coerce_deferred_tool_results(
@@ -69,9 +65,23 @@ def test_worker_coerces_block_tool_approval_override_args() -> None:
     assert approved.override_args == execute_args
 
 
+def test_worker_coerces_block_plan_id_approval_to_plan_id_override() -> None:
+    """plan_id 恢复负载只产生 {plan_id} override，绝无 status/phase 注入。"""
+    from pydantic_ai.tools import ToolApproved
+
+    worker = AgentWorker(MagicMock(), _make_settings())
+    results = worker._coerce_deferred_tool_results(
+        {"approvals": {"tc-place": {"kind": "tool-approved", "plan_id": "pid-1"}}}
+    )
+
+    approved = results.approvals["tc-place"]
+    assert isinstance(approved, ToolApproved)
+    assert approved.override_args == {"plan_id": "pid-1"}
+
+
 @pytest.mark.asyncio
-async def test_worker_rejects_block_approval_without_execute_args() -> None:
-    """方块工具不得用 normalized_args 回退填充 execute_args 进入审批队列。"""
+async def test_worker_rejects_block_approval_without_plan_id() -> None:
+    """方块工具审批 metadata 必须携带 plan_id；缺失则 fail-closed，不得进入审批队列。"""
     from pydantic_ai.messages import ToolCallPart
     from pydantic_ai.tools import DeferredToolRequests
 
@@ -88,33 +98,20 @@ async def test_worker_rejects_block_approval_without_execute_args() -> None:
         player_name="Steve",
         conversation_id="conv-1",
         content="edit",
-        run_id="run-missing-exec",
+        run_id="run-missing-plan",
     )
     deferred = DeferredToolRequests(
         approvals=[
             ToolCallPart(
-                tool_name="edit_blocks",
-                tool_call_id="tc-fill",
-                args={
-                    "edits": [{
-                        "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-                        "block": "minecraft:stone",
-                    }],
-                    "dimension": "minecraft:overworld",
-                },
+                tool_name="place_block",
+                tool_call_id="tc-place",
+                args={"pos": [1, 64, 1], "block": "stone", "expect": "air"},
             )
         ],
         metadata={
-            "tc-fill": {
-                "normalized_args": {
-                    "edits": [{
-                        "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-                        "block": "minecraft:stone",
-                    }],
-                    "dimension": "minecraft:overworld",
-                    "phase": "execute",
-                },
-                # deliberately omit execute_args
+            "tc-place": {
+                "normalized_args": {"pos": [1, 64, 1], "block": "stone", "expect": "air"},
+                # deliberately omit plan_id
                 "args_hash": "h",
                 "args_summary": "place stone",
             }
@@ -432,8 +429,8 @@ async def test_error_event_persists_partial_run_history(monkeypatch):
         ModelResponse(
             parts=[
                 ToolCallPart(
-                    tool_name="edit_blocks",
-                    args={"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:torch"}]},
+                    tool_name="place_block",
+                    args={"pos": [1, 64, 1], "block": "minecraft:torch", "expect": "air"},
                     tool_call_id="tc-1",
                 )
             ]
@@ -441,7 +438,7 @@ async def test_error_event_persists_partial_run_history(monkeypatch):
         ModelRequest(
             parts=[
                 ToolReturnPart(
-                    tool_name="edit_blocks",
+                    tool_name="place_block",
                     content='{"ok": true}',
                     tool_call_id="tc-1",
                 )
@@ -452,19 +449,19 @@ async def test_error_event_persists_partial_run_history(monkeypatch):
     async def fake_stream_chat(*_args, **_kwargs):
         yield StreamEvent(
             event_type="tool_call",
-            content="edit_blocks",
+            content="place_block",
             sequence=0,
             metadata={
-                "tool_name": "edit_blocks",
+                "tool_name": "place_block",
                 "tool_call_id": "tc-1",
-                "args": {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:torch"}]},
+                "args": {"pos": [1, 64, 1], "block": "minecraft:torch", "expect": "air"},
             },
         )
         yield StreamEvent(
             event_type="tool_result",
             content='{"ok": true}',
             sequence=1,
-            metadata={"tool_name": "edit_blocks", "tool_call_id": "tc-1"},
+            metadata={"tool_name": "place_block", "tool_call_id": "tc-1"},
         )
         yield StreamEvent(
             event_type="error",
@@ -786,19 +783,17 @@ async def test_worker_audits_validation_retry_and_later_success_without_executio
     worker = AgentWorker(broker, settings)
 
     bad_args = {
-        "edits": [{
-            "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-            "block": "minecraft:stone",
-        }],
-        "dimension": "minecraft:overworld",
+        "from": [4, 64, 3],
+        "to": [2, 64, 1],
+        "block": "minecraft:stone",
+        "expect": "air",
         "api_key": "do-not-record",
     }
     good_args = {
-        "edits": [{
-            "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-            "block": "minecraft:stone",
-        }],
-        "dimension": "minecraft:overworld",
+        "from_": [4, 64, 3],
+        "to": [2, 64, 1],
+        "block": "minecraft:stone",
+        "expect": "air",
     }
     retry_at = datetime(2026, 8, 2, 15, 0, 0, tzinfo=UTC)
     retry = RetryPromptPart(
@@ -808,38 +803,38 @@ async def test_worker_audits_validation_retry_and_later_success_without_executio
             "msg": "Invalid JSON: validation-secret",
             "input": "validation-secret",
         }],
-        tool_name="edit_blocks",
+        tool_name="fill_block",
         tool_call_id="tc-invalid",
         timestamp=retry_at,
     )
     messages = [
         ModelResponse(parts=[ToolCallPart(
-            tool_name="edit_blocks",
+            tool_name="fill_block",
             args=bad_args,
             tool_call_id="tc-invalid",
         )]),
         ModelRequest(parts=[retry]),
         ModelResponse(parts=[ToolCallPart(
-            tool_name="edit_blocks",
+            tool_name="fill_block",
             args=good_args,
             tool_call_id="tc-corrected",
         )]),
         ModelRequest(parts=[ToolReturnPart(
-            tool_name="edit_blocks",
+            tool_name="fill_block",
             content="ok",
             tool_call_id="tc-corrected",
         )]),
         ModelResponse(parts=[TextPart(content="修正成功")]),
     ]
 
-    async def corrected_tool(ctx, edits, dimension):  # noqa: ARG001
+    async def corrected_tool(ctx, from_, to, block, expect="air"):  # noqa: ARG001
         return ToolResult.success("ok")
 
     writer = AuditWriter()
     set_audit_writer(writer)
     start_audit_writer()
     try:
-        corrected = wrap_tool_function("edit_blocks", corrected_tool, settings)
+        corrected = wrap_tool_function("fill_block", corrected_tool, settings)
 
         async def fake_stream_chat(_prompt, deps, *_args, **_kwargs):
             await corrected(
@@ -848,10 +843,10 @@ async def test_worker_audits_validation_retry_and_later_success_without_executio
             )
             yield StreamEvent(
                 event_type="tool_call",
-                content="edit_blocks",
+                content="fill_block",
                 sequence=0,
                 metadata={
-                    "tool_name": "edit_blocks",
+                    "tool_name": "fill_block",
                     "tool_call_id": "tc-invalid",
                     "args": bad_args,
                 },
@@ -913,12 +908,12 @@ async def test_worker_audits_validation_retry_and_later_success_without_executio
         successes = [r for r in records if r["status"] == "success"]
         assert len(failures) == 1
         assert len(successes) == 1
-        assert failures[0]["tool_name"] == "edit_blocks"
+        assert failures[0]["tool_name"] == "fill_block"
         assert failures[0]["error_kind"] == "INVALID_ARGUMENT"
         assert failures[0]["result"]["failure_reason"] == "json_invalid"
         assert failures[0]["result"]["execution_stage"] == "validation"
         assert failures[0]["result"]["external_state_unknown"] == "false"
-        assert failures[0]["parameters"]["dimension"] == "minecraft:overworld"
+        assert failures[0]["parameters"]["from"] == [4, 64, 3]
         assert failures[0]["parameters"]["api_key"] == "[REDACTED]"
         assert "validation-secret" not in json.dumps(failures[0], ensure_ascii=False)
         assert not any(
@@ -1149,7 +1144,7 @@ async def test_partial_history_persistence_drops_orphan_retry_and_keeps_visible_
             parts=[
                 RetryPromptPart(
                     "invalid JSON",
-                    tool_name="edit_blocks",
+                    tool_name="place_block",
                     tool_call_id="call-bad",
                 )
             ]
@@ -1588,7 +1583,7 @@ async def test_validation_failure_trace_is_gated_and_does_not_start_execution(
         retry_content = [
             {
                 "type": "json_invalid",
-                "loc": ("edits",),
+                "loc": ("pos",),
                 "msg": "Invalid JSON: TRACE-VALIDATION-SECRET",
                 "input": "TRACE-VALIDATION-SECRET",
             }
@@ -1597,10 +1592,12 @@ async def test_validation_failure_trace_is_gated_and_does_not_start_execution(
             ModelResponse(
                 parts=[
                     ToolCallPart(
-                        tool_name="edit_blocks",
+                        tool_name="place_block",
                         tool_call_id="tc-trace-invalid",
                         args={
-                            "dimension": "minecraft:overworld",
+                            "pos": [1, 64, 1],
+                            "block": "minecraft:stone",
+                            "expect": "air",
                             "api_key": "TRACE-VALIDATION-SECRET",
                         },
                     )
@@ -1610,7 +1607,7 @@ async def test_validation_failure_trace_is_gated_and_does_not_start_execution(
                 parts=[
                     RetryPromptPart(
                         retry_content,
-                        tool_name="edit_blocks",
+                        tool_name="place_block",
                         tool_call_id="tc-trace-invalid",
                         timestamp=datetime(2026, 8, 2, 12, 0, tzinfo=UTC),
                     )
@@ -1670,7 +1667,7 @@ async def test_validation_failure_trace_is_gated_and_does_not_start_execution(
         assert event["attributes"]["error_kind"] == "INVALID_ARGUMENT"
         assert event["attributes"]["execution_stage"] == "validation"
         assert event["attributes"]["validation_error_type"] == "json_invalid"
-        assert event["attributes"]["validation_error_locations"] == ["edits"]
+        assert event["attributes"]["validation_error_locations"] == ["pos"]
         assert event["attributes"]["parameters"]["api_key"] == "[REDACTED]"
         assert not any(
             item["event_name"] == "tool.execution.started" for item in events

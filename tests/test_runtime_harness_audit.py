@@ -169,39 +169,35 @@ def test_validation_failure_extractor_matches_call_and_deduplicates_retry_timest
 
     retry_at = datetime(2026, 8, 2, 15, 0, 0, tzinfo=UTC)
     parameters = {
-        "edits": [
-            {
-                "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-                "block": "minecraft:stone",
-            }
-            for _ in range(40)
-        ],
-        "dimension": "minecraft:overworld",
+        "from": [0, 64, 0],
+        "to": [4, 64, 4],
+        "block": "minecraft:stone",
+        "expect": "air",
         "api_key": "do-not-record",
     }
     validation_content = [{
         "type": "json_invalid",
-        "loc": ("edits",),
+        "loc": ("from",),
         "msg": "Invalid JSON: secret-input",
         "input": "secret-input",
     }]
     retry = RetryPromptPart(
         validation_content,
-        tool_name="edit_blocks",
+        tool_name="fill_block",
         tool_call_id="tc-invalid",
         timestamp=retry_at,
     )
     messages = [
         ModelResponse(parts=[
             ToolCallPart(
-                tool_name="edit_blocks",
+                tool_name="fill_block",
                 args=parameters,
                 tool_call_id="tc-invalid",
             )
         ]),
         ModelRequest(parts=[retry, RetryPromptPart(
             validation_content,
-            tool_name="edit_blocks",
+            tool_name="fill_block",
             tool_call_id="tc-invalid",
             timestamp=retry_at,
         )]),
@@ -211,14 +207,14 @@ def test_validation_failure_extractor_matches_call_and_deduplicates_retry_timest
 
     assert len(failures) == 1
     failure = failures[0]
-    assert failure["tool_name"] == "edit_blocks"
+    assert failure["tool_name"] == "fill_block"
     assert failure["tool_call_id"] == "tc-invalid"
     assert failure["retry_timestamp"] == retry_at.isoformat()
     assert failure["error_type"] == "json_invalid"
-    assert failure["error_locations"] == ["edits"]
-    assert failure["parameters"]["dimension"] == "minecraft:overworld"
-    assert failure["parameters"]["edits"][0]["block"] == "minecraft:stone"
-    assert len(failure["parameters"]["edits"]) == 32
+    assert failure["error_locations"] == ["from"]
+    assert failure["parameters"]["from"] == [0, 64, 0]
+    assert failure["parameters"]["block"] == "minecraft:stone"
+    assert failure["parameters"]["expect"] == "air"
     assert failure["parameters"].get("api_key") == "[REDACTED]"
 
 
@@ -227,7 +223,7 @@ def test_validation_failure_audit_record_is_validation_only_and_bounded():
     deps = DummyDeps(settings, run_id="run-invalid")
     ctx = SimpleNamespace(deps=deps, tool_call_id="tc-invalid")
     failure = {
-        "tool_name": "edit_blocks",
+        "tool_name": "place_block",
         "tool_call_id": "tc-invalid",
         "retry_timestamp": "2026-08-02T15:00:00+00:00",
         "error_type": "json_invalid",
@@ -247,7 +243,7 @@ def test_validation_failure_audit_record_is_validation_only_and_bounded():
         run_id="run-invalid",
     )
 
-    assert record["tool_name"] == "edit_blocks"
+    assert record["tool_name"] == "place_block"
     assert record["tool_call_id"] == "tc-invalid"
     assert record["status"] == "failure"
     assert record["error_kind"] == "INVALID_ARGUMENT"
@@ -380,7 +376,7 @@ def test_audit_record_keeps_bounded_group_execution_evidence() -> None:
     )
 
     record = build_audit_record(
-        tool_name="edit_blocks",
+        tool_name="place_block",
         parameters={},
         ctx=ctx,
         status="success",
@@ -493,14 +489,18 @@ def test_block_approval_audit_keeps_authorized_preview_without_locked_targets() 
     settings = Settings()
     ctx = SimpleNamespace(deps=DummyDeps(settings, run_id="run-block-audit"), tool_call_id="tc-block-audit")
     record = build_audit_record(
-        tool_name="edit_blocks",
-        parameters={"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"},
+        tool_name="fill_block",
+        parameters={
+            "from": [0, 64, 0],
+            "to": [4, 64, 4],
+            "block": "minecraft:stone",
+            "expect": "air",
+        },
         authorized_args={
-            "edits": [{
-                "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-                "block": "minecraft:stone",
-            }],
-            "dimension": "minecraft:overworld",
+            "from": [0, 64, 0],
+            "to": [4, 64, 4],
+            "block": "minecraft:stone",
+            "expect": "air",
             "locked_targets": [{"x": 1, "y": 64, "z": 1}],
         },
         approval_evidence={
@@ -517,8 +517,9 @@ def test_block_approval_audit_keeps_authorized_preview_without_locked_targets() 
 
     assert record["run_id"] == "run-block-audit"
     assert record["tool_call_id"] == "tc-block-audit"
-    assert record["authorized_parameters"]["dimension"] == "minecraft:overworld"
-    assert record["authorized_parameters"]["edits"][0]["block"] == "minecraft:stone"
+    assert record["authorized_parameters"]["from"] == [0, 64, 0]
+    assert record["authorized_parameters"]["to"] == [4, 64, 4]
+    assert record["authorized_parameters"]["block"] == "minecraft:stone"
     assert record["approval_evidence"] == {"repairs_applied": ["normalized_bounds"]}
     dumped = json.dumps(record, ensure_ascii=False)
     assert "locked_targets" not in dumped
@@ -529,7 +530,7 @@ def test_audit_exception_redacts_sensitive_values_but_keeps_correlation() -> Non
     settings = Settings()
     ctx = SimpleNamespace(deps=DummyDeps(settings, run_id="run-exception"), tool_call_id="tc-exception")
     record = build_audit_record(
-        tool_name="edit_blocks",
+        tool_name="place_block",
         parameters={},
         ctx=ctx,
         status="failure",
@@ -547,7 +548,7 @@ def test_audit_exception_redacts_sensitive_values_but_keeps_correlation() -> Non
     assert "Bearer abcdef" not in dumped
 
     tool_failure = build_audit_record(
-        tool_name="edit_blocks",
+        tool_name="place_block",
         parameters={},
         ctx=ctx,
         status="failure",
@@ -634,3 +635,98 @@ async def test_shutdown_flush_persists_queued_records(tmp_path):
     assert len(records) == 1
     assert records[0]["run_id"] == "run-flush"
     assert records[0]["tool_name"] == "run_minecraft_command"
+
+
+@pytest.mark.asyncio
+async def test_block_plan_resume_audits_canonical_args_without_hidden_kwargs(
+    tmp_path, monkeypatch
+) -> None:
+    """plan_id 恢复的审计 parameters/authorized_args 从缓存 canonical args 还原。
+
+    隐藏字段（locked_targets/phase/status）不得出现在审计 JSON 中；公共
+    工具体体不得被调用（恢复路径直达缓存执行器）。
+    """
+    from unittest.mock import MagicMock
+
+    from services.agent.block_ops.preflight_cache import get_preflight_cache
+    from services.agent.harness import catalog as _catalog_module
+    from services.agent.harness.catalog import (
+        ParameterPreviewPolicy,
+        ToolIntent,
+        ToolRisk,
+        _entry,
+    )
+    from services.agent.harness.execution import (
+        HarnessToolset,
+        PolicyEngine,
+        get_block_command_fallback_store,
+        get_idempotency_store,
+    )
+
+    monkeypatch.setattr(
+        _catalog_module,
+        "_TOOL_CATALOG",
+        {
+            **_catalog_module._TOOL_CATALOG,
+            "place_block": _entry(
+                "place_block",
+                ToolIntent.CHANGE_WORLD,
+                ToolRisk.HIGH,
+                "向世界写入单个方块时使用。",
+                "不要用于查询或批量填充。",
+                "pos 为 [x, y, z] 绝对坐标；block 为方块 type_id。",
+                preview=ParameterPreviewPolicy(include=("pos", "block", "expect")),
+                may_have_external_side_effects=True,
+            ),
+        },
+    )
+
+    audit_path = tmp_path / "runtime_harness_tools.jsonl"
+    settings = AuditOnlySettings(str(audit_path))
+    canonical = {"pos": [1, 64, 1], "block": "stone", "expect": "air"}
+    called: dict[str, int] = {"count": 0}
+
+    async def fake_place_impl(
+        ctx, *, pos, block, expect="air", states=None
+    ):
+        called["count"] += 1
+        return ToolResult.ok(f"placed:{block}")
+
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.place_block_impl", fake_place_impl)
+
+    get_preflight_cache().put(
+        run_id="run-test-1",
+        tool_call_id="tc-1",
+        original_args_hash="orig-h",
+        canonical_args=canonical,
+        tool_name="place_block",
+        plan_id="pid-audit",
+    )
+
+    ts = HarnessToolset(
+        wrapped=MagicMock(),
+        policy=PolicyEngine.from_settings(settings),
+        idempotency=get_idempotency_store(),
+        fallback_store=get_block_command_fallback_store(),
+    )
+    ctx = SimpleNamespace(deps=DummyDeps(settings, run_id="run-test-1"), tool_call_id="tc-1")
+    ctx.tool_call_approved = True
+    result = await ts.call_tool("place_block", {"plan_id": "pid-audit"}, ctx, MagicMock())
+    assert called["count"] == 1
+    assert "placed:stone" in str(result)
+    _flush()
+
+    records = read_jsonl(audit_path)
+    assert len(records) == 1
+    record = records[0]
+    assert record["tool_name"] == "place_block"
+    assert record["status"] == "success"
+    assert record["parameters"] == canonical
+    assert record["authorized_parameters"] == canonical
+    # 隐藏 kwargs 不得出现在审计参数中（record 自身的 status 字段除外）
+    for field_name in ("parameters", "authorized_parameters"):
+        for hidden in ("locked_targets", "phase", "status"):
+            assert hidden not in record[field_name]
+    dumped = json.dumps(record, ensure_ascii=False)
+    assert "locked_targets" not in dumped
+    assert '"phase"' not in dumped

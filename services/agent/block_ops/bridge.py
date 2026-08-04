@@ -13,14 +13,14 @@ from services.agent.block_ops.schema import (
     BlockErrorCode,
     build_error_response,
     dumps_payload,
+    fallback_allowed_for_code,
 )
 from services.agent.tool_results import ToolResult
 
 logger = get_logger(__name__)
 
 _LIMIT_HINT = (
-    "减小 batch.positions 数量或 fill AABB；继续使用 batch/fill，"
-    "禁止拆成大量 place（禁止 place 风暴）；勿用命令绕过审批。"
+    "缩小 fill AABB 或减少 states；禁止拆成大量 place；勿用命令绕过审批。"
 )
 _LIMIT_MESSAGE = "出站帧超出 MCBE commandLine 字节预算，请求未发送。"
 _PRECONDITION_MESSAGE = "目标方块不满足 expect 前置条件。"
@@ -33,6 +33,9 @@ _SENSITIVE_MESSAGE_RE = re.compile(
     re.IGNORECASE,
 )
 _BLOCK_CAPABILITIES = frozenset({"edit_blocks", "inspect_block"})
+# Public world-mutating tools (single-op place/fill) map bridge failures after
+# send to STATE_UNKNOWN with no fallback.
+_WORLD_MUTATION_TOOL_NAMES = frozenset({"place_block", "fill_block"})
 
 
 class _BridgeClient(Protocol):
@@ -199,7 +202,7 @@ def map_bridge_exception(
             _LIMIT_MESSAGE,
             retryable=True,
             external_state_unknown=False,
-            fallback_allowed=False,
+            fallback_allowed=True,
             reason="command_line_budget",
             hint=_LIMIT_HINT,
         )
@@ -212,7 +215,7 @@ def map_bridge_exception(
             error_type=error_type,
         )
 
-    if tool_name == "edit_blocks":
+    if tool_name in _WORLD_MUTATION_TOOL_NAMES:
         # Timeout after a successful outbound means the addon may have written —
         # keep STATE_UNKNOWN + no-auto-retry contract.
         if is_timeout:
@@ -407,10 +410,7 @@ def _safe_addon_error_body(
         stable_code = BlockErrorCode.INTERNAL_ERROR
 
     error_kind, retryable, external_unknown = _error_kind_for_code(stable_code)
-    fallback_allowed = stable_code in {
-        BlockErrorCode.ADDON_UNAVAILABLE,
-        BlockErrorCode.UNSUPPORTED_CAPABILITY,
-    }
+    fallback_allowed = fallback_allowed_for_code(stable_code)
     src = payload if isinstance(payload, dict) else {}
 
     if stable_code == BlockErrorCode.LIMIT_EXCEEDED:
@@ -426,7 +426,7 @@ def _safe_addon_error_body(
         fields: dict[str, Any] = {
             "retryable": True,
             "external_state_unknown": False,
-            "fallback_allowed": False,
+            "fallback_allowed": fallback_allowed,
             "hint": _LIMIT_HINT,
         }
         reason = src.get("reason")
@@ -434,7 +434,13 @@ def _safe_addon_error_body(
             fields["reason"] = reason
         else:
             fields["reason"] = "command_line_budget"
-        for key in ("suggested_max_discrete", "matched_count", "volume"):
+        for key in (
+            "suggested_max_discrete",
+            "matched_count",
+            "volume",
+            "estimated_bytes",
+            "budget",
+        ):
             parsed = _optional_int(src.get(key))
             if parsed is not None:
                 fields[key] = parsed
@@ -447,7 +453,7 @@ def _safe_addon_error_body(
         fields = {
             "retryable": False,
             "external_state_unknown": False,
-            "fallback_allowed": False,
+            "fallback_allowed": fallback_allowed,
         }
         matched_count = _safe_nonnegative_int(src.get("matched_count"))
         if matched_count is not None:
@@ -458,7 +464,7 @@ def _safe_addon_error_body(
         actual_type_id = _extract_actual_type_id(src)
         if not actual_type_counts and actual_type_id is not None:
             actual_type_counts = {actual_type_id: 1}
-        if actual_type_counts or stable_code == BlockErrorCode.PRECONDITION_FAILED:
+        if actual_type_counts:
             fields["actual_type_counts"] = actual_type_counts
         fields["hint"] = _precondition_hint_for_counts(
             actual_type_counts,
@@ -482,7 +488,7 @@ def _safe_addon_error_body(
         fields = {
             "retryable": False,
             "external_state_unknown": False,
-            "fallback_allowed": False,
+            "fallback_allowed": fallback_allowed,
             "hint": "未知方块类型；请使用 candidates 中的候选或先 inspect_block 确认。",
         }
         type_id = src.get("type_id")
@@ -501,7 +507,7 @@ def _safe_addon_error_body(
         fields = {
             "retryable": False,
             "external_state_unknown": False,
-            "fallback_allowed": False,
+            "fallback_allowed": fallback_allowed,
             "hint": "方块 states 非法；请使用 valid_state_keys 中的字段重试。",
         }
         type_id = src.get("type_id")
@@ -520,7 +526,7 @@ def _safe_addon_error_body(
         fields = {
             "retryable": False,
             "external_state_unknown": False,
-            "fallback_allowed": False,
+            "fallback_allowed": fallback_allowed,
             "hint": "目标含受保护数据（如容器、告示牌、唱片机等），不能覆盖。",
         }
         type_id = src.get("type_id")
@@ -542,9 +548,10 @@ def _safe_addon_error_body(
         fields = {
             "retryable": False,
             "external_state_unknown": False,
-            "fallback_allowed": False,
-            "hint": "多格方块（门、床、高草等）需多格放置与整体校验，"
-            "当前工具不支持单格写入；请改用可逐格放置的方块。",
+            "fallback_allowed": fallback_allowed,
+            "hint": "多格方块（门、床、高草等）专用工具不支持单格写入；"
+            "可用 run_minecraft_command 的 setblock 回退"
+            "（Bedrock 1.26.10+ 自动放置完整结构，无需指定 half 等 Java 状态语法）。",
         }
         type_id = src.get("type_id")
         if isinstance(type_id, str) and type_id and not _looks_sensitive(type_id):
@@ -605,10 +612,14 @@ async def call_block_capability(
     mode: str | None = None,
     authorized_bounds: dict[str, Any] | None = None,
     project_for_model: bool | None = None,
+    tool_name: str | None = None,
 ) -> ToolResult:
     """Invoke a block capability and map the response to ToolResult.
 
     Never treats ok:false as success. Block tools project success bodies for the model.
+
+    ``tool_name`` is the public tool name (place_block / fill_block /
+    inspect_block) used for exception mapping; defaults to the wire capability.
     """
     if bridge is None:
         body = build_error_response(
@@ -628,7 +639,7 @@ async def call_block_capability(
     try:
         result = await bridge.request(capability, payload)
     except Exception as exc:
-        return map_bridge_exception(exc, tool_name=capability)
+        return map_bridge_exception(exc, tool_name=tool_name or capability)
 
     # Preflight responses feed merge_canonical / approval; keep full payload.
     # Only project execute (model-visible) success bodies for block tools.

@@ -340,7 +340,7 @@ expect      可选，当前方块必须满足的条件
         ]
       },
       "block": {
-        "type_id": "minecraft:oak_door",
+        "type_id": "minecraft:wooden_door",
         "states": {
           "minecraft:cardinal_direction": "south"
         }

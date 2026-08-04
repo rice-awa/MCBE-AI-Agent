@@ -97,7 +97,7 @@ def test_context_preserves_tool_call_with_validation_retry():
         ModelResponse(
             parts=[
                 ToolCallPart(
-                    "edit_blocks",
+                    "place_block",
                     '{"edits": [',
                     tool_call_id="call-bad",
                 )
@@ -107,7 +107,7 @@ def test_context_preserves_tool_call_with_validation_retry():
             parts=[
                 RetryPromptPart(
                     "invalid JSON",
-                    tool_name="edit_blocks",
+                    tool_name="place_block",
                     tool_call_id="call-bad",
                 )
             ]
@@ -127,7 +127,7 @@ def test_context_removes_orphan_tool_validation_retry():
             parts=[
                 RetryPromptPart(
                     "invalid JSON",
-                    tool_name="edit_blocks",
+                    tool_name="place_block",
                     tool_call_id="orphan-retry",
                 )
             ]
@@ -145,7 +145,7 @@ def test_context_removes_orphan_tool_return():
         ModelRequest(
             parts=[
                 ToolReturnPart(
-                    tool_name="edit_blocks",
+                    tool_name="place_block",
                     content="unexpected result",
                     tool_call_id="orphan-return",
                 )
@@ -164,7 +164,7 @@ def test_context_removes_orphan_tool_call():
         ModelResponse(
             parts=[
                 ToolCallPart(
-                    "edit_blocks",
+                    "place_block",
                     '{"edits": []}',
                     tool_call_id="orphan-call",
                 )
@@ -184,7 +184,7 @@ def test_context_removes_orphan_tool_call():
             ModelResponse(
                 parts=[
                     ToolCallPart(
-                        "edit_blocks",
+                        "place_block",
                         '{"edits": []}',
                         tool_call_id="",
                     )
@@ -196,7 +196,7 @@ def test_context_removes_orphan_tool_call():
             ModelRequest(
                 parts=[
                     ToolReturnPart(
-                        tool_name="edit_blocks",
+                        tool_name="place_block",
                         content="orphan",
                         tool_call_id="",
                     )
@@ -209,7 +209,7 @@ def test_context_removes_orphan_tool_call():
                 parts=[
                     RetryPromptPart(
                         "invalid JSON",
-                        tool_name="edit_blocks",
+                        tool_name="place_block",
                         tool_call_id="",
                     )
                 ]
@@ -256,7 +256,7 @@ def test_context_removes_orphan_call_but_preserves_assistant_text():
             parts=[
                 TextPart(content="visible answer"),
                 ToolCallPart(
-                    "edit_blocks",
+                    "place_block",
                     '{"edits": []}',
                     tool_call_id="orphan-call-with-text",
                 ),
@@ -283,7 +283,7 @@ def test_context_removes_orphan_retry_but_preserves_user_prompt():
                 UserPromptPart("keep this input"),
                 RetryPromptPart(
                     "invalid JSON",
-                    tool_name="edit_blocks",
+                    tool_name="place_block",
                     tool_call_id="orphan-retry-with-user",
                 ),
             ]
@@ -308,12 +308,12 @@ def test_context_keeps_complete_pair_and_removes_orphan_parallel_call():
         ModelResponse(
             parts=[
                 ToolCallPart(
-                    "edit_blocks",
+                    "place_block",
                     '{"edits": []}',
                     tool_call_id="parallel-complete",
                 ),
                 ToolCallPart(
-                    "edit_blocks",
+                    "place_block",
                     '{"edits": []}',
                     tool_call_id="parallel-orphan",
                 ),
@@ -322,7 +322,7 @@ def test_context_keeps_complete_pair_and_removes_orphan_parallel_call():
         ModelRequest(
             parts=[
                 ToolReturnPart(
-                    tool_name="edit_blocks",
+                    tool_name="place_block",
                     content="complete",
                     tool_call_id="parallel-complete",
                 )
@@ -348,7 +348,7 @@ def test_context_keeps_same_id_pair_when_recent_turn_cropping_runs():
         ModelResponse(
             parts=[
                 ToolCallPart(
-                    "edit_blocks",
+                    "place_block",
                     '{"edits": [',
                     tool_call_id="cropped-pair",
                 )
@@ -358,7 +358,7 @@ def test_context_keeps_same_id_pair_when_recent_turn_cropping_runs():
             parts=[
                 RetryPromptPart(
                     "invalid JSON",
-                    tool_name="edit_blocks",
+                    tool_name="place_block",
                     tool_call_id="cropped-pair",
                 )
             ]
@@ -375,22 +375,22 @@ def test_context_pairs_tool_parts_in_order_one_to_one_without_mutating_mixed_mes
     """响应必须匹配此前唯一未配对的 call，重复 ID 不能扩大成多对。"""
     builder = _large_context_builder()
     response_before_call = ToolReturnPart(
-        tool_name="edit_blocks",
+        tool_name="place_block",
         content="response before call",
         tool_call_id="duplicate-id",
     )
     first_call = ToolCallPart(
-        "edit_blocks",
+        "place_block",
         {"edits": []},
         tool_call_id="duplicate-id",
     )
     duplicate_call = ToolCallPart(
-        "edit_blocks",
+        "place_block",
         {"edits": [{"unexpected": "duplicate"}]},
         tool_call_id="duplicate-id",
     )
     valid_response = ToolReturnPart(
-        tool_name="edit_blocks",
+        tool_name="place_block",
         content="valid response",
         tool_call_id="duplicate-id",
     )
@@ -480,7 +480,7 @@ def test_context_cleans_pair_half_left_by_recent_turn_cropping():
         ModelResponse(
             parts=[
                 ToolCallPart(
-                    "edit_blocks",
+                    "place_block",
                     '{"edits": []}',
                     tool_call_id="cropped-half",
                 )
@@ -490,7 +490,7 @@ def test_context_cleans_pair_half_left_by_recent_turn_cropping():
             parts=[
                 UserPromptPart("current input"),
                 ToolReturnPart(
-                    tool_name="edit_blocks",
+                    tool_name="place_block",
                     content="return after cropped call",
                     tool_call_id="cropped-half",
                 ),
@@ -528,7 +528,7 @@ def test_context_preserves_request_and_response_metadata_when_cleaning_parts():
             UserPromptPart("keep request prompt"),
             RetryPromptPart(
                 "invalid JSON",
-                tool_name="edit_blocks",
+                tool_name="place_block",
                 tool_call_id="metadata-request-orphan",
             ),
         ],
@@ -542,7 +542,7 @@ def test_context_preserves_request_and_response_metadata_when_cleaning_parts():
         parts=[
             TextPart(content="keep response text"),
             ToolCallPart(
-                "edit_blocks",
+                "place_block",
                 '{"edits": []}',
                 tool_call_id="metadata-response-orphan",
             ),

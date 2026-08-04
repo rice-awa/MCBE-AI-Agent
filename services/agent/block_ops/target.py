@@ -21,11 +21,27 @@ from __future__ import annotations
 
 from typing import Any
 
-from services.agent.block_ops.schema import BlockErrorCode
-from services.agent.block_ops.tools_impl import _host_limit_error
+from services.agent.block_ops.schema import BlockErrorCode, _host_limit_error
 
 _ABSOLUTE_KEYS = frozenset({"x", "y", "z"})
 _RELATIVE_KEYS = frozenset({"forward", "right", "up"})
+
+
+def normalize_aabb_corners(
+    from_pos: dict[str, Any],
+    to_pos: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return min/max ordered corners for stable fill authorization."""
+    try:
+        xs = sorted((int(from_pos["x"]), int(to_pos["x"])))
+        ys = sorted((int(from_pos["y"]), int(to_pos["y"])))
+        zs = sorted((int(from_pos["z"]), int(to_pos["z"])))
+        return (
+            {"x": xs[0], "y": ys[0], "z": zs[0]},
+            {"x": xs[1], "y": ys[1], "z": zs[1]},
+        )
+    except (KeyError, TypeError, ValueError):
+        return from_pos, to_pos
 
 
 def _is_absolute_coord(value: Any) -> bool:
@@ -170,6 +186,77 @@ def normalize_inspect_target(
             box_to=to_pos,
         ),
         None,
+    )
+
+
+def normalize_array_target(
+    target: Any,
+) -> tuple[NormalizedTarget | None, Any]:
+    """Normalize an array-shaped target into a unified NormalizedTarget.
+
+    Accepts the model-facing shorthand:
+      - single point ``[x, y, z]`` → positions shape (one absolute cell);
+      - two corners ``[[x1, y1, z1], [x2, y2, z2]]`` → box shape with
+        min/max-normalized corners.
+
+    Non-int / wrong-length coordinates yield a structured INVALID_COORDINATE
+    result (never a Python exception). Array targets are always absolute
+    world coordinates.
+    """
+    if not isinstance(target, list):
+        return None, _host_limit_error(
+            BlockErrorCode.INVALID_COORDINATE,
+            "target 必须是 [x, y, z] 或 [[x1, y1, z1], [x2, y2, z2]]",
+        )
+
+    def _cell(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, list) or len(value) != 3:
+            return None
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, int):
+                return None
+        return {"x": value[0], "y": value[1], "z": value[2]}
+
+    # Point form: [x, y, z].
+    if len(target) == 3 and not any(isinstance(v, list) for v in target):
+        cell = _cell(target)
+        if cell is None:
+            return None, _host_limit_error(
+                BlockErrorCode.INVALID_COORDINATE,
+                "target 必须是 3 个整数坐标 [x, y, z]",
+            )
+        return (
+            NormalizedTarget(
+                shape="positions",
+                coordinate_mode="absolute",
+                positions=[cell],
+            ),
+            None,
+        )
+
+    # Box form: [[x1, y1, z1], [x2, y2, z2]].
+    if len(target) == 2 and all(isinstance(v, list) for v in target):
+        from_cell = _cell(target[0])
+        to_cell = _cell(target[1])
+        if from_cell is None or to_cell is None:
+            return None, _host_limit_error(
+                BlockErrorCode.INVALID_COORDINATE,
+                "target 两角点必须是恰好 3 个整数的坐标数组",
+            )
+        from_pos, to_pos = normalize_aabb_corners(from_cell, to_cell)
+        return (
+            NormalizedTarget(
+                shape="box",
+                coordinate_mode="absolute",
+                box_from=from_pos,
+                box_to=to_pos,
+            ),
+            None,
+        )
+
+    return None, _host_limit_error(
+        BlockErrorCode.INVALID_COORDINATE,
+        "target 必须是 [x, y, z] 或 [[x1, y1, z1], [x2, y2, z2]]",
     )
 
 

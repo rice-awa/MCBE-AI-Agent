@@ -6,10 +6,12 @@
  * writes only one half and silently produces a broken structure, and
  * verifying only that one cell would over-claim success.
  *
- * Until a full multi-cell placement + post-write verification path exists,
- * these blocks are rejected as ``UNSUPPORTED_BLOCK_PLACEMENT`` with
- * ``fallback_allowed=false`` so the model does not fall back to a single
- * ``setblock`` (which has the same single-cell problem).
+ * This check only constrains the **Script API single-cell write path**
+ * (``setPermutation`` writes only one permutation). The
+ * **command path** (``/setblock`` / ``/fill``) has placed the full
+ * double-block structure correctly since Bedrock 1.26.10
+ * (Microsoft Update1.26.10), so ``fallback_allowed`` is now computed by
+ * the host using a unified rule and is no longer assumed ``false`` here.
  *
  * The list is intentionally a small, stable, suffix-based heuristic rather
  * than an exhaustive registry: door and bed variants all share the ``_door``

@@ -27,8 +27,9 @@ REGISTERED_AGENT_TOOL_NAMES = {
     "get_inventory_snapshot",
     "find_entities",
     "run_world_command",
+    "place_block",
+    "fill_block",
     "inspect_block",
-    "edit_blocks",
 }
 
 
@@ -58,21 +59,48 @@ def test_group_tools_by_intent_keeps_catalog_entries() -> None:
     assert grouped_names == REGISTERED_AGENT_TOOL_NAMES
 
 
-def test_edit_blocks_catalog_only_describes_grouped_edit_contract() -> None:
-    entry = get_tool_catalog()["edit_blocks"]
-    text = " ".join(
-        (
-            entry.when_to_use,
-            entry.when_not_to_use,
-            entry.parameter_constraints,
-        )
-    )
-    assert "edits" in text
-    assert "expect" in text
-    assert "fallback_allowed" in text
-    for obsolete in ("mode=place", "batch", "PRECONDITION_FAILED", "LIMIT_EXCEEDED"):
-        assert obsolete not in text
+def test_block_tool_cards_follow_single_op_contract() -> None:
+    """place/fill/inspect cards describe only the single-op contract (spec §6.2)."""
+    place = get_tool_catalog()["place_block"]
+    fill = get_tool_catalog()["fill_block"]
+    inspect = get_tool_catalog()["inspect_block"]
 
-    assert "小而完整的施工阶段" in entry.when_to_use
-    assert "一次预检 + 一次审批" in entry.when_to_use
-    assert "稍后执行" in entry.when_not_to_use
+    assert place.intent == ToolIntent.CHANGE_WORLD
+    assert place.risk == ToolRisk.HIGH
+    assert fill.intent == ToolIntent.CHANGE_WORLD
+    assert fill.risk == ToolRisk.HIGH
+    assert inspect.intent == ToolIntent.QUERY_WORLD
+    assert inspect.risk == ToolRisk.LOW
+
+    place_text = " ".join(
+        (place.when_to_use, place.when_not_to_use, place.parameter_constraints)
+    )
+    fill_text = " ".join(
+        (fill.when_to_use, fill.when_not_to_use, fill.parameter_constraints)
+    )
+    inspect_text = " ".join(
+        (inspect.when_to_use, inspect.when_not_to_use, inspect.parameter_constraints)
+    )
+
+    # Parameter names match the public schemas.
+    for param in ("pos", "block", "expect", "states"):
+        assert param in place_text
+    for param in ("from", "to", "block", "expect", "states"):
+        assert param in fill_text
+    assert "target" in inspect_text
+
+    # Grouped-edit vocabulary is gone from all block cards.
+    for text in (place_text, fill_text, inspect_text):
+        for obsolete in (
+            "edits",
+            "grouped",
+            "fallback_allowed",
+            "mode=place",
+            "batch",
+            "PRECONDITION_FAILED",
+            "LIMIT_EXCEEDED",
+            "previous_type_counts",
+        ):
+            assert obsolete not in text, (text, obsolete)
+
+    assert "edit_blocks" not in get_tool_catalog()

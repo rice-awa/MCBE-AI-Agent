@@ -381,7 +381,7 @@ export async function handleFill(payload: EditBlocksPayload): Promise<BridgeResu
       matched_count: 0,
       actual_type_counts: actualTypeCounts,
       hint: preconditionHint(prepared.payload, actualTypeCounts),
-      fallback_allowed: false,
+      fallback_allowed: true,
       retryable: false,
     });
   }

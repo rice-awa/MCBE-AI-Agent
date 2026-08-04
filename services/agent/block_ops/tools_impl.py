@@ -1,22 +1,18 @@
-"""Model-facing inspect_block / edit_blocks tool implementations."""
+"""Model-facing inspect_block / place_block / fill_block tool implementations."""
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from typing import Any, Literal
+import secrets
+from dataclasses import dataclass
+from typing import Any
 
 from pydantic_ai import RunContext
 
 from config.logging import get_logger
 from config.redaction import redact_exception
 from models.agent import AgentDependencies
-from services.agent.block_ops.bridge import (
-    _precondition_hint_for_counts,
-    _safe_actual_type_counts,
-    call_block_capability,
-    map_bridge_exception,
-)
+from services.agent.block_ops.bridge import call_block_capability
 from services.agent.block_ops.capability import (
     BlockCapabilityStatus,
     ensure_block_capability,
@@ -26,39 +22,30 @@ from services.agent.block_ops.config import (
     get_block_tools_limits,
     get_command_line_byte_budget,
 )
-from services.agent.block_ops.project import (
-    _per_edit_changed,
-    _per_edit_skipped,
-    _per_edit_skipped_type_counts,
-    project_group_edit_result_for_model,
-)
 from services.agent.block_ops.schema import (
     BlockErrorCode,
+    _host_limit_error,
     build_error_response,
+    build_state_unknown_response,
     dumps_payload,
+    fallback_allowed_for_code,
+)
+from services.agent.block_ops.target import (
+    normalize_aabb_corners as _normalize_aabb_corners,
 )
 from services.agent.tool_results import ToolResult
 
 logger = get_logger(__name__)
 
-BLOCK_TOOL_NAMES = frozenset({"inspect_block", "edit_blocks"})
-CoordinateMode = Literal["absolute", "player_relative"]
-EditMode = Literal["place", "batch", "fill"]
+BLOCK_TOOL_NAMES = frozenset({"inspect_block", "place_block", "fill_block"})
 
 # Stable request_id length matching production ``addon-{uuid4().hex}`` (38 chars).
 _BRIDGE_REQUEST_ID_PLACEHOLDER = f"addon-{'0' * 32}"
 _BRIDGE_REQ_PREFIX = "scriptevent mcbews:bridge_req "
 _COMMAND_LINE_BUDGET_HINT = (
-    "减小 batch.positions 数量或 fill AABB；继续使用 batch/fill，"
-    "禁止拆成大量 place（禁止 place 风暴）；勿用命令绕过审批。"
+    "缩小 fill AABB 或减少 states；禁止拆成大量 place；勿用命令绕过审批。"
 )
 _COMMAND_LINE_BUDGET_MESSAGE = "出站帧超出 MCBE commandLine 字节预算，请求未发送。"
-_AUDIT_EDIT_EVIDENCE_FIELDS = frozenset({
-    "before", "after", "before_samples", "after_samples", "verification",
-    "verification_summary", "rollback", "failed_index", "written_count",
-    "repairs_applied", "candidates", "valid_state_keys", "protected",
-    "multiblock", "type_id", "component", "target",
-})
 
 
 @dataclass(frozen=True)
@@ -68,115 +55,7 @@ class BlockPreflightPlan:
     authorized_args: dict[str, Any]
     execute_args: dict[str, Any]
     approval_metadata: dict[str, Any]
-
-
-# Execute-projection fields. The new ``edits`` contract carries the full edit
-# description (target/block/expect); legacy flat fields remain for harness
-# recovery of previously-approved operations.
-_EDIT_EXECUTE_FIELDS = frozenset({
-    "edits", "dimension", "block", "expect", "status",
-    "type_id", "mode", "coordinate_mode", "position", "positions",
-    "from_pos", "to_pos", "states", "replace_any", "expected_previous",
-    "locked_targets", "locked_targets_by_edit", "noop_edit_indices",
-    "repairs_applied", "phase",
-})
-_INSPECT_EXECUTE_FIELDS = frozenset({
-    "coordinate_mode", "dimension", "position", "positions", "target",
-    "locked_targets", "phase",
-})
-
-
-def project_block_execute_args(tool_name: str, authorized_args: dict[str, Any]) -> dict[str, Any]:
-    """Strictly project bridge-facing authorization into public Python arguments."""
-    fields = _EDIT_EXECUTE_FIELDS if tool_name == "edit_blocks" else _INSPECT_EXECUTE_FIELDS
-    if tool_name not in BLOCK_TOOL_NAMES:
-        raise ValueError(f"unsupported block tool: {tool_name}")
-    projected = {key: value for key, value in authorized_args.items() if key in fields}
-    if tool_name == "edit_blocks":
-        # New ``edits`` contract (issue 03): the edit list is authoritative and
-        # carries the resolved absolute target, so the execute projection only
-        # needs edits/dimension/locked_targets/phase (+optional noop status).
-        if "edits" in projected:
-            projected = {
-                key: value for key, value in projected.items()
-                if key in {
-                    "edits", "dimension", "locked_targets",
-                    "locked_targets_by_edit", "noop_edit_indices",
-                    "repairs_applied", "phase", "status",
-                }
-                and value is not None
-            }
-            return _project_new_edit_execute_args(projected)
-        # Legacy flat contract (harness recovery of previously-approved ops).
-        if isinstance(authorized_args.get("from"), dict):
-            projected["from_pos"] = authorized_args["from"]
-        if isinstance(authorized_args.get("to"), dict):
-            projected["to_pos"] = authorized_args["to"]
-        required = {"type_id", "mode", "coordinate_mode", "dimension", "phase", "locked_targets"}
-    else:
-        # inspect: target path (issue 02) or legacy position/positions path.
-        has_target = "target" in projected and isinstance(projected["target"], dict)
-        if has_target:
-            # target path: only model-visible fields (target, dimension, phase).
-            # coordinate_mode is derived from target inside inspect_block_impl.
-            projected = {
-                key: value for key, value in projected.items()
-                if key in {"target", "dimension", "phase", "locked_targets"}
-            }
-            required = {"dimension", "phase", "target"}
-        else:
-            required = {"coordinate_mode", "dimension", "phase", "locked_targets"}
-    missing = [key for key in required if key not in projected]
-    # noop fill: all targets already at desired state; no locked_targets, no write.
-    is_noop = projected.get("status") == "noop"
-    if is_noop and tool_name == "edit_blocks" and projected.get("mode") == "fill":
-        if missing or projected.get("phase") != "execute":
-            raise ValueError("block preflight execution contract is incomplete")
-        if not isinstance(projected.get("from_pos"), dict) or not isinstance(
-            projected.get("to_pos"), dict
-        ):
-            raise ValueError("block preflight execution contract requires fill bounds")
-        return projected
-    # inspect target path: locked_targets not required (no mutation, no lock).
-    if tool_name == "inspect_block" and has_target:
-        if missing or projected.get("phase") != "execute":
-            raise ValueError("block preflight execution contract is incomplete")
-        return projected
-    if missing or projected.get("phase") != "execute" or not projected.get("locked_targets"):
-        raise ValueError("block preflight execution contract is incomplete")
-    if tool_name == "edit_blocks":
-        mode = projected["mode"]
-        if mode == "place" and not isinstance(projected.get("position"), dict):
-            raise ValueError("block preflight execution contract requires place position")
-        if mode == "batch" and not isinstance(projected.get("positions"), list):
-            raise ValueError("block preflight execution contract requires batch positions")
-        if mode == "batch" and not projected["positions"]:
-            raise ValueError("block preflight execution contract requires non-empty batch positions")
-        if mode == "fill" and (
-            not isinstance(projected.get("from_pos"), dict)
-            or not isinstance(projected.get("to_pos"), dict)
-        ):
-            raise ValueError("block preflight execution contract requires fill bounds")
-        if mode not in {"place", "batch", "fill"}:
-            raise ValueError("block preflight execution contract has invalid edit mode")
-    return projected
-
-
-def _project_new_edit_execute_args(projected: dict[str, Any]) -> dict[str, Any]:
-    """Validate and return the execute projection for the new ``edits`` contract."""
-    edits = projected.get("edits")
-    if not isinstance(edits, list) or not edits:
-        raise ValueError("block preflight execution contract requires edits")
-    is_noop = projected.get("status") == "noop"
-    if is_noop:
-        if projected.get("phase") != "execute":
-            raise ValueError("block preflight execution contract is incomplete")
-        return projected
-    required = {"edits", "dimension", "phase", "locked_targets"}
-    missing = [key for key in required if key not in projected]
-    if missing or projected.get("phase") != "execute" or not projected.get("locked_targets"):
-        raise ValueError("block preflight execution contract is incomplete")
-    return projected
+    plan_id: str = ""
 
 
 def _connection_id(deps: AgentDependencies) -> str:
@@ -239,18 +118,6 @@ async def _require_supported(ctx: RunContext[AgentDependencies]) -> ToolResult |
         diagnostic_summary=redact_exception(record.detail),
     )
     return _capability_failure_result("方块能力探测失败")
-
-
-def _host_limit_error(
-    code: BlockErrorCode,
-    message: str,
-    **fields: Any,
-) -> ToolResult:
-    return ToolResult.failure(
-        dumps_payload(build_error_response(code, message, **fields)),
-        error_kind="INVALID_ARGUMENT",
-        retryable=False,
-    )
 
 
 def _validate_inspect_args(
@@ -519,21 +386,75 @@ def _request_fill_aabb(
     return None, None
 
 
-def _normalize_aabb_corners(
-    from_pos: dict[str, Any],
-    to_pos: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Return min/max ordered corners for stable fill authorization."""
-    try:
-        xs = sorted((int(from_pos["x"]), int(to_pos["x"])))
-        ys = sorted((int(from_pos["y"]), int(to_pos["y"])))
-        zs = sorted((int(from_pos["z"]), int(to_pos["z"])))
-        return (
-            {"x": xs[0], "y": ys[0], "z": zs[0]},
-            {"x": xs[1], "y": ys[1], "z": zs[1]},
+def _normalize_position_array(
+    value: Any,
+    *,
+    field_name: str,
+) -> tuple[dict[str, Any] | None, ToolResult | None]:
+    """Normalize an ``[x, y, z]`` int array into an ``{x, y, z}`` dict.
+
+    Wrong-length / non-list / float / string / bool inputs yield a structured
+    INVALID_COORDINATE result (never a Python exception), matching the
+    int-only absolute-coordinate contract (spec §3.4).
+    """
+    if not isinstance(value, list) or len(value) != 3:
+        return None, _host_limit_error(
+            BlockErrorCode.INVALID_COORDINATE,
+            f"{field_name} 必须是恰好 3 个整数的坐标数组 [x, y, z]",
         )
-    except (KeyError, TypeError, ValueError):
-        return from_pos, to_pos
+    for i, item in enumerate(value):
+        if isinstance(item, bool) or not isinstance(item, int):
+            return None, _host_limit_error(
+                BlockErrorCode.INVALID_COORDINATE,
+                f"{field_name}[{i}] 必须是整数坐标",
+            )
+    return {"x": value[0], "y": value[1], "z": value[2]}, None
+
+
+def _normalize_single_op_block(
+    block: Any,
+    states: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any] | None, ToolResult | None]:
+    """Normalize ``block`` (+ optional separate ``states``) for single-op tools.
+
+    Returns ``(type_id, effective_states, error)``; ``error`` is a structured
+    INVALID_ARGUMENT result when no usable type_id is present.
+    """
+    block_info, _repairs = _normalize_block_input(block)
+    type_id = str(block_info.get("type_id") or "").strip()
+    if not type_id:
+        return "", None, _host_limit_error(
+            BlockErrorCode.INVALID_ARGUMENT,
+            "block.type_id 必填",
+        )
+    effective_states = states
+    if effective_states is None:
+        effective_states = block_info.get("states")
+    if effective_states is not None and not isinstance(effective_states, dict):
+        return "", None, _host_limit_error(
+            BlockErrorCode.INVALID_ARGUMENT,
+            "states 必须是对象",
+        )
+    return type_id, effective_states, None
+
+
+def _expect_to_legacy(
+    expect: Any,
+) -> tuple[bool, dict[str, Any] | None, ToolResult | None]:
+    """Map an ``expect`` value to ``(replace_any, expected_previous)``.
+
+    ``air`` (default) -> replace air only; ``any`` -> replace any block;
+    a type_id (or ``{type_id, states}``) -> expected_previous. An empty
+    type_id in the descriptor is rejected as INVALID_ARGUMENT.
+    """
+    expect_info = _normalize_expect(expect)
+    if expect_info["kind"] in {"type", "permutation"} and not expect_info.get("type_id"):
+        return False, None, _host_limit_error(
+            BlockErrorCode.INVALID_ARGUMENT,
+            "expect.type_id 必填",
+        )
+    replace_any, expected_previous = _expect_info_to_legacy(expect_info)
+    return replace_any, expected_previous, None
 
 
 def _normalize_block_id(
@@ -762,7 +683,7 @@ def command_line_budget_exceeded_result(
     fields: dict[str, Any] = {
         "retryable": True,
         "external_state_unknown": False,
-        "fallback_allowed": False,
+        "fallback_allowed": fallback_allowed_for_code(BlockErrorCode.LIMIT_EXCEEDED),
         "reason": "command_line_budget",
         "hint": _COMMAND_LINE_BUDGET_HINT,
         "estimated_bytes": estimated_bytes,
@@ -914,7 +835,7 @@ def locked_targets_wire_limit_exceeded(
         ),
         retryable=True,
         external_state_unknown=False,
-        fallback_allowed=False,
+        fallback_allowed=fallback_allowed_for_code(BlockErrorCode.LIMIT_EXCEEDED),
         reason="max_locked_targets_on_wire",
         hint=_COMMAND_LINE_BUDGET_HINT,
         suggested_max_discrete=max_locked_targets_on_wire,
@@ -1186,45 +1107,7 @@ def merge_canonical_from_preflight(
 
     # Mark as ready for execute phase.
     canonical["phase"] = "execute"
-    _resolve_edits_target_for_execute(canonical)
     return canonical
-
-
-def _resolve_edits_target_for_execute(canonical: dict[str, Any]) -> None:
-    """Rewrite ``edits[*].target`` to the resolved absolute execute target.
-
-    The execute projection (issue 03) is re-fed to ``edit_blocks_impl`` on
-    approval resume, where preflight is skipped and the legacy payload is
-    re-derived from ``edits``. A relative target (``{forward,right,up}``) would
-    otherwise be reinterpreted against the player's *current* position instead
-    of the approved anchor. Rewriting to absolute coordinates (frozen from the
-    preflight's ``locked_targets`` / authorized AABB) keeps the resumed payload
-    identical to the approved one.
-    """
-    edits = canonical.get("edits")
-    if not isinstance(edits, list) or not edits or not isinstance(edits[0], dict):
-        return
-    edit = edits[0]
-    if not isinstance(edit.get("target"), dict):
-        return
-    locked = canonical.get("locked_targets")
-    mode = canonical.get("mode")
-    if mode == "fill":
-        from_pos = canonical.get("from")
-        to_pos = canonical.get("to")
-        if isinstance(from_pos, dict) and isinstance(to_pos, dict):
-            edit["target"] = {"box": {"from": from_pos, "to": to_pos}}
-        return
-    if isinstance(locked, list) and locked:
-        positions = [
-            {"x": item.get("x"), "y": item.get("y"), "z": item.get("z")}
-            for item in locked
-            if isinstance(item, dict)
-        ]
-        if positions:
-            edit["target"] = {"positions": positions}
-    elif isinstance(canonical.get("position"), dict):
-        edit["target"] = {"positions": [canonical["position"]]}
 
 
 def build_block_preflight_plan(
@@ -1232,1139 +1115,50 @@ def build_block_preflight_plan(
     original_args: dict[str, Any],
     preflight_payload: dict[str, Any],
 ) -> BlockPreflightPlan:
+    """Build the separated plan (authorization / execute args / approval metadata).
+
+    Only ``inspect_block`` reaches here today: place/fill skip preflight and
+    execute directly (spec §3.1/§3.2). Execute args are the model-visible
+    subset of the canonical args, marked ready for the execute phase.
+    """
+    if tool_name != "inspect_block":
+        raise ValueError(f"unsupported block tool: {tool_name}")
     authorized_args = merge_canonical_from_preflight(original_args, preflight_payload)
-    execute_args = project_block_execute_args(tool_name, authorized_args)
+    has_target = isinstance(authorized_args.get("target"), dict)
+    if has_target:
+        projected = {
+            key: value
+            for key, value in authorized_args.items()
+            if key in {"target", "dimension", "phase", "locked_targets"}
+        }
+        required = {"dimension", "phase", "target"}
+    else:
+        projected = {
+            key: value
+            for key, value in authorized_args.items()
+            if key in {
+                "coordinate_mode", "dimension", "position", "positions",
+                "target", "locked_targets", "phase",
+            }
+        }
+        required = {"coordinate_mode", "dimension", "phase", "locked_targets"}
+    missing = [key for key in required if key not in projected]
+    # inspect target path: locked_targets not required (no mutation, no lock).
+    if has_target:
+        if missing or projected.get("phase") != "execute":
+            raise ValueError("block preflight execution contract is incomplete")
+    elif missing or projected.get("phase") != "execute" or not projected.get("locked_targets"):
+        raise ValueError("block preflight execution contract is incomplete")
     approval_metadata = {
         key: value
         for key, value in preflight_payload.items()
         if key not in authorized_args and key not in {"schema_version", "ok"}
     }
-    if (
-        tool_name == "edit_blocks"
-        and isinstance(original_args.get("edits"), list)
-        and isinstance(
-        approval_metadata.get("repairs_applied"), list
-        )
-    ):
-        execute_args["repairs_applied"] = approval_metadata["repairs_applied"][:8]
-    return BlockPreflightPlan(authorized_args, execute_args, approval_metadata)
-
-
-def _expect_hint_for_args(
-    args: dict[str, Any],
-    actual_type_counts: Any = None,
-    *,
-    failure_cause: str | None = None,
-) -> str:
-    """Build a model-facing recovery hint from observed block types.
-
-    The original expect policy is only used to avoid recommending ``any`` for
-    a protected-data failure. It must never be echoed as a hidden legacy
-    parameter or used instead of the observed type counts.
-    """
-    edits = args.get("edits")
-    expect_kind: Any = None
-    if isinstance(edits, list) and edits and isinstance(edits[0], dict):
-        expect_kind = _normalize_expect(edits[0].get("expect")).get("kind")
-    elif args.get("replace_any") is True:
-        expect_kind = "any"
-
-    avoid_any = failure_cause == "protected" or expect_kind == "any"
-    return _precondition_hint_for_counts(actual_type_counts, avoid_any=avoid_any)
-
-
-def _classify_zero_match_preflight(
-    tool_name: str,
-    tool_args: dict[str, Any],
-    preflight_fields: dict[str, Any],
-) -> ToolResult | None:
-    """Classify a successful preflight with zero matched targets.
-
-    Returns:
-      - None when the preflight has matched targets or is a genuine noop that
-        should proceed as a no-write plan.
-      - A failure ToolResult (PRECONDITION_FAILED) when zero targets matched and
-        the world is NOT already at the target state.
-
-    This prevents the historical INTERNAL_ERROR mapping when ``locked_targets``
-    is empty (spec §2.3 glass-replaces-planks scenario).
-    """
-    if tool_name != "edit_blocks":
-        return None
-    locked = preflight_fields.get("locked_targets")
-    matched_count = preflight_fields.get("matched_count")
-    if isinstance(matched_count, int) and matched_count > 0:
-        return None
-    if isinstance(locked, list) and locked:
-        return None
-
-    # Determine whether every target was already at the desired state (true noop).
-    already_target = preflight_fields.get("already_target")
-    volume = preflight_fields.get("volume")
-    if isinstance(already_target, int) and isinstance(volume, int) and volume > 0:
-        if already_target == volume:
-            return None  # genuine noop; plan carries status=noop
-    elif preflight_fields.get("status") == "noop":
-        return None
-
-    # Zero match, not a noop -> PRECONDITION_FAILED with actionable type counts.
-    actual_counts = preflight_fields.get("previous_type_counts")
-    if not isinstance(actual_counts, dict) or not actual_counts:
-        actual_counts = preflight_fields.get("actual_type_counts")
-    actual_counts = _safe_actual_type_counts(actual_counts)
-    failure_cause = (
-        "protected"
-        if preflight_fields.get("protected") is True
-        or preflight_fields.get("protected_samples")
-        else None
-    )
-    hint = _expect_hint_for_args(
-        tool_args,
-        actual_counts,
-        failure_cause=failure_cause,
-    )
-    body = build_error_response(
-        BlockErrorCode.PRECONDITION_FAILED,
-        "目标方块不满足 expect 前置条件。",
-        status="failed",
-        matched_count=0,
-        actual_type_counts=actual_counts,
-        hint=hint,
-        retryable=False,
-        external_state_unknown=False,
-        fallback_allowed=False,
-    )
-    return ToolResult.failure(
-        dumps_payload(body),
-        error_kind="PERMANENT",
-        retryable=False,
-        diagnostic_summary="fill_zero_match_precondition_failed",
-    )
-
-
-def _normalize_edits_target(edit: dict[str, Any]) -> Any:
-    """Normalize the ``target`` of a single edit item to a ``NormalizedTarget``."""
-    from services.agent.block_ops.target import normalize_inspect_target
-
-    target = edit.get("target")
-    normalized, error = normalize_inspect_target(target)
-    if error is not None:
-        raise _EditTargetError(error)
-    assert normalized is not None
-    return normalized
-
-
-def _target_box_volume(normalized: Any) -> int | None:
-    """Return the inclusive volume for an absolute or relative normalized box."""
-    if normalized.shape != "box":
-        return None
-    from_pos = normalized.box_from
-    to_pos = normalized.box_to
-    keys = (
-        ("x", "y", "z")
-        if normalized.coordinate_mode == "absolute"
-        else ("forward", "right", "up")
-    )
-    try:
-        if not isinstance(from_pos, dict) or not isinstance(to_pos, dict):
-            return None
-        if not all(key in from_pos and key in to_pos for key in keys):
-            return None
-        lengths = [abs(int(to_pos[key]) - int(from_pos[key])) + 1 for key in keys]
-    except (TypeError, ValueError):
-        return None
-    return lengths[0] * lengths[1] * lengths[2]
-
-
-@dataclass(frozen=True)
-class _EditNormalization:
-    """Per-edit normalized input ready for preflight payload construction."""
-
-    legacy: dict[str, Any]
-    normalized: Any  # NormalizedTarget
-    block_info: dict[str, Any]
-    expect_info: dict[str, Any]
-    repairs: list[str] = field(default_factory=list)
-
-
-class _EditTargetError(Exception):
-    """Carrier for a validation ToolResult raised out of target normalization."""
-
-    def __init__(self, result: ToolResult) -> None:
-        super().__init__()
-        self.result = result
-
-
-def _normalize_one_edit(
-    edit: dict[str, Any],
-    dimension: str | None,
-    max_positions: int,
-    max_fill_volume: int,
-) -> tuple[_EditNormalization | None, ToolResult | None]:
-    """Validate and normalize a single edit item into legacy preflight fields.
-
-    Returns ``(normalization, error)``. Enforces per-edit position/volume limits
-    and absolute-dimension requirements.
-    """
-    if not isinstance(edit, dict):
-        return None, _host_limit_error(
-            BlockErrorCode.INVALID_ARGUMENT,
-            "edits 的每项必须是对象",
-        )
-    try:
-        normalized = _normalize_edits_target(edit)
-    except _EditTargetError as exc:
-        return None, exc.result
-
-    if normalized.shape == "positions":
-        count = len(normalized.positions or [])
-        if count > max_positions:
-            return None, _host_limit_error(
-                BlockErrorCode.LIMIT_EXCEEDED,
-                f"positions 数量 {count} 超过上限 {max_positions}",
-                limit=max_positions,
-                count=count,
-            )
-    else:
-        volume = _target_box_volume(normalized)
-        if volume is not None and volume > max_fill_volume:
-            return None, _host_limit_error(
-                BlockErrorCode.LIMIT_EXCEEDED,
-                f"box 体积 {volume} 超过上限 {max_fill_volume}",
-                limit=max_fill_volume,
-                volume=volume,
-            )
-
-    block_info, repairs = _normalize_block_input(edit.get("block"))
-    if not block_info.get("type_id"):
-        return None, _host_limit_error(
-            BlockErrorCode.INVALID_ARGUMENT,
-            "block 必填（type_id 缺失）",
-        )
-    expect_info = _normalize_expect(edit.get("expect"), repairs)
-    legacy = _unified_target_to_legacy(normalized, block_info, expect_info, dimension)
-    return _EditNormalization(legacy, normalized, block_info, expect_info, repairs), None
-
-
-def _normalize_edits_for_preflight(
-    tool_args: dict[str, Any],
-    max_positions: int,
-    max_fill_volume: int,
-    max_edits_per_group: int,
-    max_total_targets_per_group: int,
-) -> tuple[list[_EditNormalization] | None, ToolResult | None]:
-    """Validate and map the new ``edits`` contract to per-edit legacy fields.
-
-    Accepts one or more edits (issue 04). Enforces the per-edit limits, the
-    group edit-count limit, and the total-target limit. Returns the list of
-    normalizations in input order, or an error.
-    """
-    edits = tool_args.get("edits")
-    if not isinstance(edits, list) or not edits:
-        return None, _host_limit_error(
-            BlockErrorCode.INVALID_ARGUMENT,
-            "edits 必须是非空列表",
-        )
-    if len(edits) > max_edits_per_group:
-        return None, _host_limit_error(
-            BlockErrorCode.LIMIT_EXCEEDED,
-            f"edits 数量 {len(edits)} 超过单组上限 {max_edits_per_group}",
-            limit=max_edits_per_group,
-            count=len(edits),
-        )
-
-    dimension = tool_args.get("dimension")
-    results: list[_EditNormalization] = []
-    total_targets = 0
-    total_discrete_positions = 0
-    for edit in edits:
-        normalization, error = _normalize_one_edit(
-            edit, dimension, max_positions, max_fill_volume
-        )
-        if error is not None:
-            return None, error
-        assert normalization is not None
-        results.append(normalization)
-        # Tally total target cells for the group limit. For positions this is the
-        # discrete count; for box it is the (absolute, when known) volume.
-        norm = normalization.normalized
-        if norm.shape == "positions":
-            positions_count = len(norm.positions or [])
-            total_targets += positions_count
-            total_discrete_positions += positions_count
-        else:
-            total_targets += _target_box_volume(norm) or 0
-
-    if total_discrete_positions > max_positions:
-        return None, _host_limit_error(
-            BlockErrorCode.LIMIT_EXCEEDED,
-            (
-                f"编辑组离散位置数 {total_discrete_positions} 超过上限 "
-                f"{max_positions}"
-            ),
-            limit=max_positions,
-            count=total_discrete_positions,
-        )
-    if total_targets > max_total_targets_per_group:
-        return None, _host_limit_error(
-            BlockErrorCode.LIMIT_EXCEEDED,
-            f"编辑组总目标数 {total_targets} 超过上限 {max_total_targets_per_group}",
-            limit=max_total_targets_per_group,
-            count=total_targets,
-        )
-
-    return results, None
-
-
-def _cell_key(x: Any, y: Any, z: Any) -> tuple[int, int, int]:
-    """Stable integer cell key for conflict/dedup bookkeeping."""
-    return (int(x), int(y), int(z))
-
-
-def _resolved_positions_from_locked(
-    locked_targets: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Synthesize absolute ``positions`` cells from resolved locked targets."""
-    out: list[dict[str, Any]] = []
-    for item in locked_targets:
-        if isinstance(item, dict) and all(k in item for k in ("x", "y", "z")):
-            out.append({"x": item["x"], "y": item["y"], "z": item["z"]})
-    return out
-
-
-def _expand_aabb_cells(
-    from_pos: dict[str, Any],
-    to_pos: dict[str, Any],
-) -> list[tuple[int, int, int]]:
-    """Enumerate the inclusive integer cell set of a resolved AABB."""
-    x0, x1 = sorted((int(from_pos["x"]), int(to_pos["x"])))
-    y0, y1 = sorted((int(from_pos["y"]), int(to_pos["y"])))
-    z0, z1 = sorted((int(from_pos["z"]), int(to_pos["z"])))
-    cells: list[tuple[int, int, int]] = []
-    for x in range(x0, x1 + 1):
-        for y in range(y0, y1 + 1):
-            for z in range(z0, z1 + 1):
-                cells.append((x, y, z))
-    return cells
-
-
-@dataclass(frozen=True)
-class _GroupEdit:
-    """Per-edit state after grouped preflight, dedup and target freezing."""
-
-    index: int
-    normalization: _EditNormalization
-    legacy: dict[str, Any]
-    block_info: dict[str, Any]
-    expect_info: dict[str, Any]
-    # Frozen absolute target actually executed. A box with a partial match or
-    # overlap is lowered to owned positions so it cannot rewrite skipped or
-    # deduped cells at execute time.
-    frozen_target: dict[str, Any]
-    frozen_positions: list[dict[str, Any]] | None
-    frozen_from: dict[str, Any] | None
-    frozen_to: dict[str, Any] | None
-    locked_targets: list[dict[str, Any]]  # owned, matched absolute cells only
-    signature: tuple[Any, ...]
-    matched: int
-    skipped: int
-    previous_type_counts: dict[str, Any]
-    volume: int
-    status: str  # preflight status for this edit (applied/noop/partial/failed/unknown)
-    is_noop: bool
-    # Resolved absolute cells targeted before dedup (for conflict detection).
-    resolved_cells: frozenset[tuple[int, int, int]]
-    repairs: list[Any] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class _EditPreflight:
-    """Raw per-edit bridge preflight result, before dedup/freezing."""
-
-    index: int
-    normalization: _EditNormalization
-    legacy: dict[str, Any]
-    block_info: dict[str, Any]
-    expect_info: dict[str, Any]
-    signature: tuple[Any, Any, Any, Any, Any]
-    preflight_fields: dict[str, Any]
-    locked_targets: list[dict[str, Any]]
-    resolved_positions: list[dict[str, Any]] | None
-    resolved_from: dict[str, Any] | None
-    resolved_to: dict[str, Any] | None
-    resolved_cells: frozenset[tuple[int, int, int]]
-    matched: int
-    skipped: int
-    previous_type_counts: dict[str, Any]
-    volume: int
-    status: str
-    is_noop: bool
-    repairs: list[Any] = field(default_factory=list)
-
-
-def _block_states_key(states: Any) -> tuple[tuple[str, Any], ...] | None:
-    """Hashable, order-independent key for a block-states dict (None when empty)."""
-    if not isinstance(states, dict) or not states:
-        return None
-    return tuple(sorted((str(k), v) for k, v in states.items()))
-
-
-def _edit_signature(block_info: dict[str, Any], expect_info: dict[str, Any]) -> tuple[Any, ...]:
-    """Signature used for overlap dedup/conflict detection.
-
-    Two edits touching the same cell conflict unless their final block and
-    ``expect`` precondition are *identical``. The signature captures exactly
-    that: ``(block_type_id, block_states, expect_kind, expect_type_id,
-    expect_states)``.
-    """
-    expect_kind = expect_info.get("kind")
-    if expect_kind == "permutation":
-        expect_tail: tuple[Any, ...] = (
-            expect_kind,
-            expect_info.get("type_id"),
-            _block_states_key(expect_info.get("states")),
-        )
-    elif expect_kind in ("type", "any"):
-        expect_tail = (expect_kind, expect_info.get("type_id"))
-    else:
-        expect_tail = (expect_kind,)
-    return (
-        block_info.get("type_id"),
-        _block_states_key(block_info.get("states")),
-    ) + expect_tail
-
-
-@dataclass
-class _CellOwnership:
-    """Result of conflict detection + dedup across a group of edits."""
-
-    # cell_key -> edit index that owns the cell (first edit claiming it)
-    owner: dict[tuple[int, int, int], int] = field(default_factory=dict)
-    # edit_index -> set of cell keys owned by that edit
-    owned: dict[int, set[tuple[int, int, int]]] = field(default_factory=dict)
-
-
-def _compute_cell_ownership(
-    edits: list[_EditPreflight],
-) -> _CellOwnership:
-    """Assign each resolved cell to the first edit claiming it (dedup).
-
-    Raises :class:`_ConflictingEditsError` if a cell is claimed by two edits
-    with *different* signatures (spec §5.2). Identical signatures are deduped
-    silently — the later edit simply does not own the shared cell.
-    """
-    ownership = _CellOwnership()
-    for edit in edits:
-        sig = edit.signature
-        for cell in edit.resolved_cells:
-            prior = ownership.owner.get(cell)
-            if prior is None:
-                ownership.owner[cell] = edit.index
-                ownership.owned.setdefault(edit.index, set()).add(cell)
-            else:
-                prior_sig = edits[prior].signature
-                if prior_sig != sig:
-                    raise _ConflictingEditsError(cell, prior, edit.index)
-                # Identical signature: keep the prior owner (dedup). The later
-                # edit does not own this cell.
-    return ownership
-
-
-class _ConflictingEditsError(Exception):
-    """Raised when two edits target the same cell with different signatures."""
-
-    def __init__(
-        self,
-        cell: tuple[int, int, int],
-        first_index: int,
-        second_index: int,
-    ) -> None:
-        super().__init__(f"cell {cell} conflict between edits {first_index} and {second_index}")
-        self.cell = cell
-        self.first_index = first_index
-        self.second_index = second_index
-
-
-def _freeze_owned_positions(
-    owned: set[tuple[int, int, int]],
-) -> list[dict[str, Any]]:
-    """Stable, canonical ordering of owned cells as absolute positions."""
-    return [
-        {"x": c[0], "y": c[1], "z": c[2]}
-        for c in sorted(owned)
-    ]
-
-
-def _build_group_edits(
-    preflights: list[_EditPreflight],
-    ownership: _CellOwnership,
-) -> list[_GroupEdit]:
-    """Freeze each edit's executable target to its owned cells (spec §8.3).
-
-    Position edits drop cells owned by earlier edits. A box keeps its AABB only
-    when every cell is both owned and preflight-matched; otherwise it is lowered
-    to owned matched positions. This is necessary for ``expect=any``: replaying
-    a partially-overlapping fill would otherwise write shared cells twice.
-    """
-    group: list[_GroupEdit] = []
-    for pre in preflights:
-        owned = ownership.owned.get(pre.index) or set()
-        owned_locked_targets = [
-            cell
-            for cell in pre.locked_targets
-            if isinstance(cell, dict)
-            and all(key in cell for key in ("x", "y", "z"))
-            and _cell_key(cell["x"], cell["y"], cell["z"]) in owned
-        ]
-        owned_matched_cells = {
-            _cell_key(cell["x"], cell["y"], cell["z"])
-            for cell in owned_locked_targets
-        }
-        # A discrete target already has an exact owned set. A box with either
-        # an overlap or preflight filtering needs exact position execution.
-        lower_box_to_positions = (
-            pre.resolved_positions is None
-            and (
-                owned != pre.resolved_cells
-                or owned_matched_cells != owned
-            )
-        )
-        if pre.resolved_positions is not None or lower_box_to_positions:
-            frozen_positions = _freeze_owned_positions(
-                owned if pre.resolved_positions is not None else owned_matched_cells
-            )
-            no_owned_positions = not frozen_positions
-            is_noop = pre.is_noop or no_owned_positions
-            if no_owned_positions:
-                # Approval-resume still traverses Pydantic's public schema.
-                # Keep a valid, frozen representative target for a deduped/noop
-                # edit; ``noop_edit_indices`` guarantees it is never executed.
-                frozen_positions = _freeze_owned_positions(pre.resolved_cells)[:1]
-                if not frozen_positions:
-                    original_positions = pre.normalization.normalized.positions
-                    if isinstance(original_positions, list):
-                        frozen_positions = list(original_positions[:1])
-            frozen_target: dict[str, Any] = {"positions": frozen_positions}
-            group.append(_GroupEdit(
-                index=pre.index,
-                normalization=pre.normalization,
-                legacy=pre.legacy,
-                block_info=pre.block_info,
-                expect_info=pre.expect_info,
-                frozen_target=frozen_target,
-                frozen_positions=frozen_positions,
-                frozen_from=None,
-                frozen_to=None,
-                locked_targets=owned_locked_targets,
-                signature=pre.signature,
-                matched=pre.matched if not is_noop else 0,
-                skipped=pre.skipped,
-                previous_type_counts=pre.previous_type_counts,
-                volume=pre.volume,
-                status="noop" if is_noop else pre.status,
-                is_noop=is_noop,
-                resolved_cells=pre.resolved_cells,
-                repairs=pre.repairs,
-            ))
-        else:
-            # Full box: every resolved cell remains owned and matched.
-            owns_any = bool(pre.resolved_cells and owned)
-            is_noop = pre.is_noop or (bool(pre.resolved_cells) and not owns_any)
-            frozen_target = {
-                "box": {"from": pre.resolved_from, "to": pre.resolved_to}
-            }
-            group.append(_GroupEdit(
-                index=pre.index,
-                normalization=pre.normalization,
-                legacy=pre.legacy,
-                block_info=pre.block_info,
-                expect_info=pre.expect_info,
-                frozen_target=frozen_target,
-                frozen_positions=None,
-                frozen_from=pre.resolved_from,
-                frozen_to=pre.resolved_to,
-                locked_targets=owned_locked_targets,
-                signature=pre.signature,
-                matched=0 if is_noop else pre.matched,
-                skipped=pre.skipped,
-                previous_type_counts=pre.previous_type_counts,
-                volume=pre.volume,
-                status="noop" if is_noop else pre.status,
-                is_noop=is_noop,
-                resolved_cells=pre.resolved_cells,
-                repairs=pre.repairs,
-            ))
-    return group
-
-
-def _status_from_preflight(preflight_fields: dict[str, Any]) -> str:
-    """Derive a per-edit preflight status (spec §9.1) from addon fields."""
-    status = preflight_fields.get("status")
-    if isinstance(status, str) and status:
-        return status
-    matched = preflight_fields.get("matched_count")
-    skipped = preflight_fields.get("skipped")
-    if isinstance(matched, int) and matched == 0:
-        return "failed"
-    if isinstance(skipped, int) and skipped > 0:
-        return "partial"
-    return "applied"
-
-
-def _split_preflight_body(
-    body: Any,
-) -> tuple[dict[str, Any] | None, ToolResult | None]:
-    """Parse a bridge preflight response body, returning (fields, error)."""
-    if not isinstance(body, dict):
-        return None, ToolResult.failure(
-            dumps_payload(
-                build_error_response(
-                    BlockErrorCode.INTERNAL_ERROR,
-                    "preflight 响应无法解析",
-                )
-            ),
-            error_kind="INTERNAL",
-        )
-    if body.get("ok") is True:
-        return {k: v for k, v in body.items() if k not in {"schema_version", "ok"}}, None
-    if isinstance(body, dict) and body.get("ok") is False:
-        return body, None
-    return body if isinstance(body, dict) else {}, None
-
-
-async def _preflight_one_edit(
-    *,
-    index: int,
-    normalization: _EditNormalization,
-    budget: int,
-    limits_payload: dict[str, Any],
-    max_locked_on_wire: int,
-    deps: Any,
-    edit_args: dict[str, Any],
-) -> tuple[_EditPreflight | None, ToolResult | None]:
-    """Run bridge preflight for a single edit and classify its result.
-
-    Mirrors the single-edit preflight path but returns structured data instead
-    of mutating shared locals. Position edits that fail the strict zero-match
-    check return a PRECONDITION_FAILED error (the whole group is rejected).
-    """
-    legacy = normalization.legacy
-    mode = legacy["mode"]
-    coord_mode = legacy["coordinate_mode"]
-    dimension = legacy.get("dimension")
-    position = legacy.get("position")
-    positions = legacy.get("positions")
-    from_pos = legacy.get("from")
-    to_pos = legacy.get("to")
-    type_id_val = legacy["type_id"]
-    states = legacy.get("states")
-    replace_any = legacy["replace_any"]
-    expected_previous = legacy.get("expected_previous")
-
-    # Limits are already enforced per-edit in _normalize_one_edit; pass the
-    # real limits here so the structural _validate_edit_args check does not
-    # re-reject a normalized batch/fill as LIMIT_EXCEEDED.
-    preflight_max_positions = limits_payload.get("max_discrete_positions", 0) or 0
-    preflight_max_fill_volume = limits_payload.get("max_fill_volume", 0) or 0
-    validation = _validate_edit_args(
-        mode=mode,
-        coordinate_mode=coord_mode,
-        dimension=dimension,
-        position=position,
-        positions=positions,
-        from_pos=from_pos if isinstance(from_pos, dict) else None,
-        to_pos=to_pos if isinstance(to_pos, dict) else None,
-        type_id=type_id_val,
-        replace_any=replace_any,
-        expected_previous=expected_previous,
-        max_positions=preflight_max_positions,
-        max_fill_volume=preflight_max_fill_volume,
-    )
-    if validation is not None:
-        return None, validation
-
-    payload = build_edit_payload(
-        mode=mode,
-        coordinate_mode=coord_mode,
-        dimension=dimension,
-        position=position,
-        positions=positions,
-        from_pos=from_pos if isinstance(from_pos, dict) else None,
-        to_pos=to_pos if isinstance(to_pos, dict) else None,
-        type_id=type_id_val,
-        states=states,
-        replace_any=replace_any,
-        expected_previous=expected_previous,
-        player_name=deps.player_name,
-        phase="preflight",
-        limits=limits_payload,
-        max_locked_targets_on_wire=max_locked_on_wire,
-    )
-    preflight_volume = (
-        _aabb_volume(from_pos, to_pos)
-        if isinstance(from_pos, dict) and isinstance(to_pos, dict)
-        else None
-    )
-    budget_fail = check_bridge_command_line_budget(
-        "edit_blocks",
-        payload,
-        budget=budget,
-        volume=preflight_volume,
-    )
-    if budget_fail is not None:
-        return None, budget_fail
-
-    result = await call_block_capability(deps.addon_bridge, "edit_blocks", payload)
-    if not result.is_success:
-        return None, result
-    try:
-        body = json.loads(result.output)
-    except Exception:
-        return None, ToolResult.failure(
-            dumps_payload(
-                build_error_response(
-                    BlockErrorCode.INTERNAL_ERROR,
-                    "preflight 响应无法解析",
-                )
-            ),
-            error_kind="INTERNAL",
-        )
-    preflight_fields, parse_error = _split_preflight_body(body)
-    if parse_error is not None:
-        return None, parse_error
-    assert preflight_fields is not None
-
-    # Strict zero-match classification (spec §4.3 / §9.2). For position edits a
-    # non-noop zero match rejects the whole group before approval. ``edit_args``
-    # carries only this edit so the repair hint names this edit's ``expect``
-    # (not ``edits[0]``) when a later edit fails.
-    zero_match_failure = _classify_zero_match_preflight("edit_blocks", edit_args, preflight_fields)
-    if zero_match_failure is not None:
-        return None, zero_match_failure
-
-    locked = preflight_fields.get("locked_targets")
-    locked_targets = list(locked) if isinstance(locked, list) else []
-    resolved_positions = (
-        _resolved_positions_from_locked(locked_targets) if mode != "fill" else None
-    )
-    resolved_from = preflight_fields.get("from") or (from_pos if mode == "fill" else None)
-    resolved_to = preflight_fields.get("to") or (to_pos if mode == "fill" else None)
-    if mode == "fill" and isinstance(resolved_from, dict) and isinstance(resolved_to, dict):
-        try:
-            resolved_cells = frozenset(_expand_aabb_cells(resolved_from, resolved_to))
-        except (KeyError, TypeError, ValueError):
-            resolved_cells = frozenset(
-                _cell_key(c["x"], c["y"], c["z"]) for c in locked_targets
-                if isinstance(c, dict) and all(k in c for k in ("x", "y", "z"))
-            )
-    else:
-        resolved_cells = frozenset(
-            _cell_key(c["x"], c["y"], c["z"]) for c in resolved_positions or []
-        )
-
-    matched = preflight_fields.get("matched_count")
-    matched = int(matched) if isinstance(matched, int) else len(locked_targets)
-    skipped = preflight_fields.get("skipped")
-    skipped = int(skipped) if isinstance(skipped, int) else 0
-    previous_counts = preflight_fields.get("previous_type_counts")
-    previous_type_counts = dict(previous_counts) if isinstance(previous_counts, dict) else {}
-    volume = preflight_fields.get("volume")
-    if not isinstance(volume, int):
-        volume = len(resolved_cells)
-    status = _status_from_preflight(preflight_fields)
-    already_target = preflight_fields.get("already_target")
-    is_noop = bool(
-        preflight_fields.get("status") == "noop"
-        or (isinstance(already_target, int) and isinstance(volume, int)
-            and volume > 0 and already_target == volume)
-    )
-    repairs: list[Any] = list(normalization.repairs)
-    addon_repairs = preflight_fields.get("repairs_applied")
-    if isinstance(addon_repairs, list):
-        for repair in addon_repairs:
-            if repair not in repairs:
-                repairs.append(repair)
-
-    return _EditPreflight(
-        index=index,
-        normalization=normalization,
-        legacy=legacy,
-        block_info=normalization.block_info,
-        expect_info=normalization.expect_info,
-        signature=_edit_signature(normalization.block_info, normalization.expect_info),
-        preflight_fields=preflight_fields,
-        locked_targets=locked_targets,
-        resolved_positions=resolved_positions,
-        resolved_from=resolved_from,
-        resolved_to=resolved_to,
-        resolved_cells=resolved_cells,
-        matched=matched,
-        skipped=skipped,
-        previous_type_counts=previous_type_counts,
-        volume=volume,
-        status=status,
-        is_noop=is_noop,
-        repairs=repairs,
-    ), None
-
-
-async def _run_grouped_edit_preflight(
-    *,
-    ctx: RunContext[AgentDependencies],
-    deps: Any,
-    tool_args: dict[str, Any],
-    limits: Any,
-    limits_payload: dict[str, Any],
-    budget: int,
-) -> tuple[BlockPreflightPlan | None, ToolResult | None]:
-    """Grouped independent-edit preflight (issue 04, spec §8.1/§8.2).
-
-    Validates all edits, runs conflict detection + dedup, calls the bridge once
-    per edit, aggregates counts, and produces a single
-    :class:`BlockPreflightPlan` whose ``execute_args`` freezes every edit's
-    resolved absolute target. One preflight, one approval, one plan.
-    """
-    normalizations, validation = _normalize_edits_for_preflight(
-        tool_args,
-        limits.max_discrete_positions,
-        limits.max_fill_volume,
-        limits.max_edits_per_group,
-        limits.max_total_targets_per_group,
-    )
-    if validation is not None:
-        return None, validation
-    assert normalizations is not None
-
-    # Per-edit bridge preflight (spec §8.1 steps 7-8). Each edit is independent
-    # and preflighted against the same world snapshot. The zero-match hint must
-    # reference the failing edit's own ``expect``, so each preflight receives a
-    # single-edit args view.
-    raw_edits = tool_args.get("edits")
-    preflights: list[_EditPreflight] = []
-    for index, normalization in enumerate(normalizations):
-        raw_edit = (
-            raw_edits[index]
-            if isinstance(raw_edits, list) and index < len(raw_edits)
-            else {}
-        )
-        preflight, failure = await _preflight_one_edit(
-            index=index,
-            normalization=normalization,
-            budget=budget,
-            limits_payload=limits_payload,
-            max_locked_on_wire=limits.max_locked_targets_on_wire,
-            deps=deps,
-            edit_args={"edits": [raw_edit]} if isinstance(raw_edit, dict) else {},
-        )
-        if failure is not None:
-            return None, failure
-        assert preflight is not None
-        preflights.append(preflight)
-
-    # Single-edit fast path: delegate to the legacy plan builder so the
-    # execute_args (and thus the idempotency hash) are byte-identical to the
-    # pre-issue-04 single-edit contract. This keeps approval-resume stable
-    # across the grouped/non-grouped boundary.
-    if len(preflights) == 1:
-        plan = build_block_preflight_plan(
-            "edit_blocks", tool_args, preflights[0].preflight_fields,
-        )
-        return plan, None
-
-    # Conflict detection + dedup (spec §5.2 / §8.1 steps 5-6).
-    try:
-        ownership = _compute_cell_ownership(preflights)
-    except _ConflictingEditsError as exc:
-        body = build_error_response(
-            BlockErrorCode.CONFLICTING_EDITS,
-            (
-                f"编辑组内存在冲突目标：位置 "
-                f"({exc.cell[0]}, {exc.cell[1]}, {exc.cell[2]}) 同时被"
-                f"编辑 {exc.first_index} 与编辑 {exc.second_index} 以不同方块"
-                f"或不同前置条件声明；请拆分为不同调用。"
-            ),
-            cell={"x": exc.cell[0], "y": exc.cell[1], "z": exc.cell[2]},
-            first_index=exc.first_index,
-            second_index=exc.second_index,
-            retryable=False,
-            external_state_unknown=False,
-            fallback_allowed=False,
-        )
-        return None, ToolResult.failure(
-            dumps_payload(body),
-            error_kind="INVALID_ARGUMENT",
-            retryable=False,
-            diagnostic_summary="conflicting_edits",
-        )
-
-    group = _build_group_edits(preflights, ownership)
-
-    # Build the single frozen execute_args carrying every edit (spec §8.3).
-    # Resolve the absolute dimension from locked targets when the original used
-    # relative coordinates (no explicit dimension). All edits in a group share
-    # the current event player's dimension.
-    dimension = tool_args.get("dimension")
-    if not dimension:
-        for g in group:
-            for cell in g.locked_targets:
-                if isinstance(cell, dict) and cell.get("dimension"):
-                    dimension = cell["dimension"]
-                    break
-            if dimension:
-                break
-    frozen_edits = [_edit_to_frozen_args(g) for g in group]
-    # Flat merged locked_targets keeps backward compatibility with harness
-    # recovery that reads execute_args["locked_targets"] as a single list.
-    locked_targets_by_edit = [list(g.locked_targets) for g in group]
-    flat_locked = [cell for locks in locked_targets_by_edit for cell in locks]
-    authorized_args: dict[str, Any] = {
-        "edits": frozen_edits,
-        "dimension": dimension,
-        "locked_targets": flat_locked,
-        "locked_targets_by_edit": locked_targets_by_edit,
-        "noop_edit_indices": [g.index for g in group if g.is_noop],
-        "phase": "execute",
-    }
-    if group and all(g.is_noop for g in group):
-        # A no-op plan is still canonical executable state, but it deliberately
-        # has no locks and must pass the strict approval-resume projection.
-        authorized_args["status"] = "noop"
-    execute_args = dict(authorized_args)
-
-    # Approval summary (spec §8.2) — bounded, never includes full locked_targets.
-    # Counts reflect the deduped plan (owned cells), not raw preflight overlap.
-    approval_metadata = _build_group_approval_metadata(
-        group, preflights, ownership, dimension
-    )
-    if approval_metadata["repairs_applied"]:
-        execute_args["repairs_applied"] = approval_metadata["repairs_applied"][:8]
-
-    # Reject before approval if any edit's post-omit execute frame overflows.
-    for g in group:
-        if g.is_noop:
-            continue
-        exec_failure = _check_group_edit_execute_budget(
-            g, dimension, budget, limits.max_locked_targets_on_wire, deps.player_name,
-        )
-        if exec_failure is not None:
-            return None, exec_failure
-
-    return BlockPreflightPlan(authorized_args, execute_args, approval_metadata), None
-
-
-def _edit_to_frozen_args(group_edit: _GroupEdit) -> dict[str, Any]:
-    """Public, harness-consumable description of one frozen edit."""
-    block = {"type_id": group_edit.block_info.get("type_id")}
-    if group_edit.block_info.get("states") is not None:
-        block["states"] = group_edit.block_info["states"]
-    out: dict[str, Any] = {
-        "target": group_edit.frozen_target,
-        "block": block,
-    }
-    if group_edit.expect_info.get("kind") != "air":
-        out["expect"] = _expect_info_to_args(group_edit.expect_info)
-    return out
-
-
-def _expect_info_to_args(expect_info: dict[str, Any]) -> Any:
-    """Convert a normalized expect descriptor back to a model-facing value."""
-    kind = expect_info.get("kind")
-    if kind == "any":
-        return "any"
-    if kind == "type":
-        return expect_info.get("type_id")
-    if kind == "permutation":
-        out: dict[str, Any] = {"type_id": expect_info.get("type_id")}
-        states = expect_info.get("states")
-        if isinstance(states, dict) and states:
-            out["states"] = states
-        return out
-    return "air"
-
-
-def _build_group_meta(
-    group: list[_GroupEdit],
-    preflights: list[_EditPreflight],
-    ownership: _CellOwnership,
-) -> dict[str, Any]:
-    """Internal-only group metadata (carried in authorized_args, not approval).
-
-    Holds per-edit locked targets and ownership so resume can re-derive each
-    edit's execute payload without re-preflight. Bounded: locked targets are the
-    resolved absolute cells, not full before/after snapshots.
-    """
-    locked_by_index: list[list[dict[str, Any]]] = []
-    for g in group:
-        locked_by_index.append(list(g.locked_targets))
-    deduped_cells: set[tuple[int, int, int]] = set()
-    for g in group:
-        if g.frozen_positions is None and not g.is_noop:
-            # Box edit overlapping earlier identical edits: report shared cells.
-            owned = ownership.owned.get(g.index) or set()
-            deduped_cells |= g.resolved_cells - owned
-    return {
-        "edit_count": len(group),
-        "locked_targets_by_index": locked_by_index,
-        "deduped_cells": sorted(deduped_cells),
-        "noop_indices": [g.index for g in group if g.is_noop],
-    }
-
-
-def _aggregate_type_counts(
-    counts_list: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Merge per-edit previous_type_counts into a single bounded map."""
-    merged: dict[str, Any] = {}
-    for counts in counts_list:
-        if not isinstance(counts, dict):
-            continue
-        for key, value in counts.items():
-            try:
-                merged[key] = int(merged.get(key, 0)) + int(value)
-            except (TypeError, ValueError):
-                merged[key] = value
-    return merged
-
-
-def _build_group_approval_metadata(
-    group: list[_GroupEdit],
-    preflights: list[_EditPreflight],
-    ownership: _CellOwnership,
-    dimension: str | None,
-) -> dict[str, Any]:
-    """Bounded approval summary for the whole group (spec §8.2).
-
-    Counts reflect the *deduped* plan (spec §5.2): each edit contributes only
-    the cells it owns after identical-overlap dedup, so the summary matches
-    what execution can actually change. ``target_block_counts`` counts target
-    cells per block type (not edits), and auto-repair evidence recorded during
-    normalization is surfaced here (spec §4.2 / §8.2).
-    """
-    total_targets = 0
-    total_matched = 0
-    total_skipped = 0
-    any_expect_any = False
-    any_non_rollbackable_fill = False
-    target_block_summary: dict[str, Any] = {}
-    replaced_counts: list[dict[str, Any]] = []
-    repairs: list[str] = []
-    per_edit: list[dict[str, Any]] = []
-    for g in group:
-        owned = ownership.owned.get(g.index) or set()
-        effective = len(owned)
-        total_targets += effective
-        matched = 0
-        if not g.is_noop:
-            if g.locked_targets:
-                # Exact post-dedup match count: preflight matched cells
-                # (locked_targets) that this edit still owns.
-                matched = sum(
-                    1
-                    for cell in g.locked_targets
-                    if isinstance(cell, dict)
-                    and all(k in cell for k in ("x", "y", "z"))
-                    and _cell_key(cell["x"], cell["y"], cell["z"]) in owned
-                )
-            else:
-                matched = g.matched
-            total_matched += matched
-            total_skipped += g.skipped
-        block_id = g.block_info.get("type_id")
-        if isinstance(block_id, str) and block_id and effective:
-            target_block_summary[block_id] = (
-                int(target_block_summary.get(block_id, 0)) + effective
-            )
-        if g.expect_info.get("kind") == "any":
-            any_expect_any = True
-        if g.frozen_positions is None and not g.is_noop:
-            any_non_rollbackable_fill = True
-        per_edit.append({
-            "index": g.index,
-            "mode": "fill" if g.frozen_positions is None else ("place" if len(g.frozen_positions or []) <= 1 else "batch"),
-            "type_id": block_id,
-            "matched": matched,
-            "skipped": g.skipped,
-            "status": g.status,
-        })
-        for repair in g.repairs:
-            if repair not in repairs:
-                repairs.append(repair)
-    for pr in preflights:
-        replaced_counts.append(pr.previous_type_counts)
-    return {
-        "dimension": dimension,
-        "edit_count": len(group),
-        "total_targets": total_targets,
-        "matched": total_matched,
-        "skipped": total_skipped,
-        "target_block_counts": target_block_summary,
-        "replaced_non_air_counts": _aggregate_type_counts(replaced_counts),
-        "expect_any": any_expect_any,
-        "non_rollbackable_fill": any_non_rollbackable_fill,
-        "repairs_applied": repairs[:8],
-        "edits": per_edit,
-    }
-
-
-def _check_group_edit_execute_budget(
-    group_edit: _GroupEdit,
-    dimension: str | None,
-    budget: int,
-    max_locked_on_wire: int,
-    player_name: str,
-) -> ToolResult | None:
-    """Budget + wire-cap check for one edit's *execute* payload (post-omit)."""
-    if group_edit.frozen_positions is not None:
-        mode = "place" if len(group_edit.frozen_positions) <= 1 else "batch"
-        position = group_edit.frozen_positions[0] if mode == "place" else None
-        positions = group_edit.frozen_positions if mode == "batch" else None
-        from_pos = None
-        to_pos = None
-    else:
-        mode = "fill"
-        position = None
-        positions = None
-        from_pos = group_edit.frozen_from
-        to_pos = group_edit.frozen_to
-    payload = build_edit_payload(
-        mode=mode,
-        coordinate_mode="absolute",
-        dimension=dimension,
-        position=position,
-        positions=positions,
-        from_pos=from_pos if isinstance(from_pos, dict) else None,
-        to_pos=to_pos if isinstance(to_pos, dict) else None,
-        type_id=str(group_edit.block_info.get("type_id") or ""),
-        states=group_edit.block_info.get("states"),
-        replace_any=group_edit.expect_info.get("kind") == "any",
-        expected_previous=None,
-        player_name=player_name,
-        phase="execute",
-        locked_targets=list(group_edit.locked_targets),
-        max_locked_targets_on_wire=max_locked_on_wire,
-    )
-    if "locked_targets" in payload:
-        wire_fail = locked_targets_wire_limit_exceeded(
-            payload.get("locked_targets")
-            if isinstance(payload.get("locked_targets"), list)
-            else list(group_edit.locked_targets),
-            max_locked_targets_on_wire=max_locked_on_wire,
-        )
-        if wire_fail is not None:
-            return wire_fail
-    locked = payload.get("locked_targets")
-    matched_count = len(locked) if isinstance(locked, list) else len(group_edit.locked_targets)
-    volume = (
-        _aabb_volume(from_pos, to_pos)
-        if isinstance(from_pos, dict) and isinstance(to_pos, dict)
-        else len(group_edit.resolved_cells)
-    )
-    return check_bridge_command_line_budget(
-        "edit_blocks",
-        payload,
-        budget=budget,
-        matched_count=matched_count,
-        volume=volume,
+    return BlockPreflightPlan(
+        authorized_args,
+        projected,
+        approval_metadata,
+        plan_id=secrets.token_hex(16),
     )
 
 
@@ -2394,33 +1188,22 @@ async def run_block_preflight(
     }
 
     # If already canonical with locked_targets from a prior approval recovery, skip re-preflight.
-    if tool_args.get("phase") == "execute" and (
-        tool_args.get("locked_targets")
-        or (
-            tool_name == "edit_blocks"
-            and tool_args.get("status") == "noop"
-            and isinstance(tool_args.get("edits"), list)
-        )
-    ):
+    if tool_args.get("phase") == "execute" and tool_args.get("locked_targets"):
         return dict(tool_args), None
-
-    budget = get_command_line_byte_budget(deps.settings)
-
-    if tool_name == "edit_blocks" and "edits" in tool_args:
-        plan, failure = await _run_grouped_edit_preflight(
-            ctx=ctx,
-            deps=deps,
-            tool_args=tool_args,
-            limits=limits,
-            limits_payload=limits_payload,
-            budget=budget,
-        )
-        return plan, failure
 
     if tool_name == "inspect_block":
         # inspect is low-risk; preflight only needed for relative resolution.
         # Absolute inspect can execute directly without a separate preflight phase.
         target = tool_args.get("target")
+        if isinstance(target, list):
+            # Array target path (spec §3.3): [x,y,z] point or [[a],[b]] box.
+            # Both are absolute and need no bridge preflight; impl normalizes.
+            from services.agent.block_ops.target import normalize_array_target
+
+            _normalized, validation = normalize_array_target(target)
+            if validation is not None:
+                return None, validation
+            return dict(tool_args), None
         if target is not None:
             # Unified target path (issue 02): validate shape + limits.
             normalized, validation = _validate_inspect_target(
@@ -2498,211 +1281,111 @@ async def run_block_preflight(
             preflight_fields = body if isinstance(body, dict) else {}
         return build_block_preflight_plan(tool_name, tool_args, preflight_fields), None
 
-    if tool_name == "edit_blocks":
-        # Legacy flat path only: every ``edit_blocks`` call carrying ``edits``
-        # is intercepted by the grouped preflight branch above.
-        mode = str(tool_args.get("mode") or "place")
-        coord_mode = str(tool_args.get("coordinate_mode") or "absolute")
-        dimension = tool_args.get("dimension")
-        position = tool_args.get("position")
-        positions = tool_args.get("positions")
-        from_pos = tool_args.get("from") or tool_args.get("from_pos")
-        to_pos = tool_args.get("to") or tool_args.get("to_pos")
-        type_id_val = str(tool_args.get("type_id") or "")
-        states = tool_args.get("states")
-        replace_any = bool(tool_args.get("replace_any", False))
-        expected_previous = tool_args.get("expected_previous")
-        validation = _validate_edit_args(
-            mode=mode,
-            coordinate_mode=coord_mode,
-            dimension=dimension,
-            position=position,
-            positions=positions,
-            from_pos=from_pos if isinstance(from_pos, dict) else None,
-            to_pos=to_pos if isinstance(to_pos, dict) else None,
-            type_id=type_id_val,
-            replace_any=replace_any,
-            expected_previous=expected_previous,
-            max_positions=limits.max_discrete_positions,
-            max_fill_volume=limits.max_fill_volume,
-        )
-        if validation is not None:
-            return None, validation
 
-        payload = build_edit_payload(
-            mode=mode,
-            coordinate_mode=coord_mode,
-            dimension=dimension,
-            position=position,
-            positions=positions,
-            from_pos=from_pos if isinstance(from_pos, dict) else None,
-            to_pos=to_pos if isinstance(to_pos, dict) else None,
-            type_id=type_id_val,
-            states=states,
-            replace_any=replace_any,
-            expected_previous=expected_previous,
-            player_name=deps.player_name,
-            phase="preflight",
-            limits=limits_payload,
-            max_locked_targets_on_wire=limits.max_locked_targets_on_wire,
-        )
-        budget = get_command_line_byte_budget(deps.settings)
-        preflight_volume = (
-            _aabb_volume(from_pos, to_pos)
-            if isinstance(from_pos, dict) and isinstance(to_pos, dict)
-            else None
-        )
-        budget_fail = check_bridge_command_line_budget(
-            "edit_blocks",
-            payload,
-            budget=budget,
-            volume=preflight_volume,
-        )
-        if budget_fail is not None:
-            return None, budget_fail
-
-        result = await call_block_capability(deps.addon_bridge, "edit_blocks", payload)
-        if not result.is_success:
-            return None, result
-        try:
-            body = json.loads(result.output)
-        except Exception:
-            return None, ToolResult.failure(
-                dumps_payload(
-                    build_error_response(
-                        BlockErrorCode.INTERNAL_ERROR,
-                        "preflight 响应无法解析",
-                    )
-                ),
-                error_kind="INTERNAL",
-            )
-        if isinstance(body, dict) and body.get("ok") is True:
-            preflight_fields = {k: v for k, v in body.items() if k not in {"schema_version", "ok"}}
-        elif isinstance(body, dict):
-            preflight_fields = body
-        else:
-            preflight_fields = {}
-        zero_match_failure = _classify_zero_match_preflight(tool_name, tool_args, preflight_fields)
-        if zero_match_failure is not None:
-            return None, zero_match_failure
-        plan = build_block_preflight_plan(tool_name, tool_args, preflight_fields)
-
-        # Reject before approval when the post-omit execute frame would still overflow.
-        exec_args = plan.execute_args
-        if "edits" in exec_args:
-            # New contract: rebuild the execute payload from the resolved edits.
-            exec_edits = exec_args.get("edits")
-            if isinstance(exec_edits, list) and exec_edits and isinstance(exec_edits[0], dict):
-                exec_legacy = _unified_target_to_legacy(
-                    _normalize_edits_target(exec_edits[0]),
-                    _normalize_block_input(exec_edits[0].get("block"))[0],
-                    _normalize_expect(exec_edits[0].get("expect")),
-                    exec_args.get("dimension"),
-                )
-            else:
-                exec_legacy = None
-            if exec_legacy is None:
-                return None, _host_limit_error(
-                    BlockErrorCode.INVALID_ARGUMENT,
-                    "edits 执行契约不完整",
-                )
-            exec_mode = exec_legacy["mode"]
-            exec_coord_mode = exec_legacy["coordinate_mode"]
-            exec_dimension = exec_legacy.get("dimension")
-            exec_position = exec_legacy.get("position")
-            exec_positions = exec_legacy.get("positions")
-            exec_from = exec_legacy.get("from")
-            exec_to = exec_legacy.get("to")
-            exec_type_id = exec_legacy["type_id"]
-            exec_states = exec_legacy.get("states")
-            exec_replace_any = exec_legacy["replace_any"]
-            exec_expected_previous = exec_legacy.get("expected_previous")
-            locked_for_exec = (
-                exec_args.get("locked_targets")
-                if isinstance(exec_args.get("locked_targets"), list)
-                else None
-            )
-        else:
-            exec_mode = str(exec_args.get("mode") or mode)
-            exec_coord_mode = str(exec_args.get("coordinate_mode") or coord_mode)
-            exec_dimension = exec_args.get("dimension")
-            exec_position = exec_args.get("position") if isinstance(exec_args.get("position"), dict) else None
-            exec_positions = exec_args.get("positions") if isinstance(exec_args.get("positions"), list) else None
-            exec_from = exec_args.get("from_pos") or exec_args.get("from")
-            exec_to = exec_args.get("to_pos") or exec_args.get("to")
-            exec_type_id = str(exec_args.get("type_id") or type_id_val)
-            exec_states = exec_args.get("states")
-            exec_replace_any = bool(exec_args.get("replace_any", False))
-            exec_expected_previous = exec_args.get("expected_previous")
-            locked_for_exec = (
-                exec_args.get("locked_targets")
-                if isinstance(exec_args.get("locked_targets"), list)
-                else None
-            )
-        exec_payload = build_edit_payload(
-            mode=exec_mode,
-            coordinate_mode=exec_coord_mode,
-            dimension=exec_dimension,
-            position=exec_position,
-            positions=exec_positions,
-            from_pos=exec_from if isinstance(exec_from, dict) else None,
-            to_pos=exec_to if isinstance(exec_to, dict) else None,
-            type_id=str(exec_type_id or ""),
-            states=exec_states,
-            replace_any=bool(exec_replace_any),
-            expected_previous=exec_expected_previous,
-            player_name=deps.player_name,
-            phase="execute",
-            locked_targets=locked_for_exec,
-            max_locked_targets_on_wire=limits.max_locked_targets_on_wire,
-        )
-        # Cap only when wire still ships locked_targets (non-omit path).
-        if "locked_targets" in exec_payload:
-            wire_cap_fail = locked_targets_wire_limit_exceeded(
-                exec_payload.get("locked_targets")
-                if isinstance(exec_payload.get("locked_targets"), list)
-                else locked_for_exec,
-                max_locked_targets_on_wire=limits.max_locked_targets_on_wire,
-            )
-            if wire_cap_fail is not None:
-                return None, wire_cap_fail
-        locked = exec_args.get("locked_targets")
-        matched_count = len(locked) if isinstance(locked, list) else None
-        exec_volume = (
-            _aabb_volume(exec_from, exec_to)
-            if isinstance(exec_from, dict) and isinstance(exec_to, dict)
-            else preflight_volume
-        )
-        execute_budget_fail = check_bridge_command_line_budget(
-            "edit_blocks",
-            exec_payload,
-            budget=budget,
-            matched_count=matched_count,
-            volume=exec_volume,
-        )
-        if execute_budget_fail is not None:
-            return None, execute_budget_fail
-        return plan, None
-
+    # place/fill 直通：canonical args 必须保持模型可见契约。pydantic-ai 经
+    # alias="from" 校验后以字段名（from_）传入 harness，但 wrap_tool_validate
+    # 与 execute_block_plan 都按模型可见键（from）校验/取参，这里统一转回
+    # 别名键，避免审批恢复时 canonical args 校验失败。
+    if tool_name == "fill_block" and "from_" in tool_args and "from" not in tool_args:
+        from_pos = tool_args.pop("from_")
+        tool_args["from"] = from_pos
     return dict(tool_args), None
+
+
+def _state_unknown_result(plan_id: str, *, reason: str = "missing") -> ToolResult:
+    """审批恢复失败：缓存缺失/过期/工具不匹配 → STATE_UNKNOWN（不抛 TypeError）。"""
+    return ToolResult.failure(
+        dumps_payload(
+            build_state_unknown_response(
+                f"方块工具审批计划缺失或已过期（plan_id={plan_id or '空'}，{reason}）；"
+                "请重新发起操作",
+            )
+        ),
+        error_kind="PERMANENT",
+        retryable=False,
+        external_state_unknown=True,
+        diagnostic_summary="block preflight plan not found or expired",
+        error_type=BlockErrorCode.STATE_UNKNOWN,
+    )
+
+
+async def execute_block_plan(plan_id: str, ctx: RunContext[AgentDependencies]) -> ToolResult:
+    """按 plan_id 执行已批准的单点方块操作（place/fill）。
+
+    从预检缓存取 frozen canonical args，直接调用对应 impl；同一 plan 只执行
+    一次（成功写入已执行标记 + 结果缓存）。缓存缺失/过期/工具不支持返回
+    ``STATE_UNKNOWN``。
+
+    幂等性由两层组成：harness 的 (run_id, tool_call_id) 幂等 store 处理同轮
+    恢复；这里的 ``executed`` 标记是第二道防线。``executed`` /
+    ``execution_result`` 的读-查-写必须在缓存锁下进行，且并发恢复必须按
+    plan_id 串行化（per-plan asyncio.Lock）——缓存锁是 threading.RLock，不能
+    跨 ``await`` 持有（会阻塞同一事件循环里的其他协程）。
+    """
+    from services.agent.block_ops.preflight_cache import (
+        get_plan_execution_lock,
+        get_preflight_cache,
+    )
+
+    pid = str(plan_id or "").strip()
+    cache = get_preflight_cache()
+    # 快路径：锁外先确认 plan 存在且未执行，避免为伪造/过期 plan_id 创建锁。
+    with cache._lock:
+        entry = cache.get_by_plan_id(pid)
+        if entry is None:
+            return _state_unknown_result(pid)
+        if entry.executed and isinstance(entry.execution_result, ToolResult):
+            return entry.execution_result
+
+    # 并发恢复串行化：等待期间另一个协程可能已完成本 plan。
+    async with get_plan_execution_lock(pid):
+        with cache._lock:
+            if entry.executed and isinstance(entry.execution_result, ToolResult):
+                return entry.execution_result
+
+        tool_name = entry.tool_name
+        canonical = entry.canonical_args
+        if tool_name == "place_block":
+            result = await place_block_impl(
+                ctx,
+                pos=canonical.get("pos"),
+                block=canonical.get("block"),
+                expect=str(canonical.get("expect") or "air"),
+                states=canonical.get("states"),
+            )
+        elif tool_name == "fill_block":
+            result = await fill_block_impl(
+                ctx,
+                from_=canonical.get("from_", canonical.get("from")),
+                to=canonical.get("to"),
+                block=canonical.get("block"),
+                expect=str(canonical.get("expect") or "air"),
+                states=canonical.get("states"),
+            )
+        else:
+            return _state_unknown_result(pid, reason="unsupported-tool")
+
+        # 幂等：成功才落 executed 标记 + 结果缓存；失败允许重新恢复重试。
+        with cache._lock:
+            if result.is_success:
+                entry.executed = True
+                entry.execution_result = result
+        return result
 
 
 async def inspect_block_impl(
     ctx: RunContext[AgentDependencies],
     *,
-    target: dict[str, Any] | None = None,
-    coordinate_mode: CoordinateMode = "absolute",
-    dimension: str | None = None,
-    position: dict[str, Any] | None = None,
-    positions: list[dict[str, Any]] | None = None,
+    target: Any,
+    phase: str = "execute",
     locked_targets: list[dict[str, Any]] | None = None,
-    phase: str | None = None,
 ) -> ToolResult:
-    """Query one or more block snapshots via addon bridge.
+    """Query one or more block snapshots via the addon bridge (spec §3.3).
 
-    The model-facing interface uses the unified ``target`` argument (positions
-    or box). Legacy ``position`` / ``positions`` are accepted for harness
-    recovery and internal callers but are not exposed in the model schema.
+    The model-facing ``target`` is a single point ``[x, y, z]``, two box
+    corners ``[[x1, y1, z1], [x2, y2, z2]]``, or the unified dict form
+    ``{positions: [...]}`` / ``{box: {from, to}}``. ``dimension`` is never
+    sent: the Add-on defaults to the current player dimension (spec §3.3).
     """
     deps = ctx.deps
     logger.info(
@@ -2712,12 +1395,17 @@ async def inspect_block_impl(
         run_id=deps.run_id,
         player_name=deps.player_name,
         has_target=target is not None,
-        coordinate_mode=coordinate_mode,
     )
 
     unsupported = await _require_supported(ctx)
     if unsupported is not None:
         return unsupported
+
+    if target is None:
+        return _host_limit_error(
+            BlockErrorCode.INVALID_ARGUMENT,
+            "target 必填",
+        )
 
     limits = get_block_tools_limits(deps.settings)
     limits_payload = {
@@ -2729,581 +1417,221 @@ async def inspect_block_impl(
         "inspect_sample_limit": limits.inspect_sample_limit,
     }
 
-    # Unified target path (issue 02): normalize then build payload.
-    if target is not None:
+    if isinstance(target, dict):
         normalized, validation = _validate_inspect_target(
             target,
-            dimension=dimension,
+            dimension=None,
             max_positions=limits.max_discrete_positions,
             max_fill_volume=limits.max_fill_volume,
         )
-        if validation is not None:
-            return validation
-        assert normalized is not None
-        from services.agent.block_ops.target import build_inspect_payload_from_target
+    else:
+        from services.agent.block_ops.target import normalize_array_target
 
-        payload = build_inspect_payload_from_target(
-            normalized,
-            dimension=dimension,
-            player_name=deps.player_name,
-            phase=phase or "execute",
-            locked_targets=locked_targets,
-            limits=limits_payload,
-        )
-        return await call_block_capability(deps.addon_bridge, "inspect_block", payload)
-
-    # Legacy path (harness recovery / internal callers).
-    validation = _validate_inspect_args(
-        coordinate_mode=coordinate_mode,
-        dimension=dimension,
-        position=position,
-        positions=positions,
-        max_positions=limits.max_discrete_positions,
-    )
+        normalized, validation = normalize_array_target(target)
     if validation is not None:
         return validation
+    assert normalized is not None
 
-    payload = build_inspect_payload(
-        coordinate_mode=coordinate_mode,
-        dimension=dimension,
-        position=position,
-        positions=positions,
+    from services.agent.block_ops.target import build_inspect_payload_from_target
+
+    payload = build_inspect_payload_from_target(
+        normalized,
+        dimension=None,
         player_name=deps.player_name,
         phase=phase or "execute",
         locked_targets=locked_targets,
-        limits={
-            "max_discrete_positions": limits.max_discrete_positions,
-            "max_fill_volume": limits.max_fill_volume,
-            "cells_per_tick": limits.cells_per_tick,
-        },
+        limits=limits_payload,
     )
-    return await call_block_capability(deps.addon_bridge, "inspect_block", payload)
-
-
-def _legacy_kwargs_from_edit(edit: dict[str, Any], dimension: str | None) -> dict[str, Any]:
-    """Map one frozen/normalized edit dict back to legacy flat kwargs."""
-    normalized = _normalize_edits_target(edit)
-    block_info, _repairs = _normalize_block_input(edit.get("block"))
-    expect_info = _normalize_expect(edit.get("expect"))
-    legacy = _unified_target_to_legacy(normalized, block_info, expect_info, dimension)
-    return {
-        "mode": legacy.get("mode", "place"),
-        "coordinate_mode": legacy.get("coordinate_mode", "absolute"),
-        "type_id": legacy.get("type_id", ""),
-        "states": legacy.get("states"),
-        "replace_any": legacy.get("replace_any", False),
-        "expected_previous": legacy.get("expected_previous"),
-        "position": legacy.get("position"),
-        "positions": legacy.get("positions"),
-        "from_pos": legacy.get("from"),
-        "to_pos": legacy.get("to"),
-    }
-
-
-async def _execute_one_group_edit(
-    ctx: RunContext[AgentDependencies],
-    *,
-    index: int,
-    edit: dict[str, Any],
-    dimension: str | None,
-    phase: str,
-    locked_targets: list[dict[str, Any]] | None,
-    is_noop: bool,
-) -> dict[str, Any]:
-    """Execute a single (frozen) edit and return a per-edit outcome dict.
-
-    On a definite failure, returns an outcome with ``status`` ``failed`` or
-    ``unknown`` plus a ``failure`` ToolResult the caller uses to stop the rest
-    of the group (spec §8.3).
-    """
-    deps = ctx.deps
-    if is_noop:
-        return {
-            "index": index,
-            "status": "noop",
-            "changed": 0,
-            "skipped": 0,
-            "mode": _mode_of_edit(edit),
-        }
-    # Deduped position/batch edits freeze to an empty positions list (spec
-    # §5.2). There is nothing to send: report a truthful noop outcome instead
-    # of failing validation (or raising) on an empty batch payload.
-    target = edit.get("target")
-    if (
-        isinstance(target, dict)
-        and isinstance(target.get("positions"), list)
-        and not target["positions"]
-    ):
-        return {
-            "index": index,
-            "status": "noop",
-            "changed": 0,
-            "skipped": 0,
-            "mode": "place",
-        }
-    legacy = _legacy_kwargs_from_edit(edit, dimension)
-    mode = legacy["mode"]
-    unsupported = await _require_supported(ctx)
-    if unsupported is not None:
-        code, fallback_allowed = _failure_metadata(unsupported)
-        return {
-            "index": index,
-            "status": "unknown",
-            "changed": 0,
-            "skipped": 0,
-            "mode": mode,
-            "warning": "Addon 桥接不可用",
-            "failure": unsupported,
-            "code": code,
-            "fallback_allowed": fallback_allowed,
-        }
-
-    limits = get_block_tools_limits(deps.settings)
-    validation = _validate_edit_args(
-        mode=mode,
-        coordinate_mode=legacy["coordinate_mode"],
-        dimension=dimension,
-        position=legacy.get("position"),
-        positions=legacy.get("positions"),
-        from_pos=legacy.get("from_pos"),
-        to_pos=legacy.get("to_pos"),
-        type_id=legacy["type_id"],
-        replace_any=legacy["replace_any"],
-        expected_previous=legacy.get("expected_previous"),
-        max_positions=limits.max_discrete_positions,
-        max_fill_volume=limits.max_fill_volume,
-    )
-    if validation is not None:
-        return {
-            "index": index,
-            "status": "failed",
-            "changed": 0,
-            "skipped": 0,
-            "mode": mode,
-            "failure": validation,
-        }
-
-    payload = build_edit_payload(
-        mode=mode,
-        coordinate_mode=legacy["coordinate_mode"],
-        dimension=dimension,
-        position=legacy.get("position"),
-        positions=legacy.get("positions"),
-        from_pos=legacy.get("from_pos"),
-        to_pos=legacy.get("to_pos"),
-        type_id=legacy["type_id"],
-        states=legacy.get("states"),
-        replace_any=legacy["replace_any"],
-        expected_previous=legacy.get("expected_previous"),
-        player_name=deps.player_name,
-        phase=phase,
-        locked_targets=locked_targets,
-        limits={
-            "max_discrete_positions": limits.max_discrete_positions,
-            "max_fill_volume": limits.max_fill_volume,
-            "cells_per_tick": limits.cells_per_tick,
-            "max_locked_targets_on_wire": limits.max_locked_targets_on_wire,
-        },
-        max_locked_targets_on_wire=limits.max_locked_targets_on_wire,
-    )
-    if "locked_targets" in payload:
-        wire_fail = locked_targets_wire_limit_exceeded(
-            payload.get("locked_targets")
-            if isinstance(payload.get("locked_targets"), list)
-            else None,
-            max_locked_targets_on_wire=limits.max_locked_targets_on_wire,
-        )
-        if wire_fail is not None:
-            return {
-                "index": index,
-                "status": "failed",
-                "changed": 0,
-                "skipped": 0,
-                "mode": mode,
-                "failure": wire_fail,
-            }
-    budget = get_command_line_byte_budget(deps.settings)
-    volume: int | None = None
-    from_pos = legacy.get("from_pos")
-    to_pos = legacy.get("to_pos")
-    if isinstance(from_pos, dict) and isinstance(to_pos, dict):
-        volume = _aabb_volume(from_pos, to_pos)
-    budget_fail = check_bridge_command_line_budget(
-        "edit_blocks",
+    return await call_block_capability(
+        deps.addon_bridge,
+        "inspect_block",
         payload,
-        budget=budget,
-        volume=volume,
+        tool_name="inspect_block",
     )
-    if budget_fail is not None:
-        return {
-            "index": index,
-            "status": "failed",
-            "changed": 0,
-            "skipped": 0,
-            "mode": mode,
-            "failure": budget_fail,
-        }
-
-    authorized_bounds: dict[str, Any] | None = None
-    if mode == "fill" and isinstance(legacy.get("from_pos"), dict) and isinstance(
-        legacy.get("to_pos"), dict
-    ):
-        authorized_bounds = {"from": legacy["from_pos"], "to": legacy["to_pos"]}
-    try:
-        result = await call_block_capability(
-            deps.addon_bridge,
-            "edit_blocks",
-            payload,
-            mode=mode,
-            authorized_bounds=authorized_bounds,
-            project_for_model=False,
-        )
-    except Exception as exc:
-        mapped = map_bridge_exception(exc, tool_name="edit_blocks")
-        unknown = bool(getattr(mapped, "external_state_unknown", False))
-        code, fallback_allowed = _failure_metadata(mapped)
-        return {
-            "index": index,
-            "status": "unknown" if unknown else "failed",
-            "changed": 0,
-            "skipped": 0,
-            "mode": mode,
-            "failure": mapped,
-            "code": code,
-            "fallback_allowed": fallback_allowed,
-        }
-
-    if not result.is_success:
-        code, fallback_allowed = _failure_metadata(result)
-        unknown = code == BlockErrorCode.STATE_UNKNOWN
-        try:
-            failure_body = json.loads(result.output)
-        except Exception:
-            failure_body = {}
-        audit_evidence = _bounded_edit_audit_evidence(
-            index, failure_body if isinstance(failure_body, dict) else {}
-        )
-        audit_evidence["code"] = code
-        return {
-            "index": index,
-            "status": "unknown" if unknown else "failed",
-            "changed": 0,
-            "skipped": 0,
-            "mode": mode,
-            "failure": result,
-            "code": code,
-            "fallback_allowed": fallback_allowed,
-            "audit_evidence": audit_evidence,
-        }
-
-    try:
-        body = json.loads(result.output)
-    except Exception:
-        body = {}
-    changed = _per_edit_changed(body)
-    skipped = _per_edit_skipped(body)
-    skipped_counts = _per_edit_skipped_type_counts(body)
-    status = body.get("status") or ("partial" if skipped > 0 else "applied")
-    if changed == 0 and skipped == 0 and body.get("status") != "noop":
-        status = body.get("status") or "applied"
-    warning = None
-    if skipped > 0:
-        warning = "部分位置因前置条件不满足而跳过"
-    return {
-        "index": index,
-        "status": status,
-        "changed": changed,
-        "skipped": skipped,
-        "skipped_type_counts": skipped_counts,
-        "mode": mode,
-        "warning": warning,
-        "audit_evidence": _bounded_edit_audit_evidence(index, body),
-    }
 
 
-def _failure_metadata(result: ToolResult) -> tuple[str, bool]:
-    """Extract the stable code and fail-closed fallback decision from a result."""
-    try:
-        body = json.loads(result.output)
-    except Exception:
-        return BlockErrorCode.INTERNAL_ERROR, False
-    if isinstance(body, dict):
-        code = body.get("code")
-        if isinstance(code, str) and code:
-            return code, bool(body.get("fallback_allowed", False))
-    return BlockErrorCode.INTERNAL_ERROR, False
+# ---------------------------------------------------------------------------
+# Task 2: single-op implementations (place_block / fill_block)
+# ---------------------------------------------------------------------------
 
 
-def _bounded_edit_audit_evidence(index: int, body: dict[str, Any]) -> dict[str, Any]:
-    """Retain bounded Add-on execution evidence for tool audit only."""
-    evidence: dict[str, Any] = {"index": index}
-    for key in _AUDIT_EDIT_EVIDENCE_FIELDS:
-        value = body.get(key)
-        if isinstance(value, list):
-            evidence[key] = value[:8]
-        elif value is not None:
-            evidence[key] = value
-    return evidence
-
-
-async def _execute_edits_group(
+async def place_block_impl(
     ctx: RunContext[AgentDependencies],
     *,
-    edits: list[dict[str, Any]],
-    dimension: str | None,
-    phase: str | None,
-    locked_targets_by_edit: list[list[dict[str, Any]]] | None = None,
-    noop_edit_indices: list[int] | None = None,
-    repairs_applied: list[Any] | None = None,
-) -> ToolResult:
-    """Execute a group of independent edits in canonical order (spec §8.3).
-
-    Each edit is executed via its own bridge call. A definite failure stops the
-    remaining edits; the aggregated result (spec §9.3) is returned even for a
-    failed/unknown group and never claims full atomicity. Only the projected
-    group result is returned to the model — full before/after/locked_targets/
-    verification stay in the audit log.
-    """
-    exec_phase = phase or "execute"
-    noop_indices = {
-        index for index in (noop_edit_indices or []) if isinstance(index, int)
-    }
-    per_edit: list[dict[str, Any]] = []
-    for index, edit in enumerate(edits):
-        edit_locks = None
-        if (
-            isinstance(locked_targets_by_edit, list)
-            and index < len(locked_targets_by_edit)
-            and isinstance(locked_targets_by_edit[index], list)
-        ):
-            edit_locks = locked_targets_by_edit[index]
-        outcome = await _execute_one_group_edit(
-            ctx,
-            index=index,
-            edit=edit,
-            dimension=dimension,
-            phase=exec_phase,
-            locked_targets=edit_locks,
-            is_noop=index in noop_indices,
-        )
-        per_edit.append(outcome)
-        # Stop remaining edits on a definite failure (spec §8.3). Unknown also
-        # halts because the world state can no longer be trusted for later edits.
-        failure = outcome.get("failure")
-        if outcome.get("status") in {"failed", "unknown"} and isinstance(failure, ToolResult):
-            for later_index in range(index + 1, len(edits)):
-                per_edit.append({
-                    "index": later_index,
-                    "status": "failed",
-                    "changed": 0,
-                    "skipped": 0,
-                    "mode": _mode_of_edit(edits[later_index]),
-                    "stopped_by_index": index,
-                })
-            break
-
-    # Always return the aggregated group result (spec §9.3) — even when an edit
-    # failed/unknown — so the model sees which edits landed and never describes
-    # a partial/unknown group as fully complete. The body's ``ok``/``status``
-    # fields carry the group-level outcome; the success ToolResult keeps the
-    # call idempotent (no re-execution of already-applied edits).
-    group = project_group_edit_result_for_model(
-        per_edit, repairs_applied=repairs_applied
-    )
-    unknown_seen = any(o.get("status") == "unknown" for o in per_edit)
-    audit_evidence = {
-        "edits": [
-            outcome["audit_evidence"]
-            for outcome in per_edit
-            if isinstance(outcome.get("audit_evidence"), dict)
-        ]
-    }
-    return ToolResult(
-        output=json.dumps(group, ensure_ascii=False),
-        external_state_unknown=unknown_seen,
-        audit_evidence=audit_evidence,
-    )
-
-
-def _mode_of_edit(edit: dict[str, Any]) -> str:
-    target = edit.get("target")
-    if isinstance(target, dict):
-        if isinstance(target.get("positions"), list):
-            return "place" if len(target["positions"]) <= 1 else "batch"
-        if isinstance(target.get("box"), dict):
-            return "fill"
-    return "place"
-
-
-async def edit_blocks_impl(
-    ctx: RunContext[AgentDependencies],
-    *,
-    mode: EditMode = "place",
-    coordinate_mode: CoordinateMode = "absolute",
-    dimension: str | None = None,
-    position: dict[str, Any] | None = None,
-    positions: list[dict[str, Any]] | None = None,
-    from_pos: dict[str, Any] | None = None,
-    to_pos: dict[str, Any] | None = None,
-    type_id: str = "",
+    pos: Any,
+    block: Any,
+    expect: Any = "air",
     states: dict[str, Any] | None = None,
-    replace_any: bool = False,
-    expected_previous: dict[str, Any] | None = None,
+    phase: str = "execute",
     locked_targets: list[dict[str, Any]] | None = None,
-    locked_targets_by_edit: list[list[dict[str, Any]]] | None = None,
-    noop_edit_indices: list[int] | None = None,
-    repairs_applied: list[Any] | None = None,
-    phase: str | None = None,
-    edits: list[dict[str, Any]] | None = None,
-    status: str | None = None,
 ) -> ToolResult:
-    """Mutate blocks via place | batch | fill after approval.
+    """Write a block at a single absolute cell (spec §3.1).
 
-    The model-facing interface now uses the unified ``edits`` contract (issue
-    03); the legacy flat kwargs remain for harness recovery of previously
-    approved operations. When ``edits`` is supplied it is mapped to the legacy
-    shape internally.
-
-    ``status`` is a harness-only bookkeeping marker (e.g. ``noop`` for an
-    all-noop group); it is stripped from the model schema and never sent to the
-    Add-on.
+    Maps to a ``mode=place`` Add-on edit frame. ``dimension`` is intentionally
+    not sent: the Add-on defaults to the current player dimension (spec §3.3).
     """
     deps = ctx.deps
-
-    # New grouped ``edits`` contract (issue 04): execute each frozen edit
-    # independently in canonical order and aggregate the result (spec §8.3/§9.3).
-    if edits is not None:
-        return await _execute_edits_group(
-            ctx,
-            edits=edits,
-            dimension=dimension,
-            phase=phase,
-            locked_targets_by_edit=locked_targets_by_edit,
-            noop_edit_indices=noop_edit_indices,
-            repairs_applied=repairs_applied,
-        )
-
-    # Legacy flat contract (harness recovery of previously-approved operations).
     logger.info(
         "agent_tool_call",
-        tool="edit_blocks",
+        tool="place_block",
         connection_id=_connection_id(deps),
         run_id=deps.run_id,
         player_name=deps.player_name,
-        mode=mode,
-        type_id=type_id,
-        has_edits=False,
+        pos=pos,
     )
 
     unsupported = await _require_supported(ctx)
     if unsupported is not None:
         return unsupported
 
-    limits = get_block_tools_limits(deps.settings)
-    validation = _validate_edit_args(
-        mode=mode,
-        coordinate_mode=coordinate_mode,
-        dimension=dimension,
-        position=position,
-        positions=positions,
-        from_pos=from_pos,
-        to_pos=to_pos,
-        type_id=type_id,
-        replace_any=replace_any,
-        expected_previous=expected_previous,
-        max_positions=limits.max_discrete_positions,
-        max_fill_volume=limits.max_fill_volume,
-    )
-    if validation is not None:
-        return validation
+    position, error = _normalize_position_array(pos, field_name="pos")
+    if error is not None:
+        return error
+    assert position is not None
 
-    exec_phase = phase or "execute"
+    type_id, effective_states, error = _normalize_single_op_block(block, states)
+    if error is not None:
+        return error
+
+    replace_any, expected_previous, error = _expect_to_legacy(expect)
+    if error is not None:
+        return error
+
     payload = build_edit_payload(
-        mode=mode,
-        coordinate_mode=coordinate_mode,
-        dimension=dimension,
+        mode="place",
+        coordinate_mode="absolute",
+        dimension=None,
         position=position,
-        positions=positions,
-        from_pos=from_pos,
-        to_pos=to_pos,
+        positions=None,
+        from_pos=None,
+        to_pos=None,
         type_id=type_id,
-        states=states,
+        states=effective_states,
         replace_any=replace_any,
         expected_previous=expected_previous,
         player_name=deps.player_name,
-        phase=exec_phase,
+        phase=phase or "execute",
         locked_targets=locked_targets,
-        limits={
-            "max_discrete_positions": limits.max_discrete_positions,
-            "max_fill_volume": limits.max_fill_volume,
-            "cells_per_tick": limits.cells_per_tick,
-            "max_locked_targets_on_wire": limits.max_locked_targets_on_wire,
-        },
-        max_locked_targets_on_wire=limits.max_locked_targets_on_wire,
     )
-    if "locked_targets" in payload:
-        wire_cap_fail = locked_targets_wire_limit_exceeded(
-            payload.get("locked_targets")
-            if isinstance(payload.get("locked_targets"), list)
-            else locked_targets,
-            max_locked_targets_on_wire=limits.max_locked_targets_on_wire,
-        )
-        if wire_cap_fail is not None:
-            return wire_cap_fail
-    locked_on_wire = payload.get("locked_targets")
-    estimated_wire = estimate_bridge_command_line_bytes("edit_blocks", payload)
-    logger.info(
-        "edit_blocks_bridge_payload",
-        connection_id=_connection_id(deps),
-        run_id=deps.run_id,
-        player_name=deps.player_name,
-        mode=mode,
-        phase=exec_phase,
-        type_id=type_id,
-        coordinate_mode=coordinate_mode,
-        dimension=dimension,
-        locked_targets_input=len(locked_targets) if isinstance(locked_targets, list) else 0,
-        locked_targets_on_wire=len(locked_on_wire) if isinstance(locked_on_wire, list) else 0,
-        has_from=from_pos is not None,
-        has_to=to_pos is not None,
-        has_position=position is not None,
-        positions_count=len(positions) if isinstance(positions, list) else 0,
-        payload_bytes=len(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        ),
-        estimated_command_line_bytes=estimated_wire,
-        omitted_locked_targets="locked_targets" not in payload and bool(locked_targets),
-    )
+
     budget = get_command_line_byte_budget(deps.settings)
-    volume = (
-        _aabb_volume(from_pos, to_pos)
-        if isinstance(from_pos, dict) and isinstance(to_pos, dict)
-        else None
-    )
-    matched_count = (
-        len(locked_targets)
-        if isinstance(locked_targets, list)
-        else (len(positions) if isinstance(positions, list) else None)
-    )
     budget_fail = check_bridge_command_line_budget(
         "edit_blocks",
         payload,
         budget=budget,
-        matched_count=matched_count,
-        volume=volume,
+        matched_count=1,
     )
     if budget_fail is not None:
         return budget_fail
-    authorized_bounds: dict[str, Any] | None = None
-    if mode == "fill" and isinstance(from_pos, dict) and isinstance(to_pos, dict):
-        authorized_bounds = {"from": from_pos, "to": to_pos}
-        vol = _aabb_volume(from_pos, to_pos)
-        if vol is not None:
-            authorized_bounds["volume"] = vol
+
     return await call_block_capability(
         deps.addon_bridge,
         "edit_blocks",
         payload,
-        mode=mode,
-        authorized_bounds=authorized_bounds,
+        mode="place",
+        tool_name="place_block",
+    )
+
+
+async def fill_block_impl(
+    ctx: RunContext[AgentDependencies],
+    *,
+    from_: Any,
+    to: Any,
+    block: Any,
+    expect: Any = "air",
+    states: dict[str, Any] | None = None,
+    phase: str = "execute",
+    locked_targets: list[dict[str, Any]] | None = None,
+) -> ToolResult:
+    """Fill the AABB between two absolute corners (spec §3.2).
+
+    Corners are min/max-normalized before reaching the Add-on. The host
+    rejects oversized volumes (LIMIT_EXCEEDED with a shrink-direction hint)
+    before any bridge call. ``dimension`` is intentionally not sent: the
+    Add-on defaults to the current player dimension (spec §3.3).
+    """
+    deps = ctx.deps
+    logger.info(
+        "agent_tool_call",
+        tool="fill_block",
+        connection_id=_connection_id(deps),
+        run_id=deps.run_id,
+        player_name=deps.player_name,
+        from_pos=from_,
+        to_pos=to,
+    )
+
+    unsupported = await _require_supported(ctx)
+    if unsupported is not None:
+        return unsupported
+
+    from_raw, error = _normalize_position_array(from_, field_name="from_")
+    if error is not None:
+        return error
+    to_raw, error = _normalize_position_array(to, field_name="to")
+    if error is not None:
+        return error
+    assert from_raw is not None and to_raw is not None
+
+    from_pos, to_pos = _normalize_aabb_corners(from_raw, to_raw)
+
+    limits = get_block_tools_limits(deps.settings)
+    volume = _aabb_volume(from_pos, to_pos)
+    if volume is None:
+        return _host_limit_error(
+            BlockErrorCode.INVALID_COORDINATE,
+            "fill 角落坐标无法计算体积",
+        )
+    if volume > limits.max_fill_volume:
+        return _host_limit_error(
+            BlockErrorCode.LIMIT_EXCEEDED,
+            f"fill 体积 {volume} 超过上限 {limits.max_fill_volume}，请求未发送",
+            limit=limits.max_fill_volume,
+            volume=volume,
+            hint=_COMMAND_LINE_BUDGET_HINT,
+        )
+
+    type_id, effective_states, error = _normalize_single_op_block(block, states)
+    if error is not None:
+        return error
+
+    replace_any, expected_previous, error = _expect_to_legacy(expect)
+    if error is not None:
+        return error
+
+    payload = build_edit_payload(
+        mode="fill",
+        coordinate_mode="absolute",
+        dimension=None,
+        position=None,
+        positions=None,
+        from_pos=from_pos,
+        to_pos=to_pos,
+        type_id=type_id,
+        states=effective_states,
+        replace_any=replace_any,
+        expected_previous=expected_previous,
+        player_name=deps.player_name,
+        phase=phase or "execute",
+        locked_targets=locked_targets,
+    )
+
+    budget = get_command_line_byte_budget(deps.settings)
+    budget_fail = check_bridge_command_line_budget(
+        "edit_blocks",
+        payload,
+        budget=budget,
+        volume=volume,
+    )
+    if budget_fail is not None:
+        return budget_fail
+
+    return await call_block_capability(
+        deps.addon_bridge,
+        "edit_blocks",
+        payload,
+        mode="fill",
+        authorized_bounds={"from": from_pos, "to": to_pos, "volume": volume},
+        tool_name="fill_block",
     )

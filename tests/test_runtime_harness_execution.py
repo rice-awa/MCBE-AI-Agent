@@ -14,8 +14,12 @@ from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
-from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved
 
+from services.agent.block_ops.preflight_cache import (
+    get_preflight_cache,
+    reset_preflight_cache,
+)
 from services.agent.harness.approvals import PendingApproval, PendingApprovalStore
 from services.agent.harness.audit import build_audit_record
 from services.agent.harness.execution import (
@@ -41,7 +45,7 @@ from services.agent.block_ops.capability import (
     get_block_capability_cache,
     reset_block_capability_cache,
 )
-from services.agent.block_ops.bridge import map_bridge_exception
+from services.agent.block_ops.bridge import map_addon_bridge_result, map_bridge_exception
 from services.agent.tool_results import ToolResult
 
 
@@ -54,6 +58,7 @@ class _Deps:
     conversation_id: str = "conv-1"
     provider: str = "test"
     auto_approve_tools: bool = False
+    addon_bridge: Any = None
 
 
 class _Settings:
@@ -102,10 +107,12 @@ def _reset_idempotency():
     reset_idempotency_store()
     reset_block_command_fallback_store()
     reset_block_capability_cache()
+    reset_preflight_cache()
     yield
     reset_idempotency_store()
     reset_block_command_fallback_store()
     reset_block_capability_cache()
+    reset_preflight_cache()
 
 
 class _FallbackContext:
@@ -122,6 +129,89 @@ def _set_supported_block_capability(connection_id: str) -> None:
             probed_at=time.time(),
         ),
     )
+
+
+@pytest.fixture
+def _block_tool_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """测试内暴露 place_block 到工具目录（Task 5 才会正式纳入目录）。"""
+    from services.agent.harness import catalog as _catalog_module
+    from services.agent.harness.catalog import ToolIntent, ToolRisk, _entry
+
+    monkeypatch.setattr(
+        _catalog_module,
+        "_TOOL_CATALOG",
+        {
+            **_catalog_module._TOOL_CATALOG,
+            "place_block": _entry(
+                "place_block",
+                ToolIntent.CHANGE_WORLD,
+                ToolRisk.HIGH,
+                "向世界写入单个方块时使用。",
+                "不要用于查询或批量填充。",
+                "pos 为 [x, y, z] 绝对坐标；block 为方块 type_id。",
+                may_have_external_side_effects=True,
+            ),
+        },
+    )
+
+
+def _build_place_block_agent(
+    side_effect_counter: dict[str, int] | None = None,
+    *,
+    policy_settings: Any | None = None,
+) -> Agent[_Deps, str | DeferredToolRequests]:
+    """与 _build_agent 同构，但挂载测试本地 place_block 工具。
+
+    公共工具体只允许在“直接调用”路径（plan_id 恢复分支之外的常规执行）
+    运行；plan_id 恢复路径必须绕过它，否则抛 AssertionError。
+    """
+    counter = side_effect_counter if side_effect_counter is not None else {}
+    policy = PolicyEngine.from_settings(policy_settings or _Settings())
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=policy)],
+    )
+
+    @agent.tool
+    async def place_block(
+        ctx: RunContext[_Deps],
+        pos: list[int],
+        block: str,
+        expect: str = "air",
+        states: dict[str, Any] | None = None,
+    ) -> str:
+        counter["place_block_public_body"] = counter.get("place_block_public_body", 0) + 1
+        raise AssertionError("public place_block body must not run (plan_id resume bypasses it)")
+
+    return agent
+
+
+async def _run_first_place_block_call(
+    agent: Agent[_Deps, str | DeferredToolRequests],
+    deps: _Deps,
+) -> tuple[str, str, list[ModelMessage]]:
+    """发起一次 place_block 调用并等待审批；返回 (tool_call_id, plan_id, messages)。"""
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="place_block",
+                    tool_call_id="tc-place-1",
+                    args={"pos": [1, 64, 1], "block": "stone", "expect": "air"},
+                )
+            ]
+        )
+
+    first = await agent.run("place stone", model=FunctionModel(model_fn), deps=deps)
+    assert isinstance(first.output, DeferredToolRequests)
+    call = first.output.approvals[0]
+    assert call.tool_name == "place_block"
+    meta = (first.output.metadata or {}).get(call.tool_call_id) or {}
+    assert isinstance(meta.get("plan_id"), str) and meta["plan_id"]
+    return call.tool_call_id, meta["plan_id"], first.all_messages()
 
 
 def _fallback_denial(
@@ -191,7 +281,7 @@ def test_edit_failure_store_accepts_preflight_exception_toolresult_and_string_js
     assert store.get("conn", "Steve", "run").fallback_allowed is False  # type: ignore[union-attr]
 
     _record_block_edit_fallback_outcome(
-        classify_tool_exception(RuntimeError("bridge error"), tool_name="edit_blocks"),
+        map_bridge_exception(RuntimeError("bridge error"), tool_name="place_block"),
         connection_id="conn",
         player_name="Steve",
         run_id="run",
@@ -244,7 +334,7 @@ def test_denies_automatic_direct_block_command_after_nonfallback_edit_failure() 
     assert denial is not None
     assert denial.action == PolicyDecisionKind.DENY
     # The model/operator needs the structured code in the denial message,
-    # not just a generic "please fix edit_blocks parameters" sentence.
+    # not just a generic "please fix place_block parameters" sentence.
     assert "PRECONDITION_FAILED" in denial.reason
 
 
@@ -253,7 +343,7 @@ def test_fallback_denial_includes_structured_diagnostic_summary() -> None:
     _record_block_edit_fallback_outcome(
         (
             '{"ok":false,"code":"STATE_UNKNOWN","fallback_allowed":false,'
-            '"diagnostic":"TypeError: edit_blocks() got an unexpected keyword '
+            '"diagnostic":"TypeError: place_block() got an unexpected keyword '
             "argument 'status'\"}"
         ),
         connection_id="conn-1",
@@ -281,6 +371,43 @@ def test_fallback_allowed_still_uses_independent_command_approval() -> None:
         "run_minecraft_command", {"command": "setblock ~ ~ ~ stone"}, player_name="Steve"
     )
     assert decision.action == PolicyDecisionKind.REQUIRE_APPROVAL
+
+
+def test_write_pre_mutation_failure_allows_command_fallback_link() -> None:
+    """写前失败码经 bridge 映射后 fallback_allowed=true → 回退不被拒绝。
+
+    PRECONDITION_FAILED 等写前失败码由宿主按一元规则重算
+    fallback_allowed=true，_block_command_fallback_denial 因此返回 None，
+    模型可回退 setblock（Bedrock 1.26.10+ 完整放置双格结构）。
+    """
+    _set_supported_block_capability("conn-1")
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "PRECONDITION_FAILED",
+                "message": "target is not air",
+                "target": {"x": 1, "y": 64, "z": 2},
+            },
+        }
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["fallback_allowed"] is True
+
+    _record_block_edit_fallback_outcome(
+        result,
+        connection_id="conn-1",
+        player_name="Steve",
+        run_id="run-1",
+    )
+    record = get_block_command_fallback_store().get("conn-1", "Steve", "run-1")
+    assert record is not None
+    assert record.fallback_allowed is True
+    assert record.code == "PRECONDITION_FAILED"
+
+    # 一元规则放行：不拒绝同 run 内 setblock 回退。
+    assert _fallback_denial() is None
 
 
 @pytest.mark.parametrize(
@@ -398,27 +525,26 @@ def test_policy_low_risk_allows_and_hard_deny_blocks() -> None:
 
 
 def test_edit_invocation_exception_returns_unknown_state_with_redacted_diagnostic() -> None:
-    result = classify_tool_exception(
-        RuntimeError("edit_blocks_impl leaked token=bridge-secret"),
-        tool_name="edit_blocks",
-        execution_stage="invocation",
+    result = map_bridge_exception(
+        RuntimeError("place_block_impl leaked token=bridge-secret"),
+        tool_name="place_block",
     )
 
     body = json.loads(result.output)
     assert body["schema_version"] == "1"
     assert body["ok"] is False
     assert body["code"] == "STATE_UNKNOWN"
-    assert body["message"] == "方块修改调用失败；外部状态未知，请勿自动重试或回退命令。"
+    assert "外部状态未知，请勿自动重试或回退命令" in body["message"]
     assert body["retryable"] is False
     assert body["external_state_unknown"] is True
     assert body["fallback_allowed"] is False
     # Host-side invocation errors surface a bounded, redacted diagnostic so
     # operators (and the model) can distinguish a harness bug from a world
     # precondition failure.
-    assert body["error_type"] == "RuntimeError"
-    assert "RuntimeError" in body["diagnostic"]
-    assert "edit_blocks_impl" in body["diagnostic"]
-    assert "bridge-secret" not in body["diagnostic"]
+    assert result.error_type == "RuntimeError"
+    assert "RuntimeError" in result.diagnostic_summary
+    assert "place_block_impl" in result.diagnostic_summary
+    assert "bridge-secret" not in result.diagnostic_summary
     assert result.retryable is False
     assert result.external_state_unknown is True
     assert "bridge-secret" not in result.output
@@ -427,7 +553,7 @@ def test_edit_invocation_exception_returns_unknown_state_with_redacted_diagnosti
 def test_projection_failure_keeps_redacted_internal_diagnostic() -> None:
     result = classify_tool_exception(
         ValueError("block preflight execution contract token=bridge-secret"),
-        tool_name="edit_blocks",
+        tool_name="place_block",
         execution_stage="projection",
     )
 
@@ -441,7 +567,7 @@ def test_projection_failure_keeps_redacted_internal_diagnostic() -> None:
 def test_block_projection_failure_is_safe_and_definitely_not_sent() -> None:
     result = classify_tool_exception(
         ValueError("block preflight execution contract token=bridge-secret"),
-        tool_name="edit_blocks",
+        tool_name="place_block",
         execution_stage="projection",
     )
 
@@ -469,14 +595,13 @@ def test_block_failure_log_is_correlated_and_omits_exception_text(monkeypatch) -
         "Context",
         (), {"deps": _Deps(run_id="run-log", player_name="Alex"), "tool_call_id": "tc-log"},
     )()
-    result = classify_tool_exception(
+    result = map_bridge_exception(
         RuntimeError("token=bridge-secret"),
-        tool_name="edit_blocks",
-        execution_stage="invocation",
+        tool_name="place_block",
     )
 
     log_tool_execution_failed(
-        tool_name="edit_blocks",
+        tool_name="place_block",
         ctx=ctx,
         result=result,
         execution_stage="invocation",
@@ -484,7 +609,7 @@ def test_block_failure_log_is_correlated_and_omits_exception_text(monkeypatch) -
     )
 
     assert captured["event"] == "tool_execution_failed"
-    assert captured["tool_name"] == "edit_blocks"
+    assert captured["tool_name"] == "place_block"
     assert captured["run_id"] == "run-log"
     assert captured["tool_call_id"] == "tc-log"
     assert captured["connection_id_short"] == str(ctx.deps.connection_id)[-8:]
@@ -510,11 +635,11 @@ def test_mapped_bridge_failure_log_uses_original_exception_type(monkeypatch) -> 
         (), {"deps": _Deps(run_id="run-bridge", player_name="Alex"), "tool_call_id": "tc-bridge"},
     )()
     result = map_bridge_exception(
-        TimeoutError("token=bridge-secret timed out"), tool_name="edit_blocks"
+        TimeoutError("token=bridge-secret timed out"), tool_name="place_block"
     )
 
     log_tool_execution_failed(
-        tool_name="edit_blocks",
+        tool_name="place_block",
         ctx=ctx,
         result=result,
         execution_stage="invocation",
@@ -1255,3 +1380,357 @@ async def test_harness_cancelled_emits_tool_execution_cancelled(tmp_path):
         assert cancelled["attributes"]["tool_name"] == "list_available_providers"
     finally:
         set_trace_recorder(None)
+
+
+@pytest.mark.asyncio
+async def test_approval_resume_uses_plan_id_without_hidden_kwargs(
+    monkeypatch: pytest.MonkeyPatch, _block_tool_catalog
+) -> None:
+    """place_block 审批恢复只携带 plan_id；impl 只收到 pos/block/expect/states。"""
+    counter: dict[str, int] = {}
+    captured: dict[str, Any] = {}
+
+    async def fake_place_impl(
+        ctx: RunContext[_Deps],
+        *,
+        pos: list[int],
+        block: str,
+        expect: str = "air",
+        states: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        captured["kwargs"] = {"pos": pos, "block": block, "expect": expect, "states": states}
+        return ToolResult.ok(f"placed:{block}")
+
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.place_block_impl", fake_place_impl)
+
+    agent = _build_place_block_agent(counter)
+    deps = _Deps(settings=_Settings(), run_id="run-plan-id-1")
+    _set_supported_block_capability(str(deps.connection_id))
+
+    tool_call_id, plan_id, messages = await _run_first_place_block_call(agent, deps)
+
+    # 预检缓存只保存模型可见字段（states 是公共默认字段，可出现）
+    entry = get_preflight_cache().get_by_plan_id(plan_id)
+    assert entry is not None
+    assert entry.tool_name == "place_block"
+    assert {"pos", "block", "expect"} <= set(entry.canonical_args)
+    for hidden in ("locked_targets", "phase", "status"):
+        assert hidden not in entry.canonical_args
+        assert hidden not in entry.execute_args
+
+    results = DeferredToolResults()
+    results.approvals[tool_call_id] = ToolApproved(override_args={"plan_id": plan_id})
+    second = await agent.run(
+        message_history=messages, deferred_tool_results=results, deps=deps, model=TestModel()
+    )
+
+    assert not isinstance(second.output, DeferredToolRequests)
+    assert captured["kwargs"] == {"pos": [1, 64, 1], "block": "stone", "expect": "air", "states": None}
+    for hidden in ("locked_targets", "phase", "status"):
+        assert hidden not in captured["kwargs"]
+
+
+@pytest.mark.asyncio
+async def test_plan_id_resume_is_idempotent_and_missing_plan_is_state_unknown(
+    monkeypatch: pytest.MonkeyPatch, _block_tool_catalog
+) -> None:
+    """同一 plan_id 二次恢复不重复执行；缺失/过期 plan → STATE_UNKNOWN（无 TypeError）。"""
+    calls: dict[str, int] = {"count": 0}
+    captured: dict[str, Any] = {}
+
+    async def fake_place_impl(
+        ctx: RunContext[_Deps],
+        *,
+        pos: list[int],
+        block: str,
+        expect: str = "air",
+        states: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        calls["count"] += 1
+        captured["kwargs"] = {"pos": pos, "block": block, "expect": expect, "states": states}
+        return ToolResult.ok(f"placed:{block}")
+
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.place_block_impl", fake_place_impl)
+
+    agent = _build_place_block_agent()
+    deps = _Deps(settings=_Settings(), run_id="run-plan-id-2")
+    _set_supported_block_capability(str(deps.connection_id))
+
+    tool_call_id, plan_id, messages = await _run_first_place_block_call(agent, deps)
+
+    # 第一次恢复：执行一次
+    results = DeferredToolResults()
+    results.approvals[tool_call_id] = ToolApproved(override_args={"plan_id": plan_id})
+    second = await agent.run(
+        message_history=messages, deferred_tool_results=results, deps=deps, model=TestModel()
+    )
+    assert calls["count"] == 1
+    assert not isinstance(second.output, DeferredToolRequests)
+
+    # 清空幂等 store 后二次恢复仍不重复执行（plan 已执行标记兜底）
+    reset_idempotency_store()
+    results2 = DeferredToolResults()
+    results2.approvals[tool_call_id] = ToolApproved(override_args={"plan_id": plan_id})
+    third = await agent.run(
+        message_history=messages, deferred_tool_results=results2, deps=deps, model=TestModel()
+    )
+    assert calls["count"] == 1
+    assert not isinstance(third.output, DeferredToolRequests)
+
+    # 缺失 plan：STATE_UNKNOWN，不抛 TypeError
+    missing = DeferredToolResults()
+    missing.approvals[tool_call_id] = ToolApproved(override_args={"plan_id": "no-such-plan-1"})
+    fourth = await agent.run(
+        message_history=messages, deferred_tool_results=missing, deps=deps, model=TestModel()
+    )
+    assert calls["count"] == 1
+    assert "STATE_UNKNOWN" in str(fourth.output)
+
+    # 过期 plan：同 STATE_UNKNOWN
+    entry = get_preflight_cache().get_by_plan_id(plan_id)
+    assert entry is not None
+    entry.created_at = time.time() - 300  # 超过 DEFAULT_APPROVAL_TTL_SECONDS
+    expired = DeferredToolResults()
+    expired.approvals[tool_call_id] = ToolApproved(override_args={"plan_id": plan_id})
+    fifth = await agent.run(
+        message_history=messages, deferred_tool_results=expired, deps=deps, model=TestModel()
+    )
+    assert calls["count"] == 1
+    assert "STATE_UNKNOWN" in str(fifth.output)
+
+
+@pytest.mark.asyncio
+async def test_regression_status_kwarg_type_error_is_impossible(
+    monkeypatch: pytest.MonkeyPatch, _block_tool_catalog
+) -> None:
+    """2026-08-03 回归：恢复 payload 曾注入 status → TypeError。新路径结构性不可达。
+
+    恢复载荷契约只允许恰好 {plan_id}；被篡改塞入 status/phase/locked_targets
+    的载荷现在在校验边界被拒绝（不会执行、不会静默归一化、不会 TypeError）。
+    缓存里的 canonical/execute args 本身也不含隐藏字段。
+    """
+    captured: dict[str, Any] = {}
+
+    async def fake_place_impl(
+        ctx: RunContext[_Deps],
+        *,
+        pos: list[int],
+        block: str,
+        expect: str = "air",
+        states: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        captured["kwargs"] = {"pos": pos, "block": block, "expect": expect, "states": states}
+        return ToolResult.ok(f"placed:{block}")
+
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.place_block_impl", fake_place_impl)
+
+    agent = _build_place_block_agent()
+    deps = _Deps(settings=_Settings(), run_id="run-regression-status")
+    _set_supported_block_capability(str(deps.connection_id))
+
+    tool_call_id, plan_id, messages = await _run_first_place_block_call(agent, deps)
+
+    # 篡改的恢复 payload：plan_id 之外塞入 status/phase/locked_targets →
+    # 校验边界拒绝，impl 绝不执行，也不会把隐藏 kwargs 透传给任何执行层
+    tampered = DeferredToolResults()
+    tampered.approvals[tool_call_id] = ToolApproved(
+        override_args={
+            "plan_id": plan_id,
+            "status": "noop",
+            "phase": "execute",
+            "locked_targets": [],
+        }
+    )
+    second = await agent.run(
+        message_history=messages, deferred_tool_results=tampered, deps=deps, model=TestModel()
+    )
+    assert "kwargs" not in captured  # impl 未被调用
+    # 拒绝发生在验证边界：调用不会执行，重新进入待审批（非静默透传）
+    assert isinstance(second.output, DeferredToolRequests)
+
+    # 结构性根因：预检缓存的 canonical/execute args 不含任何隐藏字段
+    entry = get_preflight_cache().get_by_plan_id(plan_id)
+    assert entry is not None
+    for key in ("status", "locked_targets", "phase"):
+        assert key not in entry.canonical_args
+        assert key not in entry.execute_args
+
+
+@pytest.mark.asyncio
+async def test_plan_id_resume_malformed_payload_rejected_at_validation(
+    monkeypatch: pytest.MonkeyPatch, _block_tool_catalog
+) -> None:
+    """畸形恢复载荷（plan_id 之外的额外键）在校验边界被拒绝，不静默透传。
+
+    Reviewer finding (Important 2)：cache miss 时 wrap_tool_validate 曾直接返回
+    {plan_id} 而不做任何载荷校验；``{"plan_id": "missing", "malicious_extra": true}``
+    会静默通过验证边界。现在恢复契约强制载荷恰好为 {plan_id}，额外键 → 拒绝。
+    """
+    calls: dict[str, int] = {"count": 0}
+    captured: dict[str, Any] = {}
+
+    async def fake_place_impl(
+        ctx: RunContext[_Deps],
+        *,
+        pos: list[int],
+        block: str,
+        expect: str = "air",
+        states: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        calls["count"] += 1
+        captured["kwargs"] = {"pos": pos, "block": block, "expect": expect, "states": states}
+        return ToolResult.ok(f"placed:{block}")
+
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.place_block_impl", fake_place_impl)
+
+    agent = _build_place_block_agent()
+    deps = _Deps(settings=_Settings(), run_id="run-malformed-payload")
+    _set_supported_block_capability(str(deps.connection_id))
+
+    tool_call_id, _plan_id, messages = await _run_first_place_block_call(agent, deps)
+
+    # 缺失 plan + 额外恶意键：验证边界拒绝（不执行、不静默透传为 STATE_UNKNOWN）
+    malformed = DeferredToolResults()
+    malformed.approvals[tool_call_id] = ToolApproved(
+        override_args={"plan_id": "no-such-plan", "malicious_extra": True}
+    )
+    rejected = await agent.run(
+        message_history=messages, deferred_tool_results=malformed, deps=deps, model=TestModel()
+    )
+    assert calls["count"] == 0
+    assert "kwargs" not in captured
+    # 拒绝：重新进入待审批，而不是静默通过验证边界
+    assert isinstance(rejected.output, DeferredToolRequests)
+
+
+# ---------------------------------------------------------------------------
+# Task 7 Step 4: 命令回退门控对新工具名生效
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_new_tool_failure_denies_command_fallback_in_same_run() -> None:
+    """Task 7 Step 4: 新工具名失败（fallback_allowed=false）门控命令回退。
+
+    place_block（新契约工具名）执行失败后，同一 run 内的 setblock 命令回退
+    被 ``_block_command_fallback_denial`` 拒绝：run_minecraft_command 公共
+    body 不执行，结构化 PRECONDITION_FAILED 诊断回到模型。
+    """
+    counter: dict[str, int] = {}
+    policy = PolicyEngine.from_settings(_Settings())
+    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
+        "test",
+        deps_type=_Deps,
+        output_type=[str, DeferredToolRequests],
+        capabilities=[HarnessCapability(policy=policy)],
+    )
+
+    @agent.tool
+    async def place_block(
+        ctx: RunContext[_Deps], pos: list[int], block: str, expect: str = "air"
+    ) -> str:
+        counter["place_block"] = counter.get("place_block", 0) + 1
+        return ToolResult.failure(
+            json.dumps(
+                {
+                    "ok": False,
+                    "code": "PRECONDITION_FAILED",
+                    "fallback_allowed": False,
+                    "message": "expected air, found minecraft:grass_block",
+                }
+            ),
+            error_kind="PRECONDITION_FAILED",
+            retryable=False,
+        )
+
+    @agent.tool
+    async def run_minecraft_command(ctx: RunContext[_Deps], command: str) -> str:
+        counter["run_minecraft_command"] = counter.get("run_minecraft_command", 0) + 1
+        return ToolResult.ok(f"executed:{command}")
+
+    calls = [
+        ("place_block", {"pos": [1, 64, 1], "block": "stone", "expect": "air"}),
+        ("run_minecraft_command", {"command": "setblock ~ ~ ~ stone"}),
+    ]
+
+    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
+        if calls:
+            tool_name, args = calls.pop(0)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=tool_name,
+                        tool_call_id=f"tc-{tool_name}",
+                        args=args,
+                    )
+                ]
+            )
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    connection_id = "conn-fallback-gate"
+    _set_supported_block_capability(connection_id)
+    deps = _Deps(
+        settings=_Settings(),
+        run_id="run-fallback-gate",
+        auto_approve_tools=True,
+        connection_id=connection_id,
+    )
+
+    result = await agent.run(
+        "place stone then build a wall with setblock",
+        model=FunctionModel(model_fn),
+        deps=deps,
+    )
+
+    assert counter.get("place_block") == 1
+    assert counter.get("run_minecraft_command", 0) == 0
+    record = get_block_command_fallback_store().get(
+        connection_id, "Steve", "run-fallback-gate"
+    )
+    assert record is not None
+    assert record.fallback_allowed is False
+    assert record.code == "PRECONDITION_FAILED"
+    # ToolDenied 以 ToolReturnPart.content 形式回到模型；序列化为文本断言
+    # 结构化诊断（含 code）确实送达。
+    parts_text = [
+        str(getattr(part, "content", ""))
+        for message in result.all_messages()
+        for part in getattr(message, "parts", []) or []
+    ]
+    text = " | ".join(parts_text)
+    assert "PRECONDITION_FAILED" in text
+    assert "不允许命令回退" in text
+
+
+def test_recorded_outcome_from_new_tool_failure_gates_direct_fallback() -> None:
+    """Task 7 Step 4: 直接记录的新工具失败结果同样进入回退门控。
+
+    与旧契约失败形态等价的 place_block 失败结果（经桥接映射的
+    ToolResult）写入 fallback store 后，``_block_command_fallback_denial``
+    对 setblock 命令返回 DENY，且原因含结构化 code。
+    """
+    _set_supported_block_capability("conn-1")
+    # 等价于新工具桥接失败映射后的 ToolResult（output 为结构化错误 JSON）。
+    mapped = ToolResult.failure(
+        json.dumps(
+            {
+                "ok": False,
+                "code": "PRECONDITION_FAILED",
+                "fallback_allowed": False,
+                "message": "expected air, found minecraft:grass_block",
+            }
+        ),
+        error_kind="PERMANENT",
+        retryable=False,
+    )
+    _record_block_edit_fallback_outcome(
+        mapped,
+        connection_id="conn-1",
+        player_name="Steve",
+        run_id="run-1",
+    )
+
+    denial = _fallback_denial()
+    assert denial is not None
+    assert denial.action == PolicyDecisionKind.DENY
+    assert "PRECONDITION_FAILED" in denial.reason

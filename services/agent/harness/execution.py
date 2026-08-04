@@ -13,14 +13,17 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Literal
 
+from pydantic import ValidationError
 from pydantic_ai import ApprovalRequired, RunContext, ToolDenied
 from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, ToolsetTool
 from pydantic_ai.toolsets.wrapper import WrapperToolset
 
 from config.logging import get_logger
 from config.redaction import redact_exception, truncate_for_log
+from services.agent.block_ops.preflight_cache import get_preflight_cache
 from services.agent.harness.audit import (
     audit_enabled,
     build_audit_record,
@@ -36,7 +39,7 @@ from services.agent.tool_results import ToolResult
 
 logger = get_logger(__name__)
 
-_BLOCK_OPS_TOOLS: frozenset[str] = frozenset({"inspect_block", "edit_blocks"})
+_BLOCK_OPS_TOOLS: frozenset[str] = frozenset({"inspect_block", "place_block", "fill_block"})
 
 DEFAULT_HARD_DENY_COMMAND_ROOTS: frozenset[str] = frozenset(
     {"op", "deop", "stop", "whitelist", "permission", "wsserver"}
@@ -182,7 +185,7 @@ class IdempotencyStore:
 
 @dataclass(frozen=True)
 class BlockCommandFallbackRecord:
-    """最近一次 ``edit_blocks`` 的结构化回退结论。"""
+    """最近一次方块工具（``place_block`` / ``fill_block`` / ``inspect_block``）的结构化回退结论。"""
 
     fallback_allowed: bool
     created_at: float
@@ -632,24 +635,6 @@ def classify_tool_exception(
             diagnostic_summary=diagnostic_summary,
             error_type=exc.__class__.__name__,
         )
-    if tool_name == "edit_blocks" and stage == "invocation":
-        from services.agent.block_ops.schema import (
-            build_state_unknown_response,
-            dumps_payload,
-        )
-
-        body = build_state_unknown_response(
-            error_type=exc.__class__.__name__,
-            diagnostic=truncate_for_log(diagnostic_summary, 200),
-        )
-        return ToolResult.failure(
-            dumps_payload(body),
-            error_kind="PERMANENT",
-            retryable=False,
-            external_state_unknown=True,
-            diagnostic_summary=diagnostic_summary,
-            error_type=exc.__class__.__name__,
-        )
     if "timeout" in lower or "deadline" in lower:
         entry = get_tool_entry(tool_name)
         side_effect = bool(entry.may_have_external_side_effects) if entry is not None else True
@@ -920,12 +905,14 @@ def _block_command_fallback_denial(
         reason = (
             f"专用方块编辑刚刚失败{code_text}且不允许命令回退；"
             f"诊断: {record.summary}。"
-            "请根据结构化错误修正 edit_blocks 参数，或等待明确允许回退的结果。"
+            "请根据结构化错误修正 place_block / fill_block 参数，"
+            "或等待明确允许回退的结果。"
         )
     else:
         reason = (
             f"专用方块编辑刚刚失败{code_text}且不允许命令回退；"
-            "请根据结构化错误修正 edit_blocks 参数，或等待明确允许回退的结果。"
+            "请根据结构化错误修正 place_block / fill_block 参数，"
+            "或等待明确允许回退的结果。"
         )
     return PolicyDecision(
         action=PolicyDecisionKind.DENY,
@@ -982,6 +969,31 @@ class HarnessToolset(WrapperToolset[Any]):
             tool_call_id=str(tool_call_id) if tool_call_id else None,
             tool_args=original_normalized,
         )
+
+        # 0.1) Approved plan_id resume: block ops recovery without hidden kwargs.
+        # 恢复负载只有 {plan_id}；执行走 execute_block_plan（frozen canonical
+        # args），不再 super().call_tool 注入 status/phase/locked_targets。
+        # 仅 tool_call_approved 时生效：新鲜调用即使伪造 plan_id 也不可复用。
+        plan_id = effective_args.get("plan_id")
+        if (
+            name in _BLOCK_OPS_TOOLS
+            and bool(getattr(ctx, "tool_call_approved", False))
+            and isinstance(plan_id, str)
+            and plan_id.strip()
+        ):
+            return await self._resume_approved_block_plan(
+                name=name,
+                plan_id=plan_id.strip(),
+                ctx=ctx,
+                settings=settings,
+                player_name=player_name,
+                run_id=str(run_id),
+                tool_call_id=str(tool_call_id),
+                connection_id=connection_id,
+                trace_recorder=trace_recorder,
+                trace_context=trace_context,
+                start=start,
+            )
 
         # 0) Block tools: preflight / relative resolution BEFORE policy & approval.
         # Preflight plans separate authorization, execution projection, and evidence.
@@ -1227,6 +1239,7 @@ class HarnessToolset(WrapperToolset[Any]):
                         preflight_plan.approval_metadata if preflight_plan is not None else {}
                     ),
                     "original_args_hash": original_args_hash,
+                    "plan_id": preflight_plan.plan_id if preflight_plan is not None else "",
                     "args_summary": summary,
                     "policy_version": decision.policy_version,
                     "reason": decision.reason,
@@ -1550,28 +1563,7 @@ class HarnessToolset(WrapperToolset[Any]):
         connection_id: str,
     ) -> tuple[ToolResult | None, Any | None]:
         """Run block-ops preflight; return (failure, separated plan)."""
-        from services.agent.block_ops.preflight_cache import get_preflight_cache
         from services.agent.block_ops.tools_impl import BlockPreflightPlan, run_block_preflight
-
-        deferred_approved = bool(getattr(ctx, "tool_call_approved", False))
-        # Approved block calls are never allowed to fall back to cached/model
-        # arguments or a fresh preflight: the persisted override must validate.
-        if deferred_approved:
-            try:
-                execute_args = _python_tool_args(name, tool_args)
-            except (TypeError, ValueError, KeyError) as exc:
-                classified = classify_tool_exception(
-                    exc, tool_name=name, execution_stage="projection"
-                )
-                log_tool_execution_failed(
-                    tool_name=name,
-                    ctx=ctx,
-                    result=classified,
-                    execution_stage="projection",
-                    error_type=exc.__class__.__name__,
-                )
-                return classified, None
-            return None, BlockPreflightPlan(dict(tool_args), execute_args, {})
 
         # Reuse cached canonical args on approval recovery (same original hash).
         cache = get_preflight_cache()
@@ -1582,14 +1574,8 @@ class HarnessToolset(WrapperToolset[Any]):
                     dict(cached.canonical_args),
                     dict(cached.execute_args),
                     dict(cached.approval_metadata),
+                    plan_id=cached.plan_id,
                 )
-            # Also accept lookup when tool_args already mark execute phase.
-            if tool_args.get("phase") == "execute" and tool_args.get("locked_targets"):
-                try:
-                    execute_args = _python_tool_args(name, tool_args)
-                except (TypeError, ValueError, KeyError) as exc:
-                    return _projection_failure(ctx, name, exc), None
-                return None, BlockPreflightPlan(dict(tool_args), execute_args, {})
 
         try:
             plan_or_args, failure = await run_block_preflight(ctx, name, tool_args)
@@ -1627,7 +1613,7 @@ class HarnessToolset(WrapperToolset[Any]):
             plan = BlockPreflightPlan(canonical, execute_args, {})
 
         if run_id and tool_call_id:
-            cache.put(
+            entry = cache.put(
                 run_id=run_id,
                 tool_call_id=tool_call_id,
                 original_args_hash=original_args_hash,
@@ -1636,8 +1622,177 @@ class HarnessToolset(WrapperToolset[Any]):
                 approval_metadata=plan.approval_metadata,
                 preflight_payload=plan.approval_metadata,
                 connection_id=connection_id or None,
+                tool_name=name,
+                plan_id=plan.plan_id,
             )
+            if not plan.plan_id:
+                # plan 未自带 plan_id（dict/None 直通分支）：用缓存生成的 plan_id 回填
+                plan = replace(plan, plan_id=entry.plan_id)
         return None, plan
+
+    async def _resume_approved_block_plan(
+        self,
+        *,
+        name: str,
+        plan_id: str,
+        ctx: RunContext[Any],
+        settings: Any,
+        player_name: str | None,
+        run_id: str,
+        tool_call_id: str,
+        connection_id: str,
+        trace_recorder: Any,
+        trace_context: Any,
+        start: float,
+    ) -> Any:
+        """Approved plan_id 恢复：幂等 → execute_block_plan → 分类/审计/追踪。
+
+        镜像主路径 step 1/3/4：同 run+call 同参数只执行一次；成功写入幂等
+        缓存；审计 parameters/authorized_args 从缓存 canonical args 还原，
+        绝不包含隐藏 kwargs。
+        """
+        from services.agent.block_ops.tools_impl import _state_unknown_result, execute_block_plan
+
+        entry = get_preflight_cache().get_by_plan_id(plan_id)
+        if entry is None:
+            result = _state_unknown_result(plan_id)
+            self._audit(
+                settings=settings,
+                tool_name=name,
+                parameters={"plan_id": plan_id},
+                ctx=ctx,
+                status="failure",
+                duration_ms=_duration_ms(start),
+                result=result,
+            )
+            self._trace_tool_result(
+                trace_recorder,
+                trace_context,
+                tool_name=name,
+                tool_call_id=tool_call_id or None,
+                result=result,
+                status="timeout_unknown",
+                duration_ms=_duration_ms(start),
+            )
+            return materialize_tool_result(result)
+        if entry.tool_name and entry.tool_name != name:
+            result = _state_unknown_result(plan_id, reason="tool-mismatch")
+            self._audit(
+                settings=settings,
+                tool_name=name,
+                parameters={"plan_id": plan_id},
+                ctx=ctx,
+                status="failure",
+                duration_ms=_duration_ms(start),
+                result=result,
+            )
+            self._trace_tool_result(
+                trace_recorder,
+                trace_context,
+                tool_name=name,
+                tool_call_id=tool_call_id or None,
+                result=result,
+                status="timeout_unknown",
+                duration_ms=_duration_ms(start),
+            )
+            return materialize_tool_result(result)
+
+        canonical = dict(entry.canonical_args)
+        idempotency_args_hash = hash_normalized_args(normalize_tool_args(canonical))
+
+        # 幂等（同主路径 step 1）：同 run+call 同参数只执行一次
+        if run_id and tool_call_id:
+            cached = self.idempotency.get(
+                str(run_id), str(tool_call_id), idempotency_args_hash
+            )
+            if cached is not None:
+                logger.info(
+                    "tool_idempotent_hit",
+                    tool=name,
+                    run_id=run_id,
+                    tool_call_id=tool_call_id,
+                )
+                self._audit(
+                    settings=settings,
+                    tool_name=name,
+                    parameters=canonical,
+                    ctx=ctx,
+                    status="success",
+                    duration_ms=_duration_ms(start),
+                    result=cached.result,
+                    authorized_args=canonical,
+                )
+                self._trace_tool_result(
+                    trace_recorder,
+                    trace_context,
+                    tool_name=name,
+                    tool_call_id=tool_call_id or None,
+                    result=cached.result,
+                    status="succeeded",
+                    duration_ms=_duration_ms(start),
+                    attributes={"idempotent_hit": True},
+                )
+                return materialize_tool_result(cached.result)
+
+        self._trace_tool_started(
+            trace_recorder,
+            trace_context,
+            tool_name=name,
+            tool_call_id=tool_call_id or None,
+        )
+        raw_result = await execute_block_plan(plan_id, ctx)
+
+        # 步骤 4 镜像：结果分类 / 幂等写入 / 审计 / 追踪
+        result_for_model = materialize_tool_result(raw_result)
+        success = True
+        external_unknown = False
+        if isinstance(raw_result, ToolResult):
+            success, external_unknown = _block_result_observability_status(raw_result)
+            if raw_result.is_success and run_id and tool_call_id:
+                self.idempotency.put(
+                    str(run_id),
+                    str(tool_call_id),
+                    idempotency_args_hash,
+                    raw_result,
+                    external_state_unknown=False,
+                )
+        else:
+            if run_id and tool_call_id:
+                self.idempotency.put(
+                    str(run_id),
+                    str(tool_call_id),
+                    idempotency_args_hash,
+                    result_for_model,
+                    external_state_unknown=False,
+                )
+
+        self._audit(
+            settings=settings,
+            tool_name=name,
+            parameters=canonical,
+            ctx=ctx,
+            status="success" if success else "failure",
+            duration_ms=_duration_ms(start),
+            result=raw_result if isinstance(raw_result, ToolResult) else result_for_model,
+            authorized_args=canonical,
+        )
+
+        if external_unknown:
+            exec_status = "timeout_unknown"
+        elif success:
+            exec_status = "succeeded"
+        else:
+            exec_status = "failed"
+        self._trace_tool_result(
+            trace_recorder,
+            trace_context,
+            tool_name=name,
+            tool_call_id=tool_call_id or None,
+            result=raw_result if isinstance(raw_result, ToolResult) else result_for_model,
+            status=exec_status,
+            duration_ms=_duration_ms(start),
+        )
+        return result_for_model
 
     def _audit(
         self,
@@ -1700,6 +1855,56 @@ class HarnessCapability(AbstractCapability[Any]):
             fallback_store=fallback_store,
         )
 
+    async def wrap_tool_validate(
+        self,
+        ctx: RunContext[Any],
+        *,
+        call: ToolCallPart,
+        tool_def: ToolDefinition,
+        args: Any,
+        handler: Any,
+    ) -> Any:
+        """Approved block-ops recovery: rewrite {plan_id} → frozen canonical args.
+
+        plan_id 恢复负载只含 {plan_id}，公共参数校验必须在 frozen canonical
+        args 上运行（缺失/过期 → 跳过校验，由 call_tool 的 plan_id 分支返回
+        STATE_UNKNOWN）。隐藏字段（status/phase/locked_targets）结构性不可达：
+        校验与执行都只接触 plan_id / canonical args。
+
+        恢复载荷不能直接交给 ``handler``：公共参数 schema 不含 ``plan_id``
+        （``additionalProperties: false``），``{"plan_id": X}`` 本身就无法通过
+        schema 校验。因此这里对原始载荷做结构性校验：恢复契约只允许恰好
+        ``{"plan_id": <非空字符串>}``，任何额外键都是畸形载荷，必须在校验
+        边界拒绝，而不是静默归一化放行（例如
+        ``{"plan_id": "missing", "malicious_extra": true}``）。
+        """
+        plan_id = args.get("plan_id") if isinstance(args, dict) else None
+        if (
+            tool_def.name in _BLOCK_OPS_TOOLS
+            and bool(getattr(ctx, "tool_call_approved", False))
+            and isinstance(plan_id, str)
+            and plan_id.strip()
+        ):
+            if set(args.keys()) != {"plan_id"}:
+                raise ValidationError.from_exception_data(
+                    tool_def.name,
+                    [
+                        {
+                            "type": "extra_forbidden",
+                            "loc": (str(key),),
+                            "msg": "plan_id 恢复载荷只能包含 plan_id 字段",
+                            "input": args[key],
+                        }
+                        for key in sorted(set(args.keys()) - {"plan_id"})
+                    ],
+                )
+            entry = get_preflight_cache().get_by_plan_id(plan_id.strip())
+            if entry is not None and entry.tool_name == tool_def.name:
+                # 校验 frozen canonical args；校验结果丢弃，只回传 plan_id
+                await handler(dict(entry.canonical_args))
+            return {"plan_id": plan_id.strip()}
+        return await handler(args)
+
     async def prepare_tools(
         self,
         ctx: RunContext[Any],
@@ -1717,9 +1922,9 @@ class HarnessCapability(AbstractCapability[Any]):
                     getattr(deps, "addon_bridge", None),
                 )
         exposed = [td for td in tool_defs if self.policy.is_tool_exposed(td.name, ctx=ctx)]
-        # Hide harness-only recovery fields from the model-facing schema.
-        # Approval resume / override_args still inject locked_targets + phase=execute.
-        return [strip_block_internal_tool_schema(td) for td in exposed]
+        # The single-op block tools already expose only model-visible fields in
+        # their public schemas; no internal-key stripping is needed here.
+        return exposed
 
 
 def build_harness_capability(settings: Any | None = None) -> HarnessCapability:
@@ -1730,60 +1935,15 @@ def _duration_ms(start: float) -> int:
     return max(0, round((time.perf_counter() - start) * 1000))
 
 
-# Model-facing tool schema must not advertise recovery-only fields.
-_BLOCK_INTERNAL_SCHEMA_KEYS = frozenset({
-    "locked_targets", "locked_targets_by_edit", "noop_edit_indices",
-    "repairs_applied", "phase", "status",
-})
-
-
-def strip_block_internal_tool_schema(tool_def: ToolDefinition) -> ToolDefinition:
-    """Remove locked_targets/phase from public ToolDefinition parameters.
-
-    Function implementations and harness recovery still accept these kwargs;
-    only the schema shown to the model is stripped.
-    """
-    if tool_def.name not in _BLOCK_OPS_TOOLS:
-        return tool_def
-    schema = tool_def.parameters_json_schema
-    if not isinstance(schema, dict):
-        return tool_def
-    properties = schema.get("properties")
-    if not isinstance(properties, dict):
-        return tool_def
-    if not _BLOCK_INTERNAL_SCHEMA_KEYS.intersection(properties):
-        return tool_def
-
-    new_properties = {
-        key: value
-        for key, value in properties.items()
-        if key not in _BLOCK_INTERNAL_SCHEMA_KEYS
-    }
-    new_schema = dict(schema)
-    new_schema["properties"] = new_properties
-    required = schema.get("required")
-    if isinstance(required, list):
-        new_schema["required"] = [
-            item for item in required if item not in _BLOCK_INTERNAL_SCHEMA_KEYS
-        ]
-    return replace(
-        tool_def,
-        parameters_json_schema=new_schema,  # type: ignore[arg-type]
-    )
-
-
 def _python_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Build Python call args through the block operation signature whitelist."""
-    if tool_name not in _BLOCK_OPS_TOOLS:
-        return dict(args or {})
-    if tool_name == "inspect_block" and args.get("phase") != "execute":
-        return {
-            key: value for key, value in dict(args or {}).items()
-            if key in {
-                "coordinate_mode", "dimension", "position", "positions",
-                "target", "locked_targets", "phase",
-            }
-        }
-    from services.agent.block_ops.tools_impl import project_block_execute_args
+    """Build Python call args for the public block tool signatures.
 
-    return project_block_execute_args(tool_name, dict(args or {}))
+    Canonical fill args use the model-visible alias ``from`` for approval,
+    audit, and plan storage. The registered Python function instead accepts
+    ``from_`` because ``from`` is a reserved keyword, so restore the Python
+    parameter name only at this final invocation boundary.
+    """
+    projected = dict(args or {})
+    if tool_name == "fill_block" and "from" in projected and "from_" not in projected:
+        projected["from_"] = projected.pop("from")
+    return projected

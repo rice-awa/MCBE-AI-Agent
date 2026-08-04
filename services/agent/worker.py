@@ -1840,10 +1840,17 @@ class AgentWorker:
                         message=str(value.get("message") or "已拒绝")
                     )
                 elif isinstance(value, dict) and value.get("kind") == "tool-approved":
+                    plan_id = value.get("plan_id")
                     override_args = value.get("override_args")
-                    if not isinstance(override_args, dict):
-                        raise ValueError("tool-approved requires override_args")
-                    results.approvals[tool_call_id] = ToolApproved(override_args=override_args)
+                    if isinstance(plan_id, str) and plan_id.strip():
+                        # 恢复契约：只携带 plan_id；验证与执行都从预检缓存还原
+                        results.approvals[tool_call_id] = ToolApproved(
+                            override_args={"plan_id": plan_id.strip()}
+                        )
+                    elif isinstance(override_args, dict):
+                        results.approvals[tool_call_id] = ToolApproved(override_args=override_args)
+                    else:
+                        raise ValueError("tool-approved requires plan_id or override_args")
                 else:
                     results.approvals[tool_call_id] = value
         if isinstance(calls, dict):
@@ -1908,15 +1915,15 @@ class AgentWorker:
         preassigned_ids = [store.generate_approval_id() for _ in pending_calls]
         sibling_ids = list(preassigned_ids)
 
-        # Fail closed before any store write: block tools need projected execute_args.
+        # Fail closed before any store write: block tools need plan_id (recovery contract).
         for call in pending_calls:
-            if call.tool_name not in {"inspect_block", "edit_blocks"}:
+            if call.tool_name not in {"inspect_block", "place_block", "fill_block"}:
                 continue
             meta = deferred.metadata.get(call.tool_call_id, {}) if deferred.metadata else {}
-            execute_args = meta.get("execute_args") if isinstance(meta, dict) else None
-            if not isinstance(execute_args, dict) or not execute_args:
+            plan_id = meta.get("plan_id") if isinstance(meta, dict) else None
+            if not isinstance(plan_id, str) or not plan_id.strip():
                 logger.error(
-                    "block_approval_missing_execute_args",
+                    "block_approval_missing_plan_id",
                     tool_name=call.tool_name,
                     tool_call_id=call.tool_call_id,
                     run_id=request.run_id,
@@ -1943,7 +1950,7 @@ class AgentWorker:
                 normalized_args = args
             args_hash = str(meta.get("args_hash") or "")
             execute_args = meta.get("execute_args")
-            if call.tool_name not in {"inspect_block", "edit_blocks"} and not isinstance(
+            if call.tool_name not in {"inspect_block", "place_block", "fill_block"} and not isinstance(
                 execute_args, dict
             ):
                 execute_args = normalized_args
@@ -1967,6 +1974,7 @@ class AgentWorker:
                 args_summary=args_summary,
                 args_hash=args_hash,
                 execution_args_hash=execution_args_hash,
+                plan_id=str(meta.get("plan_id") or "") if isinstance(meta, dict) else "",
                 policy_version=policy_version,
                 messages=list(messages),
                 requests=deferred,

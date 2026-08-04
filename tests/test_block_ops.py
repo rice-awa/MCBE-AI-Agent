@@ -2,22 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Annotated, Any
 from uuid import uuid4
 
 import pytest
+from pydantic import Field
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 
 from config.settings import Settings
-from services.agent.block_ops.bridge import map_addon_bridge_result, map_bridge_exception
+from services.agent.block_ops.bridge import (
+    call_block_capability,
+    map_addon_bridge_result,
+    map_bridge_exception,
+)
 from services.agent.block_ops.capability import (
     BlockCapabilityRecord,
     BlockCapabilityStatus,
@@ -45,26 +51,23 @@ from services.agent.block_ops.schema import (
     build_success_response,
 )
 from services.agent.block_ops.tools_impl import (
-    _execute_edits_group,
     apply_limits_to_payload,
     build_block_preflight_plan,
     build_edit_payload,
     build_inspect_payload,
     check_bridge_command_line_budget,
-    edit_blocks_impl,
     estimate_bridge_command_line_bytes,
+    fill_block_impl,
     inspect_block_impl,
     locked_targets_wire_limit_exceeded,
     merge_canonical_from_preflight,
-    project_block_execute_args,
-    run_block_preflight,
+    place_block_impl,
     should_omit_locked_targets_on_wire,
 )
 from services.agent.harness.execution import (
     HarnessCapability,
     PolicyDecisionKind,
     PolicyEngine,
-    classify_tool_exception,
     get_idempotency_store,
     hash_normalized_args,
     normalize_tool_args,
@@ -306,8 +309,9 @@ def test_map_bridge_exception_transient() -> None:
 
 
 def test_edit_bridge_exception_is_unknown_and_does_not_leak_transport_detail() -> None:
+    """World-mutation timeout keeps STATE_UNKNOWN (place_block replaces edit_blocks)."""
     result = map_bridge_exception(
-        TimeoutError("token=bridge-secret timed out"), tool_name="edit_blocks"
+        TimeoutError("token=bridge-secret timed out"), tool_name="place_block"
     )
 
     body = json.loads(result.output)
@@ -338,14 +342,14 @@ def test_edit_bridge_frame_too_large_is_limit_not_unknown() -> None:
 
     result = map_bridge_exception(
         FrameTooLargeError("raw command too long in bytes (1864 > 461); cannot be safely chunked"),
-        tool_name="edit_blocks",
+        tool_name="place_block",
     )
     body = json.loads(result.output)
     assert body["ok"] is False
     assert body["code"] == "LIMIT_EXCEEDED"
     assert body["external_state_unknown"] is False
     assert body["retryable"] is True
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["reason"] == "command_line_budget"
     assert result.external_state_unknown is False
     assert "未发送" in body["message"] or "字节预算" in body["message"]
@@ -671,11 +675,11 @@ def test_bridge_response_without_boolean_ok_is_safe_internal_error(response: dic
     [
         ("ADDON_UNAVAILABLE", True),
         ("UNSUPPORTED_CAPABILITY", True),
-        ("PROTECTED_BLOCK", False),
+        ("PROTECTED_BLOCK", True),
         ("STATE_UNKNOWN", False),
     ],
 )
-def test_explicit_addon_errors_preserve_code_and_only_unavailable_allows_fallback(
+def test_explicit_addon_errors_preserve_code_and_fallback_one_rule(
     code: str, fallback_allowed: bool
 ) -> None:
     result = map_addon_bridge_result(
@@ -686,8 +690,38 @@ def test_explicit_addon_errors_preserve_code_and_only_unavailable_allows_fallbac
     assert body["code"] == code
     assert body["fallback_allowed"] is fallback_allowed
     assert "bridge-secret" not in result.output
-    if fallback_allowed:
+    # 通用回退路径（无特定分支的 code）消息才会追加「独立审批」提示；
+    # 特定分支（PROTECTED_BLOCK 等）保留各自诊断消息，fallback_allowed 字段即信号。
+    if code in {"ADDON_UNAVAILABLE", "UNSUPPORTED_CAPABILITY"}:
         assert "独立审批" in body["message"]
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("UNSUPPORTED_BLOCK_PLACEMENT", True),
+        ("PRECONDITION_FAILED", True),
+        ("PRECONDITION_CHANGED", True),
+        ("PROTECTED_BLOCK", True),
+        ("BLOCK_UNKNOWN", True),
+        ("STATE_INVALID", True),
+        ("LIMIT_EXCEEDED", True),
+        ("INVALID_ARGUMENT", True),
+        ("INVALID_COORDINATE", True),
+        ("UNLOADED_CHUNK", True),
+        ("OUT_OF_BOUNDS", True),
+        ("CONFLICTING_EDITS", True),
+        ("ADDON_UNAVAILABLE", True),
+        ("UNSUPPORTED_CAPABILITY", True),
+        ("STATE_UNKNOWN", False),
+        ("INTERNAL_ERROR", False),
+    ],
+)
+def test_fallback_allowed_for_code_full_table(code: str, expected: bool) -> None:
+    """fallback 一元规则全码表（spec §3.2）：14 true / 2 false。"""
+    from services.agent.block_ops.schema import BlockErrorCode, fallback_allowed_for_code
+
+    assert fallback_allowed_for_code(BlockErrorCode(code)) is expected
 
 
 @pytest.mark.parametrize(
@@ -753,7 +787,7 @@ def test_precondition_failed_projects_actual_target_and_hint() -> None:
     assert "expected_previous" not in body["hint"]
     assert "locked_targets" not in body["hint"]
     assert "phase" not in body["hint"]
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["retryable"] is False
     assert body["message"] == "目标方块不满足 expect 前置条件。"
     assert "hunter2" not in result.output
@@ -778,7 +812,7 @@ def test_precondition_changed_projects_decision_fields() -> None:
     assert body["actual_type_id"] == "minecraft:stone"
     assert body["target"] == {"x": 1, "y": 64, "z": 2}
     assert body["hint"]
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
 
 
 def test_limit_exceeded_addon_error_includes_place_ban_hint() -> None:
@@ -797,7 +831,7 @@ def test_limit_exceeded_addon_error_includes_place_ban_hint() -> None:
     body = json.loads(result.output)
     assert body["code"] == "LIMIT_EXCEEDED"
     assert body["retryable"] is True
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["external_state_unknown"] is False
     assert "place" in body["hint"].lower() or "禁止" in body["hint"]
     assert body["matched_count"] == 6
@@ -860,17 +894,20 @@ def test_place_success_model_projection_is_slim() -> None:
     text = json.dumps(projected, ensure_ascii=False)
     assert len(text) <= 250
     assert projected["ok"] is True
-    assert projected["mode"] == "place"
-    assert projected["changed"] is True
-    assert projected["at"] == {"x": -793, "y": 94, "z": 185}
-    assert projected["type_id"] == "minecraft:stone"
+    assert projected["status"] == "applied"
+    assert projected["at"] == [-793, 94, 185]
+    assert projected["block"] == "minecraft:stone"
     # Air replacements are omitted so was only signals non-air overwrites.
     assert "was" not in projected
+    assert "mode" not in projected
+    assert "changed" not in projected
+    assert "type_id" not in projected
     assert "before" not in projected
     assert "after" not in projected
     assert "targets" not in projected
     assert "verification" not in projected
     assert "phase" not in projected
+    assert "locked_targets" not in projected
 
     mapped = map_addon_bridge_result(
         {"ok": True, "payload": fat_payload},
@@ -898,7 +935,7 @@ def test_place_success_model_projection_reports_non_air_was() -> None:
         mode="place",
     )
     assert projected["was"] == "minecraft:dirt"
-    assert projected["type_id"] == "minecraft:stone"
+    assert projected["block"] == "minecraft:stone"
 
 
 def test_place_success_model_projection_omits_was_for_air_aliases() -> None:
@@ -964,23 +1001,20 @@ def test_fill_success_model_projection_uses_authorized_aabb() -> None:
         fat_payload, mode="fill", authorized_bounds=authorized
     )
     assert projected["ok"] is True
-    assert projected["mode"] == "fill"
-    assert projected["changed_count"] == 6
+    assert projected["status"] == "applied"
+    assert projected["changed"] == 6
     assert projected["skipped"] == 19
-    assert projected["volume"] == 25
-    assert projected["from"] == {"x": -797, "y": 93, "z": 180}
-    assert projected["to"] == {"x": -793, "y": 93, "z": 184}
-    assert projected["type_id"] == "minecraft:oak_planks"
+    assert projected["bounds"] == [[-797, 93, 180], [-793, 93, 184]]
     # Air keys stripped; non-air overwrite signal remains.
-    assert "minecraft:air" not in projected["previous_type_counts"]
-    assert projected["previous_type_counts"]["minecraft:grass_path"] == 12
-    assert projected["previous_type_counts"]["minecraft:stone"] == 4
-    assert projected["previous_type_counts"]["minecraft:gravel"] == 3
-    assert "before_samples" not in projected
-    assert "targets" not in projected
-    assert "verification" not in projected
-    assert "rollback" not in projected
-    assert "phase" not in projected
+    assert "minecraft:air" not in projected["type_counts"]
+    assert projected["type_counts"]["minecraft:grass_path"] == 12
+    assert projected["type_counts"]["minecraft:stone"] == 4
+    assert projected["type_counts"]["minecraft:gravel"] == 3
+    for hidden in (
+        "before_samples", "targets", "verification", "rollback", "phase",
+        "mode", "type_id", "volume", "from", "to",
+    ):
+        assert hidden not in projected, hidden
 
     mapped = map_addon_bridge_result(
         {"ok": True, "payload": fat_payload},
@@ -990,10 +1024,8 @@ def test_fill_success_model_projection_uses_authorized_aabb() -> None:
     )
     body = json.loads(mapped.output)
     assert "before_samples" not in body
-    assert body["volume"] == 25
-    assert body["from"]["z"] == 180
-    assert body["to"]["z"] == 184
-    assert "minecraft:air" not in body["previous_type_counts"]
+    assert body["bounds"] == [[-797, 93, 180], [-793, 93, 184]]
+    assert "minecraft:air" not in body["type_counts"]
 
 
 def test_fill_success_model_projection_omits_air_only_counts() -> None:
@@ -1009,7 +1041,7 @@ def test_fill_success_model_projection_omits_air_only_counts() -> None:
         },
         mode="fill",
     )
-    assert "previous_type_counts" not in projected
+    assert "type_counts" not in projected
 
 
 def test_fill_partial_and_noop_projection_carries_status() -> None:
@@ -1030,7 +1062,7 @@ def test_fill_partial_and_noop_projection_carries_status() -> None:
     )
     assert partial["status"] == "partial"
     assert partial["skipped"] == 3
-    assert partial["previous_type_counts"] == {"minecraft:oak_planks": 3}
+    assert partial["type_counts"] == {"minecraft:oak_planks": 3}
 
     noop = project_block_result_for_model(
         {
@@ -1046,9 +1078,9 @@ def test_fill_partial_and_noop_projection_carries_status() -> None:
         mode="fill",
     )
     assert noop["status"] == "noop"
-    assert noop["changed_count"] == 0
+    assert noop["changed"] == 0
 
-    # When addon omits status, fill with skips infers partial.
+    # When addon omits status, the spec §5.2 default is applied (no skip-inference).
     inferred = project_block_result_for_model(
         {
             "ok": True,
@@ -1061,7 +1093,7 @@ def test_fill_partial_and_noop_projection_carries_status() -> None:
         },
         mode="fill",
     )
-    assert inferred["status"] == "partial"
+    assert inferred["status"] == "applied"
 
 
 def test_state_unknown_response_has_fallback_allowed_false() -> None:
@@ -1075,7 +1107,37 @@ def test_state_unknown_response_has_fallback_allowed_false() -> None:
     assert body["external_state_unknown"] is True
 
 
-def test_batch_success_model_projection_filters_air_counts() -> None:
+def test_host_limit_error_carries_fallback_allowed_true() -> None:
+    """宿主侧 INVALID_ARGUMENT / INVALID_COORDINATE / LIMIT 显式携带
+    fallback_allowed=true；否则 execution.py 读默认 false 会误拒命令回退。"""
+    from services.agent.block_ops.schema import BlockErrorCode, _host_limit_error
+
+    for code in (
+        BlockErrorCode.INVALID_ARGUMENT,
+        BlockErrorCode.INVALID_COORDINATE,
+        BlockErrorCode.LIMIT_EXCEEDED,
+    ):
+        result = _host_limit_error(code, "test message")
+        assert not result.is_success
+        body = json.loads(result.output)
+        assert body["code"] == code
+        assert body["fallback_allowed"] is True
+        assert body["external_state_unknown"] is False
+
+    # 显式传入的字段仍可覆盖默认值（内部错误语义）。
+    result = _host_limit_error(
+        BlockErrorCode.INVALID_ARGUMENT,
+        "test",
+        fallback_allowed=False,
+        external_state_unknown=True,
+    )
+    body = json.loads(result.output)
+    assert body["fallback_allowed"] is False
+    assert body["external_state_unknown"] is True
+
+
+def test_batch_mode_is_no_longer_projected_for_model() -> None:
+    """batch 已退出模型可见契约：投影回退为最小 ok envelope，不泄漏计数。"""
     projected = project_block_result_for_model(
         {
             "ok": True,
@@ -1089,7 +1151,7 @@ def test_batch_success_model_projection_filters_air_counts() -> None:
         },
         mode="batch",
     )
-    assert projected["previous_type_counts"] == {"minecraft:dirt": 1}
+    assert projected == {"ok": True}
 
 
 def test_limits_hard_clamp() -> None:
@@ -1272,15 +1334,12 @@ async def test_capability_unsupported_old_addon() -> None:
     record = await ensure_block_capability("old", bridge)
     assert record.status == BlockCapabilityStatus.UNSUPPORTED
 
-    result = await edit_blocks_impl(
+    result = await place_block_impl(
         SimpleNamespace(
             deps=_Deps(connection_id="old", addon_bridge=bridge)
         ),  # type: ignore[arg-type]
-        mode="place",
-        coordinate_mode="absolute",
-        dimension="minecraft:overworld",
-        position={"x": 1, "y": 64, "z": 1},
-        type_id="minecraft:stone",
+        pos=[1, 64, 1],
+        block="minecraft:stone",
     )
     body = json.loads(result.output)
     assert body["code"] == "UNSUPPORTED_CAPABILITY"
@@ -1354,8 +1413,7 @@ def test_fill_canonical_args_exclude_python_bound_aliases_from_authorization_has
         for x in range(2, 5)
         for z in range(1, 4)
     ]
-    plan = build_block_preflight_plan(
-        "edit_blocks",
+    canonical = merge_canonical_from_preflight(
         original,
         {
             "mode": "fill",
@@ -1369,14 +1427,12 @@ def test_fill_canonical_args_exclude_python_bound_aliases_from_authorization_has
         },
     )
 
-    assert plan.authorized_args["from"] == {"x": 2, "y": 64, "z": 1}
-    assert plan.authorized_args["to"] == {"x": 4, "y": 64, "z": 3}
-    assert "from_pos" not in plan.authorized_args
-    assert "to_pos" not in plan.authorized_args
-    assert "from_pos" not in normalize_tool_args(plan.authorized_args)
-    assert "to_pos" not in normalize_tool_args(plan.authorized_args)
-    assert plan.execute_args["from_pos"] == plan.authorized_args["from"]
-    assert plan.execute_args["to_pos"] == plan.authorized_args["to"]
+    assert canonical["from"] == {"x": 2, "y": 64, "z": 1}
+    assert canonical["to"] == {"x": 4, "y": 64, "z": 3}
+    assert "from_pos" not in canonical
+    assert "to_pos" not in canonical
+    assert "from_pos" not in normalize_tool_args(canonical)
+    assert "to_pos" not in normalize_tool_args(canonical)
 
 
 def test_merge_canonical_fill_sparse_locked_keeps_request_aabb() -> None:
@@ -1415,18 +1471,11 @@ def test_merge_canonical_fill_sparse_locked_keeps_request_aabb() -> None:
     assert "from_pos" not in canonical
     assert "to_pos" not in canonical
 
-    plan = build_block_preflight_plan("edit_blocks", original, preflight)
-    assert plan.authorized_args["from"] == {"x": -797, "y": 93, "z": 180}
-    assert plan.authorized_args["to"] == {"x": -793, "y": 93, "z": 184}
-    assert plan.execute_args["from_pos"] == plan.authorized_args["from"]
-    assert plan.execute_args["to_pos"] == plan.authorized_args["to"]
-    assert plan.execute_args["locked_targets"] == locked_targets
-
-    # Success path: authorized_bounds derived from post-merge execute corners
+    # Success path: authorized_bounds derived from post-merge canonical corners
     # must report original volume 25, not locked-shrunk volume.
     authorized_bounds = {
-        "from": plan.execute_args["from_pos"],
-        "to": plan.execute_args["to_pos"],
+        "from": canonical["from"],
+        "to": canonical["to"],
         "volume": 25,
     }
     fat_payload = {
@@ -1443,9 +1492,7 @@ def test_merge_canonical_fill_sparse_locked_keeps_request_aabb() -> None:
     projected = project_block_result_for_model(
         fat_payload, mode="fill", authorized_bounds=authorized_bounds
     )
-    assert projected["from"] == {"x": -797, "y": 93, "z": 180}
-    assert projected["to"] == {"x": -793, "y": 93, "z": 184}
-    assert projected["volume"] == 25
+    assert projected["bounds"] == [[-797, 93, 180], [-793, 93, 184]]
     assert "before_samples" not in projected
 
 
@@ -1478,66 +1525,17 @@ def test_merge_canonical_fill_accepts_from_to_request_keys() -> None:
     assert len(canonical["locked_targets"]) == 2
 
 
-def test_strip_block_internal_tool_schema_hides_locked_and_phase() -> None:
-    from pydantic_ai.tools import ToolDefinition
-
-    from services.agent.harness.execution import strip_block_internal_tool_schema
-
-    raw = ToolDefinition(
-        name="edit_blocks",
-        description="edit",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "type_id": {"type": "string"},
-                "mode": {"type": "string"},
-                "from_pos": {"type": "object"},
-                "to_pos": {"type": "object"},
-                "locked_targets": {"type": "array"},
-                "phase": {"type": "string"},
-            },
-            "required": ["type_id", "locked_targets"],
-        },
-    )
-    stripped = strip_block_internal_tool_schema(raw)
-    props = stripped.parameters_json_schema["properties"]
-    assert "locked_targets" not in props
-    assert "phase" not in props
-    assert "type_id" in props
-    assert "from_pos" in props
-    assert "locked_targets" not in stripped.parameters_json_schema.get("required", [])
-
-    inspect_raw = ToolDefinition(
-        name="inspect_block",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "position": {"type": "object"},
-                "locked_targets": {"type": "array"},
-                "phase": {"type": "string"},
-            },
-        },
-    )
-    inspect_stripped = strip_block_internal_tool_schema(inspect_raw)
-    assert "locked_targets" not in inspect_stripped.parameters_json_schema["properties"]
-    assert "phase" not in inspect_stripped.parameters_json_schema["properties"]
-
-    other = ToolDefinition(
-        name="run_minecraft_command",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {"command": {"type": "string"}, "phase": {"type": "string"}},
-        },
-    )
-    assert strip_block_internal_tool_schema(other) is other
-
-
 @pytest.mark.asyncio
-async def test_harness_prepare_tools_strips_block_internal_params() -> None:
+async def test_harness_prepare_tools_passes_through_block_schemas() -> None:
+    """prepare_tools no longer strips internal keys (Task 6).
+
+    The single-op block tools expose only model-visible fields in their public
+    schemas, so prepare_tools passes tool definitions through unchanged.
+    """
     from pydantic_ai.tools import ToolDefinition
 
     cap = HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))
-    cid = "schema-strip-1"
+    cid = "schema-passthrough-1"
     get_block_capability_cache().set(
         cid,
         BlockCapabilityRecord(
@@ -1551,39 +1549,41 @@ async def test_harness_prepare_tools_strips_block_internal_params() -> None:
 
     tool_defs = [
         ToolDefinition(
-            name="edit_blocks",
+            name="place_block",
             parameters_json_schema={
                 "type": "object",
-                "properties": {
-                    "type_id": {"type": "string"},
-                    "locked_targets": {"type": "array"},
-                    "phase": {"type": "string"},
-                },
+                "properties": {"pos": {"type": "array"}, "block": {"type": "string"}},
+            },
+        ),
+        ToolDefinition(
+            name="fill_block",
+            parameters_json_schema={
+                "type": "object",
+                "properties": {"from": {"type": "array"}, "to": {"type": "array"}},
             },
         ),
         ToolDefinition(
             name="inspect_block",
             parameters_json_schema={
                 "type": "object",
-                "properties": {
-                    "position": {"type": "object"},
-                    "locked_targets": {"type": "array"},
-                    "phase": {"type": "string"},
-                },
+                "properties": {"target": {"type": "object"}},
             },
         ),
     ]
     prepared = await cap.prepare_tools(_Ctx(), tool_defs)  # type: ignore[arg-type]
     by_name = {td.name: td for td in prepared}
-    assert "edit_blocks" in by_name
+    assert "place_block" in by_name
+    assert "fill_block" in by_name
     assert "inspect_block" in by_name
-    for name in ("edit_blocks", "inspect_block"):
-        props = by_name[name].parameters_json_schema.get("properties") or {}
-        assert "locked_targets" not in props
-        assert "phase" not in props
+    # Schemas pass through unchanged: nothing is stripped or rewritten.
+    for name, original in zip(
+        ("place_block", "fill_block", "inspect_block"), tool_defs, strict=True
+    ):
+        assert by_name[name].parameters_json_schema == original.parameters_json_schema
+        assert by_name[name].name == original.name
 
 
-def test_policy_edit_blocks_requires_approval_inspect_allows() -> None:
+def test_policy_block_mutations_require_approval_inspect_allows() -> None:
     engine = PolicyEngine.from_settings(_Settings())
     allow = engine.decide(
         "inspect_block",
@@ -1596,32 +1596,46 @@ def test_policy_edit_blocks_requires_approval_inspect_allows() -> None:
     )
     assert allow.action == PolicyDecisionKind.ALLOW
 
-    need = engine.decide(
-        "edit_blocks",
+    need_place = engine.decide(
+        "place_block",
+        {"pos": [0, 64, 0], "block": "minecraft:stone", "expect": "air"},
+        player_name="Steve",
+    )
+    assert need_place.action == PolicyDecisionKind.REQUIRE_APPROVAL
+
+    need_fill = engine.decide(
+        "fill_block",
         {
-            "mode": "place",
-            "type_id": "minecraft:stone",
-            "coordinate_mode": "absolute",
-            "dimension": "minecraft:overworld",
-            "position": {"x": 0, "y": 64, "z": 0},
+            "from": [0, 64, 0],
+            "to": [4, 64, 4],
+            "block": "minecraft:stone",
+            "expect": "air",
         },
         player_name="Steve",
     )
-    assert need.action == PolicyDecisionKind.REQUIRE_APPROVAL
+    assert need_fill.action == PolicyDecisionKind.REQUIRE_APPROVAL
 
     approved = engine.decide(
-        "edit_blocks",
-        {
-            "mode": "place",
-            "type_id": "minecraft:stone",
-            "coordinate_mode": "absolute",
-            "dimension": "minecraft:overworld",
-            "position": {"x": 0, "y": 64, "z": 0},
-        },
+        "place_block",
+        {"pos": [0, 64, 0], "block": "minecraft:stone", "expect": "air"},
         player_name="Steve",
         approved=True,
     )
     assert approved.action == PolicyDecisionKind.ALLOW
+
+    # edit_blocks 已移出目录：不再暴露，直接拒绝。
+    legacy = engine.decide(
+        "edit_blocks",
+        {
+            "mode": "place",
+            "type_id": "minecraft:stone",
+            "coordinate_mode": "absolute",
+            "dimension": "minecraft:overworld",
+            "position": {"x": 0, "y": 64, "z": 0},
+        },
+        player_name="Steve",
+    )
+    assert legacy.action == PolicyDecisionKind.DENY
 
 
 def test_exposure_hidden_without_capability() -> None:
@@ -1642,7 +1656,10 @@ def test_exposure_visible_when_supported() -> None:
     )
     ctx = SimpleNamespace(deps=SimpleNamespace(connection_id=cid))
     assert engine.is_tool_exposed("inspect_block", ctx=ctx) is True
-    assert engine.is_tool_exposed("edit_blocks", ctx=ctx) is True
+    assert engine.is_tool_exposed("place_block", ctx=ctx) is True
+    assert engine.is_tool_exposed("fill_block", ctx=ctx) is True
+    # edit_blocks 已移出目录：即使能力探测通过也不再暴露。
+    assert engine.is_tool_exposed("edit_blocks", ctx=ctx) is False
 
 
 @pytest.mark.asyncio
@@ -1654,16 +1671,15 @@ async def test_inspect_block_impl_absolute() -> None:
     ctx = SimpleNamespace(deps=deps)
     result = await inspect_block_impl(
         ctx,  # type: ignore[arg-type]
-        coordinate_mode="absolute",
-        dimension="minecraft:overworld",
-        position={"x": 3, "y": 64, "z": 4},
+        target=[3, 64, 4],
     )
     assert result.is_success
     assert any(c[0] == "inspect_block" for c in bridge.calls)
 
 
 @pytest.mark.asyncio
-async def test_inspect_block_validation_missing_position() -> None:
+async def test_inspect_block_impl_requires_target() -> None:
+    """A missing target is rejected as INVALID_ARGUMENT (never a TypeError)."""
     bridge = _FakeBridge()
     cid = str(uuid4())
     await ensure_block_capability(cid, bridge)
@@ -1671,8 +1687,7 @@ async def test_inspect_block_validation_missing_position() -> None:
     ctx = SimpleNamespace(deps=deps)
     result = await inspect_block_impl(
         ctx,  # type: ignore[arg-type]
-        coordinate_mode="absolute",
-        dimension="minecraft:overworld",
+        target=None,
     )
     assert not result.is_success
     body = json.loads(result.output)
@@ -1791,7 +1806,7 @@ def test_normalize_inspect_target_rejects_non_dict() -> None:
     assert body["code"] == "INVALID_ARGUMENT"
 
 
-def test_project_inspect_full_snapshots_strips_internal_metadata() -> None:
+def test_project_inspect_single_point_matches_spec_53() -> None:
     from services.agent.block_ops.project import project_block_result_for_model
 
     payload = {
@@ -1808,19 +1823,23 @@ def test_project_inspect_full_snapshots_strips_internal_metadata() -> None:
         "repairs_applied": [],
     }
     projected = project_block_result_for_model(payload)
-    assert projected["ok"] is True
-    assert projected["status"] == "inspected"
-    assert projected["blocks"] == payload["blocks"]
-    # Internal metadata stripped.
-    assert "targets" not in projected
-    assert "player_origin" not in projected
-    assert "facing" not in projected
-    assert "player_name" not in projected
-    assert "repairs_applied" not in projected
-    assert "coordinate_mode" not in projected
+    assert projected == {
+        "ok": True,
+        "block": "minecraft:stone",
+        "states": {},
+        "waterlogged": False,
+        "is_air": False,
+        "is_liquid": False,
+    }
+    # Internal metadata stripped (never mirrored to the model).
+    for hidden in (
+        "status", "blocks", "targets", "player_origin", "facing",
+        "player_name", "repairs_applied", "coordinate_mode", "dimension",
+    ):
+        assert hidden not in projected, hidden
 
 
-def test_project_inspect_summary_bounded_result() -> None:
+def test_project_inspect_region_matches_spec_53() -> None:
     from services.agent.block_ops.project import project_block_result_for_model
 
     payload = {
@@ -1839,15 +1858,15 @@ def test_project_inspect_summary_bounded_result() -> None:
     }
     projected = project_block_result_for_model(payload)
     assert projected["ok"] is True
-    assert projected["status"] == "inspected"
     assert projected["count"] == 27
     assert projected["type_counts"] == {"minecraft:stone": 20, "minecraft:air": 7}
-    assert projected["unknown_count"] == 0
-    assert projected["bounds"]["from"] == {"x": 0, "y": 64, "z": 0}
-    # No blocks array on summary path.
-    assert "blocks" not in projected
-    # Internal metadata stripped.
-    assert "coordinate_mode" not in projected
+    assert projected["samples"] == []
+    # Spec §5.3 region shape omits status/bounds/unknown_count; metadata stripped.
+    for hidden in (
+        "status", "bounds", "unknown_count", "blocks",
+        "coordinate_mode", "dimension",
+    ):
+        assert hidden not in projected, hidden
 
 
 @pytest.mark.asyncio
@@ -1860,7 +1879,6 @@ async def test_inspect_block_impl_target_positions() -> None:
     result = await inspect_block_impl(
         ctx,  # type: ignore[arg-type]
         target={"positions": [{"x": 1, "y": 64, "z": 2}]},
-        dimension="minecraft:overworld",
     )
     assert result.is_success
     # Verify the bridge received the unified target shape.
@@ -1881,17 +1899,17 @@ async def test_inspect_block_impl_target_box() -> None:
     result = await inspect_block_impl(
         ctx,  # type: ignore[arg-type]
         target={"box": {"from": {"x": 0, "y": 64, "z": 0}, "to": {"x": 2, "y": 66, "z": 2}}},
-        dimension="minecraft:overworld",
     )
     assert result.is_success
     inspect_calls = [c for c in bridge.calls if c[0] == "inspect_block"]
     payload = inspect_calls[-1][1]
     assert payload["target"]["box"]["from"] == {"x": 0, "y": 64, "z": 0}
-    # Result should be the summary projection (flattened, no blocks array).
+    # Result should be the region projection (spec §5.3: count/type_counts/samples, no status).
     body = json.loads(result.output)
-    assert body["status"] == "inspected"
+    assert "status" not in body
     assert "count" in body
     assert "type_counts" in body
+    assert "samples" in body
     assert "blocks" not in body
 
 
@@ -1905,7 +1923,6 @@ async def test_inspect_block_impl_target_rejects_mixed_coords() -> None:
     result = await inspect_block_impl(
         ctx,  # type: ignore[arg-type]
         target={"positions": [{"x": 0, "y": 64, "z": 0}, {"forward": 1, "right": 0, "up": 0}]},
-        dimension="minecraft:overworld",
     )
     assert not result.is_success
     body = json.loads(result.output)
@@ -1925,7 +1942,6 @@ async def test_inspect_block_impl_target_rejects_both_shapes() -> None:
             "positions": [{"x": 0, "y": 64, "z": 0}],
             "box": {"from": {"x": 0, "y": 64, "z": 0}, "to": {"x": 1, "y": 64, "z": 1}},
         },
-        dimension="minecraft:overworld",
     )
     assert not result.is_success
     body = json.loads(result.output)
@@ -1945,7 +1961,6 @@ async def test_inspect_block_impl_target_box_volume_limit() -> None:
     result = await inspect_block_impl(
         ctx,  # type: ignore[arg-type]
         target={"box": {"from": {"x": 0, "y": 0, "z": 0}, "to": {"x": 199, "y": 199, "z": 199}}},
-        dimension="minecraft:overworld",
     )
     # Host rejects before bridge call.
     assert not result.is_success
@@ -1988,8 +2003,9 @@ def test_config_example_exposes_inspect_summary_limits() -> None:
     raw_block_tools = example["addon"]["block_tools"]
     assert raw_block_tools["inspect_summary_threshold"] == 8
     assert raw_block_tools["inspect_sample_limit"] == 8
-    assert raw_block_tools["max_edits_per_group"] == 16
-    assert raw_block_tools["max_total_targets_per_group"] == 4096
+    # Grouped-edit limits were removed from config in Task 6 (single-responsibility).
+    assert "max_edits_per_group" not in raw_block_tools
+    assert "max_total_targets_per_group" not in raw_block_tools
 
     block_tools = AddonBlockToolsConfig.model_validate(raw_block_tools)
     limits = get_block_tools_limits(
@@ -1998,77 +2014,30 @@ def test_config_example_exposes_inspect_summary_limits() -> None:
 
     assert limits.inspect_summary_threshold == 8
     assert limits.inspect_sample_limit == 8
-    assert limits.max_edits_per_group == 16
-    assert limits.max_total_targets_per_group == 4096
 
 
-def test_inspect_model_schema_only_exposes_target_and_dimension() -> None:
-    """Model-facing inspect_block schema must only expose target + dimension.
+def test_inspect_model_schema_only_exposes_target() -> None:
+    """Model-facing inspect_block schema must only expose target.
 
-    ``locked_targets`` and ``phase`` are harness-recovery-only fields present
-    in the raw function schema but stripped by ``strip_block_internal_tool_schema``
-    before the model sees them.
+    The single-responsibility inspect_block has no hidden recovery fields
+    (locked_targets / phase) — nothing to strip after Task 6.
     """
-    from pydantic_ai.tools import ToolDefinition
-
-    from services.agent.harness.execution import strip_block_internal_tool_schema
-
     agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
     register_agent_tools(agent)
     tools = iter_registered_tools(agent)  # type: ignore[arg-type]
     raw_schema = tools["inspect_block"].function_schema.json_schema
     raw_props = set(raw_schema.get("properties") or {})
-    # target and dimension are the model-visible fields.
-    assert "target" in raw_props
-    assert "dimension" in raw_props
-    # Legacy fields removed from the model-facing signature.
+    # Only target is exposed.
+    assert raw_props == {"target"}
+    # Legacy / hidden fields removed.
+    assert "dimension" not in raw_props
+    assert "locked_targets" not in raw_props
+    assert "phase" not in raw_props
     assert "coordinate_mode" not in raw_props
     assert "position" not in raw_props
     assert "positions" not in raw_props
-    # locked_targets / phase are present in raw schema (harness recovery) but
-    # stripped before model exposure.
-    assert "locked_targets" in raw_props
-    assert "phase" in raw_props
-
-    # After harness stripping, only target + dimension remain.
-    stripped = strip_block_internal_tool_schema(
-        ToolDefinition(
-            name="inspect_block",
-            description=raw_schema.get("description", ""),
-            parameters_json_schema=raw_schema,
-        )
-    )
-    stripped_props = set(stripped.parameters_json_schema.get("properties") or {})
-    assert "target" in stripped_props
-    assert "dimension" in stripped_props
-    assert "locked_targets" not in stripped_props
-    assert "locked_targets_by_edit" not in stripped_props
-    assert "noop_edit_indices" not in stripped_props
-    assert "phase" not in stripped_props
-    required = set(stripped.parameters_json_schema.get("required") or [])
+    required = set(raw_schema.get("required") or [])
     assert "target" in required
-
-
-@pytest.mark.asyncio
-async def test_edit_blocks_impl_place() -> None:
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge)
-    ctx = SimpleNamespace(deps=deps)
-    result = await edit_blocks_impl(
-        ctx,  # type: ignore[arg-type]
-        mode="place",
-        coordinate_mode="absolute",
-        dimension="minecraft:overworld",
-        position={"x": 1, "y": 64, "z": 1},
-        type_id="minecraft:stone",
-        phase="execute",
-    )
-    assert result.is_success
-    edit_calls = [c for c in bridge.calls if c[0] == "edit_blocks"]
-    assert edit_calls
-    assert edit_calls[-1][1]["type_id"] == "minecraft:stone"
 
 
 @pytest.mark.asyncio
@@ -2084,13 +2053,10 @@ async def test_failed_capability_probe_does_not_expose_internal_detail() -> None
     )
     ctx = SimpleNamespace(deps=_Deps(connection_id=cid, addon_bridge=_FakeBridge()))
 
-    result = await edit_blocks_impl(
+    result = await place_block_impl(
         ctx,  # type: ignore[arg-type]
-        mode="place",
-        coordinate_mode="absolute",
-        dimension="minecraft:overworld",
-        position={"x": 1, "y": 64, "z": 1},
-        type_id="minecraft:stone",
+        pos=[1, 64, 1],
+        block="minecraft:stone",
     )
 
     body = json.loads(result.output)
@@ -2100,92 +2066,6 @@ async def test_failed_capability_probe_does_not_expose_internal_detail() -> None
     assert "package.module" not in result.output
     assert "bridge-secret" not in result.output
     assert "hunter2" not in result.output
-
-
-@pytest.mark.asyncio
-async def test_edit_blocks_limit_exceeded() -> None:
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge)
-    ctx = SimpleNamespace(deps=deps)
-    positions = [{"x": i, "y": 64, "z": 0} for i in range(300)]
-    result = await edit_blocks_impl(
-        ctx,  # type: ignore[arg-type]
-        mode="batch",
-        coordinate_mode="absolute",
-        dimension="minecraft:overworld",
-        positions=positions,
-        type_id="minecraft:dirt",
-    )
-    assert not result.is_success
-    body = json.loads(result.output)
-    assert body["code"] == "LIMIT_EXCEEDED"
-
-
-@pytest.mark.asyncio
-async def test_edit_blocks_oversized_batch_precheck_limit_without_bridge() -> None:
-    """Huge batch.positions → host commandLine budget LIMIT; bridge never called."""
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    capability_calls = list(bridge.calls)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge)
-    ctx = SimpleNamespace(deps=deps)
-    # Under max_discrete_positions (256) but still blows the 461 B wire budget.
-    positions = [{"x": i, "y": 64, "z": 0} for i in range(20)]
-    result = await edit_blocks_impl(
-        ctx,  # type: ignore[arg-type]
-        mode="batch",
-        coordinate_mode="absolute",
-        dimension="minecraft:overworld",
-        positions=positions,
-        type_id="minecraft:dirt",
-        phase="execute",
-    )
-    assert not result.is_success
-    body = json.loads(result.output)
-    assert body["code"] == "LIMIT_EXCEEDED"
-    assert body["reason"] == "command_line_budget"
-    assert body["retryable"] is True
-    assert body["fallback_allowed"] is False
-    assert body["external_state_unknown"] is False
-    assert "未发送" in body["message"]
-    assert "place" in body["hint"].lower() or "禁止" in body["hint"]
-    assert "suggested_max_discrete" in body
-    # Only capability probe; no edit_blocks request.
-    edit_calls = [c for c in bridge.calls if c[0] == "edit_blocks"]
-    assert edit_calls == []
-    assert len(bridge.calls) == len(capability_calls)
-
-
-@pytest.mark.asyncio
-async def test_run_block_preflight_rejects_oversized_batch_before_bridge() -> None:
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge)
-    ctx = SimpleNamespace(deps=deps)
-    positions = [{"x": i, "y": 64, "z": 0} for i in range(20)]
-    plan, failure = await run_block_preflight(
-        ctx,  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "mode": "batch",
-            "coordinate_mode": "absolute",
-            "dimension": "minecraft:overworld",
-            "positions": positions,
-            "type_id": "minecraft:dirt",
-        },
-    )
-    assert plan is None
-    assert failure is not None
-    body = json.loads(failure.output)
-    assert body["code"] == "LIMIT_EXCEEDED"
-    assert body["reason"] == "command_line_budget"
-    assert "hint" in body
-    assert any(k in body["hint"] for k in ("place", "batch", "fill"))
-    assert not any(c[0] == "edit_blocks" for c in bridge.calls)
 
 
 def test_get_command_line_byte_budget_reads_flow_control() -> None:
@@ -2206,256 +2086,14 @@ def test_get_command_line_byte_budget_reads_flow_control() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_block_preflight_edit_canonicalizes() -> None:
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge)
-    ctx = SimpleNamespace(deps=deps)
-    plan, failure = await run_block_preflight(
-        ctx,  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "mode": "place",
-            "coordinate_mode": "absolute",
-            "dimension": "minecraft:overworld",
-            "position": {"x": 2, "y": 70, "z": 2},
-            "type_id": "minecraft:oak_planks",
-        },
-    )
-    assert failure is None
-    assert plan is not None
-    assert plan.authorized_args.get("phase") == "execute"
-    assert plan.execute_args.get("locked_targets")
-
-
-@pytest.mark.asyncio
-async def test_fill_preflight_zero_match_non_air_is_precondition_failed_not_internal() -> None:
-    """Glass-replaces-planks: addon returns matched_count=0 with actual_type_counts.
-
-    Host must classify as PRECONDITION_FAILED (not INTERNAL_ERROR) and surface a
-    repair hint so the model does not fall back to command tools.
-    """
-
-    class _ZeroMatchBridge(_FakeBridge):
-        async def request(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-            if capability == "edit_blocks" and payload.get("phase") == "preflight":
-                return {
-                    "ok": True,
-                    "payload": {
-                        "schema_version": "1",
-                        "ok": True,
-                        "phase": "preflight",
-                        "mode": "fill",
-                        "type_id": payload.get("type_id"),
-                        "locked_targets": [],
-                        "matched_count": 0,
-                        "already_target": 0,
-                        "skipped": 2,
-                        "previous_type_counts": {"minecraft:oak_planks": 2},
-                        "coordinate_mode": "absolute",
-                        "dimension": payload.get("dimension"),
-                        "from": payload.get("from"),
-                        "to": payload.get("to"),
-                        "volume": 2,
-                        "repairs_applied": [],
-                    },
-                }
-            return await super().request(capability, payload)
-
-    bridge = _ZeroMatchBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge)
-    ctx = SimpleNamespace(deps=deps)
-    plan, failure = await run_block_preflight(
-        ctx,  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "mode": "fill",
-            "coordinate_mode": "absolute",
-            "dimension": "minecraft:overworld",
-            "from": {"x": 0, "y": 64, "z": 0},
-            "to": {"x": 1, "y": 64, "z": 0},
-            "type_id": "minecraft:glass",
-        },
-    )
-    assert plan is None
-    assert failure is not None
-    assert not failure.is_success
-    body = json.loads(failure.output)
-    assert body["ok"] is False
-    assert body["code"] == "PRECONDITION_FAILED"
-    assert body["fallback_allowed"] is False
-    assert body.get("matched_count") == 0
-    assert body["actual_type_counts"] == {"minecraft:oak_planks": 2}
-    assert "expect" in body.get("hint", "")
-    assert "minecraft:oak_planks" in body["hint"]
-    assert "设为 air" not in body["hint"]
-    assert "any" in body["hint"]
-    for hidden in ("replace_any", "expected_previous", "locked_targets", "phase"):
-        assert hidden not in body["hint"]
-
-
-def test_expect_hint_for_args_uses_actual_type_counts_and_failure_cause() -> None:
-    """Repair hints use observed blocks, not hidden legacy policy fields."""
-    from services.agent.block_ops.tools_impl import _expect_hint_for_args
-
-    homogeneous = _expect_hint_for_args(
-        {"edits": [{"expect": "air"}]},
-        {"minecraft:grass_block": 49},
-    )
-    assert "minecraft:grass_block" in homogeneous
-    assert "设为 air" not in homogeneous
-
-    mixed = _expect_hint_for_args(
-        {"edits": [{"expect": "air"}]},
-        {"minecraft:stone": 3, "minecraft:dirt": 2},
-    )
-    assert "minecraft:stone" in mixed
-    assert "minecraft:dirt" in mixed
-    assert "精确" in mixed
-    assert "any" in mixed
-
-    protected_any = _expect_hint_for_args(
-        {"edits": [{"expect": "any"}]},
-        {"minecraft:chest": 1},
-        failure_cause="protected",
-    )
-    assert "minecraft:chest" in protected_any
-    assert "any" not in protected_any
-    for hidden in ("replace_any", "expected_previous", "locked_targets", "phase"):
-        assert hidden not in mixed
-
-
-@pytest.mark.asyncio
-async def test_fill_preflight_zero_match_with_expected_previous_hints_its_type() -> None:
-    """When expected_previous is set but nothing matches, hint names that type_id.
-
-    Uses a minimal frame (no limits on preflight, short player name) to stay
-    under the 461B commandLine budget so the zero-match classifier runs.
-    """
-
-    class _ZeroMatchBridge(_FakeBridge):
-        async def request(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-            if capability == "edit_blocks" and payload.get("phase") == "preflight":
-                return {
-                    "ok": True,
-                    "payload": {
-                        "schema_version": "1",
-                        "ok": True,
-                        "phase": "preflight",
-                        "mode": "fill",
-                        "type_id": payload.get("type_id"),
-                        "locked_targets": [],
-                        "matched_count": 0,
-                        "already_target": 0,
-                        "skipped": 1,
-                        "previous_type_counts": {"minecraft:stone": 1},
-                        "coordinate_mode": "absolute",
-                        "dimension": payload.get("dimension"),
-                        "from": payload.get("from"),
-                        "to": payload.get("to"),
-                        "volume": 1,
-                        "repairs_applied": [],
-                    },
-                }
-            return await super().request(capability, payload)
-
-    bridge = _ZeroMatchBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, player_name="S")
-    ctx = SimpleNamespace(deps=deps)
-    plan, failure = await run_block_preflight(
-        ctx,  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "mode": "fill",
-            "coordinate_mode": "absolute",
-            "dimension": "minecraft:overworld",
-            "from": {"x": 0, "y": 64, "z": 0},
-            "to": {"x": 0, "y": 64, "z": 0},
-            "type_id": "minecraft:glass",
-            "expected_previous": {"type_id": "minecraft:dirt"},
-        },
-    )
-    # If the budget guard fires (frame > 461B), the preflight never reaches the
-    # classifier. Assert the classifier path runs by checking we did NOT get
-    # LIMIT_EXCEEDED when the frame fits; otherwise skip the hint assertion.
-    if failure is not None and not failure.is_success:
-        body = json.loads(failure.output)
-        if body.get("code") == "LIMIT_EXCEEDED":
-            pytest.skip("preflight frame over commandLine budget in this env")
-        assert body["code"] == "PRECONDITION_FAILED"
-        assert body["actual_type_counts"] == {"minecraft:stone": 1}
-        assert "minecraft:stone" in body["hint"]
-        assert "minecraft:dirt" not in body["hint"]
-    else:
-        pytest.fail("expected zero-match PRECONDITION_FAILED failure")
-
-
-@pytest.mark.asyncio
-async def test_fill_preflight_all_already_target_is_noop() -> None:
-    """When every cell is already at the target state, host returns noop, not INTERNAL_ERROR."""
-
-    class _NoopBridge(_FakeBridge):
-        async def request(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-            if capability == "edit_blocks" and payload.get("phase") == "preflight":
-                return {
-                    "ok": True,
-                    "payload": {
-                        "schema_version": "1",
-                        "ok": True,
-                        "phase": "preflight",
-                        "mode": "fill",
-                        "status": "noop",
-                        "type_id": payload.get("type_id"),
-                        "locked_targets": [],
-                        "matched_count": 0,
-                        "already_target": 2,
-                        "skipped": 2,
-                        "previous_type_counts": {"minecraft:glass": 2},
-                        "coordinate_mode": "absolute",
-                        "dimension": payload.get("dimension"),
-                        "from": payload.get("from"),
-                        "to": payload.get("to"),
-                        "volume": 2,
-                        "repairs_applied": [],
-                    },
-                }
-            return await super().request(capability, payload)
-
-    bridge = _NoopBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge)
-    ctx = SimpleNamespace(deps=deps)
-    plan, failure = await run_block_preflight(
-        ctx,  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "mode": "fill",
-            "coordinate_mode": "absolute",
-            "dimension": "minecraft:overworld",
-            "from": {"x": 0, "y": 64, "z": 0},
-            "to": {"x": 1, "y": 64, "z": 0},
-            "type_id": "minecraft:glass",
-        },
-    )
-    # noop: no failure, plan carries a noop marker so execution skips writing.
-    assert failure is None
-    assert plan is not None
-    assert plan.authorized_args.get("status") == "noop"
-
-
-@pytest.mark.asyncio
 async def test_registered_tools_include_block_ops_and_ok_false() -> None:
     agent = Agent("test", deps_type=_Deps, output_type=str)
     register_agent_tools(agent)
     tools = iter_registered_tools(agent)
     assert "inspect_block" in tools
-    assert "edit_blocks" in tools
+    assert "place_block" in tools
+    assert "fill_block" in tools
+    assert "edit_blocks" not in tools
 
     async def fail_handler(cap: str, payload: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -2487,8 +2125,27 @@ async def test_registered_tools_include_block_ops_and_ok_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_harness_preflight_before_approval_for_edit_blocks() -> None:
-    """edit_blocks: preflight before approval; metadata has locked canonical args; no execute yet."""
+async def test_harness_preflight_before_approval_for_place_block(monkeypatch) -> None:
+    """place_block: preflight before approval; plan_id in metadata; no execute yet."""
+    from services.agent.harness import catalog as _catalog_module
+    from services.agent.harness.catalog import ToolIntent, ToolRisk, _entry
+
+    monkeypatch.setattr(
+        _catalog_module,
+        "_TOOL_CATALOG",
+        {
+            **_catalog_module._TOOL_CATALOG,
+            "place_block": _entry(
+                "place_block",
+                ToolIntent.CHANGE_WORLD,
+                ToolRisk.HIGH,
+                "向世界写入单个方块时使用。",
+                "不要用于查询或批量填充。",
+                "pos 为 [x, y, z] 绝对坐标；block 为方块 type_id。",
+                may_have_external_side_effects=True,
+            ),
+        },
+    )
     bridge = _FakeBridge()
     cid = str(uuid4())
     await ensure_block_capability(cid, bridge)
@@ -2501,52 +2158,21 @@ async def test_harness_preflight_before_approval_for_edit_blocks() -> None:
     )
 
     @agent.tool
-    async def edit_blocks(
+    async def place_block(
         ctx: RunContext[_Deps],
-        type_id: str,
-        mode: str = "place",
-        coordinate_mode: str = "absolute",
-        dimension: str | None = None,
-        position: dict[str, Any] | None = None,
-        from_pos: dict[str, Any] | None = None,
-        to_pos: dict[str, Any] | None = None,
-        positions: list[dict[str, Any]] | None = None,
+        pos: list[int],
+        block: str,
+        expect: str = "air",
         states: dict[str, Any] | None = None,
-        replace_any: bool = False,
-        expected_previous: dict[str, Any] | None = None,
-        locked_targets: list[dict[str, Any]] | None = None,
-        phase: str | None = None,
     ) -> str:
-        result = await edit_blocks_impl(
-            ctx,  # type: ignore[arg-type]
-            mode=mode,  # type: ignore[arg-type]
-            coordinate_mode=coordinate_mode,  # type: ignore[arg-type]
-            dimension=dimension,
-            position=position,
-            positions=positions,
-            from_pos=from_pos,
-            to_pos=to_pos,
-            type_id=type_id,
-            states=states,
-            replace_any=replace_any,
-            expected_previous=expected_previous,
-            locked_targets=locked_targets,
-            phase=phase,
-        )
-        return result.output if isinstance(result, ToolResult) else str(result)
+        raise AssertionError("must not execute before approval")
 
     async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
         return ModelResponse(
             parts=[
                 ToolCallPart(
-                    tool_name="edit_blocks",
-                    args={
-                        "mode": "place",
-                        "type_id": "minecraft:stone",
-                        "coordinate_mode": "absolute",
-                        "dimension": "minecraft:overworld",
-                        "position": {"x": 8, "y": 64, "z": 8},
-                    },
+                    tool_name="place_block",
+                    args={"pos": [8, 64, 8], "block": "minecraft:stone", "expect": "air"},
                 )
             ]
         )
@@ -2557,440 +2183,190 @@ async def test_harness_preflight_before_approval_for_edit_blocks() -> None:
     assert first.output.approvals
     approval = first.output.approvals[0]
     meta = (first.output.metadata or {}).get(approval.tool_call_id) or {}
+    plan_id = meta.get("plan_id")
+    assert isinstance(plan_id, str) and plan_id
     normalized = meta.get("normalized_args") or {}
-    assert normalized.get("phase") == "execute"
-    assert normalized.get("locked_targets")
-    assert normalized.get("coordinate_mode") == "absolute"
-    locked = normalized["locked_targets"][0]
-    assert locked.get("x") == 8 and locked.get("y") == 64 and locked.get("z") == 8
-    # Preflight ran; mutation (execute) did not.
-    assert any(c[0] == "edit_blocks" and c[1].get("phase") == "preflight" for c in bridge.calls)
-    assert not any(c[0] == "edit_blocks" and c[1].get("phase") == "execute" for c in bridge.calls)
-    # Preflight cache retains canonical args for approval recovery
-    cache = get_preflight_cache()
-    original_hash = meta.get("original_args_hash")
-    assert original_hash
-    cached = cache.get("run-pf-1", approval.tool_call_id, original_hash)
+    assert normalized.get("pos") == [8, 64, 8]
+    assert normalized.get("block") == "minecraft:stone"
+    # 审批元数据只含模型可见字段
+    for hidden in ("locked_targets", "phase", "status"):
+        assert hidden not in normalized
+    # 绝对坐标直通：除 capability 探测外无任何 bridge 帧，也未执行
+    assert not any(
+        capability in {"edit_blocks", "inspect_block", "place_block", "fill_block"}
+        for capability, _payload in bridge.calls
+    )
+    # 预检缓存持有 plan_id 与 canonical args，供恢复路径使用
+    cached = get_preflight_cache().get_by_plan_id(plan_id)
     assert cached is not None
-    assert cached.canonical_args.get("locked_targets")
-
-
-def _issue6_fallback_agent() -> Agent[_Deps, str | DeferredToolRequests]:
-    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
-        "test",
-        deps_type=_Deps,
-        output_type=[str, DeferredToolRequests],
-        capabilities=[
-            HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))
-        ],
-    )
-    register_agent_tools(agent)
-    return agent
+    assert cached.tool_name == "place_block"
+    assert cached.canonical_args.get("pos") == [8, 64, 8]
 
 
 @pytest.mark.asyncio
-async def test_preflight_failure_blocks_raw_command_fallback_in_same_run(
+async def test_harness_resume_with_unknown_plan_is_state_unknown_without_bridge_call(
     monkeypatch,
 ) -> None:
+    """未知 plan_id 恢复：STATE_UNKNOWN，不调用 bridge / impl，不抛 TypeError。
+
+    取代旧「unhashable execute_mode 投影失败」用例：新契约的恢复负载只有
+    {plan_id}，未命中预检缓存时结构性返回 STATE_UNKNOWN。
+    """
+    from unittest.mock import MagicMock
+
+    from services.agent.harness.execution import (
+        HarnessToolset,
+        get_block_command_fallback_store,
+    )
+
     bridge = _FakeBridge()
     cid = str(uuid4())
     await ensure_block_capability(cid, bridge)
-    agent = _issue6_fallback_agent()
-    command_calls = 0
+    impl_called: dict[str, int] = {"count": 0}
 
-    async def count_command(*args: Any, **kwargs: Any) -> Any:
-        nonlocal command_calls
-        command_calls += 1
-        return SimpleNamespace(success=True, message="executed")
+    async def fake_place_impl(ctx, *, pos, block, expect="air", states=None):
+        impl_called["count"] += 1
+        return ToolResult.ok("placed")
 
-    monkeypatch.setattr("services.agent.tools._run_command_result", count_command)
-    model_calls = 0
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.place_block_impl", fake_place_impl)
 
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal model_calls
-        model_calls += 1
-        if model_calls == 1:
-            return ModelResponse(parts=[ToolCallPart(
-                tool_name="edit_blocks",
-                tool_call_id="tc-invalid-edit",
-                args={"edits": [], "dimension": "minecraft:overworld"},
-            )])
-        if model_calls == 2:
-            return ModelResponse(parts=[ToolCallPart(
-                tool_name="run_minecraft_command",
-                tool_call_id="tc-invalid-fallback",
-                args={"command": "setblock ~ ~ ~ stone"},
-            )])
-        return ModelResponse(parts=[TextPart(content="done")])
-
-    deps = _Deps(
-        connection_id=cid,
-        addon_bridge=bridge,
-        settings=_Settings(),
-        run_id="run-preflight-fallback",
+    settings = _Settings()
+    ts = HarnessToolset(
+        wrapped=MagicMock(),
+        policy=PolicyEngine.from_settings(settings),
+        idempotency=get_idempotency_store(),
+        fallback_store=get_block_command_fallback_store(),
     )
-    result = await agent.run("把方块改好", model=FunctionModel(model_fn), deps=deps)
-
-    assert result.output == "done"
-    assert command_calls == 0
-    assert "INVALID_ARGUMENT" in str(result.all_messages())
-
-
-@pytest.mark.asyncio
-async def test_stringified_group_failure_blocks_raw_fallback_in_same_run(
-    monkeypatch,
-) -> None:
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {
-                "ok": True,
-                "payload": {
-                    "capabilities": {
-                        "block_ops": {
-                            "inspect": True,
-                            "edit": True,
-                            "schema_version": "1",
-                        }
-                    }
-                },
-            }
-        if capability == "edit_blocks" and payload.get("phase") == "preflight":
-            return {
-                "ok": True,
-                "payload": {
-                    "schema_version": "1",
-                    "ok": True,
-                    "phase": "preflight",
-                    "locked_targets": [
-                        {
-                            "dimension": "minecraft:overworld",
-                            "x": 1,
-                            "y": 64,
-                            "z": 1,
-                        }
-                    ],
-                },
-            }
-        if capability == "edit_blocks" and payload.get("phase") == "execute":
-            return {
-                "ok": False,
-                "payload": {
-                    "code": "PROTECTED_BLOCK",
-                    "message": "protected container",
-                    "fallback_allowed": False,
-                },
-            }
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    agent = _issue6_fallback_agent()
-    command_calls = 0
-
-    async def count_command(*args: Any, **kwargs: Any) -> Any:
-        nonlocal command_calls
-        command_calls += 1
-        return SimpleNamespace(success=True, message="executed")
-
-    monkeypatch.setattr("services.agent.tools._run_command_result", count_command)
-    model_calls = 0
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal model_calls
-        model_calls += 1
-        if model_calls == 1:
-            return ModelResponse(parts=[ToolCallPart(
-                tool_name="edit_blocks",
-                tool_call_id="tc-protected-edit",
-                args={
-                    "edits": [{
-                        "target": {
-                            "positions": [{"x": 1, "y": 64, "z": 1}]
-                        },
-                        "block": "minecraft:stone",
-                    }],
-                    "dimension": "minecraft:overworld",
-                },
-            )])
-        if model_calls == 2:
-            return ModelResponse(parts=[ToolCallPart(
-                tool_name="run_minecraft_command",
-                tool_call_id="tc-protected-fallback",
-                args={"command": "setblock ~ ~ ~ stone"},
-            )])
-        return ModelResponse(parts=[TextPart(content="done")])
-
-    deps = _Deps(
-        connection_id=cid,
-        addon_bridge=bridge,
-        settings=_Settings(),
-        run_id="run-group-fallback",
-        auto_approve_tools=True,
+    ctx = SimpleNamespace(
+        deps=_Deps(connection_id=cid, addon_bridge=bridge, settings=settings, run_id="run-unknown-plan"),
+        tool_call_id="tc-unknown-plan",
+        tool_call_approved=True,
     )
-    result = await agent.run("把方块改好", model=FunctionModel(model_fn), deps=deps)
+    result = await ts.call_tool("place_block", {"plan_id": "no-such-plan"}, ctx, MagicMock())
 
-    assert result.output == "done"
-    assert command_calls == 0
-    assert "PROTECTED_BLOCK" in str(result.all_messages())
-
-
-@pytest.mark.asyncio
-async def test_inspect_failure_blocks_raw_fallback_in_same_run(monkeypatch) -> None:
-    """A failed dedicated inspect is also a non-permission to mutate by command."""
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {
-                "ok": True,
-                "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}},
-            }
-        if capability == "inspect_block":
-            return {
-                "ok": False,
-                "payload": {
-                    "code": "PRECONDITION_FAILED",
-                    "message": "inspect failed",
-                    "fallback_allowed": False,
-                },
-            }
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    agent = _issue6_fallback_agent()
-    command_calls = 0
-
-    async def count_command(*args: Any, **kwargs: Any) -> Any:
-        nonlocal command_calls
-        command_calls += 1
-        return SimpleNamespace(success=True, message="executed")
-
-    monkeypatch.setattr("services.agent.tools._run_command_result", count_command)
-    model_calls = 0
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal model_calls
-        model_calls += 1
-        if model_calls == 1:
-            return ModelResponse(parts=[ToolCallPart(
-                tool_name="inspect_block",
-                tool_call_id="tc-inspect-failure",
-                args={
-                    "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-                    "dimension": "minecraft:overworld",
-                },
-            )])
-        if model_calls == 2:
-            return ModelResponse(parts=[ToolCallPart(
-                tool_name="run_minecraft_command",
-                tool_call_id="tc-inspect-fallback",
-                args={"command": "setblock ~ ~ ~ stone"},
-            )])
-        return ModelResponse(parts=[TextPart(content="done")])
-
-    result = await agent.run(
-        "查看后处理方块",
-        model=FunctionModel(model_fn),
-        deps=_Deps(
-            connection_id=cid,
-            addon_bridge=bridge,
-            settings=_Settings(),
-            run_id="run-inspect-fallback",
-            auto_approve_tools=True,
-        ),
-    )
-
-    assert result.output == "done"
-    assert command_calls == 0
-    assert "PRECONDITION_FAILED" in str(result.all_messages())
-
-
-@pytest.mark.asyncio
-async def test_harness_preflight_exception_is_safe_projection_failure_and_is_logged(monkeypatch) -> None:
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
-        "test",
-        deps_type=_Deps,
-        output_type=[str, DeferredToolRequests],
-        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
-    )
-    register_agent_tools(agent)
-    captured: dict[str, Any] = {}
-
-    async def fail_preflight(*args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError("package.module.preflight(token=bridge-secret, password=hunter2)")
-
-    def capture(event: str, **fields: Any) -> None:
-        captured["event"] = event
-        captured.update(fields)
-
-    monkeypatch.setattr("services.agent.block_ops.tools_impl.run_block_preflight", fail_preflight)
-    monkeypatch.setattr("services.agent.harness.execution.logger.error", capture)
-    calls = 0
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal calls
-        calls += 1
-        if calls > 1:
-            return ModelResponse(parts=[TextPart(content="done")])
-        return ModelResponse(parts=[ToolCallPart(
-            tool_name="edit_blocks",
-            tool_call_id="tc-preflight-error",
-            args={
-                "edits": [{
-                    "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-                    "block": "minecraft:stone",
-                }],
-                "dimension": "minecraft:overworld",
-            },
-        )])
-
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-preflight-error")
-    result = await agent.run("edit", model=FunctionModel(model_fn), deps=deps)
-
-    contents = str(result.all_messages())
-    assert "INTERNAL_ERROR" in contents
-    assert "STATE_UNKNOWN" not in contents
-    assert "bridge-secret" not in contents
-    assert "hunter2" not in contents
+    assert isinstance(result, str)
+    body = json.loads(result)
+    assert body["code"] == "STATE_UNKNOWN"
+    assert body["external_state_unknown"] is True
+    assert impl_called["count"] == 0
+    # 只发生过 capability 探测（ensure_block_capability），绝无方块操作帧
     assert not any(
-        name == "edit_blocks" and payload.get("phase") == "execute"
-        for name, payload in bridge.calls
+        capability in {"edit_blocks", "inspect_block", "place_block", "fill_block"}
+        for capability, _payload in bridge.calls
     )
-    assert captured == {
-        "event": "tool_execution_failed",
-        "tool_name": "edit_blocks",
-        "run_id": "run-preflight-error",
-        "tool_call_id": "tc-preflight-error",
-        "connection_id_short": cid[-8:],
-        "player_name": "Steve",
-        "error_kind": "INTERNAL",
-        "error_type": "RuntimeError",
-        "diagnostic_summary": "RuntimeError: package.module.preflight(token=[REDACTED], password=[REDACTED])",
-        "external_state_unknown": False,
-        "execution_stage": "projection",
-    }
 
 
 @pytest.mark.asyncio
-async def test_harness_rejects_incomplete_non_deferred_execute_projection(monkeypatch) -> None:
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
-        "test",
-        deps_type=_Deps,
-        output_type=[str, DeferredToolRequests],
-        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+async def test_execute_block_plan_concurrent_same_plan_executes_once(monkeypatch) -> None:
+    """同一 plan_id 并发恢复只执行一次 impl（executed 读写原子化，无竞态）。
+
+    Reviewer finding (Important 1)：executed/execution_result 曾在缓存锁之外
+    读写，两个并发 execute_block_plan 都会看到 executed=False 并各自执行
+    impl（双重写入）。per-plan asyncio.Lock 串行化 + 缓存锁内读-查-写修复。
+    """
+    from services.agent.block_ops.tools_impl import execute_block_plan
+
+    calls: dict[str, int] = {"count": 0}
+    gate = asyncio.Event()
+
+    async def fake_place_impl(ctx, *, pos, block, expect="air", states=None):
+        calls["count"] += 1
+        await gate.wait()  # 拉大竞态窗口：两个协程都能在释放前看到 executed=False
+        return ToolResult.ok("placed")
+
+    monkeypatch.setattr("services.agent.block_ops.tools_impl.place_block_impl", fake_place_impl)
+
+    cache = get_preflight_cache()
+    entry = cache.put(
+        run_id="run-race",
+        tool_call_id="tc-race",
+        original_args_hash="race-hash",
+        canonical_args={"pos": [1, 64, 1], "block": "minecraft:stone", "expect": "air", "states": None},
+        execute_args={"pos": [1, 64, 1], "block": "minecraft:stone", "expect": "air", "states": None},
+        connection_id="conn-race",
+        plan_id="race-plan-1",
+        tool_name="place_block",
     )
-    register_agent_tools(agent)
-    captured: dict[str, Any] = {}
+    ctx = SimpleNamespace(deps=_Deps(run_id="run-race", connection_id="conn-race"))
 
-    def capture(event: str, **fields: Any) -> None:
-        captured["event"] = event
-        captured.update(fields)
+    first = asyncio.ensure_future(execute_block_plan(entry.plan_id, ctx))
+    second = asyncio.ensure_future(execute_block_plan(entry.plan_id, ctx))
+    await asyncio.sleep(0.05)  # 让两个协程都推进到 impl 检查点
+    assert calls["count"] == 1  # 串行化：同一时刻只有一个 impl 在飞行
+    gate.set()
+    r1, r2 = await asyncio.gather(first, second)
 
-    monkeypatch.setattr("services.agent.harness.execution.logger.error", capture)
-    calls = 0
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal calls
-        calls += 1
-        if calls > 1:
-            return ModelResponse(parts=[TextPart(content="done")])
-        return ModelResponse(parts=[ToolCallPart(
-            tool_name="edit_blocks",
-            tool_call_id="tc-fast-projection",
-            args={
-                "edits": [],
-                "dimension": "minecraft:overworld",
-                "phase": "execute", "locked_targets": [{"x": 1, "y": 64, "z": 1}],
-            },
-        )])
-
-    result = await agent.run(
-        "edit",
-        model=FunctionModel(model_fn),
-        deps=_Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-fast-projection"),
-    )
-
-    assert "INTERNAL_ERROR" in str(result.all_messages())
-    assert not any(
-        name == "edit_blocks" and payload.get("phase") == "execute"
-        for name, payload in bridge.calls
-    )
-    assert captured["event"] == "tool_execution_failed"
-    assert captured["execution_stage"] == "projection"
-    assert captured["run_id"] == "run-fast-projection"
-    assert captured["tool_call_id"] == "tc-fast-projection"
+    assert calls["count"] == 1  # 第二个协程拿到锁后命中 executed → 返回缓存结果
+    assert r1.is_success and r2.is_success
+    assert r1.output == r2.output
+    assert entry.executed is True
+    assert isinstance(entry.execution_result, ToolResult)
 
 
 @pytest.mark.asyncio
-async def test_harness_rejects_unhashable_execute_mode_without_bridge_call(monkeypatch) -> None:
+async def test_auto_approved_fill_block_invokes_python_alias() -> None:
+    """Direct fill execution must project model-visible ``from`` to ``from_``."""
     bridge = _FakeBridge()
     cid = str(uuid4())
     await ensure_block_capability(cid, bridge)
-    agent: Agent[_Deps, str] = Agent(
+    policy = PolicyEngine.from_settings(_Settings())
+    agent = Agent(
         "test",
         deps_type=_Deps,
         output_type=str,
-        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
+        capabilities=[HarnessCapability(policy=policy)],
     )
+    calls: list[tuple[list[int], list[int], str]] = []
 
     @agent.tool
-    async def edit_blocks(
+    async def fill_block(
         ctx: RunContext[_Deps],
-        type_id: str,
-        mode: Any,
-        coordinate_mode: str,
-        dimension: str,
-        locked_targets: list[dict[str, Any]],
-        phase: str,
+        from_: Annotated[list[int], Field(min_length=3, max_length=3, alias="from")],
+        to: Annotated[list[int], Field(min_length=3, max_length=3)],
+        block: str,
+        expect: str = "air",
+        states: dict[str, Any] | None = None,
     ) -> str:
-        raise AssertionError("invalid projection must not invoke the Python tool")
+        calls.append((from_, to, block))
+        return "filled"
 
-    captured: dict[str, Any] = {}
-
-    def capture(event: str, **fields: Any) -> None:
-        captured["event"] = event
-        captured.update(fields)
-
-    monkeypatch.setattr("services.agent.harness.execution.logger.error", capture)
-    calls = 0
+    model_calls = 0
 
     async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal calls
-        calls += 1
-        if calls > 1:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls > 1:
             return ModelResponse(parts=[TextPart(content="done")])
-        return ModelResponse(parts=[ToolCallPart(
-            tool_name="edit_blocks",
-            tool_call_id="tc-unhashable-mode",
-            args={
-                "type_id": "minecraft:stone", "mode": [],
-                "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
-                "phase": "execute", "locked_targets": [{"x": 1, "y": 64, "z": 1}],
-            },
-        )])
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name="fill_block",
+                    tool_call_id="tc-fill-auto-approved",
+                    args={
+                        "from": [0, 64, 0],
+                        "to": [2, 64, 2],
+                        "block": "minecraft:stone",
+                    },
+                )
+            ]
+        )
 
-    result = await agent.run(
-        "edit",
-        model=FunctionModel(model_fn),
-        deps=_Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-unhashable-mode"),
+    deps = _Deps(
+        connection_id=cid,
+        addon_bridge=bridge,
+        settings=_Settings(),
+        run_id="run-fill-auto-approved",
+        auto_approve_tools=True,
     )
+    result = await agent.run("fill area", model=FunctionModel(model_fn), deps=deps)
 
-    assert "INTERNAL_ERROR" in str(result.all_messages())
-    assert not any(
-        name == "edit_blocks" and payload.get("phase") == "execute"
-        for name, payload in bridge.calls
-    )
-    assert captured["event"] == "tool_execution_failed"
-    assert captured["execution_stage"] == "projection"
+    assert result.output == "done"
+    assert calls == [([0, 64, 0], [2, 64, 2], "minecraft:stone")]
+
+
 @pytest.mark.asyncio
-async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() -> None:
+async def test_reverse_fill_block_approval_then_execute_once() -> None:
+    """fill_block: 审批元数据保留原始参数；恢复后执行一次；重复恢复幂等。"""
     locked_targets = [
         {"dimension": "minecraft:overworld", "x": x, "y": 64, "z": z}
         for x in range(2, 5)
@@ -3057,37 +2433,21 @@ async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() 
     )
 
     @agent.tool
-    async def edit_blocks(
+    async def fill_block(
         ctx: RunContext[_Deps],
-        type_id: str,
-        mode: str = "place",
-        coordinate_mode: str = "absolute",
-        dimension: str | None = None,
-        position: dict[str, Any] | None = None,
-        positions: list[dict[str, Any]] | None = None,
-        from_pos: dict[str, Any] | None = None,
-        to_pos: dict[str, Any] | None = None,
+        from_: Annotated[list[int], Field(min_length=3, max_length=3, alias="from")],
+        to: Annotated[list[int], Field(min_length=3, max_length=3)],
+        block: str,
+        expect: str = "air",
         states: dict[str, Any] | None = None,
-        replace_any: bool = False,
-        expected_previous: dict[str, Any] | None = None,
-        locked_targets: list[dict[str, Any]] | None = None,
-        phase: str | None = None,
     ) -> str:
-        result = await edit_blocks_impl(
+        result = await fill_block_impl(
             ctx,  # type: ignore[arg-type]
-            type_id=type_id,
-            mode=mode,  # type: ignore[arg-type]
-            coordinate_mode=coordinate_mode,  # type: ignore[arg-type]
-            dimension=dimension,
-            position=position,
-            positions=positions,
-            from_pos=from_pos,
-            to_pos=to_pos,
+            from_=from_,
+            to=to,
+            block=block,
+            expect=expect,
             states=states,
-            replace_any=replace_any,
-            expected_previous=expected_previous,
-            locked_targets=locked_targets,
-            phase=phase,
         )
         return str(result)
 
@@ -3101,15 +2461,12 @@ async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() 
         return ModelResponse(
             parts=[
                 ToolCallPart(
-                    tool_name="edit_blocks",
+                    tool_name="fill_block",
                     tool_call_id="tc-fill-reverse",
                     args={
-                        "type_id": "minecraft:stone",
-                        "mode": "fill",
-                        "coordinate_mode": "absolute",
-                        "dimension": "minecraft:overworld",
-                        "from_pos": {"x": 4, "y": 64, "z": 3},
-                        "to_pos": {"x": 2, "y": 64, "z": 1},
+                        "from": [4, 64, 3],
+                        "to": [2, 64, 1],
+                        "block": "minecraft:stone",
                     },
                 )
             ]
@@ -3120,35 +2477,25 @@ async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() 
     assert isinstance(first.output, DeferredToolRequests)
     approval = first.output.approvals[0]
     metadata = first.output.metadata[approval.tool_call_id]
+    # normalized approval args 保持模型可见契约；execute args 使用 Python 参数名。
     authorized_args = metadata["normalized_args"]
-    assert authorized_args["from"] == {"x": 2, "y": 64, "z": 1}
-    assert authorized_args["to"] == {"x": 4, "y": 64, "z": 3}
+    assert authorized_args["from"] == [4, 64, 3]
+    assert authorized_args["to"] == [2, 64, 1]
+    assert authorized_args["block"] == "minecraft:stone"
     execute_args = metadata["execute_args"]
-    assert execute_args["from_pos"] == {"x": 2, "y": 64, "z": 1}
-    assert execute_args["to_pos"] == {"x": 4, "y": 64, "z": 3}
-    assert "repairs_applied" not in execute_args
-    assert "facing" not in execute_args
-    assert metadata["approval_metadata"] == {
-        "bounds": {
-            "min": {"x": 2, "y": 64, "z": 1},
-            "max": {"x": 4, "y": 64, "z": 3},
-        },
-        "repairs_applied": ["reversed_bounds"],
-        "facing": "south",
-        "player_origin": {"x": 100, "y": 64, "z": 100},
-        "before_samples": [{"type_id": "minecraft:air"}],
-        "future_preflight_evidence": {"source": "addon"},
-    }
-
-    # Approval recovery must use the persisted strict execution projection,
-    # not the in-process preflight cache or bridge-facing authorization args.
-    reset_preflight_cache()
+    assert execute_args["from_"] == [4, 64, 3]
+    assert "from" not in execute_args
+    assert execute_args["to"] == [2, 64, 1]
+    for hidden in ("locked_targets", "phase", "status", "repairs_applied"):
+        assert hidden not in execute_args, hidden
+    plan_id = metadata.get("plan_id")
+    assert isinstance(plan_id, str) and plan_id
 
     second = await agent.run(
         message_history=first.all_messages(),
         deferred_tool_results=DeferredToolResults(
             approvals={
-                approval.tool_call_id: ToolApproved(override_args=execute_args),
+                approval.tool_call_id: ToolApproved(override_args={"plan_id": plan_id}),
             }
         ),
         model=FunctionModel(model_fn),
@@ -3162,17 +2509,15 @@ async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() 
         if capability == "edit_blocks" and payload.get("phase") == "execute"
     ]
     assert len(execute_calls) == 1
+    # 恢复路径走 execute_block_plan(plan_id)：fill_block_impl 在执行线上
+    # 归一化角点，min/max 后才是线协议 from/to。
     assert execute_calls[0]["from"] == {"x": 2, "y": 64, "z": 1}
     assert execute_calls[0]["to"] == {"x": 4, "y": 64, "z": 3}
-    # Continuous fill AABB is frozen by from/to; locked_targets are omitted on the
-    # wire to stay under the MCBE commandLine budget (still present in execute_args).
-    assert "locked_targets" not in execute_calls[0]
-    assert execute_args["locked_targets"] == locked_targets
 
     repeated = await agent.run(
         message_history=first.all_messages(),
         deferred_tool_results=DeferredToolResults(
-            approvals={approval.tool_call_id: ToolApproved(override_args=execute_args)}
+            approvals={approval.tool_call_id: ToolApproved(override_args={"plan_id": plan_id})}
         ),
         model=FunctionModel(model_fn),
         deps=deps,
@@ -3184,221 +2529,6 @@ async def test_reverse_fill_approval_resumes_with_locked_normalized_operation() 
         if capability == "edit_blocks" and payload.get("phase") == "execute"
     ]
     assert len(repeated_execute_calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_denied_edit_blocks_approval_never_sends_execute() -> None:
-    """玩家拒绝后恢复不得产生 phase=execute bridge 请求。"""
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
-        "test",
-        deps_type=_Deps,
-        output_type=[str, DeferredToolRequests],
-        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
-    )
-    register_agent_tools(agent)
-    calls = 0
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal calls
-        calls += 1
-        if calls > 1:
-            return ModelResponse(parts=[TextPart(content="denied")])
-        return ModelResponse(
-            parts=[
-                ToolCallPart(
-                    tool_name="edit_blocks",
-                    tool_call_id="tc-deny-fill",
-                    args={
-                        "edits": [{
-                            "target": {"box": {"from": {"x": 1, "y": 64, "z": 1}, "to": {"x": 2, "y": 64, "z": 2}}},
-                            "block": "minecraft:stone",
-                        }],
-                        "dimension": "minecraft:overworld",
-                    },
-                )
-            ]
-        )
-
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-deny")
-    first = await agent.run("fill", model=FunctionModel(model_fn), deps=deps)
-    assert isinstance(first.output, DeferredToolRequests)
-    approval = first.output.approvals[0]
-
-    second = await agent.run(
-        message_history=first.all_messages(),
-        deferred_tool_results=DeferredToolResults(
-            approvals={
-                approval.tool_call_id: ToolDenied(message="玩家拒绝了工具调用 edit_blocks"),
-            }
-        ),
-        model=FunctionModel(model_fn),
-        deps=deps,
-    )
-
-    assert not isinstance(second.output, DeferredToolRequests)
-    assert not any(
-        name == "edit_blocks" and payload.get("phase") == "execute"
-        for name, payload in bridge.calls
-    )
-    assert any(
-        name == "edit_blocks" and payload.get("phase") == "preflight"
-        for name, payload in bridge.calls
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("mode", "original_args", "locked_targets"),
-    [
-        (
-            "place",
-            {
-                "edits": [{
-                    "target": {"positions": [{"forward": 2, "right": 1, "up": 0}]},
-                    "block": "minecraft:gold_block",
-                }],
-            },
-            [{"dimension": "minecraft:overworld", "x": 42, "y": 70, "z": -8}],
-        ),
-        (
-            "batch",
-            {
-                "edits": [{
-                    "target": {"positions": [{"x": 3, "y": 65, "z": 4}, {"x": 5, "y": 65, "z": 4}]},
-                    "block": "minecraft:gold_block",
-                }],
-                "dimension": "minecraft:the_nether",
-            },
-            [
-                {"dimension": "minecraft:the_nether", "x": 3, "y": 65, "z": 4},
-                {"dimension": "minecraft:the_nether", "x": 5, "y": 65, "z": 4},
-            ],
-        ),
-    ],
-)
-async def test_place_and_batch_approval_resume_execute_only_frozen_targets(
-    mode: str,
-    original_args: dict[str, Any],
-    locked_targets: list[dict[str, Any]],
-) -> None:
-    """真实 defer/resume 只执行批准时的绝对计划，预检缓存不是恢复依赖。"""
-    player_state = {"position": {"x": 40, "y": 70, "z": -10}, "facing": "north"}
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {
-                "ok": True,
-                "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}},
-            }
-        if capability == "edit_blocks" and payload.get("phase") == "preflight":
-            return {
-                "ok": True,
-                "payload": {
-                    "ok": True,
-                    "phase": "preflight",
-                    "mode": mode,
-                    "coordinate_mode": "absolute",
-                    "dimension": locked_targets[0]["dimension"],
-                    "position": {
-                        key: locked_targets[0][key] for key in ("x", "y", "z")
-                    },
-                    "positions": [
-                        {key: target[key] for key in ("x", "y", "z")}
-                        for target in locked_targets
-                    ],
-                    "locked_targets": locked_targets,
-                    "player_origin": player_state["position"],
-                    "facing": player_state["facing"],
-                },
-            }
-        if capability == "edit_blocks" and payload.get("phase") == "execute":
-            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": len(locked_targets)}}
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR", "message": "unexpected"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
-        "test",
-        deps_type=_Deps,
-        output_type=[str, DeferredToolRequests],
-        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
-    )
-    register_agent_tools(agent)
-    model_calls = 0
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal model_calls
-        model_calls += 1
-        if model_calls == 1:
-            return ModelResponse(parts=[ToolCallPart(
-                tool_name="edit_blocks", tool_call_id=f"tc-{mode}", args=original_args,
-            )])
-        return ModelResponse(parts=[TextPart(content="done")])
-
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id=f"run-{mode}")
-    first = await agent.run("edit", model=FunctionModel(model_fn), deps=deps)
-    assert isinstance(first.output, DeferredToolRequests)
-    approval = first.output.approvals[0]
-    execute_args = first.output.metadata[approval.tool_call_id]["execute_args"]
-    assert execute_args["locked_targets"] == locked_targets
-    assert execute_args["dimension"] == locked_targets[0]["dimension"]
-    # New ``edits`` contract: the resolved absolute target is frozen in edits[0].
-    resolved_positions = execute_args["edits"][0]["target"]["positions"]
-    if mode == "place":
-        assert resolved_positions == [{"x": 42, "y": 70, "z": -8}]
-    else:
-        assert resolved_positions == [{"x": 3, "y": 65, "z": 4}, {"x": 5, "y": 65, "z": 4}]
-
-    # Simulate movement/turning while waiting. The execute request must never
-    # consult this state again, and cache eviction must not change the result.
-    player_state.update(position={"x": 900, "y": 10, "z": 900}, facing="south")
-    reset_preflight_cache()
-    second = await agent.run(
-        message_history=first.all_messages(),
-        deferred_tool_results=DeferredToolResults(
-            approvals={approval.tool_call_id: ToolApproved(override_args=execute_args)}
-        ),
-        model=FunctionModel(model_fn),
-        deps=deps,
-    )
-
-    assert not isinstance(second.output, DeferredToolRequests)
-    edit_payloads = [payload for capability, payload in bridge.calls if capability == "edit_blocks"]
-    tool_contents = [
-        str(getattr(part, "content", ""))
-        for message in second.all_messages()
-        for part in getattr(message, "parts", [])
-    ]
-    assert [payload["phase"] for payload in edit_payloads] == ["preflight", "execute"], tool_contents
-    # Absolute place/batch geometry freezes targets; locked_targets may be omitted
-    # on the wire. The approval execute_args still retain them for idempotency.
-    assert edit_payloads[-1]["dimension"] == locked_targets[0]["dimension"]
-    if mode == "place":
-        assert edit_payloads[-1]["position"] == {"x": 42, "y": 70, "z": -8}
-    else:
-        assert edit_payloads[-1]["positions"] == [
-            {"x": 3, "y": 65, "z": 4},
-            {"x": 5, "y": 65, "z": 4},
-        ]
-    assert execute_args["locked_targets"] == locked_targets
-
-    repeated = await agent.run(
-        message_history=first.all_messages(),
-        deferred_tool_results=DeferredToolResults(
-            approvals={approval.tool_call_id: ToolApproved(override_args=execute_args)}
-        ),
-        model=FunctionModel(model_fn),
-        deps=deps,
-    )
-    assert not isinstance(repeated.output, DeferredToolRequests)
-    repeated_payloads = [
-        payload for capability, payload in bridge.calls if capability == "edit_blocks"
-    ]
-    assert [payload["phase"] for payload in repeated_payloads] == ["preflight", "execute"]
 
 
 @pytest.mark.asyncio
@@ -3454,9 +2584,14 @@ async def test_relative_inspect_executes_frozen_public_projection_only() -> None
             "position": position, "positions": positions,
             "locked_targets": locked_targets, "phase": phase,
         })
+        # Task 2: impl takes the unified target only; translate legacy kwargs.
+        target: dict[str, Any] | None = None
+        if position is not None:
+            target = {"positions": [position]}
+        elif positions is not None:
+            target = {"positions": positions}
         return str(await inspect_block_impl(
-            ctx, coordinate_mode=coordinate_mode, dimension=dimension,
-            position=position, positions=positions, locked_targets=locked_targets, phase=phase,
+            ctx, target=target, locked_targets=locked_targets, phase=phase,
         ))
 
     calls = 0
@@ -3491,14 +2626,20 @@ async def test_relative_inspect_executes_frozen_public_projection_only() -> None
 
 
 def test_unknown_preflight_metadata_does_not_change_execute_projection_hash() -> None:
+    """Unknown preflight evidence stays out of the frozen execute projection.
+
+    The final single-responsibility contract builds plans only for
+    ``inspect_block``; the projection-hash stability property is exercised on
+    the inspect target path.
+    """
     original = {
-        "type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute",
-        "dimension": "minecraft:overworld", "position": {"x": 1, "y": 64, "z": 1},
+        "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
+        "dimension": "minecraft:overworld",
     }
     locked = [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}]
-    first = build_block_preflight_plan("edit_blocks", original, {"locked_targets": locked})
+    first = build_block_preflight_plan("inspect_block", original, {"locked_targets": locked})
     second = build_block_preflight_plan(
-        "edit_blocks", original,
+        "inspect_block", original,
         {"locked_targets": locked, "future_metadata": {"facing": "north"}},
     )
 
@@ -3509,297 +2650,12 @@ def test_unknown_preflight_metadata_does_not_change_execute_projection_hash() ->
     assert second.approval_metadata["future_metadata"] == {"facing": "north"}
 
 
-@pytest.mark.asyncio
-async def test_auto_approved_edit_preflights_then_executes_locked_operation() -> None:
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
-        "test",
-        deps_type=_Deps,
-        output_type=[str, DeferredToolRequests],
-        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
-    )
-    register_agent_tools(agent)
-    calls = 0
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal calls
-        calls += 1
-        if calls > 1:
-            return ModelResponse(parts=[TextPart(content="done")])
-        return ModelResponse(parts=[ToolCallPart(
-            tool_name="edit_blocks", tool_call_id="tc-auto", args={
-                "edits": [{
-                    "target": {"positions": [{"x": 9, "y": 64, "z": 9}]},
-                    "block": "minecraft:stone",
-                }],
-                "dimension": "minecraft:overworld",
-            },
-        )])
-
-    result = await agent.run(
-        "place a block", model=FunctionModel(model_fn),
-        deps=_Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(),
-                   run_id="run-auto", auto_approve_tools=True),
-    )
-
-    assert not isinstance(result.output, DeferredToolRequests)
-    phases = [payload.get("phase") for name, payload in bridge.calls if name == "edit_blocks"]
-    assert phases == ["preflight", "execute"]
-    execute_payload = [payload for name, payload in bridge.calls if name == "edit_blocks"][-1]
-    assert execute_payload.get("phase") == "execute"
-    # place with absolute position freezes the target without shipping locked_targets.
-    assert execute_payload.get("position") == {"x": 9, "y": 64, "z": 9}
-
-
-@pytest.mark.asyncio
-async def test_auto_approved_fill_uses_execution_projection_idempotency_key() -> None:
-    locked_targets = [
-        {"dimension": "minecraft:overworld", "x": x, "y": 64, "z": z}
-        for x in range(1, 3)
-        for z in range(1, 3)
-    ]
-    preflight_payload = {
-        "schema_version": "1",
-        "ok": True,
-        "phase": "preflight",
-        "mode": "fill",
-        "type_id": "minecraft:stone",
-        "coordinate_mode": "absolute",
-        "dimension": "minecraft:overworld",
-        "bounds": {
-            "min": {"x": 1, "y": 64, "z": 1},
-            "max": {"x": 2, "y": 64, "z": 2},
-        },
-        "locked_targets": locked_targets,
-    }
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {
-                "ok": True,
-                "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}},
-            }
-        if capability == "edit_blocks" and payload.get("phase") == "preflight":
-            return {"ok": True, "payload": preflight_payload}
-        if capability == "edit_blocks" and payload.get("phase") == "execute":
-            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": 4}}
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    agent: Agent[_Deps, str] = Agent(
-        "test",
-        deps_type=_Deps,
-        output_type=str,
-        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
-    )
-    register_agent_tools(agent)
-    original_args = {
-        "edits": [{
-            "target": {"box": {"from": {"x": 2, "y": 64, "z": 2}, "to": {"x": 1, "y": 64, "z": 1}}},
-            "block": "minecraft:stone",
-        }],
-        "dimension": "minecraft:overworld",
-    }
-    plan = build_block_preflight_plan("edit_blocks", original_args, preflight_payload)
-    execution_hash = hash_normalized_args(normalize_tool_args(plan.execute_args))
-    authorization_hash = hash_normalized_args(normalize_tool_args(plan.authorized_args))
-    original_hash = hash_normalized_args(normalize_tool_args(original_args))
-    assert execution_hash != authorization_hash
-    assert execution_hash != original_hash
-    # Legacy entries could have been produced by a different execution projection.
-    # They must not suppress this exact world mutation.
-    store = get_idempotency_store()
-    store.put("run-auto-fill", "tc-auto-fill", authorization_hash, ToolResult.ok("stale-auth"))
-    store.put("run-auto-fill", "tc-auto-fill", original_hash, ToolResult.ok("stale-original"))
-
-    model_calls = 0
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal model_calls
-        model_calls += 1
-        if model_calls > 1:
-            return ModelResponse(parts=[TextPart(content="done")])
-        return ModelResponse(parts=[ToolCallPart(
-            tool_name="edit_blocks", tool_call_id="tc-auto-fill", args=original_args,
-        )])
-
-    deps = _Deps(
-        connection_id=cid,
-        addon_bridge=bridge,
-        settings=_Settings(),
-        run_id="run-auto-fill",
-        auto_approve_tools=True,
-    )
-    result = await agent.run("fill", model=FunctionModel(model_fn), deps=deps)
-
-    assert result.output == "done"
-    assert [
-        payload["phase"]
-        for capability, payload in bridge.calls
-        if capability == "edit_blocks"
-    ] == ["preflight", "execute"]
-    assert get_idempotency_store().get("run-auto-fill", "tc-auto-fill", execution_hash)
-    assert get_idempotency_store().get("run-auto-fill", "tc-auto-fill", authorization_hash)
-    assert get_idempotency_store().get("run-auto-fill", "tc-auto-fill", original_hash)
-
-
-@pytest.mark.asyncio
-async def test_auto_approved_fill_preflight_status_field_does_not_break_execution() -> None:
-    """A real Add-on preflight with ``status=applied`` must not crash invocation.
-
-    Regression for the 2026-08-03 runtime log where every ``edit_blocks`` call
-    failed with ``TypeError: edit_blocks() got an unexpected keyword argument
-    'status'`` after a successful preflight. ``status`` is a preflight
-    bookkeeping field and must not leak into the Add-on execute payload.
-    """
-    locked_targets = [
-        {"dimension": "minecraft:overworld", "x": x, "y": 64, "z": z}
-        for x in range(1, 3)
-        for z in range(1, 3)
-    ]
-    preflight_payload = {
-        "schema_version": "1",
-        "ok": True,
-        "phase": "preflight",
-        "mode": "fill",
-        "type_id": "minecraft:oak_planks",
-        "coordinate_mode": "absolute",
-        "dimension": "minecraft:overworld",
-        "status": "applied",
-        "from": {"x": 1, "y": 64, "z": 1},
-        "to": {"x": 2, "y": 64, "z": 2},
-        "locked_targets": locked_targets,
-        "repairs_applied": [],
-    }
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {
-                "ok": True,
-                "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}},
-            }
-        if capability == "edit_blocks" and payload.get("phase") == "preflight":
-            return {"ok": True, "payload": preflight_payload}
-        if capability == "edit_blocks" and payload.get("phase") == "execute":
-            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": 4}}
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    agent: Agent[_Deps, str] = Agent(
-        "test",
-        deps_type=_Deps,
-        output_type=str,
-        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
-    )
-    register_agent_tools(agent)
-    original_args = {
-        "edits": [{
-            "target": {"box": {"from": {"x": 2, "y": 64, "z": 2}, "to": {"x": 1, "y": 64, "z": 1}}},
-            "block": "oak_planks",
-            "expect": "any",
-        }],
-        "dimension": "minecraft:overworld",
-    }
-    model_calls = 0
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal model_calls
-        model_calls += 1
-        if model_calls > 1:
-            return ModelResponse(parts=[TextPart(content="done")])
-        return ModelResponse(parts=[ToolCallPart(
-            tool_name="edit_blocks", tool_call_id="tc-status-applied", args=original_args,
-        )])
-
-    deps = _Deps(
-        connection_id=cid,
-        addon_bridge=bridge,
-        settings=_Settings(),
-        run_id="run-status-applied",
-        auto_approve_tools=True,
-    )
-    result = await agent.run("fill", model=FunctionModel(model_fn), deps=deps)
-
-    assert result.output == "done"
-    phases = [
-        payload["phase"]
-        for capability, payload in bridge.calls
-        if capability == "edit_blocks"
-    ]
-    assert phases == ["preflight", "execute"]
-    assert not any(
-        payload.get("phase") == "execute" and payload.get("status")
-        for capability, payload in bridge.calls
-        if capability == "edit_blocks"
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("args", "mutate"),
-    [
-        ({"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"}, lambda value: value.update(phase="preflight")),
-        ({"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"}, lambda value: value.update(locked_targets=[])),
-        ({"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"}, lambda value: value.update(edits=[])),
-        ({"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}, {"x": 2, "y": 64, "z": 1}]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"}, lambda value: value.update(edits=[])),
-        ({"edits": [{"target": {"box": {"from": {"x": 1, "y": 64, "z": 1}, "to": {"x": 2, "y": 64, "z": 1}}}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"}, lambda value: value.update(edits=[])),
-    ],
-)
-async def test_corrupt_approved_override_never_executes_block_bridge(
-    args: dict[str, Any], mutate: Any
-) -> None:
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
-        "test", deps_type=_Deps, output_type=[str, DeferredToolRequests],
-        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
-    )
-    register_agent_tools(agent)
-    calls = 0
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal calls
-        calls += 1
-        if calls > 1:
-            return ModelResponse(parts=[TextPart(content="done")])
-        return ModelResponse(parts=[ToolCallPart(
-            tool_name="edit_blocks", tool_call_id="tc-corrupt", args=args,
-        )])
-
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-corrupt")
-    first = await agent.run("edit", model=FunctionModel(model_fn), deps=deps)
-    assert isinstance(first.output, DeferredToolRequests)
-    approval = first.output.approvals[0]
-    override_args = dict(first.output.metadata[approval.tool_call_id]["execute_args"])
-    mutate(override_args)
-    result = await agent.run(
-        message_history=first.all_messages(),
-        deferred_tool_results=DeferredToolResults(
-            approvals={approval.tool_call_id: ToolApproved(override_args=override_args)}
-        ),
-        model=FunctionModel(model_fn), deps=deps,
-    )
-
-    assert "INTERNAL_ERROR" in str(result.all_messages())
-    assert not any(
-        name == "edit_blocks" and payload.get("phase") == "execute"
-        for name, payload in bridge.calls
-    )
-
-
 def test_block_preflight_plan_keeps_unknown_evidence_out_of_operation_args() -> None:
     plan = build_block_preflight_plan(
-        "edit_blocks",
+        "inspect_block",
         {
-            "type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute",
-            "dimension": "minecraft:overworld", "position": {"x": 1, "y": 64, "z": 1},
+            "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
+            "dimension": "minecraft:overworld",
         },
         {
             "locked_targets": [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}],
@@ -3809,198 +2665,35 @@ def test_block_preflight_plan_keeps_unknown_evidence_out_of_operation_args() -> 
     )
 
     assert plan.authorized_args["phase"] == "execute"
-    assert plan.execute_args["position"] == {"x": 1, "y": 64, "z": 1}
+    assert plan.authorized_args["target"] == {"positions": [{"x": 1, "y": 64, "z": 1}]}
     assert "future_evidence" not in plan.authorized_args
     assert "future_evidence" not in plan.execute_args
     assert plan.approval_metadata["future_evidence"] == {"version": 2}
 
 
-def test_project_block_execute_args_is_subset_of_public_tool_signatures() -> None:
-    """严格执行投影的 key 必须是公开 Python 工具签名的子集（不含 ctx）。"""
+def test_single_op_tool_public_schemas_expose_only_contract_fields() -> None:
+    """Single-op tools' public schemas expose exactly the contract fields, no hidden fields."""
     agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
     register_agent_tools(agent)
     tools = iter_registered_tools(agent)  # type: ignore[arg-type]
 
     def public_fields(tool_name: str) -> set[str]:
         tool = tools[tool_name]
-        schema = tool.function_schema.json_schema
+        schema = tool.tool_def.parameters_json_schema
         return set(schema.get("properties") or {})
 
-    edit_sig = public_fields("edit_blocks")
+    place_sig = public_fields("place_block")
+    fill_sig = public_fields("fill_block")
     inspect_sig = public_fields("inspect_block")
 
-    # New ``edits`` contract (issue 03): execute projection is a subset of the
-    # model-visible signature (edits/dimension/locked_targets/phase).
-    edit_plan = build_block_preflight_plan(
-        "edit_blocks",
-        {
-            "edits": [{
-                "target": {"box": {"from": {"x": 4, "y": 64, "z": 3}, "to": {"x": 2, "y": 64, "z": 1}}},
-                "block": "minecraft:stone",
-            }],
-            "dimension": "minecraft:overworld",
-        },
-        {
-            "locked_targets": [{"dimension": "minecraft:overworld", "x": 2, "y": 64, "z": 1}],
-            "from": {"x": 2, "y": 64, "z": 1},
-            "to": {"x": 4, "y": 64, "z": 3},
-            "repairs_applied": ["reversed_bounds"],
-            "facing": "south",
-        },
-    )
-    assert set(edit_plan.execute_args) <= edit_sig
-    assert "from" not in edit_plan.execute_args
-    assert "to" not in edit_plan.execute_args
-    # Bounded repair evidence is the one recovery-only exception: it must
-    # survive approval resume so the final model result can explain canonicalization.
-    assert edit_plan.execute_args["repairs_applied"] == ["reversed_bounds"]
-    assert "edits" in edit_plan.execute_args
-    assert "dimension" in edit_plan.execute_args
-    assert "locked_targets" in edit_plan.execute_args
+    assert place_sig == {"pos", "block", "expect", "states"}
+    assert fill_sig == {"from", "to", "block", "expect", "states"}
+    assert inspect_sig == {"target"}
 
-    inspect_plan = build_block_preflight_plan(
-        "inspect_block",
-        {
-            "coordinate_mode": "player_relative",
-            "dimension": "minecraft:overworld",
-            "target": {
-                "positions": [{"forward": 1, "right": 0, "up": 0}],
-            },
-        },
-        {
-            "locked_targets": [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}],
-            "dimension": "minecraft:overworld",
-            "facing": "east",
-            "player_origin": {"x": 0, "y": 64, "z": 0},
-        },
-    )
-    assert set(inspect_plan.execute_args) <= inspect_sig
-    assert "facing" not in inspect_plan.execute_args
-    assert "player_origin" not in inspect_plan.execute_args
-
-
-@pytest.mark.parametrize(
-    ("authorized_args", "message"),
-    [
-        ({"type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "position": {"x": 1}, "locked_targets": [{}], "phase": "preflight"}, "incomplete"),
-        ({"type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "position": {"x": 1}, "locked_targets": [], "phase": "execute"}, "incomplete"),
-        ({"type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "locked_targets": [{}], "phase": "execute"}, "place position"),
-        ({"type_id": "minecraft:stone", "mode": "batch", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "positions": [], "locked_targets": [{}], "phase": "execute"}, "non-empty batch"),
-        ({"type_id": "minecraft:stone", "mode": "fill", "coordinate_mode": "absolute", "dimension": "minecraft:overworld", "locked_targets": [{}], "phase": "execute"}, "fill bounds"),
-    ],
-)
-def test_corrupt_edit_approval_contract_is_rejected_before_bridge(
-    authorized_args: dict[str, Any], message: str
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        project_block_execute_args("edit_blocks", authorized_args)
-    result = classify_tool_exception(
-        ValueError(f"block preflight execution contract {message}"), tool_name="edit_blocks"
-    )
-    assert json.loads(result.output)["code"] == "INTERNAL_ERROR"
-
-
-@pytest.mark.asyncio
-async def test_harness_approved_edit_uses_preflight_cache() -> None:
-    """After preflight cache is warm, approved call_tool executes once with locked args."""
-
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    policy = PolicyEngine.from_settings(_Settings())
-
-    agent = Agent("test", deps_type=_Deps, output_type=str)
-    register_agent_tools(agent)
-    # Build a thin wrapper toolset over the registered FunctionToolset path is hard;
-    # instead exercise preflight cache + edit_blocks_impl as the execute path does.
-
-    original_args = {
-        "mode": "place",
-        "type_id": "minecraft:stone",
-        "coordinate_mode": "absolute",
-        "dimension": "minecraft:overworld",
-        "position": {"x": 8, "y": 64, "z": 8},
-    }
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-pf-2")
-    ctx = SimpleNamespace(deps=deps, tool_call_id="tc-1", tool_call_approved=False)
-
-    plan, failure = await run_block_preflight(ctx, "edit_blocks", original_args)  # type: ignore[arg-type]
-    assert failure is None
-    assert plan is not None
-    assert plan.authorized_args.get("phase") == "execute"
-    assert plan.authorized_args.get("locked_targets")
-
-    original_hash = hash_normalized_args(normalize_tool_args(original_args))
-    get_preflight_cache().put(
-        run_id="run-pf-2",
-        tool_call_id="tc-1",
-        original_args_hash=original_hash,
-        canonical_args=plan.authorized_args,
-        connection_id=cid,
-    )
-
-    # Simulate approved execute with original args (as pydantic-ai re-invokes).
-    # Harness would recover canonical from cache; we mirror that recovery.
-    recovered = get_preflight_cache().get("run-pf-2", "tc-1", original_hash)
-    assert recovered is not None
-    exec_args = recovered.canonical_args
-    result = await edit_blocks_impl(
-        ctx,  # type: ignore[arg-type]
-        mode=exec_args.get("mode", "place"),  # type: ignore[arg-type]
-        coordinate_mode=exec_args.get("coordinate_mode", "absolute"),  # type: ignore[arg-type]
-        dimension=exec_args.get("dimension"),
-        position=exec_args.get("position"),
-        type_id=str(exec_args.get("type_id")),
-        locked_targets=exec_args.get("locked_targets"),
-        phase=exec_args.get("phase") or "execute",
-    )
-    assert result.is_success
-    execute_calls = [
-        c for c in bridge.calls if c[0] == "edit_blocks" and c[1].get("phase") == "execute"
-    ]
-    assert len(execute_calls) == 1
-    wire = execute_calls[0][1]
-    # Absolute place freezes the target via position; locked_targets may be
-    # omitted from the wire payload while remaining in the approval plan.
-    assert wire.get("phase") == "execute"
-    assert wire.get("position") == exec_args.get("position")
-    assert recovered.canonical_args.get("locked_targets")
-    # policy: edit requires approval unless approved
-    need = policy.decide("edit_blocks", normalize_tool_args(plan.authorized_args), player_name="Steve")
-    assert need.action == PolicyDecisionKind.REQUIRE_APPROVAL
-    allow = policy.decide(
-        "edit_blocks",
-        normalize_tool_args(plan.authorized_args),
-        player_name="Steve",
-        approved=True,
-    )
-    assert allow.action == PolicyDecisionKind.ALLOW
-
-
-@pytest.mark.asyncio
-async def test_edit_blocks_execute_with_locked_targets_skips_re_preflight() -> None:
-    """Canonical locked_targets + phase=execute goes straight to bridge execute."""
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge)
-    ctx = SimpleNamespace(deps=deps)
-    result = await edit_blocks_impl(
-        ctx,  # type: ignore[arg-type]
-        mode="place",
-        coordinate_mode="absolute",
-        dimension="minecraft:overworld",
-        position={"x": 1, "y": 64, "z": 1},
-        type_id="minecraft:stone",
-        locked_targets=[{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}],
-        phase="execute",
-    )
-    assert result.is_success
-    assert any(
-        c[0] == "edit_blocks" and c[1].get("phase") == "execute" for c in bridge.calls
-    )
-
-
+    # No hidden fields in any of the new tools.
+    for sig in (place_sig, fill_sig, inspect_sig):
+        for hidden in ("locked_targets", "phase", "status", "dimension", "edits", "mode"):
+            assert hidden not in sig, f"{hidden} should not be in {sig}"
 @pytest.mark.asyncio
 async def test_harness_inspect_auto_allows_when_supported() -> None:
     bridge = _FakeBridge()
@@ -4024,12 +2717,15 @@ async def test_harness_inspect_auto_allows_when_supported() -> None:
         locked_targets: list[dict[str, Any]] | None = None,
         phase: str | None = None,
     ) -> str:
+        # Task 2: impl takes the unified target only; translate legacy kwargs.
+        target: dict[str, Any] | None = None
+        if position is not None:
+            target = {"positions": [position]}
+        elif positions is not None:
+            target = {"positions": positions}
         return await inspect_block_impl(
             ctx,  # type: ignore[arg-type]
-            coordinate_mode=coordinate_mode,  # type: ignore[arg-type]
-            dimension=dimension,
-            position=position,
-            positions=positions,
+            target=target,
             locked_targets=locked_targets,
             phase=phase,
         )
@@ -4106,356 +2802,52 @@ def test_normalize_expect_kinds() -> None:
     ) == (False, {"type_id": "minecraft:stone", "states": {"lit": True}})
 
 
-def test_new_edit_contract_rejects_zero_and_many_edits() -> None:
-    from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
+def test_expect_to_legacy_permutation_descriptor() -> None:
+    """T2-M3: expect={type_id, states} maps to expected_previous with states."""
+    from services.agent.block_ops.tools_impl import _expect_to_legacy
 
-    limits = SimpleNamespace(
-        max_discrete_positions=256, max_fill_volume=4096,
-        max_edits_per_group=16, max_total_targets_per_group=4096,
+    replace_any, expected_previous, error = _expect_to_legacy(
+        {"type_id": "minecraft:stone", "states": {"lit": True}}
     )
-    # Zero edits -> invalid.
-    norms, error = _normalize_edits_for_preflight(
-        {"edits": []}, limits.max_discrete_positions, limits.max_fill_volume,
-        limits.max_edits_per_group, limits.max_total_targets_per_group,
-    )
-    assert norms is None
+    assert error is None
+    assert replace_any is False
+    assert expected_previous == {"type_id": "minecraft:stone", "states": {"lit": True}}
+
+    # Empty type_id in the descriptor is rejected as INVALID_ARGUMENT.
+    replace_any, expected_previous, error = _expect_to_legacy({"type_id": ""})
     assert error is not None
-    assert json.loads(error.output)["code"] == "INVALID_ARGUMENT"
-    # Two edits now VALID (issue 04 removes the single-edit limit).
-    norms, error = _normalize_edits_for_preflight(
-        {"edits": [
-            {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"},
-            {"target": {"positions": [{"x": 2, "y": 64, "z": 2}]}, "block": "minecraft:stone"},
-        ], "dimension": "minecraft:overworld"},
-        limits.max_discrete_positions, limits.max_fill_volume,
-        limits.max_edits_per_group, limits.max_total_targets_per_group,
-    )
+    body = json.loads(error.output)
+    assert body["code"] == "INVALID_ARGUMENT"
+    assert "expect.type_id 必填" in body["message"]
+
+    # Plain strings keep the existing mapping.
+    replace_any, expected_previous, error = _expect_to_legacy("minecraft:oak_planks")
     assert error is None
-    assert norms is not None
-    assert len(norms) == 2
-    # Exceeding max_edits_per_group -> LIMIT_EXCEEDED.
-    limits_small = SimpleNamespace(
-        max_discrete_positions=256, max_fill_volume=4096,
-        max_edits_per_group=1, max_total_targets_per_group=4096,
-    )
-    norms, error = _normalize_edits_for_preflight(
-        {"edits": [
-            {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"},
-            {"target": {"positions": [{"x": 2, "y": 64, "z": 2}]}, "block": "minecraft:stone"},
-        ], "dimension": "minecraft:overworld"},
-        limits_small.max_discrete_positions, limits_small.max_fill_volume,
-        limits_small.max_edits_per_group, limits_small.max_total_targets_per_group,
-    )
-    assert norms is None
-    assert error is not None
-    assert json.loads(error.output)["code"] == "LIMIT_EXCEEDED"
+    assert replace_any is False
+    assert expected_previous == {"type_id": "minecraft:oak_planks"}
 
 
-def _norm_first(norms):
-    assert norms is not None and norms
-    return norms[0]
+def test_inspect_target_schema_exposes_point_or_box_union() -> None:
+    """The inspect_block target schema is a single-point or two-corner union.
 
+    Runtime rejection of invalid coordinates (non-int / wrong length) is
+    covered by the impl-level INVALID_COORDINATE tests, not by Pydantic here.
+    """
+    from services.agent.tools import BlockPosition
 
-def test_new_edit_contract_single_position_maps_to_place() -> None:
-    from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
+    # Note: BlockPosition / InspectTarget are Annotated types used as function
+    # parameter annotations; they are validated by PydanticAI at tool call time.
+    # Pydantic native validation of Annotated[list[int], Field(min_length=3, max_length=3)]
+    # is exercised through the function signature, not model_validate directly.
+    # The schema-level constraints are verified in test_block_tool_schemas_only_expose_public_fields.
 
-    limits = SimpleNamespace(
-        max_discrete_positions=256, max_fill_volume=4096,
-        max_edits_per_group=16, max_total_targets_per_group=4096,
-    )
-    norms, error = _normalize_edits_for_preflight(
-        {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}],
-         "dimension": "minecraft:overworld"},
-        limits.max_discrete_positions, limits.max_fill_volume,
-        limits.max_edits_per_group, limits.max_total_targets_per_group,
-    )
-    assert error is None
-    legacy = _norm_first(norms).legacy
-    assert legacy["mode"] == "place"
-    assert legacy["coordinate_mode"] == "absolute"
-    assert legacy["position"] == {"x": 1, "y": 64, "z": 1}
-    assert legacy["type_id"] == "minecraft:stone"
-    assert "from" not in legacy and "to" not in legacy
-    assert legacy["replace_any"] is False
-    assert legacy["expected_previous"] is None
-
-
-def test_new_edit_contract_multi_position_maps_to_batch() -> None:
-    from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
-
-    limits = SimpleNamespace(
-        max_discrete_positions=256, max_fill_volume=4096,
-        max_edits_per_group=16, max_total_targets_per_group=4096,
-    )
-    norms, error = _normalize_edits_for_preflight(
-        {"edits": [{"target": {"positions": [
-            {"x": 1, "y": 64, "z": 1}, {"x": 2, "y": 64, "z": 1},
-        ]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"},
-        limits.max_discrete_positions, limits.max_fill_volume,
-        limits.max_edits_per_group, limits.max_total_targets_per_group,
-    )
-    assert error is None
-    legacy = _norm_first(norms).legacy
-    assert legacy["mode"] == "batch"
-    assert legacy["positions"] == [{"x": 1, "y": 64, "z": 1}, {"x": 2, "y": 64, "z": 1}]
-    assert "position" not in legacy
-
-
-def test_new_edit_contract_box_maps_to_fill() -> None:
-    from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
-
-    limits = SimpleNamespace(
-        max_discrete_positions=256, max_fill_volume=4096,
-        max_edits_per_group=16, max_total_targets_per_group=4096,
-    )
-    norms, error = _normalize_edits_for_preflight(
-        {"edits": [{"target": {"box": {"from": {"x": 5, "y": 64, "z": 5}, "to": {"x": 1, "y": 64, "z": 1}}},
-                    "block": "minecraft:stone"}], "dimension": "minecraft:overworld"},
-        limits.max_discrete_positions, limits.max_fill_volume,
-        limits.max_edits_per_group, limits.max_total_targets_per_group,
-    )
-    assert error is None
-    legacy = _norm_first(norms).legacy
-    assert legacy["mode"] == "fill"
-    # Reversed corners are normalized (min/max).
-    assert legacy["from"] == {"x": 1, "y": 64, "z": 1}
-    assert legacy["to"] == {"x": 5, "y": 64, "z": 5}
-    assert "position" not in legacy and "positions" not in legacy
-
-
-def test_new_edit_contract_expect_type_and_any() -> None:
-    from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
-
-    limits = SimpleNamespace(
-        max_discrete_positions=256, max_fill_volume=4096,
-        max_edits_per_group=16, max_total_targets_per_group=4096,
-    )
-    # expect="minecraft:oak_planks" -> expected_previous={type_id}
-    norms, _ = _normalize_edits_for_preflight(
-        {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone",
-                    "expect": "minecraft:oak_planks"}], "dimension": "minecraft:overworld"},
-        limits.max_discrete_positions, limits.max_fill_volume,
-        limits.max_edits_per_group, limits.max_total_targets_per_group,
-    )
-    legacy = _norm_first(norms).legacy
-    assert legacy["replace_any"] is False
-    assert legacy["expected_previous"] == {"type_id": "minecraft:oak_planks"}
-    # expect="any" -> replace_any=True
-    norms, _ = _normalize_edits_for_preflight(
-        {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone",
-                    "expect": "any"}], "dimension": "minecraft:overworld"},
-        limits.max_discrete_positions, limits.max_fill_volume,
-        limits.max_edits_per_group, limits.max_total_targets_per_group,
-    )
-    legacy = _norm_first(norms).legacy
-    assert legacy["replace_any"] is True
-    assert legacy["expected_previous"] is None
-
-
-def test_new_edit_contract_mixed_coords_invalid() -> None:
-    from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
-
-    limits = SimpleNamespace(
-        max_discrete_positions=256, max_fill_volume=4096,
-        max_edits_per_group=16, max_total_targets_per_group=4096,
-    )
-    norms, error = _normalize_edits_for_preflight(
-        {"edits": [{"target": {"positions": [
-            {"x": 1, "y": 64, "z": 1}, {"forward": 1, "right": 0, "up": 0},
-        ]}, "block": "minecraft:stone"}], "dimension": "minecraft:overworld"},
-        limits.max_discrete_positions, limits.max_fill_volume,
-        limits.max_edits_per_group, limits.max_total_targets_per_group,
-    )
-    assert norms is None
-    assert error is not None
-    assert json.loads(error.output)["code"] == "INVALID_COORDINATE"
-
-
-def test_new_edit_contract_absolute_without_dimension_is_deferred_to_addon() -> None:
-    from services.agent.block_ops.tools_impl import _normalize_edits_for_preflight
-
-    limits = SimpleNamespace(
-        max_discrete_positions=256, max_fill_volume=4096,
-        max_edits_per_group=16, max_total_targets_per_group=4096,
-    )
-    norms, error = _normalize_edits_for_preflight(
-        {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"}]},
-        limits.max_discrete_positions, limits.max_fill_volume,
-        limits.max_edits_per_group, limits.max_total_targets_per_group,
-    )
-    assert error is None
-    assert norms is not None
-    assert _norm_first(norms).legacy["coordinate_mode"] == "absolute"
-    assert "dimension" not in _norm_first(norms).legacy
-
-
-def test_block_tool_schema_rejects_invalid_target_and_edit_shapes() -> None:
-    """The public schema, not only host logic, constrains the new contract."""
-    from pydantic import ValidationError
-
-    from services.agent.tools import BlockEdit, BlockTarget
-
-    with pytest.raises(ValidationError):
-        BlockTarget.model_validate({
-            "positions": [{"x": 1, "y": 64, "z": 1}],
-            "box": {"from": {"x": 1, "y": 64, "z": 1}, "to": {"x": 2, "y": 64, "z": 2}},
-        })
-    with pytest.raises(ValidationError):
-        BlockEdit.model_validate({
-            "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-        })
-    with pytest.raises(ValidationError):
-        BlockEdit.model_validate({
-            "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-            "block": {"type_id": "minecraft:stone", "states": "not-an-object"},
-        })
-    target_schema = BlockTarget.model_json_schema()
-    assert len(target_schema["oneOf"]) == 2
-    assert target_schema["oneOf"][0]["required"] == ["positions"]
-    assert target_schema["oneOf"][1]["required"] == ["box"]
-
-
-@pytest.mark.asyncio
-async def test_grouped_absolute_edit_defaults_dimension_and_preserves_addon_repairs() -> None:
-    """The Add-on resolves omitted dimensions and the canonical plan retains its evidence."""
-    repair = {
-        "field": "dimension",
-        "from": None,
-        "to": "minecraft:overworld",
-        "reason": "current_player_dimension_default",
-    }
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks":
-            assert payload.get("phase") == "preflight"
-            assert "dimension" not in payload
-            position = payload["position"]
-            return {
-                "ok": True,
-                "payload": {
-                    "ok": True,
-                    "phase": "preflight",
-                    "mode": "place",
-                    "dimension": "minecraft:overworld",
-                    "locked_targets": [{
-                        "dimension": "minecraft:overworld",
-                        "x": position["x"],
-                        "y": position["y"],
-                        "z": position["z"],
-                    }],
-                    "repairs_applied": [repair],
-                },
-            }
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-default-dim")
-    plan, failure = await run_block_preflight(
-        SimpleNamespace(deps=deps),  # type: ignore[arg-type]
-        "edit_blocks",
-        {"edits": [
-            {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stone"},
-            {"target": {"positions": [{"x": 2, "y": 64, "z": 1}]}, "block": "minecraft:dirt"},
-        ]},
-    )
-
-    assert failure is None
-    assert plan is not None
-    assert plan.execute_args["dimension"] == "minecraft:overworld"
-    assert plan.approval_metadata["repairs_applied"] == [repair]
-    assert plan.execute_args["repairs_applied"] == [repair]
-
-
-@pytest.mark.asyncio
-async def test_new_edit_contract_end_to_end_place_through_harness() -> None:
-    """Full harness run: new edits contract -> preflight -> approval -> execute."""
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    policy = PolicyEngine.from_settings(_Settings())
-    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
-        "test",
-        deps_type=_Deps,
-        output_type=[str, DeferredToolRequests],
-        capabilities=[HarnessCapability(policy=policy)],
-    )
+    # Validate inspect_block schema has anyOf for target union.
+    agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
     register_agent_tools(agent)
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        return ModelResponse(parts=[ToolCallPart(
-            tool_name="edit_blocks", tool_call_id="tc-e2e",
-            args={
-                "edits": [{"target": {"positions": [{"x": 3, "y": 70, "z": 3}]}, "block": "oak_planks"}],
-                "dimension": "minecraft:overworld",
-            },
-        )])
-
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-e2e")
-    first = await agent.run("place", model=FunctionModel(model_fn), deps=deps)
-    assert isinstance(first.output, DeferredToolRequests)
-    approval = first.output.approvals[0]
-    meta = (first.output.metadata or {}).get(approval.tool_call_id) or {}
-    normalized = meta.get("normalized_args") or {}
-    # Target resolved to absolute position and frozen into edits[0]; locked_targets stored.
-    assert normalized["edits"][0]["target"]["positions"] == [{"x": 3, "y": 70, "z": 3}]
-    assert normalized.get("locked_targets")
-    assert normalized["phase"] == "execute"
-    # Preflight ran; execute did not.
-    assert any(c[0] == "edit_blocks" and c[1].get("phase") == "preflight" for c in bridge.calls)
-    assert not any(c[0] == "edit_blocks" and c[1].get("phase") == "execute" for c in bridge.calls)
-
-
-@pytest.mark.asyncio
-async def test_new_edit_contract_zero_match_is_precondition_failed() -> None:
-    """New contract: preflight zero-match -> PRECONDITION_FAILED with actual_type_counts."""
-
-    class _ZeroMatchBridge(_FakeBridge):
-        async def request(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-            if capability == "edit_blocks" and payload.get("phase") == "preflight":
-                return {
-                    "ok": True,
-                    "payload": {
-                        "schema_version": "1",
-                        "ok": True,
-                        "phase": "preflight",
-                        "mode": "place",
-                        "type_id": payload.get("type_id"),
-                        "locked_targets": [],
-                        "matched_count": 0,
-                        "already_target": 0,
-                        "skipped": 1,
-                        "previous_type_counts": {"minecraft:oak_planks": 1},
-                        "coordinate_mode": "absolute",
-                        "dimension": payload.get("dimension"),
-                        "position": payload.get("position"),
-                        "volume": 1,
-                        "repairs_applied": [],
-                    },
-                }
-            return await super().request(capability, payload)
-
-    bridge = _ZeroMatchBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge)
-    ctx = SimpleNamespace(deps=deps)
-    plan, failure = await run_block_preflight(
-        ctx,  # type: ignore[arg-type]
-        "edit_blocks",
-        {"edits": [{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:glass"}],
-         "dimension": "minecraft:overworld"},
-    )
-    assert plan is None
-    assert failure is not None
-    body = json.loads(failure.output)
-    assert body["code"] == "PRECONDITION_FAILED"
-    assert body["actual_type_counts"] == {"minecraft:oak_planks": 1}
-    assert "expect" in body.get("hint", "")
-    assert "minecraft:oak_planks" in body["hint"]
+    tools = iter_registered_tools(agent)  # type: ignore[arg-type]
+    target_schema = tools["inspect_block"].tool_def.parameters_json_schema["properties"]["target"]
+    assert "anyOf" in target_schema
+    assert len(target_schema["anyOf"]) == 2
 
 
 def test_precondition_error_projects_bounded_actual_type_counts() -> None:
@@ -4518,1177 +2910,89 @@ def test_precondition_any_protected_does_not_suggest_any() -> None:
     assert "any" not in body["hint"]
 
 
-def test_model_visible_edit_blocks_schema_exposes_only_edits_contract() -> None:
-    """Model-facing schema (after strip) must only expose the new contract."""
-    from pydantic_ai.tools import ToolDefinition
-
-    from services.agent.harness.execution import strip_block_internal_tool_schema
-
+def test_model_visible_place_fill_schema_exposes_only_single_op_contract() -> None:
+    """Model-facing place_block / fill_block schema exposes only the new single-op contract."""
     agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
     register_agent_tools(agent)
     tools = iter_registered_tools(agent)  # type: ignore[arg-type]
-    tool = tools["edit_blocks"]
-    raw_schema = tool.function_schema.json_schema
-    raw_props = set(raw_schema.get("properties") or {})
-    # Model-visible fields are edits + dimension.
-    assert "edits" in raw_props
-    assert "dimension" in raw_props
-    # Old flat params must NOT appear in the model schema at all.
+
+    # place_block: pos, block, expect, states
+    place_schema = tools["place_block"].tool_def.parameters_json_schema
+    place_props = set(place_schema.get("properties") or {})
+    assert place_props == {"pos", "block", "expect", "states"}
     for legacy in ("mode", "coordinate_mode", "position", "positions",
-                   "from", "to", "from_pos", "to_pos", "type_id",
-                   "replace_any", "expected_previous"):
-        assert legacy not in raw_props, legacy
-    # locked_targets / phase are harness-only (present in raw, stripped for model).
-    assert "locked_targets" in raw_props
-    assert "phase" in raw_props
-    assert "status" in raw_props
+                   "edits", "dimension", "locked_targets", "phase", "status"):
+        assert legacy not in place_props, legacy
 
-    stripped = strip_block_internal_tool_schema(
-        ToolDefinition(
-            name="edit_blocks",
-            description=tool.description or "",
-            parameters_json_schema=raw_schema,
-        )
-    )
-    stripped_props = set(stripped.parameters_json_schema.get("properties") or {})
-    assert stripped_props == {"edits", "dimension"}
-    assert not {
-        "locked_targets",
-        "locked_targets_by_edit",
-        "noop_edit_indices",
-        "repairs_applied",
-        "phase",
-        "status",
-    } & stripped_props
+    # fill_block: from, to, block, expect, states
+    fill_schema = tools["fill_block"].tool_def.parameters_json_schema
+    fill_props = set(fill_schema.get("properties") or {})
+    assert fill_props == {"from", "to", "block", "expect", "states"}
+    for legacy in ("mode", "coordinate_mode", "position", "positions",
+                   "edits", "dimension", "locked_targets", "phase", "status"):
+        assert legacy not in fill_props, legacy
 
+    # Schema size check: new tools are much smaller than old edit_blocks.
+    # Task 7 pins the exact 2,271-char edit_blocks baseline as the upper bound.
     schema_bytes = len(
         json.dumps(
-            stripped.parameters_json_schema,
+            place_schema,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
     )
-    assert schema_bytes <= 4096
-    assert len(stripped.description or "") <= 1600
+    assert schema_bytes <= 2271
 
 
-def test_edit_blocks_schema_description_has_short_canonical_examples() -> None:
+def test_place_fill_block_descriptions_are_concise() -> None:
     agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
     register_agent_tools(agent)
-    description = iter_registered_tools(agent)["edit_blocks"].description or ""
+    tools = iter_registered_tools(agent)
+    place_tool = tools["place_block"]
+    fill_tool = tools["fill_block"]
+    place_desc = place_tool.description or ""
+    fill_desc = fill_tool.description or ""
 
-    box_example = (
-        '{"target":{"box":{"from":{"x":0,"y":64,"z":0},'
-        '"to":{"x":4,"y":64,"z":4}}},"block":"oak_planks",'
-        '"expect":"any"}'
-    )
-    positions_example = (
-        '{"target":{"positions":[{"x":0,"y":65,"z":0}]},'
-        '"block":"oak_log","expect":"air"}'
-    )
-    assert description.count(box_example) == 1
-    assert description.count(positions_example) == 1
-    assert "target.target" not in description
-    assert "replace_any" not in description
+    # PydanticAI puts the docstring summary in `description` and per-arg docs
+    # in JSON-schema property descriptions, so assert on both layers.
+    assert "单个格子" in place_desc
+    assert "长方体区域" in fill_desc
+
+    place_props = place_tool.tool_def.parameters_json_schema["properties"]
+    fill_props = fill_tool.tool_def.parameters_json_schema["properties"]
+    assert "目标坐标" in place_props["pos"]["description"]
+    assert "区域一角" in fill_props["from"]["description"]
+    assert "区域另一角" in fill_props["to"]["description"]
+
+    # No legacy contract terms leaked into any description.
+    for desc in (place_desc, fill_desc):
+        assert "edits" not in desc
+        assert "target.target" not in desc
+        assert "replace_any" not in desc
+        assert "coordinate_mode" not in desc
 
 
 @pytest.mark.parametrize("provider", ("deepseek", "openai", "anthropic", "ollama"))
 def test_all_supported_providers_expose_the_same_block_tool_schema(provider: str) -> None:
     """Provider selection cannot expand the public block-tool contract."""
-    from pydantic_ai.tools import ToolDefinition
-
     from services.agent.core import ChatAgentManager
-    from services.agent.harness.execution import strip_block_internal_tool_schema
 
     manager = ChatAgentManager()
     manager._settings = Settings(default_provider=provider)
     tools = iter_registered_tools(manager._create_agent())
-    raw_schema = tools["edit_blocks"].function_schema.json_schema
-    visible = strip_block_internal_tool_schema(
-        ToolDefinition(
-            name="edit_blocks",
-            description=raw_schema.get("description", ""),
-            parameters_json_schema=raw_schema,
-        )
-    )
 
-    assert set(visible.parameters_json_schema.get("properties") or {}) == {
-        "edits",
-        "dimension",
-    }
+    # place_block
+    place_props = set(tools["place_block"].tool_def.parameters_json_schema.get("properties") or {})
+    assert place_props == {"pos", "block", "expect", "states"}
 
+    # fill_block
+    fill_props = set(tools["fill_block"].tool_def.parameters_json_schema.get("properties") or {})
+    assert fill_props == {"from", "to", "block", "expect", "states"}
 
-def _fixed_grouped_shape_model(
-    tool_calls: list[dict[str, Any]],
-    observed: list[dict[str, Any]],
-) -> FunctionModel:
-    """Return a deterministic FunctionModel for one grouped-edit scenario."""
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        del messages, info
-        index = len(observed)
-        if index == len(tool_calls):
-            return ModelResponse(parts=[TextPart(content="done")])
-        if index > len(tool_calls):
-            raise AssertionError("grouped fixture produced too many model calls")
-        args = tool_calls[index]
-        observed.append(args)
-        return ModelResponse(
-            parts=[
-                ToolCallPart(
-                    tool_name="edit_blocks",
-                    tool_call_id=f"grouped-shape-{index}",
-                    args=args,
-                )
-            ]
-        )
-
-    return FunctionModel(model_fn)
-
-
-async def _run_fixed_grouped_shape_fixture(
-    tool_calls: list[dict[str, Any]],
-    *,
-    bridge: _FakeBridge | None = None,
-) -> list[dict[str, Any]]:
-    bridge = bridge or _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
-        "test",
-        deps_type=_Deps,
-        output_type=[str, DeferredToolRequests],
-        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
-    )
-    register_agent_tools(agent)
-    observed: list[dict[str, Any]] = []
-    result = await agent.run(
-        "按施工阶段完成方块编辑",
-        model=_fixed_grouped_shape_model(tool_calls, observed),
-        deps=_Deps(
-            connection_id=cid,
-            addon_bridge=bridge,
-            settings=_Settings(),
-            run_id="run-grouped-shape",
-            auto_approve_tools=True,
-        ),
-    )
-    assert result.output == "done"
-    return observed
-
-
-@pytest.mark.asyncio
-async def test_grouped_shape_fixture_7x7_floor_uses_one_edit() -> None:
-    floor = {
-        "edits": [
-            {
-                "target": {
-                    "box": {
-                        "from": {"x": 0, "y": 64, "z": 0},
-                        "to": {"x": 6, "y": 64, "z": 6},
-                    }
-                },
-                "block": "oak_planks",
-                "expect": "air",
-            }
-        ],
-        "dimension": "minecraft:overworld",
-    }
-
-    observed = await _run_fixed_grouped_shape_fixture([floor])
-
-    assert len(observed) == 1
-    assert len(observed[0]["edits"]) == 1
-    assert observed[0]["edits"][0]["target"]["box"]["to"] == {
-        "x": 6,
-        "y": 64,
-        "z": 6,
-    }
-
-
-@pytest.mark.asyncio
-async def test_grouped_shape_fixture_four_walls_stays_within_soft_limit() -> None:
-    walls = {
-        "edits": [
-            {
-                "target": {
-                    "box": {
-                        "from": {"x": 0, "y": 65, "z": 0},
-                        "to": {"x": 6, "y": 68, "z": 0},
-                    }
-                },
-                "block": "stone",
-                "expect": "air",
-            },
-            {
-                "target": {
-                    "box": {
-                        "from": {"x": 0, "y": 65, "z": 6},
-                        "to": {"x": 6, "y": 68, "z": 6},
-                    }
-                },
-                "block": "stone",
-                "expect": "air",
-            },
-            {
-                "target": {
-                    "box": {
-                        "from": {"x": 0, "y": 65, "z": 1},
-                        "to": {"x": 0, "y": 68, "z": 5},
-                    }
-                },
-                "block": "stone",
-                "expect": "air",
-            },
-            {
-                "target": {
-                    "box": {
-                        "from": {"x": 6, "y": 65, "z": 1},
-                        "to": {"x": 6, "y": 68, "z": 5},
-                    }
-                },
-                "block": "stone",
-                "expect": "air",
-            },
-        ],
-        "dimension": "minecraft:overworld",
-    }
-
-    observed = await _run_fixed_grouped_shape_fixture([walls])
-
-    assert len(observed) == 1
-    assert 1 <= len(observed[0]["edits"]) <= 4
-    assert all("box" in edit["target"] for edit in observed[0]["edits"])
-
-
-@pytest.mark.asyncio
-async def test_grouped_shape_fixture_doorway_header_uses_positions_without_nested_target() -> None:
-    doorway_header = {
-        "edits": [
-            {
-                "target": {"positions": [{"x": 3, "y": 69, "z": 0}]},
-                "block": "oak_planks",
-                "expect": "air",
-            }
-        ],
-        "dimension": "minecraft:overworld",
-    }
-
-    observed = await _run_fixed_grouped_shape_fixture([doorway_header])
-
-    target = observed[0]["edits"][0]["target"]
-    assert target["positions"] == [{"x": 3, "y": 69, "z": 0}]
-    assert "target" not in target
-
-
-@pytest.mark.asyncio
-async def test_grouped_shape_fixture_validation_retry_repeats_floor_only() -> None:
-    class _RetryFloorBridge(_FakeBridge):
-        def __init__(self) -> None:
-            super().__init__()
-            self.preflight_attempts = 0
-
-        async def request(
-            self, capability: str, payload: dict[str, Any]
-        ) -> dict[str, Any]:
-            if capability == "edit_blocks" and payload.get("phase") == "preflight":
-                self.preflight_attempts += 1
-                if self.preflight_attempts == 1:
-                    return {
-                        "ok": False,
-                        "payload": {
-                            "code": "PRECONDITION_FAILED",
-                            "message": "floor precondition failed",
-                            "actual_type_counts": {"minecraft:stone": 49},
-                        },
-                    }
-            return await super().request(capability, payload)
-
-    floor = {
-        "edits": [
-            {
-                "target": {
-                    "box": {
-                        "from": {"x": 0, "y": 64, "z": 0},
-                        "to": {"x": 6, "y": 64, "z": 6},
-                    }
-                },
-                "block": "oak_planks",
-                "expect": "air",
-            }
-        ],
-        "dimension": "minecraft:overworld",
-    }
-    bridge = _RetryFloorBridge()
-
-    observed = await _run_fixed_grouped_shape_fixture([floor, floor], bridge=bridge)
-
-    assert len(observed) == 2
-    assert observed[1] == observed[0]
-    assert all(len(call["edits"]) == 1 for call in observed)
-    assert {
-        edit["block"]
-        for call in observed
-        for edit in call["edits"]
-    } == {"oak_planks"}
-    assert bridge.preflight_attempts == 2
-    assert len(
-        [
-            payload
-            for capability, payload in bridge.calls
-            if capability == "edit_blocks" and payload.get("phase") == "execute"
-        ]
-    ) == 1
-
-
-@pytest.mark.asyncio
-async def test_grouped_edits_produce_single_approval_then_aggregate_result() -> None:
-    """Two independent edits share one preflight + one approval, then execute."""
-    targets_a = [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}]
-    targets_b = [{"dimension": "minecraft:overworld", "x": 2, "y": 64, "z": 2}]
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks" and payload.get("phase") == "preflight":
-            positions = payload.get("positions")
-            if isinstance(positions, list) and positions:
-                locked = [{"dimension": "minecraft:overworld", "x": p["x"], "y": p["y"], "z": p["z"]} for p in positions]
-            else:
-                pos = payload.get("position") or {"x": 1, "y": 64, "z": 1}
-                locked = [{"dimension": "minecraft:overworld", "x": pos["x"], "y": pos["y"], "z": pos["z"]}]
-            return {
-                "ok": True,
-                "payload": {
-                    "ok": True, "phase": "preflight",
-                    "mode": payload.get("mode") or "place",
-                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
-                    "locked_targets": locked,
-                },
-            }
-        if capability == "edit_blocks" and payload.get("phase") == "execute":
-            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": 1}}
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
-        "test", deps_type=_Deps, output_type=[str, DeferredToolRequests],
-        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
-    )
-    register_agent_tools(agent)
-    original_args = {
-        "edits": [
-            {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:gold_block"},
-            {"target": {"positions": [{"x": 2, "y": 64, "z": 2}]}, "block": "minecraft:iron_block"},
-        ],
-        "dimension": "minecraft:overworld",
-    }
-    mc = 0
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal mc
-        mc += 1
-        if mc == 1:
-            return ModelResponse(parts=[ToolCallPart(tool_name="edit_blocks", tool_call_id="tc-g", args=original_args)])
-        return ModelResponse(parts=[TextPart(content="done")])
-
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-group")
-    first = await agent.run("edit", model=FunctionModel(model_fn), deps=deps)
-    assert isinstance(first.output, DeferredToolRequests)
-    # Exactly ONE approval covers the whole group.
-    assert len(first.output.approvals) == 1
-    approval = first.output.approvals[0]
-    execute_args = first.output.metadata[approval.tool_call_id]["execute_args"]
-    # The frozen plan carries BOTH edits under the new contract.
-    assert len(execute_args["edits"]) == 2
-    assert execute_args["edits"][0]["block"] == {"type_id": "minecraft:gold_block"}
-    assert execute_args["edits"][1]["block"] == {"type_id": "minecraft:iron_block"}
-    assert execute_args["locked_targets_by_edit"] == [targets_a, targets_b]
-
-    second = await agent.run(
-        message_history=first.all_messages(),
-        deferred_tool_results=DeferredToolResults(
-            approvals={approval.tool_call_id: ToolApproved(override_args=execute_args)},
-        ),
-        model=FunctionModel(model_fn),
-        deps=deps,
-    )
-    assert not isinstance(second.output, DeferredToolRequests)
-    # Both edits executed (one preflight each + one execute each), no re-preflight on resume.
-    phases = [p["phase"] for c, p in bridge.calls if c == "edit_blocks"]
-    assert phases == ["preflight", "preflight", "execute", "execute"]
-    # The aggregated group result reports both edits applied without over-claiming.
-    tool_contents = [
-        str(getattr(part, "content", ""))
-        for message in second.all_messages()
-        for part in getattr(message, "parts", [])
-    ]
-    group_result = json.loads(next(c for c in tool_contents if c.startswith("{") and "changed_total" in c))
-    assert group_result["ok"] is True
-    assert group_result["status"] == "applied"
-    assert group_result["changed_total"] == 2
-    assert len(group_result["edits"]) == 2
-    assert sum(e["changed"] for e in group_result["edits"]) == group_result["changed_total"]
-
-
-@pytest.mark.asyncio
-async def test_grouped_noop_edits_resume_without_execute_bridge_calls() -> None:
-    """All-noop groups retain their canonical execute contract without writes."""
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks" and payload.get("phase") == "preflight":
-            return {
-                "ok": True,
-                "payload": {
-                    "ok": True,
-                    "phase": "preflight",
-                    "mode": "place",
-                    "coordinate_mode": "absolute",
-                    "dimension": "minecraft:overworld",
-                    "status": "noop",
-                    "locked_targets": [],
-                },
-            }
-        pytest.fail(f"unexpected bridge call: {capability} {payload}")
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
-        "test", deps_type=_Deps, output_type=[str, DeferredToolRequests],
-        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
-    )
-    register_agent_tools(agent)
-    original_args = {
-        "edits": [
-            {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:gold_block"},
-            {"target": {"positions": [{"x": 2, "y": 64, "z": 2}]}, "block": "minecraft:iron_block"},
-        ],
-        "dimension": "minecraft:overworld",
-    }
-    model_calls = 0
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal model_calls
-        model_calls += 1
-        if model_calls == 1:
-            return ModelResponse(parts=[ToolCallPart(
-                tool_name="edit_blocks", tool_call_id="tc-noop", args=original_args,
-            )])
-        return ModelResponse(parts=[TextPart(content="done")])
-
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-noop")
-    first = await agent.run("edit", model=FunctionModel(model_fn), deps=deps)
-    assert isinstance(first.output, DeferredToolRequests)
-    approval = first.output.approvals[0]
-    execute_args = first.output.metadata[approval.tool_call_id]["execute_args"]
-    assert execute_args["status"] == "noop"
-    assert execute_args["locked_targets_by_edit"] == [[], []]
-
-    second = await agent.run(
-        message_history=first.all_messages(),
-        deferred_tool_results=DeferredToolResults(
-            approvals={approval.tool_call_id: ToolApproved(override_args=execute_args)},
-        ),
-        model=FunctionModel(model_fn),
-        deps=deps,
-    )
-    assert not isinstance(second.output, DeferredToolRequests)
-    phases = [p["phase"] for c, p in bridge.calls if c == "edit_blocks"]
-    assert phases == ["preflight", "preflight"]
-
-
-@pytest.mark.asyncio
-async def test_grouped_relative_box_honors_per_edit_volume_limit() -> None:
-    """Relative box dimensions are known before the bridge and cannot bypass limits."""
-    settings = Settings()
-    settings.addon.block_tools.max_fill_volume = 2
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=settings, run_id="run-relative-limit")
-
-    plan, failure = await run_block_preflight(
-        SimpleNamespace(deps=deps),  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "edits": [{
-                "target": {"box": {
-                    "from": {"forward": 0, "right": 0, "up": 0},
-                    "to": {"forward": 2, "right": 0, "up": 0},
-                }},
-                "block": "minecraft:stone",
-            }],
-        },
-    )
-    assert plan is None
-    assert failure is not None
-    assert json.loads(failure.output)["code"] == BlockErrorCode.LIMIT_EXCEEDED
-    assert not any(capability == "edit_blocks" for capability, _ in bridge.calls)
-
-
-@pytest.mark.asyncio
-async def test_grouped_discrete_positions_honor_group_limit() -> None:
-    """Several valid batches cannot bypass the group's discrete-position budget."""
-    settings = Settings()
-    settings.addon.block_tools.max_discrete_positions = 2
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=settings, run_id="run-discrete-limit")
-
-    plan, failure = await run_block_preflight(
-        SimpleNamespace(deps=deps),  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "edits": [
-                {"target": {"positions": [{"x": 1, "y": 64, "z": 1}, {"x": 2, "y": 64, "z": 1}]}, "block": "minecraft:stone"},
-                {"target": {"positions": [{"x": 3, "y": 64, "z": 1}]}, "block": "minecraft:stone"},
-            ],
-            "dimension": "minecraft:overworld",
-        },
-    )
-    assert plan is None
-    assert failure is not None
-    assert json.loads(failure.output)["code"] == BlockErrorCode.LIMIT_EXCEEDED
-    assert not any(capability == "edit_blocks" for capability, _ in bridge.calls)
-
-
-@pytest.mark.asyncio
-async def test_grouped_partial_box_overlap_lowers_later_edit_to_owned_positions() -> None:
-    """Identical overlapping fills never replay shared cells under expect=any."""
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks" and payload.get("phase") == "preflight":
-            from_pos = payload["from"]
-            to_pos = payload["to"]
-            locked = [
-                {"dimension": "minecraft:overworld", "x": x, "y": 64, "z": 1}
-                for x in range(min(from_pos["x"], to_pos["x"]), max(from_pos["x"], to_pos["x"]) + 1)
-            ]
-            return {
-                "ok": True,
-                "payload": {
-                    "ok": True, "phase": "preflight", "mode": "fill",
-                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
-                    "from": from_pos, "to": to_pos,
-                    "locked_targets": locked,
-                    "matched_count": len(locked),
-                    "volume": len(locked),
-                },
-            }
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-box-dedup")
-    plan, failure = await run_block_preflight(
-        SimpleNamespace(deps=deps),  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "edits": [
-                {"target": {"box": {"from": {"x": 1, "y": 64, "z": 1}, "to": {"x": 2, "y": 64, "z": 1}}}, "block": "minecraft:stone", "expect": "any"},
-                {"target": {"box": {"from": {"x": 2, "y": 64, "z": 1}, "to": {"x": 3, "y": 64, "z": 1}}}, "block": "minecraft:stone", "expect": "any"},
-            ],
-            "dimension": "minecraft:overworld",
-        },
-    )
-    assert failure is None
-    assert plan is not None
-    assert plan.execute_args["edits"][0]["target"] == {
-        "box": {"from": {"x": 1, "y": 64, "z": 1}, "to": {"x": 2, "y": 64, "z": 1}}
-    }
-    assert plan.execute_args["edits"][1]["target"] == {
-        "positions": [{"x": 3, "y": 64, "z": 1}]
-    }
-    assert plan.execute_args["locked_targets_by_edit"][1] == [
-        {"dimension": "minecraft:overworld", "x": 3, "y": 64, "z": 1}
-    ]
-
-
-@pytest.mark.asyncio
-async def test_grouped_edits_conflicting_cell_rejects_with_conflicting_edits() -> None:
-    """Two edits targeting the same cell with different blocks are rejected."""
-    shared = [{"dimension": "minecraft:overworld", "x": 5, "y": 64, "z": 5}]
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks" and payload.get("phase") == "preflight":
-            return {
-                "ok": True,
-                "payload": {
-                    "ok": True, "phase": "preflight", "mode": "place",
-                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
-                    "locked_targets": shared,
-                },
-            }
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-c")
-    ctx = SimpleNamespace(deps=deps)
-    plan, failure = await run_block_preflight(
-        ctx,  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "edits": [
-                {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "minecraft:gold_block"},
-                {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "minecraft:iron_block"},
-            ],
-            "dimension": "minecraft:overworld",
-        },
-    )
-    assert plan is None
-    assert failure is not None
-    body = json.loads(failure.output)
-    assert body["code"] == BlockErrorCode.CONFLICTING_EDITS
-    assert body["cell"] == {"x": 5, "y": 64, "z": 5}
-
-
-@pytest.mark.asyncio
-async def test_grouped_edits_identical_cell_dedups_silently() -> None:
-    """Two identical edits targeting the same cell: first wins, second is a noop."""
-    shared = [{"dimension": "minecraft:overworld", "x": 5, "y": 64, "z": 5}]
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks" and payload.get("phase") == "preflight":
-            return {
-                "ok": True,
-                "payload": {
-                    "ok": True, "phase": "preflight", "mode": "place",
-                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
-                    "locked_targets": shared,
-                },
-            }
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-d")
-    ctx = SimpleNamespace(deps=deps)
-    plan, failure = await run_block_preflight(
-        ctx,  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "edits": [
-                {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "minecraft:gold_block"},
-                {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "minecraft:gold_block"},
-            ],
-            "dimension": "minecraft:overworld",
-        },
-    )
-    # No conflict: identical signatures dedup. The frozen plan carries both edits.
-    assert failure is None
-    assert plan is not None
-    assert len(plan.execute_args["edits"]) == 2
-    # Approval resume still validates against the public schema, so a deduped
-    # noop retains one frozen representative position and is marked separately.
-    assert all(e["target"]["positions"] for e in plan.execute_args["edits"])
-    assert plan.execute_args["noop_edit_indices"] == [1]
-    assert tuple(plan.execute_args["edits"][0]["target"]["positions"][0].values()) == (5, 64, 5)
-
-
-@pytest.mark.asyncio
-async def test_grouped_edits_exceeding_edit_count_limit_rejected() -> None:
-    """Group edit-count limit (max_edits_per_group) is enforced before preflight."""
-    settings_obj = Settings()
-    settings_obj.addon.block_tools.max_edits_per_group = 2
-    edits = [
-        {"target": {"positions": [{"x": i, "y": 64, "z": 1}]}, "block": "minecraft:stone"}
-        for i in range(3)
-    ]
-    bridge = _FakeBridge()
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=settings_obj, run_id="run-lim")
-    ctx = SimpleNamespace(deps=deps)
-    plan, failure = await run_block_preflight(
-        ctx,  # type: ignore[arg-type]
-        "edit_blocks",
-        {"edits": edits, "dimension": "minecraft:overworld"},
-    )
-    assert plan is None
-    assert failure is not None
-    body = json.loads(failure.output)
-    assert body["code"] == BlockErrorCode.LIMIT_EXCEEDED
-    # No bridge edit call should have happened (rejected before preflight).
-    assert not any(cap == "edit_blocks" for cap, _ in bridge.calls)
-
-
-def test_project_group_edit_result_never_over_claims() -> None:
-    """Aggregated group result derives status conservatively (spec §9.3)."""
-    from services.agent.block_ops.project import project_group_edit_result_for_model
-
-    # One applied + one partial (skipped) -> group partial, changed_total sums.
-    per_edit = [
-        {"index": 0, "status": "applied", "changed": 3, "skipped": 0},
-        {"index": 1, "status": "partial", "changed": 1, "skipped": 2,
-         "skipped_type_counts": {"minecraft:water": 2}},
-    ]
-    group = project_group_edit_result_for_model(per_edit)
-    assert group["ok"] is True
-    assert group["status"] == "partial"
-    assert group["changed_total"] == 4
-    assert group["edits"][1]["skipped"] == 2
-    assert group["edits"][1]["skipped_type_counts"] == {"minecraft:water": 2}
-
-    # Any failure with nothing applied -> failed, ok False.
-    failed = project_group_edit_result_for_model([
-        {"index": 0, "status": "applied", "changed": 2, "skipped": 0},
-        {"index": 1, "status": "failed", "changed": 0, "skipped": 0},
-    ])
-    assert failed["ok"] is False
-    assert failed["status"] == "partial"
-
-    # All unknown -> unknown, ok False.
-    unknown = project_group_edit_result_for_model([
-        {"index": 0, "status": "unknown", "changed": 0, "skipped": 0},
-    ])
-    assert unknown["ok"] is False
-    assert unknown["status"] == "unknown"
-
-
-@pytest.mark.asyncio
-async def test_grouped_edits_mid_run_failure_returns_aggregated_result() -> None:
-    """A definite failure stops later edits but still returns the aggregate (spec §8.3/§9.3)."""
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks" and payload.get("phase") == "execute":
-            if payload.get("type_id") == "minecraft:iron_block":
-                return {"ok": False, "payload": {"code": "OUT_OF_BOUNDS"}}
-            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": 1}}
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-fail")
-    ctx = SimpleNamespace(deps=deps)
-    result = await _execute_edits_group(
-        ctx,  # type: ignore[arg-type]
-        edits=[
-            {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": {"type_id": "minecraft:gold_block"}},
-            {"target": {"positions": [{"x": 2, "y": 64, "z": 2}]}, "block": {"type_id": "minecraft:iron_block"}},
-            {"target": {"positions": [{"x": 3, "y": 64, "z": 3}]}, "block": {"type_id": "minecraft:diamond_block"}},
-        ],
-        dimension="minecraft:overworld",
-        phase="execute",
-    )
-    # Success-status ToolResult carrying the aggregate keeps the call idempotent
-    # (no re-execution of already-applied edits after a partial failure).
-    assert result.is_success
-    assert result.external_state_unknown is False
-    body = json.loads(result.output)
-    assert body["ok"] is False
-    assert body["status"] == "partial"
-    assert body["changed_total"] == 1
-    assert [e["status"] for e in body["edits"]] == ["applied", "failed", "failed"]
-    assert body["edits"][1]["error"] == "OUT_OF_BOUNDS"
-    # The third edit never ran and records which edit stopped it.
-    assert body["edits"][2]["stopped_by_index"] == 1
-    assert any("编辑 1 失败" in w for w in body.get("warnings", []))
-    # Only two execute payloads reached the bridge (third was stopped).
-    executes = [p for c, p in bridge.calls if c == "edit_blocks" and p.get("phase") == "execute"]
-    assert len(executes) == 2
-
-
-@pytest.mark.asyncio
-async def test_grouped_edit_propagates_allowed_command_fallback() -> None:
-    """A grouped ADDON_UNAVAILABLE result retains its structured fallback decision."""
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {
-                "ok": True,
-                "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}},
-            }
-        if capability == "edit_blocks" and payload.get("phase") == "execute":
-            return {"ok": False, "payload": {"code": "ADDON_UNAVAILABLE"}}
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-fallback")
-    result = await _execute_edits_group(
-        SimpleNamespace(deps=deps),  # type: ignore[arg-type]
-        edits=[
-            {
-                "target": {"positions": [{"x": 1, "y": 64, "z": 1}]},
-                "block": {"type_id": "minecraft:gold_block"},
-            }
-        ],
-        dimension="minecraft:overworld",
-        phase="execute",
-    )
-
-    body = json.loads(result.output)
-    assert body["ok"] is False
-    assert body["code"] == "ADDON_UNAVAILABLE"
-    assert body["fallback_allowed"] is True
-
-
-@pytest.mark.asyncio
-async def test_grouped_edits_unknown_halt_marks_external_state_unknown() -> None:
-    """STATE_UNKNOWN halts the group and flags external_state_unknown (spec §8.3)."""
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks" and payload.get("phase") == "execute":
-            if payload.get("type_id") == "minecraft:diamond_block":
-                return {"ok": False, "payload": {"code": "STATE_UNKNOWN"}}
-            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": 1}}
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-unknown")
-    ctx = SimpleNamespace(deps=deps)
-    result = await _execute_edits_group(
-        ctx,  # type: ignore[arg-type]
-        edits=[
-            {"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": {"type_id": "minecraft:gold_block"}},
-            {"target": {"positions": [{"x": 2, "y": 64, "z": 2}]}, "block": {"type_id": "minecraft:diamond_block"}},
-            {"target": {"positions": [{"x": 3, "y": 64, "z": 3}]}, "block": {"type_id": "minecraft:iron_block"}},
-        ],
-        dimension="minecraft:overworld",
-        phase="execute",
-    )
-    assert result.is_success
-    assert result.external_state_unknown is True
-    body = json.loads(result.output)
-    assert body["ok"] is False
-    assert body["status"] == "unknown"
-    assert body["changed_total"] == 1
-    assert body["edits"][1]["error"] == "STATE_UNKNOWN"
-    assert body["edits"][2]["stopped_by_index"] == 1
-
-
-@pytest.mark.asyncio
-async def test_grouped_edit_keeps_bounded_write_evidence_for_audit() -> None:
-    """The model projection excludes proof while the ToolResult retains it for audit."""
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks" and payload.get("phase") == "execute":
-            return {
-                "ok": True,
-                "payload": {
-                    "ok": True,
-                    "status": "applied",
-                    "changed": 1,
-                    "before": {"type_id": "minecraft:air"},
-                    "after": {"type_id": "minecraft:stone"},
-                    "verification": {"ok": True},
-                    "player_name": "must-not-be-retained",
-                },
-            }
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    result = await _execute_edits_group(
-        SimpleNamespace(deps=_Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings())),  # type: ignore[arg-type]
-        edits=[{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": {"type_id": "minecraft:stone"}}],
-        dimension="minecraft:overworld",
-        phase="execute",
-    )
-    assert "before" not in json.loads(result.output)
-    assert result.audit_evidence == {
-        "edits": [{
-            "index": 0,
-            "before": {"type_id": "minecraft:air"},
-            "after": {"type_id": "minecraft:stone"},
-            "verification": {"ok": True},
-        }]
-    }
-
-
-@pytest.mark.asyncio
-async def test_grouped_edits_deduped_noop_edit_executes_without_crash() -> None:
-    """Identical overlaps dedup; the noop edit reports noop instead of crashing execution."""
-    shared = [{"dimension": "minecraft:overworld", "x": 5, "y": 64, "z": 5}]
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks" and payload.get("phase") == "preflight":
-            return {
-                "ok": True,
-                "payload": {
-                    "ok": True, "phase": "preflight", "mode": "place",
-                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
-                    "locked_targets": shared,
-                },
-            }
-        if capability == "edit_blocks" and payload.get("phase") == "execute":
-            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": 1}}
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    agent: Agent[_Deps, str | DeferredToolRequests] = Agent(
-        "test", deps_type=_Deps, output_type=[str, DeferredToolRequests],
-        capabilities=[HarnessCapability(policy=PolicyEngine.from_settings(_Settings()))],
-    )
-    register_agent_tools(agent)
-    original_args = {
-        "edits": [
-            {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "minecraft:gold_block"},
-            {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "minecraft:gold_block"},
-        ],
-        "dimension": "minecraft:overworld",
-    }
-    mc = 0
-
-    async def model_fn(messages: list[ModelMessage], info: Any) -> ModelResponse:
-        nonlocal mc
-        mc += 1
-        if mc == 1:
-            return ModelResponse(parts=[ToolCallPart(tool_name="edit_blocks", tool_call_id="tc-d", args=original_args)])
-        return ModelResponse(parts=[TextPart(content="done")])
-
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-dedup")
-    first = await agent.run("edit", model=FunctionModel(model_fn), deps=deps)
-    assert isinstance(first.output, DeferredToolRequests)
-    assert len(first.output.approvals) == 1
-    approval = first.output.approvals[0]
-    meta = first.output.metadata[approval.tool_call_id]
-    execute_args = meta["execute_args"]
-    # Approval summary reflects the deduped plan (spec §5.2 / §8.2).
-    approval_meta = meta["approval_metadata"]
-    assert approval_meta["edit_count"] == 2
-    assert approval_meta["total_targets"] == 1
-    assert approval_meta["matched"] == 1
-    assert approval_meta["target_block_counts"] == {"minecraft:gold_block": 1}
-    assert [e["status"] for e in approval_meta["edits"]] == ["applied", "noop"]
-
-    second = await agent.run(
-        message_history=first.all_messages(),
-        deferred_tool_results=DeferredToolResults(
-            approvals={approval.tool_call_id: ToolApproved(override_args=execute_args)},
-        ),
-        model=FunctionModel(model_fn),
-        deps=deps,
-    )
-    assert not isinstance(second.output, DeferredToolRequests)
-    phases = [p["phase"] for c, p in bridge.calls if c == "edit_blocks"]
-    # Second (deduped noop) edit never sends a payload.
-    assert phases == ["preflight", "preflight", "execute"]
-    tool_contents = [
-        str(getattr(part, "content", ""))
-        for message in second.all_messages()
-        for part in getattr(message, "parts", [])
-    ]
-    group_result = json.loads(next(c for c in tool_contents if c.startswith("{") and "changed_total" in c))
-    assert group_result["ok"] is True
-    assert group_result["status"] == "applied"
-    assert group_result["changed_total"] == 1
-    assert [e["status"] for e in group_result["edits"]] == ["applied", "noop"]
-
-
-@pytest.mark.asyncio
-async def test_grouped_edits_relative_targets_freeze_absolute_coordinates() -> None:
-    """Approval resume uses frozen absolute coordinates and current player_name."""
-    locked = [{"dimension": "minecraft:overworld", "x": 10, "y": 64, "z": 10}]
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks" and payload.get("phase") == "preflight":
-            return {
-                "ok": True,
-                "payload": {
-                    "ok": True, "phase": "preflight", "mode": "place",
-                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
-                    "locked_targets": locked,
-                },
-            }
-        if capability == "edit_blocks" and payload.get("phase") == "execute":
-            return {"ok": True, "payload": {"ok": True, "phase": "execute", "changed": 1}}
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-frozen")
-    ctx = SimpleNamespace(deps=deps)
-    plan, failure = await run_block_preflight(
-        ctx,  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "edits": [
-                {"target": {"positions": [{"forward": 0, "right": 0, "up": 0}]}, "block": "minecraft:gold_block"},
-            ],
-            "dimension": "minecraft:overworld",
-        },
-    )
-    assert failure is None
-    assert plan is not None
-    frozen = plan.execute_args["edits"][0]["target"]["positions"]
-    assert frozen == [{"x": 10, "y": 64, "z": 10}]
-
-    result = await _execute_edits_group(
-        ctx,  # type: ignore[arg-type]
-        edits=plan.execute_args["edits"],
-        dimension=plan.execute_args.get("dimension"),
-        phase="execute",
-    )
-    body = json.loads(result.output)
-    assert body["ok"] is True
-    assert body["changed_total"] == 1
-    executes = [p for c, p in bridge.calls if c == "edit_blocks" and p.get("phase") == "execute"]
-    assert len(executes) == 1
-    assert executes[0]["coordinate_mode"] == "absolute"
-    assert executes[0]["position"] == {"x": 10, "y": 64, "z": 10}
-    assert executes[0]["player_name"] == deps.player_name
-
-
-@pytest.mark.asyncio
-async def test_grouped_edits_in_group_state_dependency_rejected_at_preflight() -> None:
-    """A plan where a later edit depends on an earlier edit fails preflight (spec §5.1)."""
-    gold_cell = [{"dimension": "minecraft:overworld", "x": 5, "y": 64, "z": 5}]
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks" and payload.get("phase") == "preflight":
-            expected = payload.get("expected_previous")
-            if isinstance(expected, dict) and expected.get("type_id") == "minecraft:gold_block":
-                # World does not have gold yet: the dependent edit cannot pass.
-                return {
-                    "ok": True,
-                    "payload": {
-                        "ok": True, "phase": "preflight", "mode": "place",
-                        "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
-                        "locked_targets": [], "matched_count": 0,
-                        "actual_type_counts": {"minecraft:stone": 1},
-                    },
-                }
-            return {
-                "ok": True,
-                "payload": {
-                    "ok": True, "phase": "preflight", "mode": "place",
-                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
-                    "locked_targets": gold_cell, "matched_count": 1,
-                },
-            }
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-dep")
-    ctx = SimpleNamespace(deps=deps)
-    plan, failure = await run_block_preflight(
-        ctx,  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "edits": [
-                {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "minecraft:gold_block"},
-                {"target": {"positions": [{"x": 6, "y": 64, "z": 6}]}, "block": "minecraft:diamond_block",
-                 "expect": "minecraft:gold_block"},
-            ],
-            "dimension": "minecraft:overworld",
-        },
-    )
-    # Rejected before approval: the group cannot rely on list order.
-    assert plan is None
-    assert failure is not None
-    body = json.loads(failure.output)
-    assert body["code"] == BlockErrorCode.PRECONDITION_FAILED
-    # The repair hint names the failing edit's own expect, not edits[0]'s.
-    assert "minecraft:stone" in body["hint"]
-    assert "minecraft:gold_block" not in body["hint"]
-    assert "设为 air" not in body["hint"]
-
-
-@pytest.mark.asyncio
-async def test_grouped_edits_approval_metadata_deduped_counts_and_repairs() -> None:
-    """Approval counts reflect deduped cells and surface auto-repair evidence."""
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks" and payload.get("phase") == "preflight":
-            cells = payload.get("positions") or [payload.get("position")]
-            locked = [
-                {"dimension": "minecraft:overworld", "x": p["x"], "y": p["y"], "z": p["z"]}
-                for p in cells
-                if isinstance(p, dict) and "x" in p
-            ]
-            return {
-                "ok": True,
-                "payload": {
-                    "ok": True, "phase": "preflight", "mode": payload.get("mode") or "place",
-                    "coordinate_mode": "absolute", "dimension": "minecraft:overworld",
-                    "locked_targets": locked, "matched_count": len(locked),
-                },
-            }
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-meta")
-    ctx = SimpleNamespace(deps=deps)
-    plan, failure = await run_block_preflight(
-        ctx,  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "edits": [
-                # Two identical edits: the second is fully deduped (noop).
-                {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "GOLD_BLOCK"},
-                {"target": {"positions": [{"x": 5, "y": 64, "z": 5}]}, "block": "GOLD_BLOCK"},
-                # Two independent iron cells.
-                {"target": {"positions": [{"x": 6, "y": 64, "z": 6}]}, "block": {"type_id": "minecraft:iron_block"}, "expect": "STONE"},
-                {"target": {"positions": [{"x": 7, "y": 64, "z": 7}]}, "block": {"type_id": "minecraft:iron_block"}},
-            ],
-            "dimension": "minecraft:overworld",
-        },
-    )
-    assert failure is None
-    assert plan is not None
-    meta = plan.approval_metadata
-    assert meta["edit_count"] == 4
-    assert meta["total_targets"] == 3
-    assert meta["matched"] == 3
-    assert meta["target_block_counts"] == {
-        "minecraft:gold_block": 1,
-        "minecraft:iron_block": 2,
-    }
-    assert [e["status"] for e in meta["edits"]] == ["applied", "noop", "applied", "applied"]
-    assert [e["matched"] for e in meta["edits"]] == [1, 0, 1, 1]
-    # Auto-repairs from block-id normalization are bounded and deduped (spec §4.2).
-    assert meta["repairs_applied"] == [
-        "block.type_id: lowercased 'GOLD_BLOCK' -> 'gold_block'",
-        "block.type_id: added namespace -> 'minecraft:gold_block'",
-        "expect.type_id: lowercased 'STONE' -> 'stone'",
-        "expect.type_id: added namespace -> 'minecraft:stone'",
-    ]
-
-
+    # inspect_block
+    inspect_props = set(tools["inspect_block"].tool_def.parameters_json_schema.get("properties") or {})
+    assert inspect_props == {"target"}
 def test_place_preflight_payload_with_expect_type_fits_command_line_budget() -> None:
     """Place preflight omits enumeration caps so expect-type frames stay under budget.
 
@@ -5753,39 +3057,6 @@ def test_place_preflight_payload_with_expect_type_fits_command_line_budget() -> 
     assert "cells_per_tick" in batch_payload
 
 
-def test_project_group_edit_result_noop_group_reports_noop() -> None:
-    """A group whose edits are all noops reports noop, never applied (spec §9.1)."""
-    from services.agent.block_ops.project import project_group_edit_result_for_model
-
-    noop = project_group_edit_result_for_model([
-        {"index": 0, "status": "noop", "changed": 0, "skipped": 0},
-        {"index": 1, "status": "noop", "changed": 0, "skipped": 0},
-    ])
-    assert noop["ok"] is True
-    assert noop["status"] == "noop"
-    assert noop["changed_total"] == 0
-
-    mixed = project_group_edit_result_for_model([
-        {"index": 0, "status": "noop", "changed": 0, "skipped": 0},
-        {"index": 1, "status": "applied", "changed": 2, "skipped": 0},
-    ])
-    assert mixed["ok"] is True
-    assert mixed["status"] == "applied"
-    assert mixed["changed_total"] == 2
-
-
-def test_project_group_edit_result_surfaces_bounded_repairs() -> None:
-    """Canonical block/expect repairs remain visible in the final group result."""
-    from services.agent.block_ops.project import project_group_edit_result_for_model
-
-    result = project_group_edit_result_for_model(
-        [{"index": 0, "status": "applied", "changed": 1, "skipped": 0}],
-        repairs_applied=[f"repair-{index}" for index in range(12)],
-    )
-
-    assert result["repairs_applied"] == [f"repair-{index}" for index in range(8)]
-
-
 # ---------------------------------------------------------------------------
 # issue 05 — block repair suggestions + multiblock safety (host-side)
 # ---------------------------------------------------------------------------
@@ -5808,7 +3079,7 @@ def test_block_unknown_surfaces_candidates_from_addon() -> None:
     assert not result.is_success
     body = json.loads(result.output)
     assert body["code"] == "BLOCK_UNKNOWN"
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["type_id"] == "minecraft:stonx"
     assert body["candidates"] == ["minecraft:stone", "minecraft:ston"]
     assert "hint" in body
@@ -5867,7 +3138,7 @@ def test_state_invalid_surfaces_valid_state_keys() -> None:
     assert not result.is_success
     body = json.loads(result.output)
     assert body["code"] == "STATE_INVALID"
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["type_id"] == "minecraft:oak_stairs"
     assert body["valid_state_keys"] == [
         "minecraft:cardinal_direction",
@@ -5911,7 +3182,7 @@ def test_protected_block_envelope_includes_component_and_target() -> None:
     assert not result.is_success
     body = json.loads(result.output)
     assert body["code"] == "PROTECTED_BLOCK"
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["type_id"] == "minecraft:chest"
     assert body["component"] == "minecraft:inventory"
     assert body["target"] == {"x": 10, "y": 64, "z": 10}
@@ -5921,7 +3192,8 @@ def test_protected_block_envelope_includes_component_and_target() -> None:
 
 
 def test_unsupported_block_placement_preserves_multiblock_flag() -> None:
-    """UNSUPPORTED_BLOCK_PLACEMENT is a PERMANENT error with fallback_allowed=False
+    """UNSUPPORTED_BLOCK_PLACEMENT is a PERMANENT error with fallback_allowed=True
+    (command fallback via setblock/fill places the full structure on 1.26.10+)
     and carries the type_id + multiblock flag (spec issue 05 §6/§7)."""
     result = map_addon_bridge_result(
         {
@@ -5929,7 +3201,7 @@ def test_unsupported_block_placement_preserves_multiblock_flag() -> None:
             "payload": {
                 "code": "UNSUPPORTED_BLOCK_PLACEMENT",
                 "message": "multiblock block requires multi-cell placement",
-                "type_id": "minecraft:oak_door",
+                "type_id": "minecraft:wooden_door",
                 "multiblock": True,
             },
         }
@@ -5937,26 +3209,30 @@ def test_unsupported_block_placement_preserves_multiblock_flag() -> None:
     assert not result.is_success
     body = json.loads(result.output)
     assert body["code"] == "UNSUPPORTED_BLOCK_PLACEMENT"
-    assert body["fallback_allowed"] is False
+    assert body["fallback_allowed"] is True
     assert body["retryable"] is False
-    assert body["type_id"] == "minecraft:oak_door"
+    assert body["type_id"] == "minecraft:wooden_door"
     assert body["multiblock"] is True
     assert "hint" in body
     assert "多格" in body["hint"]
+    assert "setblock" in body["hint"]
+    assert "1.26.10" in body["hint"]
 
 
 @pytest.mark.parametrize(
     ("code", "fallback_allowed"),
     [
-        ("BLOCK_UNKNOWN", False),
-        ("STATE_INVALID", False),
-        ("UNSUPPORTED_BLOCK_PLACEMENT", False),
+        ("BLOCK_UNKNOWN", True),
+        ("STATE_INVALID", True),
+        ("UNSUPPORTED_BLOCK_PLACEMENT", True),
+        ("STATE_UNKNOWN", False),
+        ("INTERNAL_ERROR", False),
     ],
 )
-def test_issue_05_error_codes_never_allow_fallback(
+def test_issue_05_error_codes_fallback_one_rule(
     code: str, fallback_allowed: bool
 ) -> None:
-    """All issue 05 error codes have fallback_allowed=False (spec §4.2/§4.3/§6)."""
+    """Issue 05 error codes allow fallback unless world state is unknown."""
     result = map_addon_bridge_result(
         {"ok": False, "payload": {"code": code, "message": "test"}}
     )
@@ -5965,183 +3241,771 @@ def test_issue_05_error_codes_never_allow_fallback(
     assert body["fallback_allowed"] is fallback_allowed
 
 
-def test_audit_evidence_fields_cover_issue_05_metadata() -> None:
-    """The _AUDIT_EDIT_EVIDENCE_FIELDS whitelist includes repair/safety keys
-    so tool audit records capture bounded issue 05 metadata (spec §5 task list)."""
-    from services.agent.block_ops.tools_impl import _AUDIT_EDIT_EVIDENCE_FIELDS
-
-    assert "repairs_applied" in _AUDIT_EDIT_EVIDENCE_FIELDS
-    assert "candidates" in _AUDIT_EDIT_EVIDENCE_FIELDS
-    assert "valid_state_keys" in _AUDIT_EDIT_EVIDENCE_FIELDS
-    assert "protected" in _AUDIT_EDIT_EVIDENCE_FIELDS
-    assert "multiblock" in _AUDIT_EDIT_EVIDENCE_FIELDS
+# ---------------------------------------------------------------------------
+# Task 2: single-op implementation layer (place_block_impl / fill_block_impl /
+#         inspect_block_impl) and Add-on frame mapping
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_grouped_edit_failure_keeps_bounded_issue_05_evidence_for_audit() -> None:
-    """Structured repair/safety metadata survives a grouped execute failure."""
+async def test_place_maps_to_mode_place_frame() -> None:
+    """place_block_impl builds a mode=place frame: normalized type_id, expect mapping.
 
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks" and payload.get("phase") == "execute":
-            return {
-                "ok": False,
-                "payload": {
-                    "code": "BLOCK_UNKNOWN",
-                    "type_id": "minecraft:stonx",
-                    "candidates": ["minecraft:stone", "minecraft:ston"],
-                },
-            }
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
+    expect=air → replace_any=False with no expected_previous; expect=any →
+    replace_any=True; expect="minecraft:stone" → expected_previous. No
+    ``dimension`` is sent: the Add-on defaults to the current player dimension.
+    """
+    bridge = _FakeBridge()
     cid = str(uuid4())
     await ensure_block_capability(cid, bridge)
-    result = await _execute_edits_group(
-        SimpleNamespace(deps=_Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings())),  # type: ignore[arg-type]
-        edits=[{"target": {"positions": [{"x": 1, "y": 64, "z": 1}]}, "block": "minecraft:stonx"}],
-        dimension="minecraft:overworld",
-        phase="execute",
-    )
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
 
-    assert result.audit_evidence == {
-        "edits": [{
-            "index": 0,
-            "code": "BLOCK_UNKNOWN",
-            "type_id": "minecraft:stonx",
-            "candidates": ["minecraft:stone", "minecraft:ston"],
-        }]
+    # Default expect=air: replace_any=False, no expected_previous, type_id normalized.
+    result = await place_block_impl(
+        ctx,  # type: ignore[arg-type]
+        pos=[1, 64, 2],
+        block="stone",
+        expect="air",
+    )
+    assert result.is_success
+    payload = [c for c in bridge.calls if c[0] == "edit_blocks"][-1][1]
+    assert payload["mode"] == "place"
+    assert payload["position"] == {"x": 1, "y": 64, "z": 2}
+    assert payload["type_id"] == "minecraft:stone"
+    assert payload["replace_any"] is False
+    assert "expected_previous" not in payload
+    assert "dimension" not in payload
+
+    # expect=any → replace_any=True.
+    result = await place_block_impl(
+        ctx,  # type: ignore[arg-type]
+        pos=[2, 64, 2],
+        block="minecraft:glass",
+        expect="any",
+    )
+    assert result.is_success
+    payload = [c for c in bridge.calls if c[0] == "edit_blocks"][-1][1]
+    assert payload["replace_any"] is True
+    assert "expected_previous" not in payload
+
+    # expect="minecraft:stone" → expected_previous.
+    result = await place_block_impl(
+        ctx,  # type: ignore[arg-type]
+        pos=[3, 64, 2],
+        block="glass",
+        expect="minecraft:stone",
+    )
+    assert result.is_success
+    payload = [c for c in bridge.calls if c[0] == "edit_blocks"][-1][1]
+    assert payload["replace_any"] is False
+    assert payload["expected_previous"] == {"type_id": "minecraft:stone"}
+    assert "dimension" not in payload
+
+
+@pytest.mark.asyncio
+async def test_fill_normalizes_corners_and_enforces_volume() -> None:
+    """fill_block_impl min/max-normalizes corners and enforces max_fill_volume.
+
+    Oversized AABBs are rejected host-side with LIMIT_EXCEEDED and a
+    shrink-direction hint; the request never reaches the bridge.
+    """
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+
+    # from=(10,10,10), to=(8,8,8) → from_pos=min, to_pos=max.
+    result = await fill_block_impl(
+        ctx,  # type: ignore[arg-type]
+        from_=[10, 10, 10],
+        to=[8, 8, 8],
+        block="oak_planks",
+    )
+    assert result.is_success
+    payload = [c for c in bridge.calls if c[0] == "edit_blocks"][-1][1]
+    assert payload["mode"] == "fill"
+    assert payload["from"] == {"x": 8, "y": 8, "z": 8}
+    assert payload["to"] == {"x": 10, "y": 10, "z": 10}
+    assert "dimension" not in payload
+
+    # Volume 51^3 = 132651 > default max_fill_volume 4096 → LIMIT_EXCEEDED.
+    edit_calls_before = len([c for c in bridge.calls if c[0] == "edit_blocks"])
+    result = await fill_block_impl(
+        ctx,  # type: ignore[arg-type]
+        from_=[0, 0, 0],
+        to=[50, 50, 50],
+        block="stone",
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "LIMIT_EXCEEDED"
+    assert "缩小" in body.get("hint", "")
+    assert body["volume"] == 51 * 51 * 51
+    edit_calls_after = len([c for c in bridge.calls if c[0] == "edit_blocks"])
+    assert edit_calls_after == edit_calls_before  # rejected before the bridge
+
+
+@pytest.mark.asyncio
+async def test_long_states_frame_hits_budget_defense() -> None:
+    """An oversized states frame trips the commandLine budget defense.
+
+    LIMIT_EXCEEDED with estimated_bytes/budget is returned and the request
+    never leaves the host (no edit_blocks bridge call).
+    """
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+
+    edit_calls_before = len([c for c in bridge.calls if c[0] == "edit_blocks"])
+    result = await place_block_impl(
+        ctx,  # type: ignore[arg-type]
+        pos=[1, 64, 1],
+        block="minecraft:oak_stairs",
+        expect="air",
+        states={"facing": "north" + "x" * 500},
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "LIMIT_EXCEEDED"
+    assert body["reason"] == "command_line_budget"
+    assert body["estimated_bytes"] >= body["budget"]
+    edit_calls_after = len([c for c in bridge.calls if c[0] == "edit_blocks"])
+    assert edit_calls_after == edit_calls_before  # request never left the host
+
+
+@pytest.mark.asyncio
+async def test_place_block_impl_rejects_invalid_coordinates() -> None:
+    """Non-int / wrong-length pos → structured INVALID_COORDINATE, no exception."""
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+    baseline = len([c for c in bridge.calls if c[0] == "edit_blocks"])
+
+    for bad_pos in ([1, 2], [1.5, 2, 3], [1, 2, 3, 4], ["a", 2, 3], [1, True, 3], "1,2,3"):
+        result = await place_block_impl(
+            ctx,  # type: ignore[arg-type]
+            pos=bad_pos,  # type: ignore[arg-type]
+            block="stone",
+        )
+        assert not result.is_success, bad_pos
+        body = json.loads(result.output)
+        assert body["code"] == "INVALID_COORDINATE", bad_pos
+        assert body["ok"] is False
+
+    assert len([c for c in bridge.calls if c[0] == "edit_blocks"]) == baseline
+
+
+@pytest.mark.asyncio
+async def test_fill_block_impl_rejects_invalid_corners() -> None:
+    """Non-int / wrong-length corners → structured INVALID_COORDINATE."""
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+
+    for bad_from, bad_to in (
+        ([1, 2], [3, 4, 5]),
+        ([1.5, 2, 3], [4, 5, 6]),
+        ([1, 2, 3], [4, 5]),
+    ):
+        result = await fill_block_impl(
+            ctx,  # type: ignore[arg-type]
+            from_=bad_from,  # type: ignore[arg-type]
+            to=bad_to,  # type: ignore[arg-type]
+            block="stone",
+        )
+        assert not result.is_success, (bad_from, bad_to)
+        body = json.loads(result.output)
+        assert body["code"] == "INVALID_COORDINATE", (bad_from, bad_to)
+
+
+@pytest.mark.asyncio
+async def test_inspect_block_impl_array_target() -> None:
+    """The array target maps to the Add-on unified target with no dimension.
+
+    Single point → target.positions; two corners → target.box with normalized
+    min/max corners.
+    """
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+
+    result = await inspect_block_impl(
+        ctx,  # type: ignore[arg-type]
+        target=[3, 64, 4],
+    )
+    assert result.is_success
+    payload = [c for c in bridge.calls if c[0] == "inspect_block"][-1][1]
+    assert payload["target"] == {"positions": [{"x": 3, "y": 64, "z": 4}]}
+    assert "dimension" not in payload
+
+    result = await inspect_block_impl(
+        ctx,  # type: ignore[arg-type]
+        target=[[10, 10, 10], [8, 8, 8]],
+    )
+    assert result.is_success
+    payload = [c for c in bridge.calls if c[0] == "inspect_block"][-1][1]
+    assert payload["target"] == {
+        "box": {"from": {"x": 8, "y": 8, "z": 8}, "to": {"x": 10, "y": 10, "z": 10}}
+    }
+    assert "dimension" not in payload
+
+
+@pytest.mark.asyncio
+async def test_inspect_block_impl_rejects_invalid_array_target() -> None:
+    """Non-int / wrong-length array targets → structured INVALID_COORDINATE."""
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+
+    for bad in ([1, 2], [1.5, 2, 3], [[1, 2, 3]], [[1, 2, 3], [4, 5]], "1,2,3"):
+        result = await inspect_block_impl(
+            ctx,  # type: ignore[arg-type]
+            target=bad,  # type: ignore[arg-type]
+        )
+        assert not result.is_success, bad
+        body = json.loads(result.output)
+        assert body["code"] == "INVALID_COORDINATE", bad
+
+
+# ---------------------------------------------------------------------------
+# Task 4 (spec §5): slim result projections — place / fill / inspect shapes
+# ---------------------------------------------------------------------------
+
+
+def test_place_projection_matches_spec_51_shape() -> None:
+    from services.agent.block_ops.project import project_place_result_for_model
+
+    projected = project_place_result_for_model(
+        {
+            "schema_version": "1",
+            "ok": True,
+            "phase": "execute",
+            "mode": "place",
+            "type_id": "minecraft:torch",
+            "position": {"x": 10, "y": 64, "z": -5},
+            "was": "minecraft:air",
+        }
+    )
+    # spec §5.1 example shows was: air but the note is normative: was only
+    # appears when a non-air block was replaced — air stays omitted.
+    assert projected == {
+        "ok": True,
+        "status": "applied",
+        "at": [10, 64, -5],
+        "block": "minecraft:torch",
+    }
+    assert "was" not in projected
+
+    replaced = project_place_result_for_model(
+        {
+            "ok": True,
+            "mode": "place",
+            "type_id": "minecraft:stone",
+            "position": {"x": 1, "y": 2, "z": 3},
+            "before": {"type_id": "minecraft:dirt"},
+        }
+    )
+    assert replaced["was"] == "minecraft:dirt"
+    assert replaced["at"] == [1, 2, 3]
+
+    # at may arrive as an array directly.
+    array_at = project_place_result_for_model(
+        {
+            "ok": True,
+            "mode": "place",
+            "type_id": "minecraft:stone",
+            "at": [7, 8, 9],
+        }
+    )
+    assert array_at["at"] == [7, 8, 9]
+    for hidden in ("mode", "type_id", "phase", "position", "before", "after"):
+        assert hidden not in replaced, hidden
+
+
+def test_fill_projection_matches_spec_52_shape() -> None:
+    from services.agent.block_ops.project import project_fill_result_for_model
+
+    projected = project_fill_result_for_model(
+        {
+            "schema_version": "1",
+            "ok": True,
+            "phase": "execute",
+            "mode": "fill",
+            "type_id": "minecraft:stone",
+            "changed_count": 15,
+            "skipped": 10,
+            "previous_type_counts": {
+                "minecraft:air": 6,
+                "minecraft:grass_block": 10,
+                "minecraft:gravel": 5,
+            },
+            "from": {"x": -797, "y": 93, "z": 180},
+            "to": {"x": -793, "y": 93, "z": 184},
+        }
+    )
+    assert projected["ok"] is True
+    assert projected["status"] == "applied"
+    assert projected["changed"] == 15
+    assert projected["skipped"] == 10
+    # type_counts only carries non-air counts (spec §5.2).
+    assert projected["type_counts"] == {
+        "minecraft:grass_block": 10,
+        "minecraft:gravel": 5,
+    }
+    assert "minecraft:air" not in projected["type_counts"]
+    assert projected["bounds"] == [[-797, 93, 180], [-793, 93, 184]]
+    for hidden in ("mode", "type_id", "phase", "changed_count", "previous_type_counts"):
+        assert hidden not in projected, hidden
+
+
+def test_inspect_projection_matches_spec_53_shapes() -> None:
+    from services.agent.block_ops.project import project_block_result_for_model as project
+
+    single = project(
+        {
+            "ok": True,
+            "blocks": [
+                {
+                    "x": 0,
+                    "y": 64,
+                    "z": 0,
+                    "type_id": "minecraft:air",
+                    "states": {"waterlogged": False},
+                    "waterlogged": False,
+                    "is_air": True,
+                    "is_liquid": False,
+                    "dimension": "minecraft:overworld",
+                }
+            ],
+            "coordinate_mode": "absolute",
+            "dimension": "minecraft:overworld",
+        }
+    )
+    assert single == {
+        "ok": True,
+        "block": "minecraft:air",
+        "states": {"waterlogged": False},
+        "waterlogged": False,
+        "is_air": True,
+        "is_liquid": False,
     }
 
+    region = project(
+        {
+            "ok": True,
+            "summary": {
+                "bounds": {
+                    "from": {"x": 0, "y": 64, "z": 0},
+                    "to": {"x": 1, "y": 64, "z": 1},
+                },
+                "count": 4,
+                "type_counts": {"minecraft:air": 3, "minecraft:stone": 1},
+                "unknown_count": 0,
+                "samples": [
+                    {"x": 0, "y": 64, "z": 0, "type_id": "minecraft:air"},
+                    {"x": 1, "y": 64, "z": 0, "type_id": "minecraft:air"},
+                    {"x": 0, "y": 64, "z": 1, "type_id": "minecraft:air"},
+                    {"x": 1, "y": 64, "z": 1, "type_id": "minecraft:stone"},
+                ],
+            },
+        }
+    )
+    assert region["count"] == 4
+    assert region["type_counts"] == {"minecraft:air": 3, "minecraft:stone": 1}
+    assert region["samples"] == [
+        [0, 64, 0, "minecraft:air"],
+        [1, 64, 0, "minecraft:air"],
+        [0, 64, 1, "minecraft:air"],
+        [1, 64, 1, "minecraft:stone"],
+    ]
+    for hidden in (
+        "status", "bounds", "unknown_count", "blocks",
+        "coordinate_mode", "dimension",
+    ):
+        assert hidden not in region, hidden
+
+
+def test_inspect_region_samples_are_compact_and_bounded_to_eight() -> None:
+    from services.agent.block_ops.project import project_block_result_for_model as project
+
+    blocks = [
+        {"x": i, "y": 64, "z": j, "type_id": f"minecraft:block_{i}_{j}"}
+        for i in range(4)
+        for j in range(4)
+    ]
+    region = project(
+        {
+            "ok": True,
+            "blocks": blocks,
+            "coordinate_mode": "absolute",
+            "dimension": "minecraft:overworld",
+        }
+    )
+    assert region["count"] == 16
+    assert len(region["samples"]) == 8
+    assert all(
+        isinstance(sample, list)
+        and len(sample) == 4
+        and isinstance(sample[3], str)
+        for sample in region["samples"]
+    )
+    assert region["samples"][0] == [0, 64, 0, "minecraft:block_0_0"]
+    assert "status" not in region
+    assert "blocks" not in region
+
+
+def test_projection_never_mirrors_raw_addon_payload() -> None:
+    """Success projections never mirror raw addon payload internals (spec §5.5)."""
+    fat = {
+        "schema_version": "1",
+        "ok": True,
+        "phase": "execute",
+        "mode": "place",
+        "type_id": "minecraft:stone",
+        "position": {"x": 0, "y": 64, "z": 0, "dimension": "minecraft:overworld"},
+        "targets": [{"x": 0, "y": 64, "z": 0, "type_id": "minecraft:stone"}],
+        "before": {"type_id": "minecraft:dirt", "x": 0, "y": 64, "z": 0},
+        "after": {"type_id": "minecraft:stone", "x": 0, "y": 64, "z": 0},
+        "locked_targets": [{"x": 0, "y": 64, "z": 0}],
+        "repairs_applied": ["reposition"],
+        "verification": {"checked": True},
+        "rollback": {"attempted": False},
+    }
+    projected = project_block_result_for_model(fat, mode="place")
+    assert projected == {
+        "ok": True,
+        "status": "applied",
+        "at": [0, 64, 0],
+        "block": "minecraft:stone",
+        "was": "minecraft:dirt",
+    }
+    for hidden in (
+        "targets", "before", "after", "locked_targets", "repairs_applied",
+        "verification", "rollback", "phase", "mode", "type_id",
+        "schema_version", "dimension", "position",
+    ):
+        assert hidden not in projected, hidden
+
+
+def test_new_mutation_tools_map_timeout_to_state_unknown() -> None:
+    """place_block / fill_block keep the STATE_UNKNOWN + no-fallback contract."""
+    for tool in ("place_block", "fill_block"):
+        result = map_bridge_exception(TimeoutError("bridge timeout"), tool_name=tool)
+        assert not result.is_success
+        assert result.retryable is False
+        assert result.external_state_unknown is True
+        body = json.loads(result.output)
+        assert body["code"] == "STATE_UNKNOWN", tool
+        assert body["fallback_allowed"] is False
+        assert "请勿自动重试" in body["message"]
+
 
 @pytest.mark.asyncio
-async def test_grouped_edit_rejects_multiblock_block_before_approval() -> None:
-    """When the addon preflight returns UNSUPPORTED_BLOCK_PLACEMENT for a
-    multiblock block, the group fails before approval (spec issue 05 §6)."""
-    from services.agent.block_ops.capability import ensure_block_capability
-    from services.agent.block_ops.tools_impl import run_block_preflight
+async def test_call_block_capability_passes_public_tool_name_for_exception_mapping() -> None:
+    class _RaisingBridge:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks":
-            return {
-                "ok": False,
-                "payload": {
-                    "code": "UNSUPPORTED_BLOCK_PLACEMENT",
-                    "message": "multiblock not supported",
-                    "type_id": "minecraft:oak_door",
-                    "multiblock": True,
-                },
-            }
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+        async def request(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append((capability, payload))
+            raise TimeoutError("bridge request timed out")
 
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-mb")
-    ctx = SimpleNamespace(deps=deps)
-    plan, failure = await run_block_preflight(
-        ctx,  # type: ignore[arg-type]
+    bridge = _RaisingBridge()
+    result = await call_block_capability(
+        bridge,
         "edit_blocks",
-        {
-            "edits": [
-                {"target": {"positions": [{"x": 0, "y": 64, "z": 0}]}, "block": "minecraft:oak_door"},
-            ],
-            "dimension": "minecraft:overworld",
-        },
+        {"phase": "execute", "mode": "place"},
+        mode="place",
+        tool_name="place_block",
     )
-    # The group must fail before approval — no plan is returned.
-    assert plan is None
-    assert failure is not None
-    body = json.loads(failure.output)
-    assert body["code"] == "UNSUPPORTED_BLOCK_PLACEMENT"
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "STATE_UNKNOWN"
+    assert body["external_state_unknown"] is True
     assert body["fallback_allowed"] is False
 
+    result = await call_block_capability(
+        bridge,
+        "inspect_block",
+        {"phase": "execute"},
+        tool_name="inspect_block",
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "ADDON_UNAVAILABLE"
+    assert body["retryable"] is True
+    assert body["fallback_allowed"] is True
+
+
+def test_limit_exceeded_addon_error_carries_estimated_bytes_and_budget() -> None:
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "LIMIT_EXCEEDED",
+                "message": "frame too large",
+                "estimated_bytes": 4128,
+                "budget": 461,
+            },
+        }
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "LIMIT_EXCEEDED"
+    assert body["estimated_bytes"] == 4128
+    assert body["budget"] == 461
+    assert body["retryable"] is True
+    assert body["fallback_allowed"] is True
+    assert body["schema_version"] == "1"
+
+
+def test_precondition_failed_without_counts_omits_empty_keys() -> None:
+    """No counts / no actual_type_id → no empty actual_type_counts key (Step 4)."""
+    result = map_addon_bridge_result(
+        {
+            "ok": False,
+            "payload": {
+                "code": "PRECONDITION_FAILED",
+                "message": "target is not air",
+                "target": {"x": 1, "y": 64, "z": 2},
+            },
+        }
+    )
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "PRECONDITION_FAILED"
+    assert "actual_type_counts" not in body
+    assert "actual_type_id" not in body
+    assert body["target"] == {"x": 1, "y": 64, "z": 2}
+    assert "hint" in body
+
+
+# ---------------------------------------------------------------------------
+# Task 7: 新契约回归与集成测试（spec §8.2）
+# ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
-async def test_grouped_edit_preflight_addon_returns_block_unknown_with_candidates() -> None:
-    """When the addon preflight returns BLOCK_UNKNOWN with candidates, the
-    host exposes them in the preflight failure (spec issue 05 §4.2)."""
-    from services.agent.block_ops.capability import ensure_block_capability
-    from services.agent.block_ops.tools_impl import run_block_preflight
+async def test_twelve_discrete_points_never_exceed_budget_and_no_limit_exceeded() -> None:
+    """Task 7 Step 2: 旧 12 离散点场景在新契约下不再产生 LIMIT_EXCEEDED。
 
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks":
+    旧 contract 的 12 个离散点 batch 帧 654–777B > 461B 必然触发
+    LIMIT_EXCEEDED 重试；新契约模型只能表达 12 个独立 place_block（或
+    4 个 1x3x1 柱形 fill），宿主逐帧通过 commandLine 预算检查（spec §1.2）。
+    """
+    # 旧形态锚点：单帧 12 个离散点必然超预算（回归 spec §1.2 表格）。
+    legacy_positions = [
+        {"x": x, "y": 64, "z": z} for x in range(1, 5) for z in range(1, 4)
+    ]
+    legacy_payload = build_edit_payload(
+        mode="place",
+        coordinate_mode="absolute",
+        dimension=None,
+        position=None,
+        positions=legacy_positions,
+        from_pos=None,
+        to_pos=None,
+        type_id="minecraft:stone",
+        states=None,
+        replace_any=False,
+        expected_previous=None,
+        player_name="Steve",
+        phase="execute",
+    )
+    legacy_bytes = estimate_bridge_command_line_bytes("edit_blocks", legacy_payload)
+    assert legacy_bytes > DEFAULT_COMMAND_LINE_BYTE_BUDGET  # 654–777B > 461B
+
+    # 12 个独立 place_block：全部成功、无 LIMIT_EXCEEDED、每帧合规。
+    bridge = _FakeBridge()
+    cid = str(uuid4())
+    await ensure_block_capability(cid, bridge)
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
+    ctx = SimpleNamespace(deps=deps)
+
+    for x in range(1, 5):
+        for z in range(1, 4):
+            result = await place_block_impl(
+                ctx,  # type: ignore[arg-type]
+                pos=[x, 64, z],
+                block="stone",
+            )
+            assert result.is_success
+            assert "LIMIT_EXCEEDED" not in result.output
+
+    place_payloads = [p for cap, p in bridge.calls if cap == "edit_blocks"]
+    assert len(place_payloads) == 12
+    for payload in place_payloads:
+        assert check_bridge_command_line_budget("edit_blocks", payload) is None
+        assert (
+            estimate_bridge_command_line_bytes("edit_blocks", payload)
+            <= DEFAULT_COMMAND_LINE_BYTE_BUDGET
+        )
+
+    # 4 个 1x3x1 柱形 fill（旧场景 4 帧 1,484B）：同样无超限。
+    bridge2 = _FakeBridge()
+    cid2 = str(uuid4())
+    await ensure_block_capability(cid2, bridge2)
+    deps2 = _Deps(connection_id=cid2, addon_bridge=bridge2)
+    ctx2 = SimpleNamespace(deps=deps2)
+    for x in range(1, 5):
+        result = await fill_block_impl(
+            ctx2,  # type: ignore[arg-type]
+            from_=[x, 64, 1],
+            to=[x, 66, 1],
+            block="stone",
+        )
+        assert result.is_success
+        assert "LIMIT_EXCEEDED" not in result.output
+
+    fill_payloads = [p for cap, p in bridge2.calls if cap == "edit_blocks"]
+    assert len(fill_payloads) == 4
+    for payload in fill_payloads:
+        assert check_bridge_command_line_budget("edit_blocks", payload) is None
+        assert (
+            estimate_bridge_command_line_bytes("edit_blocks", payload)
+            <= DEFAULT_COMMAND_LINE_BYTE_BUDGET
+        )
+
+
+@pytest.mark.asyncio
+async def test_grass_house_fill_expect_any_succeeds_expect_air_precondition() -> None:
+    """Task 7 Step 3: 草地上盖房子。
+
+    ``expect=any`` 成功覆盖草方块；``expect=air`` 遇到草方块返回可操作的
+    PRECONDITION_FAILED（含 actual_type_counts 与坐标），fallback_allowed=True。
+    """
+    async def grass_handler(cap: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if cap == "get_capabilities":
+            return {
+                "ok": True,
+                "payload": {
+                    "capabilities": {
+                        "block_ops": {"inspect": True, "edit": True, "schema_version": "1"}
+                    }
+                },
+            }
+        if cap == "edit_blocks":
+            if payload.get("replace_any") is True:
+                return {
+                    "ok": True,
+                    "payload": {
+                        "schema_version": "1",
+                        "ok": True,
+                        "status": "succeeded",
+                        "mode": "fill",
+                        "changed": 9,
+                        "skipped": 0,
+                        "from": payload["from"],
+                        "to": payload["to"],
+                    },
+                }
             return {
                 "ok": False,
                 "payload": {
-                    "code": "BLOCK_UNKNOWN",
-                    "message": "unknown block type",
-                    "type_id": "minecraft:stonx",
-                    "candidates": ["minecraft:stone", "minecraft:ston"],
+                    "code": "PRECONDITION_FAILED",
+                    "message": "expected air but target contains non-air blocks",
+                    "target": payload.get("from") or payload.get("position"),
+                    "actual_type_counts": {"minecraft:grass_block": 3},
                 },
             }
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
+        return {"ok": True, "payload": {"ok": True}}
 
-    bridge = _FakeBridge(bridge_handler)
+    bridge = _FakeBridge(grass_handler)
     cid = str(uuid4())
     await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-bu")
+    deps = _Deps(connection_id=cid, addon_bridge=bridge)
     ctx = SimpleNamespace(deps=deps)
-    plan, failure = await run_block_preflight(
+
+    # expect=any：成功覆盖草方块。
+    result = await fill_block_impl(
         ctx,  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "edits": [
-                {"target": {"positions": [{"x": 0, "y": 64, "z": 0}]}, "block": "minecraft:stonx"},
-            ],
-            "dimension": "minecraft:overworld",
-        },
+        from_=[1, 64, 1],
+        to=[3, 64, 3],
+        block="minecraft:oak_planks",
+        expect="any",
     )
-    assert plan is None
-    assert failure is not None
-    body = json.loads(failure.output)
-    assert body["code"] == "BLOCK_UNKNOWN"
-    assert body["candidates"] == ["minecraft:stone", "minecraft:ston"]
+    assert result.is_success
+    body = json.loads(result.output)
+    assert body["ok"] is True
+    assert body["status"] == "succeeded"
+    wire = [c for c in bridge.calls if c[0] == "edit_blocks"][-1][1]
+    assert wire["replace_any"] is True
 
-
-@pytest.mark.asyncio
-async def test_grouped_edit_preflight_addon_returns_state_invalid_with_keys() -> None:
-    """When the addon preflight returns STATE_INVALID with valid_state_keys,
-    the host surfaces them in the preflight failure (spec issue 05 §4.3)."""
-    from services.agent.block_ops.capability import ensure_block_capability
-    from services.agent.block_ops.tools_impl import run_block_preflight
-
-    async def bridge_handler(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if capability == "get_capabilities":
-            return {"ok": True, "payload": {"capabilities": {"block_ops": {"inspect": True, "edit": True}}}}
-        if capability == "edit_blocks":
-            return {
-                "ok": False,
-                "payload": {
-                    "code": "STATE_INVALID",
-                    "message": "Invalid state",
-                    "type_id": "minecraft:oak_stairs",
-                    "valid_state_keys": ["minecraft:cardinal_direction"],
-                },
-            }
-        return {"ok": False, "payload": {"code": "INTERNAL_ERROR"}}
-
-    bridge = _FakeBridge(bridge_handler)
-    cid = str(uuid4())
-    await ensure_block_capability(cid, bridge)
-    deps = _Deps(connection_id=cid, addon_bridge=bridge, settings=_Settings(), run_id="run-si")
-    ctx = SimpleNamespace(deps=deps)
-    plan, failure = await run_block_preflight(
+    # expect=air：遇到草方块 → PRECONDITION_FAILED（可操作诊断）。
+    result = await fill_block_impl(
         ctx,  # type: ignore[arg-type]
-        "edit_blocks",
-        {
-            "edits": [
-                {"target": {"positions": [{"x": 0, "y": 64, "z": 0}]}, "block": {"type_id": "minecraft:oak_stairs", "states": {"bad": True}}},
-            ],
-            "dimension": "minecraft:overworld",
-        },
+        from_=[1, 64, 1],
+        to=[3, 64, 3],
+        block="minecraft:oak_planks",
+        expect="air",
     )
-    assert plan is None
-    assert failure is not None
-    body = json.loads(failure.output)
-    assert body["code"] == "STATE_INVALID"
+    assert not result.is_success
+    body = json.loads(result.output)
+    assert body["code"] == "PRECONDITION_FAILED"
+    assert body["actual_type_counts"] == {"minecraft:grass_block": 3}
+    assert body["target"] == {"x": 1, "y": 64, "z": 1}
+    assert body["fallback_allowed"] is True
+    assert body["retryable"] is False
+    assert "grass_block" in body.get("hint", "")
+
+
+def test_new_tool_schemas_are_slim_no_hidden_fields_and_prompt_catalog_clean() -> None:
+    """Task 7 Step 5: 三个新工具 schema 无隐藏字段且总字符数 < 旧 2,271 基线。
+
+    - place_block / fill_block / inspect_block 的完整 JSON schema（含描述）
+      不含 locked_targets / phase / status / dimension / mode / edits /
+      positions / coordinate_mode 等内部字段；
+    - 三个 schema 序列化总字符数小于旧 ``edit_blocks`` 单模型 schema 的
+      2,271 字符基线（spec §1.2）；
+    - 提示词与工具目录不含 locked_targets / phase / status 字符串。
+    """
+    agent: Agent[Any, str] = Agent("test", deps_type=_Deps, output_type=str)
+    register_agent_tools(agent)
+    tools = iter_registered_tools(agent)  # type: ignore[arg-type]
+
+    hidden = (
+        "locked_targets",
+        "locked_targets_by_edit",
+        "phase",
+        "status",
+        "dimension",
+        "mode",
+        "edits",
+        "positions",
+        "coordinate_mode",
+        "noop_edit_indices",
+        "repairs_applied",
+        "expected_previous",
+    )
+    total_chars = 0
+    for tool_name in ("place_block", "fill_block", "inspect_block"):
+        schema = tools[tool_name].tool_def.parameters_json_schema
+        serialized = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+        total_chars += len(serialized)
+        for token in hidden:
+            assert token not in serialized, (
+                f"{token} leaked into {tool_name} model-visible schema"
+            )
+
+    assert total_chars < 2271, f"three schemas total {total_chars} chars >= legacy 2271"
+
+    for path in (
+        Path("services/agent/prompt.py"),
+        Path("services/agent/harness/prompting.py"),
+        Path("services/agent/harness/catalog.py"),
+    ):
+        text = path.read_text(encoding="utf-8")
+        for token in ("locked_targets", "phase", "status"):
+            assert token not in text, f"{token} found in {path}"

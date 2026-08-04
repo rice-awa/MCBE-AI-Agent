@@ -278,8 +278,8 @@ export function prepareTypeAndPolicy(
   if (isMultiblockBlock(typeId)) {
     return fail(
       "UNSUPPORTED_BLOCK_PLACEMENT",
-      `multiblock block ${typeId} requires multi-cell placement; single-cell write is not supported`,
-      { type_id: typeId, multiblock: true, reason: "multiblock_not_supported" }
+      `multiblock block ${typeId} requires multi-cell placement; single-cell write is not supported; command fallback via setblock/fill is supported`,
+      { type_id: typeId, multiblock: true, reason: "multiblock_not_supported", command_fallback_viable: true }
     );
   }
 

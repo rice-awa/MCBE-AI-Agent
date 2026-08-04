@@ -158,7 +158,7 @@ describe("multiblock placement safety (issue 05 §6/§7)", () => {
   });
 
   it("detects doors and beds as multiblock", () => {
-    expect(isMultiblockBlock("minecraft:oak_door")).toBe(true);
+    expect(isMultiblockBlock("minecraft:wooden_door")).toBe(true);
     expect(isMultiblockBlock("minecraft:iron_door")).toBe(true);
     expect(isMultiblockBlock("minecraft:red_bed")).toBe(true);
     expect(isMultiblockBlock("minecraft:tall_grass")).toBe(true);
@@ -177,14 +177,14 @@ describe("multiblock placement safety (issue 05 §6/§7)", () => {
       coordinate_mode: "absolute",
       dimension: "minecraft:overworld",
       position: { x: 0, y: 64, z: 0 },
-      type_id: "minecraft:oak_door",
+      type_id: "minecraft:wooden_door",
       phase: "preflight",
     });
 
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.payload.code).toBe("UNSUPPORTED_BLOCK_PLACEMENT");
-    expect((result.payload as any).type_id).toBe("minecraft:oak_door");
+    expect((result.payload as any).type_id).toBe("minecraft:wooden_door");
     expect((result.payload as any).multiblock).toBe(true);
   });
 

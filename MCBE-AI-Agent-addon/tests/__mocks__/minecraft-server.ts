@@ -177,7 +177,7 @@ const knownBlockTypes = new Set([
   "minecraft:cobblestone",
   // Multiblock blocks (known so the UNSUPPORTED_BLOCK_PLACEMENT path is
   // reachable; they are rejected before placement, spec issue 05 §6/§7).
-  "minecraft:oak_door",
+  "minecraft:wooden_door",
   "minecraft:red_bed",
 ]);
 
@@ -191,8 +191,8 @@ const defaultBlockStates: Record<string, Record<string, string | number | boolea
     "minecraft:cardinal_direction": "north",
     "minecraft:vertical_half": "bottom",
   },
-  "minecraft:oak_door": {
-    "minecraft:direction": 0,
+  "minecraft:wooden_door": {
+    "minecraft:cardinal_direction": "north",
     "minecraft:door_hinge_bit": false,
     "minecraft:open_bit": false,
     "minecraft:upper_block_bit": false,

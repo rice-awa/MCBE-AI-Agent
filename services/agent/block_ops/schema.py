@@ -6,6 +6,8 @@ import json
 from enum import StrEnum
 from typing import Any
 
+from services.agent.tool_results import ToolResult
+
 BLOCK_OPS_SCHEMA_VERSION = "1"
 
 
@@ -26,6 +28,19 @@ class BlockErrorCode(StrEnum):
     UNSUPPORTED_BLOCK_PLACEMENT = "UNSUPPORTED_BLOCK_PLACEMENT"
     STATE_UNKNOWN = "STATE_UNKNOWN"
     INTERNAL_ERROR = "INTERNAL_ERROR"
+
+
+def fallback_allowed_for_code(code: BlockErrorCode | str) -> bool:
+    """一元规则：世界状态已知未变即允许命令回退。
+
+    仅 STATE_UNKNOWN（调用开始后结果未知，可能已写入）和
+    INTERNAL_ERROR（宿主 bug）保持拒绝；其余所有写前失败码均放行。
+    """
+    try:
+        stable = BlockErrorCode(str(code))
+    except ValueError:
+        stable = BlockErrorCode.INTERNAL_ERROR
+    return stable not in {BlockErrorCode.STATE_UNKNOWN, BlockErrorCode.INTERNAL_ERROR}
 
 
 def build_success_response(**fields: Any) -> dict[str, Any]:
@@ -95,3 +110,19 @@ def dumps_error(code: BlockErrorCode | str, message: str, **fields: Any) -> str:
 
 def dumps_payload(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _host_limit_error(
+    code: BlockErrorCode,
+    message: str,
+    **fields: Any,
+) -> ToolResult:
+    """Host-side INVALID_ARGUMENT-style failure result for block tools."""
+    body = build_error_response(code, message, **fields)
+    body.setdefault("fallback_allowed", True)
+    body.setdefault("external_state_unknown", False)
+    return ToolResult.failure(
+        dumps_payload(body),
+        error_kind="INVALID_ARGUMENT",
+        retryable=False,
+    )

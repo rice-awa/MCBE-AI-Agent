@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Protocol, cast
+from typing import Annotated, Any, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import Field
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
@@ -28,93 +28,11 @@ logger = get_logger(__name__)
 
 BUILTIN_TOOLSET_ID = "mcbe-builtin"
 
+# 坐标必须为恰好 3 个整数
+BlockPosition = Annotated[list[int], Field(min_length=3, max_length=3)]
 
-class _BlockToolModel(BaseModel):
-    """Strict public JSON-schema building block for dedicated block tools."""
-
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-
-class AbsoluteBlockCoordinate(_BlockToolModel):
-    x: float
-    y: float
-    z: float
-
-
-class RelativeBlockCoordinate(_BlockToolModel):
-    forward: float
-    right: float
-    up: float
-
-
-BlockCoordinate = AbsoluteBlockCoordinate | RelativeBlockCoordinate
-BlockStateValue = str | int | float | bool
-
-
-class BlockTargetBox(_BlockToolModel):
-    from_: BlockCoordinate = Field(alias="from")
-    to: BlockCoordinate
-
-
-class BlockTarget(_BlockToolModel):
-    """A non-empty homogeneous point set or a box, but never both."""
-
-    model_config = ConfigDict(
-        extra="forbid",
-        populate_by_name=True,
-        json_schema_extra={
-            "oneOf": [
-                {
-                    "required": ["positions"],
-                    "properties": {"positions": {"type": "array"}},
-                    "not": {"required": ["box"]},
-                },
-                {
-                    "required": ["box"],
-                    "properties": {"box": {"type": "object"}},
-                    "not": {"required": ["positions"]},
-                },
-            ],
-        },
-    )
-    positions: list[BlockCoordinate] | None = None
-    box: BlockTargetBox | None = None
-
-    @model_validator(mode="after")
-    def validate_shape_and_coordinate_mode(self) -> BlockTarget:
-        if (self.positions is None) == (self.box is None):
-            raise ValueError("target 必须且只能提供 positions 或 box")
-        if self.positions is not None:
-            if not self.positions:
-                raise ValueError("target.positions 必须是非空列表")
-            kinds = {type(position) for position in self.positions}
-            if len(kinds) != 1:
-                raise ValueError("同一 target 内不能混用绝对坐标和玩家相对坐标")
-        elif self.box is not None and type(self.box.from_) is not type(self.box.to):
-            raise ValueError("同一 target 内不能混用绝对坐标和玩家相对坐标")
-        return self
-
-
-class BlockSpec(_BlockToolModel):
-    type_id: str
-    states: dict[str, BlockStateValue] | None = None
-
-
-BlockInput = str | BlockSpec
-ExpectInput = str | BlockSpec
-
-
-class BlockEdit(_BlockToolModel):
-    target: BlockTarget
-    block: BlockInput
-    expect: ExpectInput | None = None
-
-
-def _block_tool_data(value: BaseModel | dict[str, Any]) -> dict[str, Any]:
-    """Accept both PydanticAI-validated models and approval-resume dictionaries."""
-    if isinstance(value, BaseModel):
-        return value.model_dump(by_alias=True, exclude_none=True)
-    return value
+# inspect_block 目标：单点 [x,y,z] 或 双角点 [[x1,y1,z1],[x2,y2,z2]]
+InspectTarget = BlockPosition | Annotated[list[BlockPosition], Field(min_length=2, max_length=2)]
 
 
 class ToolRegistrationSettings(Protocol):
@@ -264,7 +182,14 @@ def register_agent_tools(
         command: str,
     ) -> str:
         """
-        执行 Minecraft 命令
+        执行 Minecraft 命令（Bedrock 基岩版命令语法）。
+
+        命令必须使用基岩版（Bedrock Edition）命令格式，不能用 Java 版语法：
+        - 方块/物品/实体 ID 一律带 ``minecraft:`` 命名空间，如 ``minecraft:wooden_door``；
+        - 不支持 Java 版的 NBT ``{...}`` 数据标签；
+        - ``setblock`` / ``fill`` 的方块状态用 ``["状态名":"值"]`` 语法，如
+          ``setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction":"south"]``，
+          不要用 Java 的 ``[facing=south,half=lower]``。
 
         Args:
             ctx: 运行上下文
@@ -304,7 +229,13 @@ def register_agent_tools(
         commands: list[str],
     ) -> str:
         """
-        批量执行 Minecraft 命令，注意一定要遵循MCBE的语法。
+        批量执行 Minecraft 命令，必须遵循基岩版（Bedrock Edition）命令语法。
+        命令格式要求：
+        - 方块/物品/实体 ID 一律带 ``minecraft:`` 命名空间，如 ``minecraft:wooden_door``；
+        - 不支持 Java 版的 NBT ``{...}`` 数据标签；
+        - ``setblock`` / ``fill`` 的方块状态用 ``["状态名":"值"]`` 语法，如
+          ``setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction":"south"]``，
+          不要用 Java 的 ``[facing=south,half=lower]``。
         每次最多 20 条命令，超出请拆分为多次调用。
         一次 run 最多 16 次工具调用，请合理规划，避免超限被拒后反复重试。
 
@@ -1191,7 +1122,10 @@ def register_agent_tools(
         ctx: RunContext[AgentDependencies],
         command: str,
     ) -> str:
-        """通过 addon 桥接受控执行世界命令。(仅当run_minecraft_command工具无法使用才用)"""
+        """通过 addon 桥接受控执行世界命令。(仅当run_minecraft_command工具无法使用才用)
+        命令必须使用基岩版（Bedrock Edition）命令语法，ID 一律带 ``minecraft:`` 命名空间；
+        不支持 Java 版 NBT ``{...}`` 数据标签与 ``[state=value]`` 状态语法。
+        """
         from services.agent.block_ops.bridge import (
             map_addon_bridge_result,
             map_bridge_exception,
@@ -1213,75 +1147,100 @@ def register_agent_tools(
     @chat_agent.tool
     async def inspect_block(
         ctx: RunContext[AgentDependencies],
-        target: BlockTarget,
-        dimension: str | None = None,
-        locked_targets: list[dict[str, Any]] | None = None,
-        phase: str | None = None,
+        target: InspectTarget,
     ) -> str:
-        """查询方块快照（type ID、states、含水/空气/液体）或区域摘要。
+        """查询方块快照或区域摘要。
+
+        单点查询返回 type_id、states、含水/空气/液体状态；
+        区域查询返回 type_counts 与样本（最多 8 个）。
 
         Args:
             ctx: 运行上下文
-            target: 目标结构。``{positions: [...]}`` 查询点集（单点用长度 1），
-                ``{box: {from, to}}`` 查询长方体区域。两者互斥。
-                坐标为世界坐标 ``{x,y,z}`` 或玩家相对 ``{forward,right,up}``，
-                同一 target 内不能混用。
-            dimension: 维度 ID（绝对坐标默认当前玩家维度；跨维度时需要）
+            target: 目标坐标。单点 ``[x, y, z]`` 或
+                长方体两角点 ``[[x1, y1, z1], [x2, y2, z2]]``。
+                所有坐标均为绝对世界坐标整数。
         """
-        # locked_targets / phase: harness recovery only; stripped from model schema.
         from services.agent.block_ops.tools_impl import inspect_block_impl
 
-        return await inspect_block_impl(
+        return await inspect_block_impl(ctx, target=target)
+
+    @chat_agent.tool
+    async def place_block(
+        ctx: RunContext[AgentDependencies],
+        pos: BlockPosition,
+        block: str,
+        expect: str = "air",
+        states: dict[str, Any] | None = None,
+    ) -> str:
+        """在单个格子上写入方块。
+
+        方块 type_id 使用基岩版（Bedrock Edition）命名空间，必须带 ``minecraft:``
+        前缀，如 ``"minecraft:stone"`` / ``"minecraft:oak_planks"``；不要使用 Java 版
+        独有 ID。缺失前缀时宿主会自动补 ``minecraft:``。
+        states 键名同样用基岩版状态名（带 ``minecraft:`` 前缀），如
+        ``{"minecraft:cardinal_direction": "north"}``，不要用 Java 的 ``facing``/``half``。
+        expect 默认 ``"air"``（仅替换空气）；``"any"`` 允许覆写非空方块（需审批）。
+
+        成功返回 ``{ok, status, at: [x, y, z], block, was?}``；
+        ``was`` 仅在替换了非空气方块时出现。
+
+        Args:
+            ctx: 运行上下文
+            pos: 目标坐标 ``[x, y, z]``（绝对世界坐标整数）
+            block: 方块 type_id，如 ``"minecraft:stone"``
+            expect: 前置条件，默认 ``"air"``（仅替换空气）；
+                ``"any"`` 允许覆写非空方块（需审批）
+            states: 键名用基岩版状态名
+        """
+        from services.agent.block_ops.tools_impl import place_block_impl
+
+        return await place_block_impl(
             ctx,
-            target=_block_tool_data(target),
-            dimension=dimension,
-            locked_targets=locked_targets,
-            phase=phase,
+            pos=pos,
+            block=block,
+            expect=expect,
+            states=states,
         )
 
     @chat_agent.tool
-    async def edit_blocks(
+    async def fill_block(
         ctx: RunContext[AgentDependencies],
-        edits: list[BlockEdit],
-        dimension: str | None = None,
-        locked_targets: list[dict[str, Any]] | None = None,
-        locked_targets_by_edit: list[list[dict[str, Any]]] | None = None,
-        noop_edit_indices: list[int] | None = None,
-        repairs_applied: list[Any] | None = None,
-        phase: str | None = None,
-        status: str | None = None,
+        from_: Annotated[list[int], Field(min_length=3, max_length=3, alias="from")],
+        to: Annotated[list[int], Field(min_length=3, max_length=3)],
+        block: str,
+        expect: str = "air",
+        states: dict[str, Any] | None = None,
     ) -> str:
-        """按统一 `edits` 契约写入当前小而完整的施工阶段。
+        """在长方体区域内写入方块。
 
-        一次调用可提交一个或多个相互独立的编辑，共享一次预检和一次审批；
-        有顺序依赖或计划稍后执行的编辑拆到后续调用。每项只需 `target`、
-        `block`、`expect`，target 在 positions 与 box 中二选一。
+        方块 type_id 使用基岩版（Bedrock Edition）命名空间，必须带 ``minecraft:``
+        前缀，如 ``"minecraft:stone"`` / ``"minecraft:oak_planks"``；不要使用 Java 版
+        独有 ID。缺失前缀时宿主会自动补 ``minecraft:``。
+        states 键名同样用基岩版状态名（带 ``minecraft:`` 前缀），如
+        ``{"minecraft:cardinal_direction": "north"}``，不要用 Java 的 ``facing``/``half``。
+        expect 默认 ``"air"``（仅替换空气）；``"any"`` 允许覆写非空方块（需审批）。
 
-        最短完整 target 示例（不要把 target 再嵌套在 target 中）：
-        {"target":{"box":{"from":{"x":0,"y":64,"z":0},"to":{"x":4,"y":64,"z":4}}},"block":"oak_planks","expect":"any"}
-        {"target":{"positions":[{"x":0,"y":65,"z":0}]},"block":"oak_log","expect":"air"}
-
-        结果返回聚合的 ok/status/changed_total/edits；失败包含稳定 code 和
-        fallback_allowed。
+        角点自动 min/max 归一化。expect=air 时非空气格跳过。
+        成功返回 ``{ok, status, changed, skipped, type_counts?, bounds}``；
+        ``type_counts`` 仅统计被替换的非空气方块。
 
         Args:
             ctx: 运行上下文
-            edits: 当前施工阶段的一个或多个独立编辑
-            dimension: 维度 ID（absolute 必填）
+            from_: 区域一角 ``[x, y, z]``（绝对世界坐标整数）
+            to: 区域另一角 ``[x, y, z]``（绝对世界坐标整数）
+            block: 方块 type_id
+            expect: 前置条件，默认 ``"air"``
+            states: 键名用基岩版状态名
         """
-        # Recovery-only fields are stripped from the model-facing schema.
-        from services.agent.block_ops.tools_impl import edit_blocks_impl
+        from services.agent.block_ops.tools_impl import fill_block_impl
 
-        return await edit_blocks_impl(
+        return await fill_block_impl(
             ctx,
-            edits=[_block_tool_data(edit) for edit in edits],
-            dimension=dimension,
-            locked_targets=locked_targets,
-            locked_targets_by_edit=locked_targets_by_edit,
-            noop_edit_indices=noop_edit_indices,
-            repairs_applied=repairs_applied,
-            phase=phase,
-            status=status,
+            from_=from_,
+            to=to,
+            block=block,
+            expect=expect,
+            states=states,
         )
 
     if _runtime_harness_schema_enabled(settings):

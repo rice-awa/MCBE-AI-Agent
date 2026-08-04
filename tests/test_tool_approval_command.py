@@ -21,10 +21,18 @@ from pydantic_ai.tools import DeferredToolRequests
 
 from config.settings import MinecraftConfig
 from mcbe_ws_sdk.command.registry import CommandRegistry
+from services.agent.block_ops.preflight_cache import get_preflight_cache, reset_preflight_cache
 from services.agent.harness.approvals import PendingApproval, PendingApprovalStore
 from services.agent.harness.execution import hash_normalized_args, normalize_tool_args
 from services.gateway.session_store import HostSessionStore
 from services.gateway.command_handlers import CommandHandlers
+
+
+@pytest.fixture(autouse=True)
+def _reset_preflight_cache():
+    reset_preflight_cache()
+    yield
+    reset_preflight_cache()
 
 
 def _make_pending(
@@ -38,6 +46,7 @@ def _make_pending(
     sibling_ids: list[str] | None = None,
     ttl: float = 120.0,
     cmd: str = "x",
+    plan_id: str = "",
 ) -> PendingApproval:
     now = time.time()
     reqs = DeferredToolRequests(
@@ -61,6 +70,7 @@ def _make_pending(
         args_summary=f"command={cmd}",
         args_hash="h",
         policy_version="v",
+        plan_id=plan_id,
         messages=[],
         requests=reqs,
         provider="test",
@@ -391,20 +401,24 @@ async def test_gateway_approval_resume_uses_override_only_for_block_tools() -> N
         should_auto_approve_tools=lambda *_args: False,
     )
     state = SimpleNamespace(id=uuid4())
-    block = _make_pending(approval_id="b", tool_call_id="tc-block")
+    canonical = {"pos": [1, 64, 1], "block": "stone", "expect": "air"}
+    block = _make_pending(approval_id="b", tool_call_id="tc-block", plan_id="pid-1")
     block.connection_id = str(state.id)
-    block.tool_name = "edit_blocks"
-    block.normalized_args = {
-        "type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute",
-        "dimension": "minecraft:overworld", "position": {"x": 1, "y": 64, "z": 1},
-        "locked_targets": [{"x": 1, "y": 64, "z": 1}], "phase": "execute",
-    }
-    block.execute_args = dict(block.normalized_args)
-    block.execution_args_hash = hash_normalized_args(normalize_tool_args(block.execute_args))
+    block.tool_name = "place_block"
+    block.execution_args_hash = hash_normalized_args(normalize_tool_args(canonical))
     block.requests.approvals[0] = ToolCallPart(
-        tool_name="edit_blocks",
-        args=block.normalized_args,
+        tool_name="place_block",
+        args=canonical,
         tool_call_id="tc-block",
+    )
+    get_preflight_cache().put(
+        run_id=block.run_id,
+        tool_call_id="tc-block",
+        original_args_hash="orig-h",
+        canonical_args=canonical,
+        connection_id=str(state.id),
+        tool_name="place_block",
+        plan_id="pid-1",
     )
     regular = _make_pending(approval_id="r", tool_call_id="tc-regular")
     regular.connection_id = str(state.id)
@@ -426,7 +440,7 @@ async def test_gateway_approval_resume_uses_override_only_for_block_tools() -> N
     )
 
     payload = handler.broker.submit_request.await_args.args[1].deferred_tool_results["approvals"]
-    assert payload["tc-block"] == {"kind": "tool-approved", "override_args": block.execute_args}
+    assert payload["tc-block"] == {"kind": "tool-approved", "plan_id": "pid-1"}
     assert payload["tc-regular"] is True
 
 
@@ -444,17 +458,49 @@ async def test_gateway_rejects_tampered_block_execution_hash_before_resume() -> 
         should_auto_approve_tools=lambda *_args: False,
     )
     state = SimpleNamespace(id=uuid4())
-    block = _make_pending(approval_id="b", tool_call_id="tc-block")
+    canonical = {"pos": [1, 64, 1], "block": "stone", "expect": "air"}
+    block = _make_pending(approval_id="b", tool_call_id="tc-block", plan_id="pid-2")
     block.connection_id = str(state.id)
-    block.tool_name = "edit_blocks"
-    block.normalized_args = {
-        "type_id": "minecraft:stone", "mode": "place", "coordinate_mode": "absolute",
-        "dimension": "minecraft:overworld", "position": {"x": 1, "y": 64, "z": 1},
-        "locked_targets": [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}],
-        "phase": "execute",
-    }
-    block.execute_args = dict(block.normalized_args)
+    block.tool_name = "place_block"
     block.execution_args_hash = "tampered"
+    block.decision = True
+    get_preflight_cache().put(
+        run_id=block.run_id,
+        tool_call_id="tc-block",
+        original_args_hash="orig-h",
+        canonical_args=canonical,
+        connection_id=str(state.id),
+        tool_name="place_block",
+        plan_id="pid-2",
+    )
+
+    await handler._resume_from_completed_batch(
+        state, completed_batch=[block], pending=block, owner="Steve",
+        conversation_id="conv-1", player_name="Steve", source="test",
+    )
+
+    handler.broker.submit_request.assert_not_awaited()
+    handler._send_player_reply.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_resume_when_block_plan_missing_from_cache() -> None:
+    """恢复时 plan_id 在预检缓存中不存在（过期/重启）→ 拒绝恢复，不提交。"""
+    handler = object.__new__(CommandHandlers)
+    handler.protocol = MagicMock()
+    handler.protocol.create_error_message.return_value = "invalid"
+    handler._send_player_reply = AsyncMock()
+    handler.broker = MagicMock()
+    handler.broker.submit_request = AsyncMock()
+    handler._require_host = lambda _state: SimpleNamespace(
+        get_player_session=lambda _owner: SimpleNamespace(current_provider="test"),
+        should_auto_approve_tools=lambda *_args: False,
+    )
+    state = SimpleNamespace(id=uuid4())
+    block = _make_pending(approval_id="b", tool_call_id="tc-block", plan_id="pid-ghost")
+    block.connection_id = str(state.id)
+    block.tool_name = "place_block"
+    block.execution_args_hash = hash_normalized_args(normalize_tool_args({"pos": [1, 64, 1], "block": "stone", "expect": "air"}))
     block.decision = True
 
     await handler._resume_from_completed_batch(
@@ -470,24 +516,16 @@ def test_expired_block_approval_is_not_resumable() -> None:
     """过期方块审批不得从 store 取出并静默用原始参数重新预检执行。"""
     store = PendingApprovalStore(default_ttl_seconds=0.01)
     block = _make_pending(approval_id="b", tool_call_id="tc-block", ttl=0.01)
-    block.tool_name = "edit_blocks"
+    block.tool_name = "place_block"
     block.normalized_args = {
-        "type_id": "minecraft:stone",
-        "mode": "place",
-        "coordinate_mode": "absolute",
-        "dimension": "minecraft:overworld",
-        "position": {"x": 1, "y": 64, "z": 1},
-        "locked_targets": [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}],
-        "phase": "execute",
+        "pos": [1, 64, 1],
+        "block": "minecraft:stone",
+        "expect": "air",
     }
     block.execute_args = {
-        "type_id": "minecraft:stone",
-        "mode": "place",
-        "coordinate_mode": "absolute",
-        "dimension": "minecraft:overworld",
-        "position": {"x": 1, "y": 64, "z": 1},
-        "locked_targets": [{"dimension": "minecraft:overworld", "x": 1, "y": 64, "z": 1}],
-        "phase": "execute",
+        "pos": [1, 64, 1],
+        "block": "minecraft:stone",
+        "expect": "air",
     }
     block.execution_args_hash = hash_normalized_args(normalize_tool_args(block.execute_args))
     store.put(block)
@@ -562,3 +600,112 @@ async def test_handle_tool_approval_rejects_swapped_original_tool_call_ids(
 
     handler.broker.submit_request.assert_not_awaited()
     assert handler._send_player_reply.await_count >= 3
+
+
+@pytest.mark.asyncio
+async def test_four_parallel_fill_blocks_merge_into_one_approval_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task 7 Step 1: 同一轮 4 个并行 fill_block 合并为一批审批。
+
+    前 3 次 ``AGENT 同意`` 只记录决策并等待；第 4 次齐套后一次性恢复，
+    四个 ``{"kind": "tool-approved", "plan_id": ...}`` 负载一起回到 broker，
+    且 submit_request 只被调用一次。``batch_id`` / ``sibling_approval_ids``
+    语义与旧 contract 完全一致。
+    """
+    store = PendingApprovalStore(default_ttl_seconds=120.0)
+    monkeypatch.setattr(
+        "services.agent.runtime.get_agent_runtime",
+        lambda: SimpleNamespace(get_pending_approval_store=lambda _settings: store),
+    )
+    handler = object.__new__(CommandHandlers)
+    handler.protocol = MagicMock()
+    handler.protocol.create_success_message.return_value = "ok"
+    handler.protocol.create_info_message.return_value = "info"
+    handler.protocol.create_error_message.return_value = "invalid"
+    handler._send_player_reply = AsyncMock()
+    handler.broker = MagicMock()
+    handler.settings = MagicMock()
+    handler.broker.get_active_conversation_id.return_value = "conv-1"
+    handler.broker.get_conversation_generation.return_value = 1
+    handler.broker.get_conversation_invalidation_epoch.return_value = 1
+    handler.broker.submit_request = AsyncMock()
+    session = SimpleNamespace(current_provider="test")
+    handler._require_host = lambda _state: SimpleNamespace(
+        get_player_session=lambda _owner: session,
+        should_auto_approve_tools=lambda *_args: False,
+    )
+    state = SimpleNamespace(id=uuid4())
+
+    batch_id = "batch-fill"
+    sibling_ids = ["f1", "f2", "f3", "f4"]
+    canonical = {
+        "from": [2, 64, 1],
+        "to": [4, 64, 3],
+        "block": "minecraft:stone",
+        "expect": "air",
+    }
+    approval_parts = []
+    for index, ap_id in enumerate(sibling_ids, start=1):
+        tool_call_id = f"tc-fill-{index}"
+        plan_id = f"pid-{index}"
+        pending = _make_pending(
+            approval_id=ap_id,
+            tool_call_id=tool_call_id,
+            batch_id=batch_id,
+            sibling_ids=sibling_ids,
+            plan_id=plan_id,
+        )
+        pending.connection_id = str(state.id)
+        pending.tool_name = "fill_block"
+        pending.expected_tool_call_id = tool_call_id
+        pending.execution_args_hash = hash_normalized_args(
+            normalize_tool_args(canonical)
+        )
+        approval_parts.append(
+            ToolCallPart(
+                tool_name="fill_block", args=canonical, tool_call_id=tool_call_id
+            )
+        )
+        get_preflight_cache().put(
+            run_id=pending.run_id,
+            tool_call_id=tool_call_id,
+            original_args_hash=f"orig-h-{index}",
+            canonical_args=canonical,
+            connection_id=str(state.id),
+            tool_name="fill_block",
+            plan_id=plan_id,
+        )
+        store.put(pending)
+
+    # 同批共享同一组 deferred calls（模型同轮并行发出的 4 个调用）。
+    requests = DeferredToolRequests(approvals=approval_parts)
+    for ap_id in sibling_ids:
+        pending = store.get(str(state.id), "Steve", "conv-1", ap_id)
+        assert pending is not None
+        pending.requests = requests
+
+    for index, ap_id in enumerate(sibling_ids, start=1):
+        await handler.handle_tool_approval(
+            state, ap_id, approved=True, player_name="Steve"
+        )
+        if index < 4:
+            handler.broker.submit_request.assert_not_awaited()
+        else:
+            handler.broker.submit_request.assert_awaited_once()
+
+    payload = handler.broker.submit_request.await_args.args[
+        1
+    ].deferred_tool_results["approvals"]
+    assert payload == {
+        f"tc-fill-{index}": {"kind": "tool-approved", "plan_id": f"pid-{index}"}
+        for index in range(1, 5)
+    }
+
+    # 前 3 次决策各发一条“等待”信息；第 4 次发“继续执行”。
+    info_replies = [
+        call.args[1]
+        for call in handler._send_player_reply.await_args_list
+        if call.args[1] == "info"
+    ]
+    assert len(info_replies) == 3
