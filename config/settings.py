@@ -258,6 +258,7 @@ REQUIRED_CONFIG_PATHS = (
     "agent.output_tokens_limit",
     "agent.total_tokens_limit",
     "agent.run_timeout",
+    "agent.request_timeout",
     "agent.max_tool_concurrency",
     "agent.context_output_reserve_tokens",
     "agent.count_tokens_before_request",
@@ -829,7 +830,10 @@ class Settings(BaseSettings):
     input_tokens_limit: int | None = Field(default=None, ge=1)
     output_tokens_limit: int | None = Field(default=None, ge=1)
     total_tokens_limit: int | None = Field(default=None, ge=1)
-    run_timeout: float = Field(default=90.0, gt=0)
+    run_timeout: float = Field(default=180.0, gt=0)
+    # 单次 LLM 请求超时（秒）：仅约束一次模型请求的流式读取时长，
+    # 不累加多步工具循环。请求在此超时即视为 TRANSIENT 并 salvage 已产出的消息。
+    request_timeout: float = Field(default=90.0, gt=0)
     max_tool_concurrency: int = Field(default=4, ge=1)
     context_output_reserve_tokens: int = Field(default=1024, ge=0)
     # 请求前 token 硬边界（UsageLimits.count_tokens_before_request）。

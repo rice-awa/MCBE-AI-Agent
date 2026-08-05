@@ -113,7 +113,8 @@ def test_agent_run_budget_defaults_when_absent(tmp_path, monkeypatch):
     assert settings.input_tokens_limit is None
     assert settings.output_tokens_limit is None
     assert settings.total_tokens_limit is None
-    assert settings.run_timeout == 90.0
+    assert settings.run_timeout == 180.0
+    assert settings.request_timeout == 90.0
     assert settings.max_tool_concurrency == 4
     assert settings.context_output_reserve_tokens == 1024
 

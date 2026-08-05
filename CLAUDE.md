@@ -191,7 +191,7 @@ feature/* / fix/* / ...  →  dev  →  master
 - `server.host` / `server.port`
 - `auth.jwt_secret` / `auth.jwt_expiration` / `auth.jwt_algorithm` / `auth.default_password`；`jwt_secret` 和 `default_password` 通过 `${...}` 引用 `.env`
 - `providers.default` 与各 provider 的 `model`、`base_url`、`api_key`；`api_key` 字段通常写 `${...}` 引用 `.env` 中的密钥，不要直接写明文密钥。
-- `agent.agent_retries` / `agent.worker_http_timeout` / `agent.worker_poll_timeout` / `agent.run_command_timeout` / `agent.system_prompt` / `agent.max_history_turns` / `agent.compression_*` / `agent.stream_sentence_mode` / `agent.llm_warmup_enabled`
+- `agent.agent_retries` / `agent.worker_http_timeout` / `agent.worker_poll_timeout` / `agent.run_command_timeout` / `agent.system_prompt` / `agent.max_history_turns` / `agent.compression_*` / `agent.stream_sentence_mode` / `agent.llm_warmup_enabled` / `agent.run_timeout` / `agent.request_timeout`
 - `queue.llm_worker_count` / `queue.max_size`
 - `flow_control.command_line_byte_budget` / `flow_control.chunk_delays.*` / `flow_control.non_stream_*` / `flow_control.max_chunk_content_length` / `flow_control.chunk_sentence_mode`
 - `addon.protocol.*`（文档镜像；运行时强制 mcbews v1，旧 mcbeai 值会被忽略）
