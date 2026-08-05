@@ -635,6 +635,49 @@ def test_non_stream_constants_removed_from_module() -> None:
     assert not hasattr(core, "NON_STREAM_SEND_DELAY")
 
 
+def test_get_request_timeout_defaults_to_90() -> None:
+    """未配置 request_timeout 时应回退到默认 90s。"""
+    assert core.get_request_timeout(SimpleNamespace()) == 90.0
+    assert core.get_request_timeout(SimpleNamespace(request_timeout=0.0)) == 90.0
+    assert core.get_request_timeout(SimpleNamespace(request_timeout=42.5)) == 42.5
+
+
+def test_stream_with_request_timeout_elapsed_sets_flag_and_raises() -> None:
+    """单次请求流超过超时后应置位 flag 并重新抛出 TimeoutError。"""
+    ctx = core._HandlerContext()
+
+    async def slow_stream():
+        await asyncio.sleep(0.2)
+        yield "x"
+
+    async def run() -> None:
+        with pytest.raises(asyncio.TimeoutError):
+            async for _ in core._stream_with_request_timeout(slow_stream(), 0.05, ctx):
+                pass  # pragma: no cover
+
+    asyncio.run(run())
+    assert ctx.request_timeout_hit is True
+
+
+def test_stream_with_request_timeout_not_elapsed_leaves_flag_false() -> None:
+    """未触发超时时应正常产出全部事件，且不置位 flag。"""
+    ctx = core._HandlerContext()
+
+    async def fast_stream():
+        yield "a"
+        yield "b"
+
+    async def run() -> None:
+        collected = [
+            item
+            async for item in core._stream_with_request_timeout(fast_stream(), 5.0, ctx)
+        ]
+        assert collected == ["a", "b"]
+
+    asyncio.run(run())
+    assert ctx.request_timeout_hit is False
+
+
 def test_empty_text_chunks_should_not_yield_content_events(monkeypatch) -> None:
     """空文本列表不应产生内容事件"""
     _patch_agent_node_adapter(monkeypatch)
