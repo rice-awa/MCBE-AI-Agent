@@ -18,44 +18,52 @@
 
 ## 开发规范（Git 工作流）
 
-**所有新功能与 bug 修复必须在新分支上完成，禁止直接在 `master` 或 `dev` 上开发。**
+仓库只维护两个长期主线：
 
-### 分支模型
+- `master`：稳定发布线，只接收已经在 `dev` 验证过的内容，并在发布时打 tag。
+- `dev`：日常集成线，也是功能 / 修复 PR 的默认目标。
+
+整体流向：
 
 ```
-feature/* / fix/* / ...  →  dev  →  master
+feature/* / fix/* / refactor/*  →  dev  →  master
+                                      ↘
+                                      beta（仅用于独立实验产物）
 ```
 
-1. **功能 / 修复分支**：从最新 `dev` 拉出（`git fetch origin && git checkout -b <type>/<name> origin/dev`）。
-2. **合并回 `dev`**：自测通过后，开 PR 合入 `dev`（或在获准后本地 merge 再 push）。同一主题的多个小提交可 squash。
-3. **合回 `master`**：仅从已验证的 `dev` 合入 `master`；不要把 feature/fix 分支直接合进 `master`。
-4. **禁止**：在 `master` / `dev` 上直接 commit；跳过 `dev` 直合 `master`；用模糊或无类型的分支名。
+### 变更路径
 
-热修复若必须从 `master` 拉出，修复后仍先合入 `dev`，再让 `dev` 合回 `master`，避免分支漂移。
+1. **小而低风险的改动**可以直接提交到 `dev`，例如错别字、少量文档整理、简单配置调整或不影响行为的测试补充。提交前仍需运行相关检查，并确认 `dev` 工作树已同步。
+2. **新功能、非简单 bug 修复、协议 / 架构 / 多模块改动**从最新 `dev` 创建主题分支：
+   `git fetch origin && git switch -c <type>/<name> origin/dev`。
+3. 主题分支完成自测后合入 `dev`。同一主题的实现、测试和文档应放在同一个分支 / PR 中，不要为配套文档另开分支。
+4. 普通文档改动不再默认创建 `docs/*` 分支：小改动直接进 `dev`，与功能或修复相关的文档跟随对应主题分支；只有需要单独评审的大型文档工程才例外开分支。
+5. 只有经过 `dev` 验证的内容才能从 `dev` 合入 `master`；功能 / 修复分支不得直接合入 `master`。
+6. `master` 和 `dev` 不提交无关的临时调试内容；紧急生产修复如必须从 `master` 拉出，合入后要立即把同一修复同步回 `dev`。
 
 ### 分支命名
 
-格式：`<type>/<short-kebab-desc>`
+格式统一为 `<type>/<short-kebab-desc>`，使用英文小写和 kebab-case：
 
 | type | 用途 | 示例 |
 |------|------|------|
-| `feature/` 或 `feat/` | 新功能 | `feature/ddui-chat-panel`、`feat/models-dev-context-metadata` |
-| `fix/` | bug 修复 | `fix/pydantic-ai-1.0-import` |
+| `feature/` | 新功能 | `feature/ddui-chat-panel` |
+| `fix/` | bug 修复 | `fix/request-timeout` |
 | `refactor/` | 重构（行为不变） | `refactor/agent-conversation` |
-| `chore/` | 构建、依赖、杂项 | `chore/update-vitest` |
-| `docs/` | 仅文档 | `docs/addon-bridge-protocol` |
 | `test/` | 仅测试 | `test/agent-worker-isolation` |
+| `chore/` | 构建、依赖、杂项 | `chore/update-vitest` |
+| `worktree/` | 临时 worktree 隔离（不作为长期协作分支） | `worktree/agent-trace-audit` |
 
 规则：
 
-- 英文小写 + kebab-case；描述要能从名字看出意图，避免 `fix-1`、`tmp`、`wip`、纯中文路径名。
-- 一个分支一个主题；不要在同一分支混杂无关功能。
-- 临时 worktree / agent 分支可用 `worktree-<topic>`，合入前整理为上述正式命名或经 PR 标题说明主题。
-- 不强制在分支名中写日期；需要区分并行方案时再加简短后缀（如 `-beta`）。
+- 新功能只使用 `feature/`，不再使用 `feat/`；`feat` 仅作为 Conventional Commits 的提交类型。
+- 普通配套文档不使用 `docs/` 分支，随对应 `feature/` / `fix/` 分支提交。
+- 一个分支只处理一个主题；分支名要能说明意图，避免 `tmp`、`wip`、`fix-1`、日期堆砌或纯中文路径名。
+- 主题分支合入后及时删除本地和远端分支；不要从已合并的旧分支继续开发。
 
 ### 提交信息
 
-遵循 Conventional Commits，与分支 type 对齐，例如：
+遵循 Conventional Commits；提交类型按提交内容选择，不要求与分支前缀完全一致。配套文档可以使用 `docs(...)`，但应留在对应的功能 / 修复分支中，例如：
 
 ```
 feat(chat): 支持 @AI 触发与连续对话
@@ -83,6 +91,7 @@ pytest
 ## Git 与工作树
 
 - 不要提交或覆盖用户未明确要求处理的改动。
-- 需要隔离开发较大功能或修复时，优先使用已被忽略的 `.worktrees/`，分支仍按上文命名并从 `dev` 拉出。
-- 提交、合并或移除工作树前先检查 `git status --short`。
-- 推送 / 开 PR 前确认目标分支是 `dev`（功能与修复），不是 `master`。
+- 小改动直达 `dev` 时，先执行 `git switch dev && git pull --ff-only origin dev`；较大功能或修复优先使用已被忽略的 `.worktrees/` 隔离开发。
+- 使用 worktree 时，分支仍按上文命名并从最新 `dev` 拉出；提交、合并或移除 worktree 前先检查 `git status --short` 和 `git worktree list`。
+- 推送 / 开 PR 前确认目标分支：主题分支指向 `dev`，发布 PR 指向 `master`。
+- 合并完成后检查对应远端分支是否仍存在，及时清理已合并分支。

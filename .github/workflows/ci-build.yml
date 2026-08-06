@@ -2,12 +2,12 @@ name: CI Build
 
 on:
   push:
-    branches: [main, master, develop]
+    branches: [master, dev, beta]
     paths:
       - 'MCBE-AI-Agent-addon/**'
       - '.github/workflows/ci-build.yml'
   pull_request:
-    branches: [main, master, develop]
+    branches: [master, dev, beta]
     paths:
       - 'MCBE-AI-Agent-addon/**'
 

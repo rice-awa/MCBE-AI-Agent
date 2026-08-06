@@ -98,14 +98,16 @@ MCBE 的 `/wsserver` 在一个世界内通常只有一条 WebSocket 连接，多
 ### 分支模型
 
 ```
-feature/* / fix/* / ...  →  dev  →  master
+feature/* / fix/* / refactor/*  →  dev  →  master
+                                      ↘ beta（仅用于独立实验产物）
 ```
 
-1. **新功能与 bug 修复必须新建分支**，禁止在 `master` 或 `dev` 上直接开发与提交。
-2. 功能 / 修复分支从最新 **`dev`** 拉出：`git fetch origin && git checkout -b <type>/<name> origin/dev`。
-3. 完成后先合入 **`dev`**（PR 或获准后的 merge），自测与评审在 `dev` 上完成。
-4. 仅从已验证的 **`dev` 合回 `master`**；禁止 feature/fix 分支跳过 `dev` 直合 `master`。
-5. 热修复若从 `master` 拉出，修复后仍先合 `dev`，再由 `dev` 合回 `master`。
+1. `master` 是稳定发布线，`dev` 是日常集成线；发布只从已验证的 `dev` 合入 `master`。
+2. 错别字、少量文档整理、简单配置调整等低风险小改动可直接提交到 `dev`，提交前运行相关检查。
+3. 新功能、非简单 bug 修复和跨模块改动从最新 `dev` 创建主题分支：`git fetch origin && git switch -c <type>/<name> origin/dev`，完成后合入 `dev`。
+4. 实现、测试和配套文档属于同一主题时放在同一分支 / PR；普通文档不单独创建 `docs/*` 分支。
+5. 新功能分支统一使用 `feature/*`，不使用 `feat/*`；`feat` 仅用于提交类型。其他允许的分支类型为 `fix/*`、`refactor/*`、`test/*`、`chore/*`。
+6. 合并完成后及时删除主题分支；紧急生产修复若从 `master` 拉出，合入后立即同步回 `dev`。
 
 ### 分支命名
 
@@ -113,17 +115,17 @@ feature/* / fix/* / ...  →  dev  →  master
 
 | type | 用途 | 示例 |
 |------|------|------|
-| `feature/` 或 `feat/` | 新功能 | `feature/ddui-chat-panel` |
-| `fix/` | bug 修复 | `fix/pydantic-ai-1.0-import` |
+| `feature/` | 新功能 | `feature/ddui-chat-panel` |
+| `fix/` | bug 修复 | `fix/request-timeout` |
 | `refactor/` | 重构 | `refactor/agent-conversation` |
 | `chore/` | 杂项 / 依赖 | `chore/update-vitest` |
-| `docs/` | 文档 | `docs/addon-bridge-protocol` |
 | `test/` | 测试 | `test/agent-worker-isolation` |
+| `worktree/` | 临时 worktree 隔离 | `worktree/agent-trace-audit` |
 
 - 一个分支一个主题；避免 `tmp`、`wip`、`fix-1`、纯中文路径名。
-- 临时 worktree 可用 `worktree-<topic>`，合入前用正式 type 命名或在 PR 中写清主题。
+- 普通配套文档跟随对应的 `feature/*` / `fix/*` 分支；临时 worktree 可用 `worktree/<topic>`。
 - 提交信息遵循 Conventional Commits（如 `fix(agent): ...`、`feat(chat): ...`）。
-- 推送 / 开 PR 时目标分支默认是 **`dev`**，不是 `master`。
+- 推送 / 开 PR 时主题分支目标默认是 **`dev`**，发布 PR 才指向 `master`。
 
 ## Key Files
 
