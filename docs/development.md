@@ -102,7 +102,10 @@ async def your_tool(ctx: RunContext[AgentDependencies], param: str) -> str:
 
 ## Git 工作流
 
-- 新功能 / 修复在 `feature/*` / `fix/*` 分支开发，从 `dev` 拉出，合回 `dev`；`master` 只接收已验证的 `dev`。
+- `master` 是稳定发布线，`dev` 是日常集成线；发布只从已验证的 `dev` 合入 `master`。
+- 错别字、少量文档整理、简单配置调整等低风险小改动可直接提交到 `dev`；新功能、非简单 bug 修复和跨模块改动从最新 `dev` 拉出 `feature/*` / `fix/*` 等主题分支后合回 `dev`。
+- 实现、测试和配套文档放在同一主题分支 / PR 中，普通文档不单独创建 `docs/*` 分支；新功能分支统一使用 `feature/*`，不使用 `feat/*`。
+- 主题分支合并后及时删除；详细规则见 [`AGENTS.md`](../AGENTS.md)。
 - 提交信息遵循 Conventional Commits（`feat(chat): ...` / `fix(agent): ...`）。
 - 详细规范见 [`AGENTS.md`](../AGENTS.md)。
 

@@ -45,6 +45,7 @@ class StreamModeSettings(Protocol):
     output_tokens_limit: int | None
     total_tokens_limit: int | None
     run_timeout: float
+    request_timeout: float
     max_tool_concurrency: int
     context_output_reserve_tokens: int
 
@@ -169,7 +170,33 @@ def format_usage_limit_player_message(exc: UsageLimitExceeded) -> str:
 
 
 def get_run_timeout(settings: Any) -> float:
-    return float(getattr(settings, "run_timeout", 90.0) or 90.0)
+    return float(getattr(settings, "run_timeout", 180.0) or 180.0)
+
+
+def get_request_timeout(settings: Any) -> float:
+    """单次 LLM 请求超时（秒）。仅约束一次模型请求的流式读取时长。"""
+    return float(getattr(settings, "request_timeout", 90.0) or 90.0)
+
+
+async def _stream_with_request_timeout(
+    stream: Any,
+    timeout: float,
+    ctx: _HandlerContext,
+) -> AsyncIterator[Any]:
+    """在单次模型请求的流式读取外加墙钟超时。
+
+    语义：约束从开始读取该次模型请求流到读完的墙钟时长（含消费方在 yield 之间
+    处理事件的时间，因生成器与其消费方运行于同一 task）。超时把
+    `ctx.request_timeout_hit` 置位后重新抛出 TimeoutError，交由外层 except
+    走既有 salvage 流程，并区分出 request_timeout diagnostic。
+    """
+    try:
+        async with asyncio.timeout(timeout):
+            async for item in stream:
+                yield item
+    except TimeoutError:
+        ctx.request_timeout_hit = True
+        raise
 
 
 def player_facing_error(error_kind: ErrorKind, fallback: str | None = None) -> str:
@@ -912,6 +939,8 @@ class _HandlerContext:
     tool_events: list[dict[str, Any]] = field(default_factory=list)  # 记录工具调用事件
     tool_results: dict[str, str] = field(default_factory=dict)  # 记录工具返回结果，key=tool_call_id
     tool_call_names: dict[str, str] = field(default_factory=dict)  # tool_call_id -> tool_name
+    # 单次请求超时已触发：用于把 diagnostic 从 run_timeout 区分为 request_timeout
+    request_timeout_hit: bool = False
 
 
 async def _send_content_event(
@@ -1011,6 +1040,7 @@ async def stream_response_handler(
 
     usage_limits = build_usage_limits(deps.settings, deps.provider)
     run_timeout = get_run_timeout(deps.settings)
+    request_timeout = get_request_timeout(deps.settings)
     # 审批事件必须在 agent.iter() 上下文干净退出后再 yield。
     # 若在 async with 内 yield+return，消费者停止迭代时会注入 GeneratorExit，
     # pydantic-ai 的 iter 清理会变成 RuntimeError("coroutine ignored GeneratorExit")，
@@ -1048,7 +1078,9 @@ async def stream_response_handler(
                     # 处理模型请求节点 - 流式输出文本
                     elif Agent.is_model_request_node(node):
                         async with node.stream(run.ctx) as request_stream:
-                            async for event in request_stream:
+                            async for event in _stream_with_request_timeout(
+                                request_stream, request_timeout, ctx
+                            ):
                                 # 处理部分开始事件
                                 if isinstance(event, PartStartEvent):
                                     logger.debug(
@@ -1260,6 +1292,10 @@ async def stream_response_handler(
             )
         else:
             error_kind, player_msg, diagnostic = classify_run_exception(e)
+
+            # 区分单次请求超时（request_timeout）与整轮 run 超时（run_timeout）
+            if ctx.request_timeout_hit:
+                diagnostic = "request_timeout"
 
             # MCP 故障：只标记有证据关联的 server，不在本 run 内递归重放
             if _is_mcp_timeout_error(e):
