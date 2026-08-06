@@ -13,7 +13,8 @@ config.json
 .vscode
 .cursor
 .worktrees
-
+.agents
+.codex
 # logs
 logs/*
 *.log
