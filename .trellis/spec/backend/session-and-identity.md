@@ -33,6 +33,8 @@ Minecraft 世界通常只有一条 `/wsserver` WebSocket 连接，因此 `connec
 
 禁止使用 SDK `ConnectionState.player_name` 做业务分支；该属性既不是多人世界中的真实玩家身份，也不应替代事件中的 `sender`。禁止使用全局“当前玩家”、单一连接历史或未带玩家参数的缓存。
 
+连接级可变状态（如曾经的 `state._player_name`）不得作为业务身份的回退来源：一名玩家的任务写入后等待、另一名玩家覆盖连接状态，前者若在回退分支读取连接状态，就会得到后者的身份。回退分支在缺少显式 `player_name` 时应使用非业务性默认值（如广播到全体的 `@a` 或 `DEFAULT_PLAYER_DISPLAY_NAME`），而不是连接级状态。相关改动应先补同一连接下双玩家交错的确定性安全门测试（见 [`tests/test_gateway_hook_auth_chat.py`](../../../tests/test_gateway_hook_auth_chat.py) 的方案二测试组）。
+
 ## 验证方式
 
 涉及此规则的改动至少覆盖一名连接下两名玩家的隔离测试。现有参考包括 [`tests/test_queue_context.py`](../../../tests/test_queue_context.py)、[`tests/test_gateway_session_store.py`](../../../tests/test_gateway_session_store.py)、[`tests/test_gateway_hook_auth_chat.py`](../../../tests/test_gateway_hook_auth_chat.py) 和 [`tests/test_agent_context.py`](../../../tests/test_agent_context.py)。检查历史、锁、provider、模板、变量、广播和 UI 响应是否都落在正确的玩家桶中。
