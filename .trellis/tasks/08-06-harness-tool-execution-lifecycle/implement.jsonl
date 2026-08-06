@@ -1,1 +1,2 @@
-{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": "spec/backend/runtime-architecture.md", "reason": "运行时 Harness 工具执行生命周期、AgentWorker 与工具审计/追踪的分层边界，用于定位统一执行深模块的归属"}
+{"file": "spec/backend/quality-guidelines.md", "reason": "深模块 / 浅层转发质量准则，作为收敛普通执行与审批恢复两条路径的删檢验依据"}
