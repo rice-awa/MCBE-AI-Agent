@@ -42,3 +42,45 @@ block_ops 包内部重构：新增 limits.py/message.py/preflight.py 三个模�
 ### Status
 
 [OK] **Completed**
+
+---
+
+## 2026-08-07 — 方案四：把单次 MCBE Chat Agent 执行从 AgentWorker 生命周期中独立
+
+**Commit**: `29ca4a0`
+**Branch**: `dev`（直接提交到 dev）
+
+### Summary
+
+从 `AgentWorker` 提取 `_execute_single_request` 深模块，收敛单次 MCBE Chat Agent 执行的全部终态路径：
+
+- 新增 `ExecutionResult` dataclass 统一描述 success/approval_pending/partial/timeout/cancelled/exception/disconnected
+- `_execute_single_request` 承载完整流式执行管道：模型获取、流事件循环、tool_call/tool_result/approval_required/error 处理，成功时自动提交历史/触发标题生成
+- `_process_request_locked` 简化为上下文准备 + 委托执行 + 基于结果收尾
+- 提取 `_make_context_info_fn` 和 `_maybe_compress_before_run` 辅助方法
+- 测试：22/22 agent_worker、32/32 queue_context、27/27 stream_mode、27/27 provider_lifecycle 全部通过
+
+### Status
+
+[OK] **Completed** — 代码已合入 dev，待归档
+
+---
+
+## 2026-08-07 — 方案五：让工具目录成为真实契约中心
+
+**Commit**: `84b14c3`
+**Branch**: `dev`（直接提交到 dev）
+
+### Summary
+
+消除工具使用指南的手工维护副本，使 `_TOOL_CATALOG` 成为唯一真实来源：
+
+- `catalog.py` 新增 `project_tool_usage_guide()`，从 `_TOOL_CATALOG` 统一投影提示
+- `core.py` 删除重复的 `TOOL_USAGE_GUIDE` 副本
+- `prompt.py` 改为从 catalog 投影，消除两份副本
+- 测试新增 9 个契约完整性测试：唯一性、MCP 独立、约束引用存在、预览字段匹配、风险一致性等
+- 规格文档 `directory-structure.md` 更新
+
+### Status
+
+[OK] **Completed** — 代码已合入 dev，待归档
