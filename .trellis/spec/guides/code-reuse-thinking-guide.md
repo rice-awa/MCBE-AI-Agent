@@ -22,6 +22,30 @@ rg -n "player_name|BrokerResponseBridge|chunkPayload|ToolResult|mcbews:" core mo
 
 当同一规则被两个以上跨层消费者读取，或重复逻辑会改变安全/并发/协议语义时，应在拥有数据的边界创建共享类型、decoder、normalizer 或 projection。只使用一次的简单转换不必为了形式抽象成公共模块；抽象必须让调用方更难绕过真实契约。
 
+### 已验证的反重复模式：统一收尾链
+
+当两条路径在"收尾"阶段（结果分类→幂等写入→审计→追踪）有相同实现时，提取到共享方法：
+
+- 主路径（`call_tool`）和审批恢复路径（`_resume_approved_block_plan`）在 `execution.py` 中共享 `_finish_tool_execution` 方法，消除约 35 行重复代码。
+- **注意**：幂等命中（idempotent hit）分支通常在收尾链之前提前返回，不在共享方法中。两条路径的幂等命中分支仍各自保留 inline audit+trace。如果在重构中删除了某条路径的幂等命中 audit+trace，这是回归，必须恢复。
+
+错误示例——重构后丢失审计/追踪：
+```python
+# _resume_approved_block_plan 中错误地删除了 audit+trace
+if cached is not None:
+    logger.info("tool_idempotent_hit", tool=name, ...)
+    return materialize_tool_result(cached.result)  # ❌ 丢失了 audit + trace
+```
+
+正确示例——保留审计/追踪：
+```python
+if cached is not None:
+    logger.info("tool_idempotent_hit", tool=name, ...)
+    self._audit(...)
+    self._trace_tool_result(..., attributes={"idempotent_hit": True})
+    return materialize_tool_result(cached.result)
+```
+
 ## 提交前复查
 
 - 搜索是否存在同名/同义实现和旧协议字符串。

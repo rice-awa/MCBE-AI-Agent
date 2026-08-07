@@ -3,7 +3,7 @@
   "name": "architecture-review-optimization",
   "title": "架构优化：按 review 落实六项候选方案",
   "description": "依据 docs/review/architecture-review-20260806-191022.md 审查结论，逐步落实六项架构优化候选方案。父任务只拥有源需求、子任务映射、跨子任务验收标准（报告 12.1 节）与最终集成复核，本身不承担具体实现。按报告第十一节确定推进顺序：先落地方案二的前置双玩家交错测试作为安全门；再实施方案一（首要）；随后按一→三→四→六的依赖顺序推进；方案五独立可随时并行。",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,
