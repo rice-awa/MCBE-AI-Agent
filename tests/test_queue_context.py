@@ -304,8 +304,8 @@ def test_worker_keeps_serial_chat_history_when_requests_share_initial_generation
         from types import SimpleNamespace
 
         monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
-        monkeypatch.setattr("services.agent.providers.ProviderRegistry.get_model", lambda _config: object())
         monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: SimpleNamespace(
+            runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
             get_agent_manager=lambda: FakeAgentManager(),
             get_mcp_manager=lambda _settings: None,
             get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
@@ -366,8 +366,8 @@ def test_worker_skips_history_write_when_request_invalidation_epoch_is_stale(mon
         from types import SimpleNamespace
 
         monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
-        monkeypatch.setattr("services.agent.providers.ProviderRegistry.get_model", lambda _config: object())
         monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: SimpleNamespace(
+            runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
             get_agent_manager=lambda: FakeAgentManager(),
             get_mcp_manager=lambda _settings: None,
             get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
@@ -463,12 +463,9 @@ def test_worker_self_heals_orphan_tool_history_before_model_request(monkeypatch)
 
         monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
         monkeypatch.setattr(
-            "services.agent.providers.ProviderRegistry.get_model",
-            lambda _config: object(),
-        )
-        monkeypatch.setattr(
             "services.agent.worker.get_agent_runtime",
             lambda: SimpleNamespace(
+                runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
                 get_mcp_manager=lambda _settings: None,
                 get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
                     check_and_compress=fake_check_and_compress,
@@ -633,13 +630,13 @@ def test_worker_tool_events_should_not_be_sent_twice(monkeypatch) -> None:
 
     monkeypatch.setattr("services.agent.worker.stream_chat", _fake_stream_chat)
     monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: SimpleNamespace(
+        runtime_adapters=SimpleNamespace(get_model=lambda *_: object()),
         get_agent_manager=lambda: _FakeManager(),
         get_mcp_manager=lambda _settings: None,
         get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
             check_and_compress=_fake_check_and_compress,
         ),
     ))
-    monkeypatch.setattr("services.agent.worker.ProviderRegistry.get_model", lambda *_: object())
 
     request = ChatRequest(
         connection_id=connection_id,
@@ -705,13 +702,13 @@ def test_worker_generates_title_after_first_completed_turn(monkeypatch) -> None:
 
     monkeypatch.setattr("services.agent.worker.stream_chat", _fake_stream_chat)
     monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: SimpleNamespace(
+        runtime_adapters=SimpleNamespace(get_model=lambda *_: model),
         get_agent_manager=lambda: _FakeManager(),
         get_mcp_manager=lambda _settings: None,
         get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
             check_and_compress=_fake_check_and_compress,
         ),
     ))
-    monkeypatch.setattr("services.agent.worker.ProviderRegistry.get_model", lambda *_: model)
     monkeypatch.setattr("services.agent.worker.generate_conversation_title", _fake_generate_title)
     monkeypatch.setattr(
         "core.conversation.ConversationManager.check_and_compress",
@@ -787,13 +784,13 @@ def test_worker_does_not_regenerate_title_after_later_turn(monkeypatch) -> None:
 
     monkeypatch.setattr("services.agent.worker.stream_chat", _fake_stream_chat)
     monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: SimpleNamespace(
+        runtime_adapters=SimpleNamespace(get_model=lambda *_: object()),
         get_agent_manager=lambda: _FakeManager(),
         get_mcp_manager=lambda _settings: None,
         get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
             check_and_compress=_fake_check_and_compress,
         ),
     ))
-    monkeypatch.setattr("services.agent.worker.ProviderRegistry.get_model", lambda *_: object())
     monkeypatch.setattr("services.agent.worker.generate_conversation_title", _fake_generate_title)
     monkeypatch.setattr(
         "core.conversation.ConversationManager.check_and_compress",
@@ -981,13 +978,13 @@ def test_worker_persists_completed_history_when_context_disabled(monkeypatch) ->
 
     monkeypatch.setattr("services.agent.worker.stream_chat", _fake_stream_chat)
     monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: SimpleNamespace(
+        runtime_adapters=SimpleNamespace(get_model=lambda *_: object()),
         get_agent_manager=lambda: _FakeManager(),
         get_mcp_manager=lambda _settings: None,
         get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
             check_and_compress=_fake_check_and_compress,
         ),
     ))
-    monkeypatch.setattr("services.agent.worker.ProviderRegistry.get_model", lambda *_: object())
     monkeypatch.setattr(
         "core.conversation.ConversationManager.check_and_compress",
         _fake_check_and_compress,
@@ -1053,13 +1050,13 @@ def test_worker_passes_request_provider_to_auto_compression(monkeypatch) -> None
 
     monkeypatch.setattr("services.agent.worker.stream_chat", _fake_stream_chat)
     monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: SimpleNamespace(
+        runtime_adapters=SimpleNamespace(get_model=lambda *_: object()),
         get_agent_manager=lambda: _FakeManager(),
         get_mcp_manager=lambda _settings: None,
         get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
             check_and_compress=_fake_check_and_compress,
         ),
     ))
-    monkeypatch.setattr("services.agent.worker.ProviderRegistry.get_model", lambda *_: object())
     monkeypatch.setattr(
         "core.conversation.ConversationManager.check_and_compress",
         _fake_check_and_compress,
@@ -1118,13 +1115,13 @@ def test_worker_sends_notification_when_auto_compression_runs(monkeypatch) -> No
 
     monkeypatch.setattr("services.agent.worker.stream_chat", _fake_stream_chat)
     monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: SimpleNamespace(
+        runtime_adapters=SimpleNamespace(get_model=lambda *_: object()),
         get_agent_manager=lambda: _FakeManager(),
         get_mcp_manager=lambda _settings: None,
         get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
             check_and_compress=_fake_check_and_compress,
         ),
     ))
-    monkeypatch.setattr("services.agent.worker.ProviderRegistry.get_model", lambda *_: object())
     monkeypatch.setattr(
         "core.conversation.ConversationManager.check_and_compress",
         _fake_check_and_compress,

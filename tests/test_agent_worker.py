@@ -375,8 +375,22 @@ async def test_usage_limit_exceeded_does_not_continue_tools(monkeypatch):
 
     monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
     monkeypatch.setattr(
-        "services.agent.providers.ProviderRegistry.get_model",
-        lambda _config: object(),
+        "services.agent.worker.get_agent_runtime",
+        lambda: SimpleNamespace(
+            runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
+            get_mcp_manager=lambda _settings: None,
+            get_agent_manager=lambda: None,
+            get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
+                check_and_compress=AsyncMock(return_value=(False, "disabled")),
+            ),
+            get_pending_approval_store=lambda _settings: SimpleNamespace(
+                register_approval=lambda *_: None,
+                get_approval_by_tool_call=lambda _: None,
+                clear=lambda: None,
+                __len__=lambda: 0,
+            ),
+            refresh_mcp_tools=lambda _settings: None,
+        ),
     )
 
     connection_id = uuid4()
@@ -487,8 +501,22 @@ async def test_error_event_persists_partial_run_history(monkeypatch):
 
     monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
     monkeypatch.setattr(
-        "services.agent.providers.ProviderRegistry.get_model",
-        lambda _config: object(),
+        "services.agent.worker.get_agent_runtime",
+        lambda: SimpleNamespace(
+            runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
+            get_mcp_manager=lambda _settings: None,
+            get_agent_manager=lambda: None,
+            get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
+                check_and_compress=AsyncMock(return_value=(False, "disabled")),
+            ),
+            get_pending_approval_store=lambda _settings: SimpleNamespace(
+                register_approval=lambda *_: None,
+                get_approval_by_tool_call=lambda _: None,
+                clear=lambda: None,
+                __len__=lambda: 0,
+            ),
+            refresh_mcp_tools=lambda _settings: None,
+        ),
     )
 
     connection_id = uuid4()
@@ -565,8 +593,22 @@ async def test_approval_resume_keeps_only_deferred_pending_tool_call(monkeypatch
 
     monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
     monkeypatch.setattr(
-        "services.agent.providers.ProviderRegistry.get_model",
-        lambda _config: object(),
+        "services.agent.worker.get_agent_runtime",
+        lambda: SimpleNamespace(
+            runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
+            get_mcp_manager=lambda _settings: None,
+            get_agent_manager=lambda: None,
+            get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
+                check_and_compress=AsyncMock(return_value=(False, "disabled")),
+            ),
+            get_pending_approval_store=lambda _settings: SimpleNamespace(
+                register_approval=lambda *_: None,
+                get_approval_by_tool_call=lambda _: None,
+                clear=lambda: None,
+                __len__=lambda: 0,
+            ),
+            refresh_mcp_tools=lambda _settings: None,
+        ),
     )
 
 
@@ -669,8 +711,22 @@ async def test_approval_resume_uses_final_duplicate_id_or_fails_closed_if_ambigu
 
     monkeypatch.setattr("services.agent.worker.stream_chat", resume_with_real_agent)
     monkeypatch.setattr(
-        "services.agent.providers.ProviderRegistry.get_model",
-        lambda _config: object(),
+        "services.agent.worker.get_agent_runtime",
+        lambda: SimpleNamespace(
+            runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
+            get_mcp_manager=lambda _settings: None,
+            get_agent_manager=lambda: None,
+            get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
+                check_and_compress=AsyncMock(return_value=(False, "disabled")),
+            ),
+            get_pending_approval_store=lambda _settings: SimpleNamespace(
+                register_approval=lambda *_: None,
+                get_approval_by_tool_call=lambda _: None,
+                clear=lambda: None,
+                __len__=lambda: 0,
+            ),
+            refresh_mcp_tools=lambda _settings: None,
+        ),
     )
 
 
@@ -876,12 +932,9 @@ async def test_worker_audits_validation_retry_and_later_success_without_executio
 
         monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
         monkeypatch.setattr(
-            "services.agent.providers.ProviderRegistry.get_model",
-            lambda _config: object(),
-        )
-        monkeypatch.setattr(
             "services.agent.worker.get_agent_runtime",
             lambda: SimpleNamespace(
+                runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
                 get_mcp_manager=lambda _s: None,
                 get_conversation_manager=lambda *_args, **_kwargs: _NoCompression(),
             ),
@@ -1062,6 +1115,7 @@ async def test_approval_required_records_validation_failure_once_before_suspensi
         )
 
     runtime = SimpleNamespace(
+        runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
         get_pending_approval_store=lambda _settings=None: store,
         refresh_mcp_tools=lambda _settings: None,
         get_mcp_manager=lambda _s: None,
@@ -1070,10 +1124,6 @@ async def test_approval_required_records_validation_failure_once_before_suspensi
         ),
     )
     monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
-    monkeypatch.setattr(
-        "services.agent.providers.ProviderRegistry.get_model",
-        lambda _config: object(),
-    )
 
     monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: runtime)
 
@@ -1256,8 +1306,22 @@ async def test_stream_chunks_carry_trace_correlation(monkeypatch):
 
     monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
     monkeypatch.setattr(
-        "services.agent.providers.ProviderRegistry.get_model",
-        lambda _config: object(),
+        "services.agent.worker.get_agent_runtime",
+        lambda: SimpleNamespace(
+            runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
+            get_mcp_manager=lambda _settings: None,
+            get_agent_manager=lambda: None,
+            get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
+                check_and_compress=AsyncMock(return_value=(False, "disabled")),
+            ),
+            get_pending_approval_store=lambda _settings: SimpleNamespace(
+                register_approval=lambda *_: None,
+                get_approval_by_tool_call=lambda _: None,
+                clear=lambda: None,
+                __len__=lambda: 0,
+            ),
+            refresh_mcp_tools=lambda _settings: None,
+        ),
     )
 
     connection_id = uuid4()
@@ -1381,10 +1445,24 @@ async def test_single_tool_trace_contains_model_tool_model_and_final_response(
 
         monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
         monkeypatch.setattr(
-            "services.agent.providers.ProviderRegistry.get_model",
-            lambda _config: object(),
+            "services.agent.worker.get_agent_runtime",
+            lambda: SimpleNamespace(
+                runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
+                get_mcp_manager=lambda _s: None,
+                get_agent_manager=lambda: None,
+                get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
+                    check_and_compress=AsyncMock(return_value=(False, "")),
+                ),
+                get_pending_approval_store=lambda _settings: SimpleNamespace(
+                    register_approval=lambda *_: None,
+                    get_approval_by_tool_call=lambda _: None,
+                    clear=lambda: None,
+                    __len__=lambda: 0,
+                ),
+                refresh_mcp_tools=lambda _settings: None,
+            ),
         )
-    
+
         connection_id = uuid4()
         await worker._process_request_locked(
             ChatRequest(
@@ -1467,10 +1545,24 @@ async def test_content_disabled_keeps_metadata_but_omits_messages_and_results(
 
         monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
         monkeypatch.setattr(
-            "services.agent.providers.ProviderRegistry.get_model",
-            lambda _config: object(),
+            "services.agent.worker.get_agent_runtime",
+            lambda: SimpleNamespace(
+                runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
+                get_mcp_manager=lambda _s: None,
+                get_agent_manager=lambda: None,
+                get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
+                    check_and_compress=AsyncMock(return_value=(False, "")),
+                ),
+                get_pending_approval_store=lambda _settings: SimpleNamespace(
+                    register_approval=lambda *_: None,
+                    get_approval_by_tool_call=lambda _: None,
+                    clear=lambda: None,
+                    __len__=lambda: 0,
+                ),
+                refresh_mcp_tools=lambda _settings: None,
+            ),
         )
-    
+
         connection_id = uuid4()
         await worker._process_request_locked(
             ChatRequest(
@@ -1522,10 +1614,24 @@ async def test_stream_error_emits_trace_failed_once(tmp_path, monkeypatch):
 
         monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
         monkeypatch.setattr(
-            "services.agent.providers.ProviderRegistry.get_model",
-            lambda _config: object(),
+            "services.agent.worker.get_agent_runtime",
+            lambda: SimpleNamespace(
+                runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
+                get_mcp_manager=lambda _s: None,
+                get_agent_manager=lambda: None,
+                get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
+                    check_and_compress=AsyncMock(return_value=(False, "")),
+                ),
+                get_pending_approval_store=lambda _settings: SimpleNamespace(
+                    register_approval=lambda *_: None,
+                    get_approval_by_tool_call=lambda _: None,
+                    clear=lambda: None,
+                    __len__=lambda: 0,
+                ),
+                refresh_mcp_tools=lambda _settings: None,
+            ),
         )
-    
+
         connection_id = uuid4()
         await worker._process_request_locked(
             ChatRequest(
@@ -1643,10 +1749,24 @@ async def test_validation_failure_trace_is_gated_and_does_not_start_execution(
 
         monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
         monkeypatch.setattr(
-            "services.agent.providers.ProviderRegistry.get_model",
-            lambda _config: object(),
+            "services.agent.worker.get_agent_runtime",
+            lambda: SimpleNamespace(
+                runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
+                get_mcp_manager=lambda _s: None,
+                get_agent_manager=lambda: None,
+                get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
+                    check_and_compress=AsyncMock(return_value=(False, "")),
+                ),
+                get_pending_approval_store=lambda _settings: SimpleNamespace(
+                    register_approval=lambda *_: None,
+                    get_approval_by_tool_call=lambda _: None,
+                    clear=lambda: None,
+                    __len__=lambda: 0,
+                ),
+                refresh_mcp_tools=lambda _settings: None,
+            ),
         )
-    
+
         connection_id = uuid4()
         await worker._process_request_locked(
             ChatRequest(
@@ -1797,6 +1917,7 @@ async def test_approval_suspended_records_model_pairs_without_duplicate_proposed
 
         store = PendingApprovalStore(default_ttl_seconds=120.0)
         runtime = SimpleNamespace(
+            runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
             get_pending_approval_store=lambda _settings=None: store,
             refresh_mcp_tools=lambda _s: None,
             get_mcp_manager=lambda _s: None,
@@ -1805,10 +1926,6 @@ async def test_approval_suspended_records_model_pairs_without_duplicate_proposed
             ),
         )
         monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
-        monkeypatch.setattr(
-            "services.agent.providers.ProviderRegistry.get_model",
-            lambda _config: object(),
-        )
         monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: runtime)
 
         connection_id = uuid4()

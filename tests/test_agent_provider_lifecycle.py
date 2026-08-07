@@ -9,7 +9,7 @@ from models.agent import StreamEvent
 from models.messages import ChatRequest
 from services.agent.core import ChatAgentManager
 from services.agent.model_metadata import ModelMetadataCache
-from services.agent.providers import ProviderRegistry, RuntimeAdapterRegistry
+from services.agent.providers import RuntimeAdapterRegistry
 from services.agent.runtime import AgentRuntime, get_agent_runtime, set_agent_runtime
 
 
@@ -129,11 +129,13 @@ def test_worker_stream_chat_does_not_pass_primary_agent(monkeypatch):
                 raise AssertionError("worker should not request the primary agent")
 
         monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
-        monkeypatch.setattr("services.agent.providers.ProviderRegistry.get_model", lambda _config: object())
         monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: SimpleNamespace(
             get_agent_manager=lambda: FakeAgentManager(),
             get_mcp_manager=lambda _settings: None,
             get_conversation_manager=lambda *_a, **_k: None,
+            runtime_adapters=SimpleNamespace(
+                get_model=lambda _config: object(),
+            ),
         ))
         monkeypatch.setattr(
             worker,
@@ -221,7 +223,8 @@ def test_runtime_adapter_registry_shutdown_closes_clients_and_clears_caches(monk
     assert registry._model_cache == {}
 
 
-def test_provider_registry_facade_delegates_to_runtime_adapter():
+def test_runtime_adapters_accessible_via_agent_runtime():
+    """Verify runtime_adapters are directly accessible from AgentRuntime."""
     original = get_agent_runtime()
     runtime_adapters = SimpleNamespace(
         get_model=lambda config: ("model", config.name),
@@ -235,14 +238,15 @@ def test_provider_registry_facade_delegates_to_runtime_adapter():
         set_agent_runtime(runtime)
         config = provider_config(name="fake", model="fake-model")
 
-        assert ProviderRegistry.get_model(config) == ("model", "fake")
-        assert ProviderRegistry.list_providers() == ["fake"]
-        assert ProviderRegistry.get_model_string(config) == "fake:fake-model"
+        adapters = get_agent_runtime().runtime_adapters
+        assert adapters.get_model(config) == ("model", "fake")
+        assert adapters.list_providers() == ["fake"]
+        assert adapters.get_model_string(config) == "fake:fake-model"
     finally:
         set_agent_runtime(original)
 
 
-def test_agent_runtime_owns_provider_registry_facade():
+def test_agent_runtime_owns_runtime_adapters():
     original = get_agent_runtime()
     runtime_adapters = SimpleNamespace(
         get_model=lambda config: ("runtime-model", config.name),
@@ -256,9 +260,10 @@ def test_agent_runtime_owns_provider_registry_facade():
         set_agent_runtime(runtime)
         config = provider_config(name="runtime", model="runtime-model")
 
-        assert ProviderRegistry.get_model(config) == ("runtime-model", "runtime")
-        assert ProviderRegistry.list_providers() == ["runtime"]
-        assert ProviderRegistry.get_model_string(config) == "runtime:runtime-model"
+        adapters = get_agent_runtime().runtime_adapters
+        assert adapters.get_model(config) == ("runtime-model", "runtime")
+        assert adapters.list_providers() == ["runtime"]
+        assert adapters.get_model_string(config) == "runtime:runtime-model"
     finally:
         set_agent_runtime(original)
 

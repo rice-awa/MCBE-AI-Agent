@@ -1220,6 +1220,7 @@ async def test_worker_approval_required_does_not_cancel_on_return(monkeypatch):
 
     store = PendingApprovalStore(default_ttl_seconds=120.0)
     runtime = SimpleNamespace(
+        runtime_adapters=SimpleNamespace(get_model=lambda _config: object()),
         get_pending_approval_store=lambda _settings=None: store,
         get_agent_manager=lambda: None,
         refresh_mcp_tools=lambda _s: None,
@@ -1229,10 +1230,6 @@ async def test_worker_approval_required_does_not_cancel_on_return(monkeypatch):
         ),
     )
     monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
-    monkeypatch.setattr(
-        "services.agent.providers.ProviderRegistry.get_model",
-        lambda _config: object(),
-    )
     monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: runtime)
 
     connection_id = uuid4()

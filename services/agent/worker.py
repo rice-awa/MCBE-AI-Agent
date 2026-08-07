@@ -30,7 +30,6 @@ from services.agent.harness.audit import (
     extract_tool_validation_failures,
 )
 from services.agent.harness.execution import summarize_args_for_player
-from services.agent.providers import ProviderRegistry
 from services.agent.runtime import get_agent_runtime
 from services.agent.title import generate_conversation_title
 from services.agent.tool_results import CommandResult
@@ -820,7 +819,7 @@ class AgentWorker:
         # 获取模型
         try:
             provider_config = self.settings.get_provider_config(provider_name)
-            model = ProviderRegistry.get_model(provider_config)
+            model = get_agent_runtime().runtime_adapters.get_model(provider_config)
 
             logger.debug(
                 "using_provider",
@@ -1057,9 +1056,7 @@ class AgentWorker:
                                     )
                                     title_generation_triggered = True
 
-                                from core.conversation import get_conversation_manager
-
-                                conv_manager = get_conversation_manager(self.broker, self.settings)
+                                conv_manager = get_agent_runtime().get_conversation_manager(self.broker, self.settings)
                                 compressed, msg = await conv_manager.check_and_compress(
                                     connection_id,
                                     request.player_name,
@@ -1335,8 +1332,6 @@ class AgentWorker:
                             )
                             matched = True
                     if matched:
-                        from services.agent.runtime import get_agent_runtime
-
                         get_agent_runtime().refresh_mcp_tools(self.settings)
 
             logger.error(
@@ -1456,9 +1451,7 @@ class AgentWorker:
         ):
             return message_history
 
-        from core.conversation import get_conversation_manager
-
-        conv_manager = get_conversation_manager(self.broker, self.settings)
+        conv_manager = get_agent_runtime().get_conversation_manager(self.broker, self.settings)
         compressed, compress_msg = await conv_manager.check_and_compress(
             connection_id,
             request.player_name,

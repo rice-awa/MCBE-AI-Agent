@@ -229,7 +229,6 @@ def info():
 def test_provider(provider: str):
     """测试 LLM 提供商连接"""
     import httpx
-    from services.agent.providers import ProviderRegistry
 
     settings = get_settings()
 
@@ -243,7 +242,7 @@ def test_provider(provider: str):
             sys.exit(1)
 
         # 创建模型
-        model = ProviderRegistry.get_model(config)
+        model = get_agent_runtime().runtime_adapters.get_model(config)
 
         click.echo(f"✓ 提供商: {config.name}")
         click.echo(f"✓ 模型: {config.model}")
