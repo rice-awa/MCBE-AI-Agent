@@ -27,6 +27,36 @@ Minecraft /wsserver
 - Worker 和 Gateway 都有幂等的 start/stop 逻辑；停止时要取消任务、等待取消完成，并清理 session、pending command、bridge loop、Addon client 和 Broker connection。
 - 单次 Agent 执行（`_execute_single_request`）已从 `AgentWorker` 生命周期中独立。`AgentWorker` 只负责队列消费、按玩家取锁、提交执行上下文，并基于 `ExecutionResult` 决定收尾动作（终态追踪、标题生成）。执行核心（模型获取、流式处理、工具调用、审批挂起、异常/取消/超时处理、历史提交）收敛到 `_execute_single_request` 单一观察入口。
 
+### ExecutionResult 契约
+
+`ExecutionResult`（`services/agent/worker.py`）是 `_execute_single_request` 与 `_process_request_locked` 之间的返回值契约：
+
+```python
+@dataclass
+class ExecutionResult:
+    status: Literal[
+        "success",           # 正常完成，含空内容（无输出）
+        "approval_pending",  # 工具审批挂起，含 pending_tool_call_id
+        "partial",           # 异常中断但部分内容已保存
+        "timeout",           # 流结束无 is_complete 且无内容
+        "cancelled",         # asyncio.CancelledError
+        "exception",         # 不可恢复异常，含 error_type（如 "mcp_timeout"）
+        "disconnected",      # 连接断开（预留，尚无代码路径产生）
+    ]
+    content: str = ""
+    pending_tool_call_id: str | None = None
+    tool_call_id: str | None = None
+    error_type: str | None = None
+```
+
+`_process_request_locked` 根据 `result.status` 分发收尾：
+- `success` → 终态成功追踪
+- `approval_pending` → `trace.suspended`（挂起追踪）
+- `partial` → 已保存部分结果，`trace.failed`
+- `timeout` / `cancelled` / `exception` / `disconnected` → `trace.failed` 或 `trace.cancelled`
+
+`_execute_single_request` 内部不直接调用 `trace` 或审计；所有横切收尾由 `_process_request_locked` 在收到 `ExecutionResult` 后统一执行。
+
 参考实现：[`core/queue.py`](../../../core/queue.py)、[`services/agent/worker.py`](../../../services/agent/worker.py)（`ExecutionResult`、`_execute_single_request`、`_process_request_locked`）、[`services/gateway/hook.py`](../../../services/gateway/hook.py)、[`services/gateway/server.py`](../../../services/gateway/server.py)。
 
 ## SDK 适配边界
@@ -39,4 +69,4 @@ Minecraft /wsserver
 
 ## Harness、审计和 Trace
 
-运行时 Harness 的工具提示、审批/拒绝、工具审计和 Trace 属于 Agent 运行路径的横切能力：工具定义在 `services/agent/tools.py`，执行与审批在 `services/agent/harness/`，事件记录在 `services/agent/trace.py`。它们不能改变工具的成功/失败语义来“顺便记录日志”；写入失败应降级为计数或告警而不阻塞主路径。
+运行时 Harness 的工具提示、审批/拒绝、工具审计和 Trace 属于 Agent 运行路径的横切能力：工具定义在 `services/agent/tools.py`，执行与审批在 `services/agent/harness/`，事件记录在 `services/agent/trace.py`。它们不能改变工具的成功/失败语义来"顺便记录日志"；写入失败应降级为计数或告警而不阻塞主路径。
