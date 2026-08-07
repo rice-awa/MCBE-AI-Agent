@@ -18,3 +18,5 @@
 - **工作分支**：`test/player-identity-interleave`（待创建并提交）。
 
 ---
+
+## 2026-08-07 — 方案三：集中 block_ops 宿主侧报文准备

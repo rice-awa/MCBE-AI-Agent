@@ -1603,7 +1603,7 @@ class HarnessToolset(WrapperToolset[Any]):
         connection_id: str,
     ) -> tuple[ToolResult | None, Any | None]:
         """Run block-ops preflight; return (failure, separated plan)."""
-        from services.agent.block_ops.tools_impl import BlockPreflightPlan, run_block_preflight
+        from services.agent.block_ops.preflight import BlockPreflightPlan, run_block_preflight
 
         # Reuse cached canonical args on approval recovery (same original hash).
         cache = get_preflight_cache()
@@ -1690,11 +1690,12 @@ class HarnessToolset(WrapperToolset[Any]):
         与主路径共享同一套收尾链（幂等写入 → 审计 → 追踪），审计参数
         从缓存 canonical args 还原，绝不包含隐藏 kwargs。
         """
-        from services.agent.block_ops.tools_impl import _state_unknown_result, execute_block_plan
+        from services.agent.block_ops import execute_block_plan
+        from services.agent.block_ops.preflight import state_unknown_result
 
         entry = get_preflight_cache().get_by_plan_id(plan_id)
         if entry is None:
-            result = _state_unknown_result(plan_id)
+            result = state_unknown_result(plan_id)
             self._audit(
                 settings=settings,
                 tool_name=name,
