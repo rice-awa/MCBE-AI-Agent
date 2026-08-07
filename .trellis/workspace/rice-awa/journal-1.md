@@ -20,3 +20,25 @@
 ---
 
 ## 2026-08-07 — 方案三：集中 block_ops 宿主侧报文准备
+
+
+## Session 1: 方案三：集中 block_ops 宿主侧报文准备
+
+**Date**: 2026-08-07
+**Task**: 方案三：集中 block_ops 宿主侧报文准备
+**Branch**: `dev`
+
+### Summary
+
+block_ops 包内部重构：新增 limits.py/message.py/preflight.py 三个模块；消除 target.py 对 tools_impl 的反向导入；tools_impl.py 瘦身 62KB→31KB；__init__.py 出口收窄；全量方块测试 152/152 通过。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ef81860` | (see git log) |
+| `b86d628` | (see git log) |
+
+### Status
+
+[OK] **Completed**
