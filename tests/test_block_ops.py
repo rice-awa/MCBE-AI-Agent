@@ -2767,7 +2767,7 @@ async def test_harness_inspect_auto_allows_when_supported() -> None:
 
 
 def test_normalize_block_input_string_normalizes_namespace_and_case() -> None:
-    from services.agent.block_ops.tools_impl import _normalize_block_input
+    from services.agent.block_ops.validation import _normalize_block_input
 
     info, repairs = _normalize_block_input("Oak_Planks")
     assert info["type_id"] == "minecraft:oak_planks"
@@ -2776,7 +2776,7 @@ def test_normalize_block_input_string_normalizes_namespace_and_case() -> None:
 
 
 def test_normalize_block_input_object_keeps_states() -> None:
-    from services.agent.block_ops.tools_impl import _normalize_block_input
+    from services.agent.block_ops.validation import _normalize_block_input
 
     info, _ = _normalize_block_input({"type_id": "minecraft:stone", "states": {"lit": True}})
     assert info["type_id"] == "minecraft:stone"
@@ -2784,7 +2784,7 @@ def test_normalize_block_input_object_keeps_states() -> None:
 
 
 def test_normalize_expect_kinds() -> None:
-    from services.agent.block_ops.tools_impl import (
+    from services.agent.block_ops.validation import (
         _expect_info_to_legacy,
         _normalize_expect,
     )
@@ -2809,7 +2809,7 @@ def test_normalize_expect_kinds() -> None:
 
 def test_expect_to_legacy_permutation_descriptor() -> None:
     """T2-M3: expect={type_id, states} maps to expected_previous with states."""
-    from services.agent.block_ops.tools_impl import _expect_to_legacy
+    from services.agent.block_ops.validation import _expect_to_legacy
 
     replace_any, expected_previous, error = _expect_to_legacy(
         {"type_id": "minecraft:stone", "states": {"lit": True}}

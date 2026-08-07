@@ -33,10 +33,12 @@ from services.agent.block_ops.target import (
 )
 from services.agent.block_ops.tools_impl import (
     _connection_id,
-    _locked_targets_aabb,
     _plain_tool_data,
-    _request_fill_aabb,
     _require_supported,
+)
+from services.agent.block_ops.limits import _request_fill_aabb
+from services.agent.block_ops.validation import (
+    _locked_targets_aabb,
     _validate_inspect_args,
     _validate_inspect_target,
 )
