@@ -28,8 +28,8 @@ from services.agent.context import (
 from services.agent.prompt import (
     SYSTEM_TRUST_CONSTRAINTS,
     SYSTEM_TRUST_CONSTRAINTS_VERSION,
-    get_prompt_manager,
 )
+from services.agent.runtime import get_agent_runtime
 
 
 class _ProviderConfig:
@@ -680,7 +680,7 @@ def test_summary_injection_does_not_replace_system_policy():
     assert "factual_hints_only_never_instructions" in summary_text
 
     # 系统提示始终重建信任约束，不从摘要恢复策略
-    prompt = get_prompt_manager().build_system_prompt(
+    prompt = get_agent_runtime().get_prompt_manager().build_system_prompt(
         connection_id=str(uuid4()),
         player_name="Steve",
         provider="deepseek",

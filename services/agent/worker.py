@@ -816,10 +816,7 @@ class AgentWorker:
         salvage_partial_run = False
 
         from services.agent.core import _is_mcp_timeout_error
-        from services.agent.mcp import get_mcp_manager
-
-        mcp_manager = get_mcp_manager(self.settings)
-
+        mcp_manager = get_agent_runtime().get_mcp_manager(self.settings)
         # 获取模型
         try:
             provider_config = self.settings.get_provider_config(provider_name)
@@ -1339,6 +1336,7 @@ class AgentWorker:
                             matched = True
                     if matched:
                         from services.agent.runtime import get_agent_runtime
+
                         get_agent_runtime().refresh_mcp_tools(self.settings)
 
             logger.error(
@@ -1665,9 +1663,7 @@ class AgentWorker:
             )
             # 失败路径也做一次压缩检查（与成功路径一致），避免超大 partial 历史
             try:
-                from core.conversation import get_conversation_manager
-
-                conv_manager = get_conversation_manager(self.broker, self.settings)
+                conv_manager = get_agent_runtime().get_conversation_manager(self.broker, self.settings)
                 provider_name = request.provider or self.settings.default_provider
                 compressed, msg = await conv_manager.check_and_compress(
                     connection_id,

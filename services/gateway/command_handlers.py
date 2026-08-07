@@ -589,9 +589,9 @@ class CommandHandlers:
     async def _handle_conversation(
         self, state: ConnectionState, option: str, player_name: str | None = None
     ) -> TellrawMessage:
-        from core.conversation import get_conversation_manager
+        from services.agent.runtime import get_agent_runtime
 
-        conv_manager = get_conversation_manager(self.broker, self.settings)
+        conv_manager = get_agent_runtime().get_conversation_manager(self.broker, self.settings)
         host = self._require_host(state)
         session = host.get_player_session(player_name)
         actor = player_name or session.player_name
@@ -852,9 +852,9 @@ class CommandHandlers:
     async def handle_template(
         self, state: ConnectionState, content: str, player_name: str | None = None
     ) -> None:
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         connection_id = str(state.id)
         host = self._require_host(state)
         session = host.get_player_session(player_name)
@@ -904,9 +904,9 @@ class CommandHandlers:
     async def handle_setting(
         self, state: ConnectionState, content: str, player_name: str | None = None
     ) -> None:
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         connection_id = str(state.id)
         host = self._require_host(state)
         session = host.get_player_session(player_name)
@@ -1485,9 +1485,10 @@ class CommandHandlers:
         content: str,
         player_name: str | None = None,
     ) -> None:
-        from services.agent.mcp import MCPConnectionStatus, get_mcp_manager
+        from services.agent.runtime import get_agent_runtime
+        from services.agent.mcp import MCPConnectionStatus
 
-        manager = get_mcp_manager(self.settings)
+        manager = get_agent_runtime().get_mcp_manager(self.settings)
         parts = content.strip().split(None, 1) if content.strip() else []
         action = parts[0] if parts else ""
         arg = parts[1] if len(parts) > 1 else ""

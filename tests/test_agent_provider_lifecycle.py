@@ -130,8 +130,11 @@ def test_worker_stream_chat_does_not_pass_primary_agent(monkeypatch):
 
         monkeypatch.setattr("services.agent.worker.stream_chat", fake_stream_chat)
         monkeypatch.setattr("services.agent.providers.ProviderRegistry.get_model", lambda _config: object())
-        monkeypatch.setattr("services.agent.core.get_agent_manager", lambda: FakeAgentManager())
-        monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _settings: None)
+        monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: SimpleNamespace(
+            get_agent_manager=lambda: FakeAgentManager(),
+            get_mcp_manager=lambda _settings: None,
+            get_conversation_manager=lambda *_a, **_k: None,
+        ))
         monkeypatch.setattr(
             worker,
             "_schedule_title_generation",
@@ -143,6 +146,7 @@ def test_worker_stream_chat_does_not_pass_primary_agent(monkeypatch):
                 connection_id=connection_id,
                 content="hello",
                 player_name="alice",
+                use_context=False,
             ),
             connection_id,
         )
@@ -218,7 +222,7 @@ def test_runtime_adapter_registry_shutdown_closes_clients_and_clears_caches(monk
 
 
 def test_provider_registry_facade_delegates_to_runtime_adapter():
-    original = ProviderRegistry.get_runtime_adapters()
+    original = get_agent_runtime()
     runtime_adapters = SimpleNamespace(
         get_model=lambda config: ("model", config.name),
         list_providers=lambda: ["fake"],
@@ -226,15 +230,16 @@ def test_provider_registry_facade_delegates_to_runtime_adapter():
         shutdown=lambda: None,
         get_model_string=lambda config: f"fake:{config.model}",
     )
+    runtime = AgentRuntime(runtime_adapters=runtime_adapters)
     try:
-        ProviderRegistry.set_runtime_adapters(runtime_adapters)  # type: ignore[arg-type]
+        set_agent_runtime(runtime)
         config = provider_config(name="fake", model="fake-model")
 
         assert ProviderRegistry.get_model(config) == ("model", "fake")
         assert ProviderRegistry.list_providers() == ["fake"]
         assert ProviderRegistry.get_model_string(config) == "fake:fake-model"
     finally:
-        ProviderRegistry.set_runtime_adapters(original)
+        set_agent_runtime(original)
 
 
 def test_agent_runtime_owns_provider_registry_facade():
@@ -251,7 +256,6 @@ def test_agent_runtime_owns_provider_registry_facade():
         set_agent_runtime(runtime)
         config = provider_config(name="runtime", model="runtime-model")
 
-        assert ProviderRegistry.get_runtime_adapters() is runtime_adapters
         assert ProviderRegistry.get_model(config) == ("runtime-model", "runtime")
         assert ProviderRegistry.list_providers() == ["runtime"]
         assert ProviderRegistry.get_model_string(config) == "runtime:runtime-model"
@@ -416,41 +420,34 @@ def test_agent_runtime_shutdown_closes_mcp_before_adapters():
 
 def test_agent_runtime_owns_prompt_and_conversation_managers(monkeypatch):
     from core.conversation import ConversationManager
-    from services.agent.prompt import PromptManager, get_prompt_manager
-    from core.conversation import get_conversation_manager
+    from services.agent.prompt import PromptManager
 
-    original = get_agent_runtime()
     runtime = AgentRuntime()
     broker = object()
     settings = Settings(default_provider="ollama", dev_mode=True)
 
-    try:
-        set_agent_runtime(runtime)
+    prompt1 = runtime.get_prompt_manager()
+    prompt2 = runtime.get_prompt_manager()
+    assert isinstance(prompt1, PromptManager)
+    assert prompt1 is prompt2
+    assert runtime.prompt_manager is prompt1
 
-        prompt1 = runtime.get_prompt_manager()
-        prompt2 = get_prompt_manager()
-        assert isinstance(prompt1, PromptManager)
-        assert prompt1 is prompt2
-        assert runtime.prompt_manager is prompt1
+    conv1 = runtime.get_conversation_manager(broker, settings)
+    conv2 = runtime.get_conversation_manager(broker, settings)
+    assert isinstance(conv1, ConversationManager)
+    assert conv1 is conv2
+    assert runtime.conversation_manager is conv1
+    assert runtime._conversation_broker is broker
+    assert runtime._conversation_settings is settings
 
-        conv1 = runtime.get_conversation_manager(broker, settings)
-        conv2 = get_conversation_manager(broker, settings)
-        assert isinstance(conv1, ConversationManager)
-        assert conv1 is conv2
-        assert runtime.conversation_manager is conv1
-        assert runtime._conversation_broker is broker
-        assert runtime._conversation_settings is settings
-
-        # New broker/settings identity must not reuse stale manager.
-        other_broker = object()
-        other_settings = Settings(default_provider="ollama", dev_mode=True)
-        conv3 = runtime.get_conversation_manager(other_broker, other_settings)
-        assert conv3 is not conv1
-        assert runtime.conversation_manager is conv3
-        assert runtime._conversation_broker is other_broker
-        assert runtime._conversation_settings is other_settings
-    finally:
-        set_agent_runtime(original)
+    # New broker/settings identity must not reuse stale manager.
+    other_broker = object()
+    other_settings = Settings(default_provider="ollama", dev_mode=True)
+    conv3 = runtime.get_conversation_manager(other_broker, other_settings)
+    assert conv3 is not conv1
+    assert runtime.conversation_manager is conv3
+    assert runtime._conversation_broker is other_broker
+    assert runtime._conversation_settings is other_settings
 
 
 def test_agent_runtime_shutdown_aggregates_errors_and_continues(monkeypatch):

@@ -397,13 +397,6 @@ class PromptManager:
         return content
 
 
-def get_prompt_manager() -> PromptManager:
-    """获取提示词管理器（AgentRuntime 持有的薄 facade）。"""
-    from services.agent.runtime import get_agent_runtime
-
-    return get_agent_runtime().get_prompt_manager()
-
-
 # 方便在 agent/core.py 中使用的构建函数
 async def build_dynamic_prompt(ctx: RunContext) -> str:
     """
@@ -415,7 +408,9 @@ async def build_dynamic_prompt(ctx: RunContext) -> str:
     Returns:
         完整的系统提示词
     """
-    manager = get_prompt_manager()
+    from services.agent.runtime import get_agent_runtime
+
+    manager = get_agent_runtime().get_prompt_manager()
 
     # 从 deps 获取必要信息
     connection_id = str(ctx.deps.connection_id)

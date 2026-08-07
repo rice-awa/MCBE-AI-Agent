@@ -1221,7 +1221,9 @@ async def test_worker_approval_required_does_not_cancel_on_return(monkeypatch):
     store = PendingApprovalStore(default_ttl_seconds=120.0)
     runtime = SimpleNamespace(
         get_pending_approval_store=lambda _settings=None: store,
+        get_agent_manager=lambda: None,
         refresh_mcp_tools=lambda _s: None,
+        get_mcp_manager=lambda _s: None,
         get_conversation_manager=lambda *_a, **_k: SimpleNamespace(
             check_and_compress=AsyncMock(return_value=(False, "")),
         ),
@@ -1231,14 +1233,7 @@ async def test_worker_approval_required_does_not_cancel_on_return(monkeypatch):
         "services.agent.providers.ProviderRegistry.get_model",
         lambda _config: object(),
     )
-    monkeypatch.setattr("services.agent.mcp.get_mcp_manager", lambda _s: None)
     monkeypatch.setattr("services.agent.worker.get_agent_runtime", lambda: runtime)
-    monkeypatch.setattr(
-        "core.conversation.get_conversation_manager",
-        lambda *_a, **_k: SimpleNamespace(
-            check_and_compress=AsyncMock(return_value=(False, "")),
-        ),
-    )
 
     connection_id = uuid4()
     await worker._process_request_locked(

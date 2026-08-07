@@ -94,17 +94,19 @@ class TestPromptManager:
 
     def test_prompt_manager_singleton(self):
         """测试单例模式"""
-        from services.agent.prompt import get_prompt_manager, PromptManager
+        from services.agent.prompt import PromptManager
+        from services.agent.runtime import get_agent_runtime
 
-        manager1 = get_prompt_manager()
-        manager2 = get_prompt_manager()
+        manager1 = get_agent_runtime().get_prompt_manager()
+        manager2 = get_agent_runtime().get_prompt_manager()
         assert manager1 is manager2
+        assert isinstance(manager1, PromptManager)
 
     def test_list_templates(self):
         """测试列出模板"""
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         templates = manager.list_templates()
 
         assert "default" in templates
@@ -113,9 +115,9 @@ class TestPromptManager:
 
     def test_get_template(self):
         """测试获取模板"""
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         template = manager.get_template("default")
 
         assert template is not None
@@ -123,18 +125,18 @@ class TestPromptManager:
 
     def test_get_nonexistent_template(self):
         """测试获取不存在的模板"""
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         template = manager.get_template("nonexistent")
 
         assert template is None
 
     def test_set_connection_template(self):
         """测试设置连接模板"""
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         conn_id = "test-connection-123"
 
         # 设置模板
@@ -147,9 +149,9 @@ class TestPromptManager:
 
     def test_set_invalid_template(self):
         """测试设置无效模板"""
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         conn_id = "test-connection-456"
 
         result = manager.set_connection_template(conn_id, "invalid_template")
@@ -157,9 +159,9 @@ class TestPromptManager:
 
     def test_set_connection_variable(self):
         """测试设置连接变量"""
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         conn_id = "test-connection-789"
 
         result = manager.set_connection_variable(conn_id, "custom_greeting", "你好，冒险家！")
@@ -172,9 +174,9 @@ class TestPromptManager:
 
     def test_set_connection_variable_auto_prefix(self):
         """测试设置变量时自动添加 custom_ 前缀"""
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         conn_id = "test-connection-abc"
 
         manager.set_connection_variable(conn_id, "greeting", "Hello")
@@ -185,9 +187,9 @@ class TestPromptManager:
 
     def test_build_system_prompt(self):
         """测试构建系统提示词"""
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         conn_id = "test-connection-prompt"
 
         # 先设置模板
@@ -230,9 +232,9 @@ class TestPromptManager:
 
     def test_build_system_prompt_with_custom_variables(self):
         """测试使用自定义变量构建提示词"""
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         conn_id = "test-connection-custom"
 
         # 设置模板和自定义变量
@@ -253,9 +255,9 @@ class TestPromptManager:
 
     def test_clear_connection(self):
         """测试清理连接数据"""
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         conn_id = "test-connection-clear"
 
         # 设置数据
@@ -305,9 +307,9 @@ class TestVariableReplacement:
 
     def test_all_builtin_variables(self):
         """测试所有内置变量"""
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         conn_id = "test-vars"
 
         manager.set_connection_template(conn_id, "detailed")
@@ -329,9 +331,9 @@ class TestVariableReplacement:
 
     def test_context_length_variable(self):
         """测试上下文长度变量"""
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         conn_id = "test-context"
 
         manager.set_connection_template(conn_id, "detailed")
