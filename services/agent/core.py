@@ -507,20 +507,15 @@ class ChatAgentManager:
         return self.get_agent()
 
 
-def get_agent_manager() -> ChatAgentManager:
-    """获取 Agent 管理器单例"""
-    from services.agent.runtime import get_agent_runtime
-
-    return get_agent_runtime().get_agent_manager()
-
-
-# 为了向后兼容，保留 chat_agent 变量（推荐使用 get_agent_manager）
+# 为了向后兼容，保留 chat_agent 变量
 # 通过懒加载方式获取 Agent，确保 MCP 工具被正确加载
 
 
 def _get_legacy_chat_agent() -> Agent[AgentDependencies, str | DeferredToolRequests]:
     """获取兼容性 Agent 实例（懒加载）"""
-    return get_agent_manager().get_agent()
+    from services.agent.runtime import get_agent_runtime
+
+    return get_agent_runtime().get_agent_manager().get_agent()
 
 
 class _LegacyChatAgentProxy:
@@ -787,9 +782,10 @@ def _build_approval_required_event(
 def _mark_mcp_failure_from_exception(exc: BaseException, diagnostic: str) -> None:
     """仅标记有证据关联的 MCP server；无证据时不盲目禁用全部。"""
     try:
-        from services.agent.mcp import get_mcp_manager
+        from services.agent.runtime import get_agent_runtime
 
-        mcp_manager = get_mcp_manager()
+        runtime = get_agent_runtime()
+        mcp_manager = runtime.get_mcp_manager()
     except Exception:
         return
 
@@ -1030,7 +1026,9 @@ async def stream_response_handler(
     if ctx is None:
         ctx = _HandlerContext()
 
-    agent_manager = get_agent_manager()
+    from services.agent.runtime import get_agent_runtime as _get_agent_runtime
+
+    agent_manager = _get_agent_runtime().get_agent_manager()
 
     active_agent = agent_manager.get_active_agent(
         agent,
@@ -1387,7 +1385,9 @@ async def non_stream_response_handler(
     if ctx is None:
         ctx = _HandlerContext()
 
-    agent_manager = get_agent_manager()
+    from services.agent.runtime import get_agent_runtime as _get_agent_runtime
+
+    agent_manager = _get_agent_runtime().get_agent_manager()
 
     active_agent = agent_manager.get_active_agent(
         agent,

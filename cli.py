@@ -599,9 +599,10 @@ def mcp_status():
 
     # 尝试获取运行中的 MCP 管理器状态
     try:
-        from services.agent.mcp import get_mcp_manager, MCPConnectionStatus
+        from services.agent.runtime import get_agent_runtime
+        from services.agent.mcp import MCPConnectionStatus
 
-        manager = get_mcp_manager(settings)
+        manager = get_agent_runtime().get_mcp_manager(settings)
 
         if not manager.is_initialized:
             click.echo("⚠️  MCP 管理器尚未初始化")
@@ -658,9 +659,10 @@ def mcp_test(server_name: str | None):
         return
 
     async def _test_config():
-        from services.agent.mcp import get_mcp_manager, MCPConnectionStatus
+        from services.agent.runtime import get_agent_runtime
+        from services.agent.mcp import MCPConnectionStatus
 
-        manager = get_mcp_manager(settings)
+        manager = get_agent_runtime().get_mcp_manager(settings)
 
         # 如果未初始化，先初始化
         if not manager.is_initialized:

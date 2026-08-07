@@ -17,7 +17,6 @@ from mcbe_ws_sdk.protocol.minecraft import (
 from config.logging import get_logger
 from config.settings import Settings
 from core.queue import MessageBroker
-from services.agent.prompt import get_prompt_manager
 from services.gateway.broker_bridge import BrokerResponseBridge
 from services.gateway.command_handlers import CommandHandlers
 from services.gateway.session_store import HostSessionStore
@@ -128,7 +127,10 @@ class HostConnectionHook(NoOpHook):
         self.broker.unregister_connection(state.id)
         self.sessions.remove(state.id)
         try:
-            get_prompt_manager().clear_connection(str(state.id))
+            from services.agent.runtime import get_agent_runtime
+
+            runtime = get_agent_runtime()
+            runtime.get_prompt_manager().clear_connection(str(state.id))
         except Exception as exc:
             logger.warning(
                 "prompt_clear_connection_failed",
@@ -136,9 +138,7 @@ class HostConnectionHook(NoOpHook):
                 error=str(exc),
             )
         try:
-            from services.agent.runtime import get_agent_runtime
-
-            cleared = get_agent_runtime().pending_approvals.clear_connection(
+            cleared = runtime.pending_approvals.clear_connection(
                 str(state.id)
             )
             if cleared:

@@ -294,14 +294,17 @@ class TestMCPManager:
 
 
 class TestGetMCPManager:
-    """MCP 管理器单例测试"""
+    """MCP 管理器 singleton via runtime test"""
 
     def test_get_mcp_manager_singleton(self):
-        """测试获取 MCP 管理器单例"""
-        from services.agent.mcp import get_mcp_manager, MCPManager
+        """测试通过 runtime 获取 MCP 管理器单例"""
+        from services.agent.runtime import get_agent_runtime
+        from services.agent.mcp import MCPManager
 
-        manager1 = get_mcp_manager(Settings())
-        manager2 = get_mcp_manager(Settings())
+        runtime = get_agent_runtime()
+        settings = Settings()
+        manager1 = runtime.get_mcp_manager(settings)
+        manager2 = runtime.get_mcp_manager(settings)
         assert manager1 is manager2
         assert isinstance(manager1, MCPManager)
 
@@ -620,13 +623,16 @@ class TestMCPFailureInvariants:
             conversation_id="conv-mcp",
         )
 
-        from services.agent import core as core_mod
+        from services.agent.runtime import get_agent_runtime
 
         class _FakeManager:
             def get_active_agent(self, agent_arg=None, **kwargs):
                 return agent_arg or agent
 
-        monkeypatch.setattr(core_mod, "get_agent_manager", lambda: _FakeManager())
+        monkeypatch.setattr("services.agent.runtime.get_agent_runtime", lambda: SimpleNamespace(
+            get_agent_manager=lambda: _FakeManager(),
+            get_mcp_manager=lambda _s: None,
+        ))
 
         events = []
         handler_invocations["count"] += 1

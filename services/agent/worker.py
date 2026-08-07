@@ -568,9 +568,7 @@ class AgentWorker:
         if request.use_context and not (
             request.resume_approval_id and request.deferred_tool_results is not None
         ):
-            from core.conversation import get_conversation_manager
-
-            conv_manager = get_conversation_manager(self.broker, self.settings)
+            conv_manager = get_agent_runtime().get_conversation_manager(self.broker, self.settings)
             compressed, compress_msg = await conv_manager.check_and_compress(
                 connection_id,
                 request.player_name,
@@ -665,10 +663,9 @@ class AgentWorker:
         start_time = time.monotonic()
 
         from services.agent.core import _is_mcp_timeout_error
-        from services.agent.mcp import get_mcp_manager
 
         # 尝试获取 MCP 管理器以跟踪服务器状态
-        mcp_manager = get_mcp_manager(self.settings)
+        mcp_manager = get_agent_runtime().get_mcp_manager(self.settings)
 
         try:
             async for event in stream_chat(
@@ -868,9 +865,7 @@ class AgentWorker:
                                     )
 
                                 # 自动压缩检查：当对话历史超过阈值的 80% 时自动压缩
-                                from core.conversation import get_conversation_manager
-
-                                conv_manager = get_conversation_manager(self.broker, self.settings)
+                                conv_manager = get_agent_runtime().get_conversation_manager(self.broker, self.settings)
                                 compressed, msg = await conv_manager.check_and_compress(
                                     connection_id,
                                     request.player_name,
@@ -1168,8 +1163,6 @@ class AgentWorker:
                             )
                             matched = True
                     if matched:
-                        from services.agent.runtime import get_agent_runtime
-
                         get_agent_runtime().refresh_mcp_tools(self.settings)
                 # 不在当前 run 内递归重放
 
@@ -1371,9 +1364,7 @@ class AgentWorker:
             )
             # 失败路径也做一次压缩检查（与成功路径一致），避免超大 partial 历史
             try:
-                from core.conversation import get_conversation_manager
-
-                conv_manager = get_conversation_manager(self.broker, self.settings)
+                conv_manager = get_agent_runtime().get_conversation_manager(self.broker, self.settings)
                 provider_name = request.provider or self.settings.default_provider
                 compressed, msg = await conv_manager.check_and_compress(
                     connection_id,

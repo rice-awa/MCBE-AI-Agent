@@ -991,11 +991,4 @@ class ConversationManager:
         return "\n".join(lines)
 
 
-def get_conversation_manager(
-    broker,
-    settings: Settings | None = None,
-) -> ConversationManager:
-    """获取对话管理器（AgentRuntime 持有的薄 facade）。"""
-    from services.agent.runtime import get_agent_runtime
 
-    return get_agent_runtime().get_conversation_manager(broker, settings)
