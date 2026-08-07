@@ -567,6 +567,7 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     # DeepSeek
     "deepseek-chat": 128000,
     "deepseek-coder": 128000,
+    "deepseek-v4-flash": 128000,
     # OpenAI
     "gpt-4o": 128000,
     "gpt-4o-mini": 128000,
