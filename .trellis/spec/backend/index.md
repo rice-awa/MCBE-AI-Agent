@@ -19,7 +19,7 @@
 
 | 指南 | 内容 |
 |---|---|
-| [目录与模块边界](./directory-structure.md) | Python 模块的职责、测试和文档位置 |
+| [目录与模块边界](./directory-structure.md) | Python 模块的职责、**工具目录契约中心**、测试和文档位置 |
 | [运行时架构](./runtime-architecture.md) | WebSocket、队列、Worker、Agent 与 Gateway 的异步边界 |
 | [会话与身份](./session-and-identity.md) | 玩家隔离、对话键、锁和 trace 身份的传递 |
 | [配置与敏感信息](./configuration-and-secrets.md) | `config.json`、`.env`、Pydantic Settings 和新增配置字段 |

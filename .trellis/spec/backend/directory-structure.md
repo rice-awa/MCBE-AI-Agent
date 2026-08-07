@@ -42,7 +42,28 @@ README 的旧结构说明不能替代这个目录清单；新增模块时以文�
 4. 新的 Agent 工具放 `services/agent/tools.py` 或对应的 `services/agent/block_ops/` 子模块，并补充工具结果、审计和失败路径测试。
 5. 运行时数据目录 `data/`、日志目录 `logs/` 和本地 `config.json` / `.env` 不属于源代码提交；测试使用 `tmp_path` 或显式临时路径。
 
-## 命名与导入
+## 工具目录契约中心
+
+`services/agent/harness/catalog.py` 的 `_TOOL_CATALOG` 是内置工具的契约中心。所有工具语义声明（意图、风险、适用/禁用场景、参数约束、审计预览）**必须**在目录中有唯一条目，且与实际注册结果一致。
+
+### 核心规则
+
+1. **一处声明、注册时核对、多个用途自动投影**：
+   - 工具实际名称、参数结构、长说明仍来自 `tools.py` 文档字符串/PydanticAI 注册结果，**不在目录中复制完整参数模型**。
+   - 目录保存语义声明：`ToolIntent`（改变世界/通知展示/查询世界/查询知识/系统信息）、`ToolRisk`（低/中/高/危险）、`when_to_use`、`when_not_to_use`、`parameter_constraints`、`preview` 策略。
+   - MCP 工具保留 `source="mcp"` 标记和 `mcp_server`，不强行改造成内置工具。
+
+2. **投影消费方**：
+   - 工具提示（`TOOL_USAGE_GUIDE`）由 `project_tool_usage_guide()` 从目录投影，消除 `prompt.py` 与 `core.py` 的手工副本。
+   - 工具决策树与工具卡片由 `harness/prompting.py` 从目录渲染。
+   - 测试注册集合由 `list_tool_names()` 从目录投影驱动，移除手工维护的 `REGISTERED_AGENT_TOOL_NAMES`。
+
+3. **校验**（由 `tests/test_runtime_harness_catalog.py` 自动执行）：
+   - 每个内置工具在目录中有且只有一个条目。
+   - 目录中不存在未注册工具。
+   - 参数约束中引用的预览字段真实存在于约束文本。
+   - CHANGE_WORLD 意图的工具风险不低于 HIGH。
+   - 已移除工具（如 `edit_blocks`）不在目录中残留。
 
 Python 使用 4 空格缩进，模块和函数使用 `snake_case`，类使用 `PascalCase`，常量使用 `UPPER_CASE`。公共导出由模块自己的 `__all__`（已有模块使用时）或明确的顶层定义表达，避免通过循环导入拼装隐式 API。
 

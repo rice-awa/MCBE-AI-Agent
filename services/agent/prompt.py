@@ -9,6 +9,7 @@ from pydantic_ai import RunContext
 from config.logging import get_logger
 from config.settings import LLMProviderConfig, Settings
 from core.session import DEFAULT_PLAYER_KEY
+from services.agent.harness.catalog import project_tool_usage_guide
 from services.agent.harness.prompting import render_runtime_harness_prompt
 
 logger = get_logger(__name__)
@@ -25,13 +26,8 @@ class PromptSettings(Protocol):
         ...
 
 
-# 工具使用指南 - 延迟导入避免循环依赖
-TOOL_USAGE_GUIDE = """你可以使用工具与 Minecraft 交互。
-- 当用户要求"执行命令/给物品/发送消息/发标题/查询 Wiki"等可操作任务时，优先调用对应工具执行，而不是只解释步骤。
-- 不要在有对应工具时直接说"我做不到"；若执行失败，要返回失败原因与下一步建议。
-- 对于纯问答类问题，可直接回答。
-- 执行命令 / 指定方块 / 物品时，一律使用基岩版（Bedrock Edition）命令语法与命名空间（minecraft:），不用 Java 版语法。
-""".strip()
+# 工具使用指南 - 从工具目录统一投影
+TOOL_USAGE_GUIDE = project_tool_usage_guide()
 
 # 版本化系统约束：历史摘要/工具结果/外部内容信任边界
 SYSTEM_TRUST_CONSTRAINTS_VERSION = "2026-07-21.1"
