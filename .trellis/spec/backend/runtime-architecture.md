@@ -25,8 +25,9 @@ Minecraft /wsserver
 - `MessageBroker.submit_request()` 把请求包装为带优先级和序号的 `QueueItem`；`AgentWorker` 负责消费、按玩家获取锁、调用 Agent 并将响应送回连接队列。
 - 队列是 WebSocket 与 Agent 的解耦边界。不要从 Hook 直接调用 Agent，也不要让 Agent 直接持有 WebSocket 连接对象。
 - Worker 和 Gateway 都有幂等的 start/stop 逻辑；停止时要取消任务、等待取消完成，并清理 session、pending command、bridge loop、Addon client 和 Broker connection。
+- 单次 Agent 执行（`_execute_single_request`）已从 `AgentWorker` 生命周期中独立。`AgentWorker` 只负责队列消费、按玩家取锁、提交执行上下文，并基于 `ExecutionResult` 决定收尾动作（终态追踪、标题生成）。执行核心（模型获取、流式处理、工具调用、审批挂起、异常/取消/超时处理、历史提交）收敛到 `_execute_single_request` 单一观察入口。
 
-参考实现：[`core/queue.py`](../../../core/queue.py)、[`services/agent/worker.py`](../../../services/agent/worker.py)、[`services/gateway/hook.py`](../../../services/gateway/hook.py)、[`services/gateway/server.py`](../../../services/gateway/server.py)。
+参考实现：[`core/queue.py`](../../../core/queue.py)、[`services/agent/worker.py`](../../../services/agent/worker.py)（`ExecutionResult`、`_execute_single_request`、`_process_request_locked`）、[`services/gateway/hook.py`](../../../services/gateway/hook.py)、[`services/gateway/server.py`](../../../services/gateway/server.py)。
 
 ## SDK 适配边界
 
