@@ -1257,12 +1257,12 @@ async def test_partial_history_persistence_drops_orphan_retry_and_keeps_visible_
     processed = ContextBuilder().process_history(
         saved_history,
         budget=ContextBudget(
-            context_window=8192,
+            context_window=128_000,
             system_reserve=0,
             tool_schema_reserve=0,
             current_input_reserve=0,
             output_reserve=0,
-            history_budget=8192,
+            history_budget=128_000,
         ),
     )
     assert not any(

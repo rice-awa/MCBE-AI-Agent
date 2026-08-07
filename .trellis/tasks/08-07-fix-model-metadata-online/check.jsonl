@@ -1,1 +1,7 @@
-{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": "config/settings.py", "reason": "确认 MODEL_CONTEXT_WINDOWS 已删除，get_context_window 已简化，默认模型名已更新"}
+{"file": "services/agent/context.py", "reason": "确认 DEFAULT_FALLBACK_CONTEXT_WINDOW 已从 8192 更新为 128_000"}
+{"file": "config.example.json", "reason": "确认 ollama.model 已同步为 llama3.1"}
+{"file": "tests/test_agent_context.py", "reason": "确认所有 context_window=8192 已替换为 128_000"}
+{"file": "tests/test_agent_worker.py", "reason": "确认 context_window/history_budget 已更新为 128_000"}
+{"file": "tests/test_json_settings.py", "reason": "确认 test_provider_context_window_uses_cache_preferring_online_data 已替换旧的静态表优先测试"}
+{"file": "tests/test_cli_config_validation.py", "reason": "确认 test_info_command_shows_context_window_for_providers 在删表后仍通过（get_context_window 返回 128_000 fallback）"}

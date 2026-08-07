@@ -459,7 +459,7 @@ def test_model_metadata_settings_loaded_from_json(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_provider_context_window_prefers_static_table(tmp_path, monkeypatch):
+def test_provider_context_window_uses_cache_preferring_online_data(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     settings = Settings(openai_model="gpt-4o")
     cache = ModelMetadataCache.from_models_dev_api(
@@ -467,7 +467,7 @@ def test_provider_context_window_prefers_static_table(tmp_path, monkeypatch):
     )
     settings.attach_model_metadata_cache(cache)
 
-    assert settings.get_provider_config("openai").context_window == 128000
+    assert settings.get_provider_config("openai").context_window == 999
 
 
 def test_provider_context_window_uses_models_dev_cache_when_static_missing(
@@ -504,7 +504,8 @@ def test_provider_context_window_ignores_cache_when_metadata_disabled(
     )
     settings.attach_model_metadata_cache(cache)
 
-    assert settings.get_provider_config("openai").context_window is None
+    # metadata 禁用时忽略缓存，返回 fallback 默认值
+    assert settings.get_provider_config("openai").context_window == 128_000
 
 
 def test_provider_context_window_cache_applies_to_all_providers(tmp_path, monkeypatch):

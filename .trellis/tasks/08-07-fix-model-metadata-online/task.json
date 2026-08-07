@@ -3,7 +3,7 @@
   "name": "fix-model-metadata-online",
   "title": "移除硬编码 MODEL_CONTEXT_WINDOWS，完全依赖 models.dev 在线数据",
   "description": "",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,
