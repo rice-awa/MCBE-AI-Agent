@@ -188,8 +188,8 @@ def register_agent_tools(
         - 方块/物品/实体 ID 一律带 ``minecraft:`` 命名空间，如 ``minecraft:wooden_door``；
         - 不支持 Java 版的 NBT ``{...}`` 数据标签，默认无需 NBT 参数；
         - 多格方块（门、床、高草等）直接用 ``setblock`` 放置完整结构即可；
-        - ``setblock`` / ``fill`` 的方块状态用 ``["状态名":"值"]`` 语法，如
-          ``setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction":"south"]``，
+        - ``setblock`` / ``fill`` 的方块状态用 ``["状态名"="值"]`` 语法，如
+          ``setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction"="south"]``，
           不要用 Java 的 ``[facing=south,half=lower]``。
         - 不确定某个命令的用法或参数时，先执行 ``help <命令名>``（即游戏内 ``/help <命令名>``）
           获取用法说明，不要凭空猜测。
@@ -237,8 +237,8 @@ def register_agent_tools(
         - 方块/物品/实体 ID 一律带 ``minecraft:`` 命名空间，如 ``minecraft:wooden_door``；
         - 不支持 Java 版的 NBT ``{...}`` 数据标签，默认无需 NBT 参数；
         - 多格方块（门、床、高草等）直接用 ``setblock`` 放置完整结构即可；
-        - ``setblock`` / ``fill`` 的方块状态用 ``["状态名":"值"]`` 语法，如
-          ``setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction":"south"]``，
+        - ``setblock`` / ``fill`` 的方块状态用 ``["状态名"="值"]`` 语法，如
+          ``setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction"="south"]``，
           不要用 Java 的 ``[facing=south,half=lower]``。
         每次最多 20 条命令，超出请拆分为多次调用。
         一次 run 最多 16 次工具调用，请合理规划，避免超限被拒后反复重试。

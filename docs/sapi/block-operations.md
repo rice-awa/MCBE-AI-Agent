@@ -271,10 +271,10 @@ Microsoft 官方更新说明（`Update1.26.10`）：
 | `open_bit` | `0` / `1` | 开关 |
 | `door_hinge_bit` | `0` / `1` | 铰链侧 |
 
-`setblock` 状态语法示例（Bedrock 格式 `["state":value]`，非 Java 的 `[facing=south,half=lower]`）：
+`setblock` 状态语法示例（Bedrock 格式 `["state"=value]`，非 Java 的 `[facing=south,half=lower]`）：
 
 ```text
-/setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction":"south"]
+/setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction"="south"]
 ```
 
 **附注**：Add-on 未来若支持多格放置，路径为写上下两格（`upper_block_bit` 分设）+ 写后校验，或直接命令回退。
