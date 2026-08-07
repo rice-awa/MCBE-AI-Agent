@@ -84,3 +84,26 @@ block_ops 包内部重构：新增 limits.py/message.py/preflight.py 三个模�
 ### Status
 
 [OK] **Completed** — 代码已合入 dev，待归档
+
+
+## Session 2: 方案四/五归档 + 任务全景 review
+
+**Date**: 2026-08-07
+**Task**: 方案四/五归档 + 任务全景 review
+**Branch**: `dev`
+
+### Summary
+
+review近期6项任务完成状态，确认方案四和方案五已完成；合入 dev、归档 task、更新 spec(runtime-architecture.md 补充 ExecutionResult 完整契约)、清理远程分支、记录 journal。父任务进度更新为[5/6 done]。剩余待办：方案六(planning)和cli上下文窗口bug修复(planning)。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b6d83a2` | (see git log) |
+| `b37904b` | (see git log) |
+| `c7590f3` | (see git log) |
+
+### Status
+
+[OK] **Completed**
