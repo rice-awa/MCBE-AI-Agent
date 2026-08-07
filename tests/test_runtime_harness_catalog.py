@@ -82,6 +82,12 @@ def test_block_tool_cards_follow_single_op_contract() -> None:
         assert param in fill_text
     assert "target" in inspect_text
 
+    # 多格方块卡片直接指向 setblock，且默认不带 NBT 参数。
+    for text in (place_text, fill_text):
+        assert "多格方块" in text
+        assert "setblock" in text
+        assert "NBT" in text
+
     # Grouped-edit vocabulary is gone from all block cards.
     for text in (place_text, fill_text, inspect_text):
         for obsolete in (

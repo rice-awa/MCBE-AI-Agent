@@ -549,9 +549,8 @@ def _safe_addon_error_body(
             "retryable": False,
             "external_state_unknown": False,
             "fallback_allowed": fallback_allowed,
-            "hint": "多格方块（门、床、高草等）专用工具不支持单格写入；"
-            "可用 run_minecraft_command 的 setblock 回退"
-            "（Bedrock 1.26.10+ 自动放置完整结构，无需指定 half 等 Java 状态语法）。",
+            "hint": "多格方块（门、床、高草等）直接用 run_minecraft_command 的 setblock 放置即可"
+            "（Bedrock 1.26.10+ 自动放置完整结构，默认无需 NBT 参数）。",
         }
         type_id = src.get("type_id")
         if isinstance(type_id, str) and type_id and not _looks_sensitive(type_id):

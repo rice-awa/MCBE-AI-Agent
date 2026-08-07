@@ -284,10 +284,12 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         ToolIntent.CHANGE_WORLD,
         ToolRisk.HIGH,
         "在单个格子上写入方块时使用；连续区域优先用 fill_block。",
-        "不要用于查询；不要拆成多个单格来填充连续区域；不要用于覆盖保护数据。",
+        "不要用于查询；不要拆成多个单格来填充连续区域；不要用于覆盖保护数据；"
+        "多格方块（门、床、高草等）不要用本工具，直接用 run_minecraft_command 的 setblock 放置。",
         "pos 为 [x,y,z] 绝对坐标；block 为 type_id 字符串，使用基岩版命名空间（如 \"minecraft:stone\"，缺失前缀自动补 minecraft:）；"
         "expect 默认 air（仅替换空气），可选 any（需再审批）/ type_id；"
-        "states 为可选的方块状态字典，键名使用基岩版状态名（如 {\"minecraft:cardinal_direction\":\"north\"}，不要用 Java 的 facing）。",
+        "states 为可选字典（默认留空，Bedrock 不支持 Java NBT，无需 NBT 参数），"
+        "键名使用基岩版状态名（如 {\"minecraft:cardinal_direction\":\"north\"}，不要用 Java 的 facing）。",
         preview=ParameterPreviewPolicy(
             include=("pos", "block", "expect", "states")
         ),
@@ -298,11 +300,13 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         ToolIntent.CHANGE_WORLD,
         ToolRisk.HIGH,
         "填充连续区域（地板/墙体/屋顶等）时使用；单格用 place_block。",
-        "不要用于查询；不要用多个 place_block 模拟连续区域；不要用于覆盖保护数据。",
+        "不要用于查询；不要用多个 place_block 模拟连续区域；不要用于覆盖保护数据；"
+        "多格方块（门、床、高草等）不要用本工具，直接用 run_minecraft_command 的 setblock 放置。",
         "from 与 to 为两个绝对角点 [x,y,z]（自动归一化）；block 为 type_id 字符串，"
         "使用基岩版命名空间（如 \"minecraft:stone\"，缺失前缀自动补 minecraft:）；"
         "expect 默认 air（仅替换空气），可选 any（需再审批）/ type_id；"
-        "states 为可选的方块状态字典，键名使用基岩版状态名（如 {\"minecraft:cardinal_direction\":\"north\"}，不要用 Java 的 facing）。",
+        "states 为可选字典（默认留空，Bedrock 不支持 Java NBT，无需 NBT 参数），"
+        "键名使用基岩版状态名（如 {\"minecraft:cardinal_direction\":\"north\"}，不要用 Java 的 facing）。",
         preview=ParameterPreviewPolicy(
             include=("from", "to", "block", "expect", "states")
         ),

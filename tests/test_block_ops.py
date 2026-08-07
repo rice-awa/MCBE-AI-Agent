@@ -3222,6 +3222,7 @@ def test_unsupported_block_placement_preserves_multiblock_flag() -> None:
     assert "多格" in body["hint"]
     assert "setblock" in body["hint"]
     assert "1.26.10" in body["hint"]
+    assert "NBT" in body["hint"]
 
 
 @pytest.mark.parametrize(

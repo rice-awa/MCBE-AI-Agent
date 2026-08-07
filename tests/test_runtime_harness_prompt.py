@@ -21,6 +21,9 @@ def test_runtime_harness_prompt_renders_decision_tree_and_cards() -> None:
     assert "失败时只读 code 与 hint" in prompt
     assert "仅 fallback_allowed=true 时才能考虑命令回退" in prompt
     assert "同一轮可以并行发出多个相互独立的 fill/place" in prompt
+    assert "多格方块" in prompt
+    assert "setblock" in prompt
+    assert "NBT" in prompt
     # Cards for the new single-op tools.
     assert "place_block [改变世界/高]" in prompt
     assert "fill_block [改变世界/高]" in prompt

@@ -21,6 +21,8 @@ _INTENT_GUIDANCE: dict[ToolIntent, str] = {
 _BLOCK_TOOL_PRIORITY = (
     "方块操作编排规则：\n"
     "- 连续区域（地板/墙体/屋顶）用 fill_block；单格用 place_block。\n"
+    "- 多格方块（门、床、高草等）直接用 run_minecraft_command 的 setblock 放置即可，"
+    "不要用 place_block/fill_block 试探；setblock 默认无需 NBT 参数（Bedrock 不支持 Java NBT）。\n"
     "- inspect_block 只在需要确认世界状态时调用，不要机械地在每次编辑前先查一遍。\n"
     "- expect 默认 air（仅替换空气）；要覆盖非空方块用 expect=any（需再审批）。\n"
     "- 失败时只读 code 与 hint；仅 fallback_allowed=true 时才能考虑命令回退。\n"

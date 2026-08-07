@@ -186,7 +186,8 @@ def register_agent_tools(
 
         命令必须使用基岩版（Bedrock Edition）命令格式，不能用 Java 版语法：
         - 方块/物品/实体 ID 一律带 ``minecraft:`` 命名空间，如 ``minecraft:wooden_door``；
-        - 不支持 Java 版的 NBT ``{...}`` 数据标签；
+        - 不支持 Java 版的 NBT ``{...}`` 数据标签，默认无需 NBT 参数；
+        - 多格方块（门、床、高草等）直接用 ``setblock`` 放置完整结构即可；
         - ``setblock`` / ``fill`` 的方块状态用 ``["状态名":"值"]`` 语法，如
           ``setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction":"south"]``，
           不要用 Java 的 ``[facing=south,half=lower]``。
@@ -234,7 +235,8 @@ def register_agent_tools(
         批量执行 Minecraft 命令，必须遵循基岩版（Bedrock Edition）命令语法。
         命令格式要求：
         - 方块/物品/实体 ID 一律带 ``minecraft:`` 命名空间，如 ``minecraft:wooden_door``；
-        - 不支持 Java 版的 NBT ``{...}`` 数据标签；
+        - 不支持 Java 版的 NBT ``{...}`` 数据标签，默认无需 NBT 参数；
+        - 多格方块（门、床、高草等）直接用 ``setblock`` 放置完整结构即可；
         - ``setblock`` / ``fill`` 的方块状态用 ``["状态名":"值"]`` 语法，如
           ``setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction":"south"]``，
           不要用 Java 的 ``[facing=south,half=lower]``。
@@ -1184,8 +1186,12 @@ def register_agent_tools(
         前缀，如 ``"minecraft:stone"`` / ``"minecraft:oak_planks"``；不要使用 Java 版
         独有 ID。缺失前缀时宿主会自动补 ``minecraft:``。
         states 键名同样用基岩版状态名（带 ``minecraft:`` 前缀），如
-        ``{"minecraft:cardinal_direction": "north"}``，不要用 Java 的 ``facing``/``half``。
+        ``{"minecraft:cardinal_direction": "north"}``，不要用 Java 的 ``facing``/``half``；
+        states 默认留空（Bedrock 不支持 Java 版 NBT）。
         expect 默认 ``"air"``（仅替换空气）；``"any"`` 允许覆写非空方块（需审批）。
+
+        多格方块（门、床、高草等）不要用本工具，直接用 ``run_minecraft_command``
+        的 ``setblock`` 放置完整结构。
 
         成功返回 ``{ok, status, at: [x, y, z], block, was?}``；
         ``was`` 仅在替换了非空气方块时出现。
@@ -1223,8 +1229,12 @@ def register_agent_tools(
         前缀，如 ``"minecraft:stone"`` / ``"minecraft:oak_planks"``；不要使用 Java 版
         独有 ID。缺失前缀时宿主会自动补 ``minecraft:``。
         states 键名同样用基岩版状态名（带 ``minecraft:`` 前缀），如
-        ``{"minecraft:cardinal_direction": "north"}``，不要用 Java 的 ``facing``/``half``。
+        ``{"minecraft:cardinal_direction": "north"}``，不要用 Java 的 ``facing``/``half``；
+        states 默认留空（Bedrock 不支持 Java 版 NBT）。
         expect 默认 ``"air"``（仅替换空气）；``"any"`` 允许覆写非空方块（需审批）。
+
+        多格方块（门、床、高草等）不要用本工具，直接用 ``run_minecraft_command``
+        的 ``setblock`` 放置完整结构。
 
         角点自动 min/max 归一化。expect=air 时非空气格跳过。
         成功返回 ``{ok, status, changed, skipped, type_counts?, bounds}``；

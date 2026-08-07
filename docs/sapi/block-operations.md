@@ -260,7 +260,7 @@ Microsoft 官方更新说明（`Update1.26.10`）：
 
 > "Fixed an issue where … `/setblock` and `/fill` commands incorrectly placing partial double blocks, such as the upper half of a door."
 
-即 Script API 单格写入的语义**始终不变**；命令回退路径从 1.26.10 起才能正确放置完整门。宿主对 `UNSUPPORTED_BLOCK_PLACEMENT` 的 `fallback_allowed` 按一元规则放行，模型可回退 `setblock <pos> minecraft:wooden_door`（无需 half 状态）。
+即 Script API 单格写入的语义**始终不变**；命令回退路径从 1.26.10 起才能正确放置完整门。提示词直接引导模型对多格方块使用 `run_minecraft_command` 的 `setblock <pos> minecraft:wooden_door`（默认无需 NBT 参数，也无需 half 状态）；若仍走了专用工具，宿主对 `UNSUPPORTED_BLOCK_PLACEMENT` 的 `fallback_allowed` 按一元规则放行命令回退。
 
 **Bedrock 门的状态清单**
 
