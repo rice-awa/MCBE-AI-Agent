@@ -260,40 +260,5 @@ def normalize_array_target(
     )
 
 
-def build_inspect_payload_from_target(
-    normalized: NormalizedTarget,
-    *,
-    dimension: str | None,
-    player_name: str,
-    phase: str | None = None,
-    locked_targets: list[dict[str, Any]] | None = None,
-    limits: dict[str, int] | None = None,
-) -> dict[str, Any]:
-    """Build the Add-on inspect payload from a normalized unified target.
-
-    The Add-on inspect handler accepts both the legacy
-    ``coordinate_mode/position/positions`` shape and the new ``target`` shape.
-    We send the unified ``target`` so the Add-on can resolve box volumes and
-    auto-summary in one place.
-    """
-    payload: dict[str, Any] = {
-        "coordinate_mode": normalized.coordinate_mode,
-        "player_name": player_name,
-    }
-    if dimension is not None:
-        payload["dimension"] = dimension
-    if normalized.shape == "positions":
-        payload["target"] = {"positions": normalized.positions}
-    else:
-        payload["target"] = {
-            "box": {"from": normalized.box_from, "to": normalized.box_to}
-        }
-    if phase is not None:
-        payload["phase"] = phase
-    if locked_targets is not None:
-        payload["locked_targets"] = locked_targets
-    if limits is not None:
-        from services.agent.block_ops.tools_impl import apply_limits_to_payload
-
-        apply_limits_to_payload(payload, limits)
-    return payload
+# build_inspect_payload_from_target has been moved to message.py
+# to eliminate the reverse import of tools_impl.apply_limits_to_payload.

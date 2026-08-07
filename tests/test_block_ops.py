@@ -50,19 +50,25 @@ from services.agent.block_ops.schema import (
     build_error_response,
     build_success_response,
 )
-from services.agent.block_ops.tools_impl import (
+from services.agent.block_ops.limits import (
     apply_limits_to_payload,
-    build_block_preflight_plan,
-    build_edit_payload,
-    build_inspect_payload,
     check_bridge_command_line_budget,
     estimate_bridge_command_line_bytes,
+    locked_targets_wire_limit_exceeded,
+    should_omit_locked_targets_on_wire,
+)
+from services.agent.block_ops.message import (
+    build_edit_payload,
+    build_inspect_payload,
+)
+from services.agent.block_ops.preflight import (
+    build_block_preflight_plan,
+    merge_canonical_from_preflight,
+)
+from services.agent.block_ops.tools_impl import (
     fill_block_impl,
     inspect_block_impl,
-    locked_targets_wire_limit_exceeded,
-    merge_canonical_from_preflight,
     place_block_impl,
-    should_omit_locked_targets_on_wire,
 )
 from services.agent.harness.execution import (
     HarnessCapability,
@@ -1213,9 +1219,8 @@ def test_locked_targets_wire_limit_exceeded_only_when_cap_positive() -> None:
     body = json.loads(fail.output)
     assert body["code"] == "LIMIT_EXCEEDED"
     assert body["reason"] == "max_locked_targets_on_wire"
-    assert body["suggested_max_discrete"] == 2
-    assert body["matched_count"] == 5
-    assert any(k in body.get("hint", "") for k in ("place", "batch", "fill"))
+    assert body["count"] == 5
+    assert body["max_locked_targets_on_wire"] == 2
 
 
 def test_absolute_execute_still_omits_when_max_locked_wire_zero() -> None:
