@@ -152,3 +152,26 @@ review近期6项任务完成状态，确认方案四和方案五已完成；合�
 ### Status
 
 [OK] **Completed**
+
+## 2026-08-07 — 架构优化后续改进三项并行（ExecutionResult模式/运行时加深/校验拆分）
+
+### Summary
+
+架构优化 review 的三条改进建议并行推进并全部完成：
+
+1. **spec-execution-result-pattern**: code-reuse-thinking-guide.md 追加 ExecutionResult 模式条目（已验证契约边界），含模式说明、正确/错误示例。
+2. **runtime-deepening**: 移除 ProviderRegistry 薄转发层（providers.py），调用方直接 get_agent_runtime().runtime_adapters；消除 worker.py 两个废弃懒导入导致的 UnboundLocalError。
+3. **block-ops-validation-split**: 新建 validation.py，从 tools_impl 迁移 11 个校验/归一化函数（~320行）；修复 execute_block_plan 中 state_unknown_result 引用（下划线未同步更新，潜藏 NameError）。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| 4d47e1c | docs(spec): 补充 ExecutionResult 已验证契约边界模式 |
+| c09b7b7 | refactor(block_ops): 拆分校验函数到独立 validation.py 模块 |
+| 427b667 | refactor(runtime): 移除 ProviderRegistry 薄转发层 |
+
+### Status
+
+[OK] **全部完成，已提交 dev 并归档**
+
