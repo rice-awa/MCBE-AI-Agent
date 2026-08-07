@@ -328,3 +328,30 @@ def group_tools_by_intent() -> dict[ToolIntent, list[ToolCatalogEntry]]:
     for entry in _TOOL_CATALOG.values():
         grouped[entry.intent].append(entry)
     return grouped
+
+
+# ── 工具使用指南投影 ──────────────────────────────────────────────
+# 从工具目录统一投影 TOOL_USAGE_GUIDE，消除 prompt.py / core.py 的手工副本。
+
+TOOL_USAGE_GUIDE_PREAMBLE = """你可以使用工具与 Minecraft 交互。
+- 当用户要求"执行命令/给物品/发送消息/发标题/查询 Wiki"等可操作任务时，优先调用对应工具执行，而不是只解释步骤。
+- 不要在有对应工具时直接说"我做不到"；若执行失败，要返回失败原因与下一步建议。
+- 对于纯问答类问题，可直接回答。
+- 执行命令 / 指定方块 / 物品时，一律使用基岩版（Bedrock Edition）命令语法与命名空间（minecraft:），不用 Java 版语法。
+"""
+
+
+def project_tool_usage_guide() -> str:
+    """从工具目录投影工具使用指南文本。
+
+    将每类意图的工具名称列在指南中，避免手工维护两份 TOOL_USAGE_GUIDE。
+    """
+    lines = [TOOL_USAGE_GUIDE_PREAMBLE.strip()]
+    # 按意图分组列出可用工具
+    for intent in ToolIntent:
+        entries = _TOOL_CATALOG.values()
+        intent_tools = sorted(e.name for e in entries if e.intent == intent and e.source == "builtin")
+        if not intent_tools:
+            continue
+        lines.append(f"  {intent.value}工具: {', '.join(intent_tools)}")
+    return "\n".join(lines)

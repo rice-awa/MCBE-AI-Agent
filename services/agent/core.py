@@ -299,13 +299,6 @@ def _is_generator_exit_cleanup_error(exc: BaseException) -> bool:
     return False
 
 
-TOOL_USAGE_GUIDE = """
-你可以使用工具与 Minecraft 交互。
-- 当用户要求"执行命令/给物品/发送消息/发标题/查询 Wiki"等可操作任务时，优先调用对应工具执行，而不是只解释步骤。
-- 不要在有对应工具时直接说"我做不到"；若执行失败，要返回失败原因与下一步建议。
-- 对于纯问答类问题，可直接回答。
-""".strip()
-
 
 class ChatAgentManager:
     """
