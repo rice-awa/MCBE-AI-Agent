@@ -1,0 +1,2 @@
+{"file": "spec/backend/runtime-architecture.md", "reason": "验收核对：普通执行与审批恢复的工具审计/追踪/幂等由同一实现驱动且一致"}
+{"file": "spec/backend/quality-guidelines.md", "reason": "质量检查：收敛后无重复实现、无第二份收尾链，深模块集中性达成"}
