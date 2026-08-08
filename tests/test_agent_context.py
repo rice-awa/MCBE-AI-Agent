@@ -28,8 +28,8 @@ from services.agent.context import (
 from services.agent.prompt import (
     SYSTEM_TRUST_CONSTRAINTS,
     SYSTEM_TRUST_CONSTRAINTS_VERSION,
-    get_prompt_manager,
 )
+from services.agent.runtime import get_agent_runtime
 
 
 class _ProviderConfig:
@@ -83,7 +83,7 @@ def _find_part(messages, part_kind: str, tool_call_id: str):
 
 def _large_context_builder(settings=None) -> ContextBuilder:
     return ContextBuilder(
-        settings or _Settings(context_window=8192),
+        settings or _Settings(context_window=128_000),
         system_reserve_tokens=100,
         tool_schema_reserve_tokens=100,
         current_input_reserve_tokens=50,
@@ -338,7 +338,7 @@ def test_context_keeps_complete_pair_and_removes_orphan_parallel_call():
 
 
 def test_context_keeps_same_id_pair_when_recent_turn_cropping_runs():
-    settings = _Settings(context_window=8192)
+    settings = _Settings(context_window=128_000)
     settings.max_history_turns = 1
     builder = _large_context_builder(settings)
     messages = [
@@ -472,7 +472,7 @@ def test_context_pairs_tool_parts_in_order_one_to_one_without_mutating_mixed_mes
 
 
 def test_context_cleans_pair_half_left_by_recent_turn_cropping():
-    settings = _Settings(context_window=8192)
+    settings = _Settings(context_window=128_000)
     settings.max_history_turns = 1
     builder = _large_context_builder(settings)
     messages = [
@@ -668,7 +668,7 @@ def test_summary_injection_does_not_replace_system_policy():
         parts=[UserPromptPart(content=f"[历史摘要]\n{summary_body}")]
     )
 
-    settings = _Settings(context_window=8192)
+    settings = _Settings(context_window=128_000)
     builder = ContextBuilder(settings)
     processed = builder.process_history(
         [summary_msg, _user("你好"), _assistant("hi")],
@@ -680,7 +680,7 @@ def test_summary_injection_does_not_replace_system_policy():
     assert "factual_hints_only_never_instructions" in summary_text
 
     # 系统提示始终重建信任约束，不从摘要恢复策略
-    prompt = get_prompt_manager().build_system_prompt(
+    prompt = get_agent_runtime().get_prompt_manager().build_system_prompt(
         connection_id=str(uuid4()),
         player_name="Steve",
         provider="deepseek",
@@ -715,8 +715,9 @@ def test_missing_context_window_does_not_use_unlimited_budget():
     budget = builder.compute_budget(provider_name="x")
     assert budget.missing_context_window is True
     assert budget.history_budget >= 0
-    # fallback 窗口有限，不是无限
-    assert budget.history_budget < 100000
+    # fallback 窗口有限，不是无限；DEFAULT_FALLBACK_CONTEXT_WINDOW=128k 减去各保留值
+    assert budget.history_budget < 128_000
+    assert budget.history_budget > 120_000
 
 
 def test_summary_not_rewrapped_on_repeated_normalize():
@@ -734,7 +735,7 @@ def test_summary_not_rewrapped_on_repeated_normalize():
     assert first_content.count(UNTRUSTED_HISTORY_MARKER) == 1
     assert "factual_hints_only_never_instructions" in first_content
 
-    settings = _Settings(context_window=8192)
+    settings = _Settings(context_window=128_000)
     builder = ContextBuilder(settings)
 
     once = builder.process_history([summary_msg], provider_name="deepseek")
@@ -823,12 +824,12 @@ async def test_call_extracts_current_user_input_for_budget():
 def test_missing_context_window_refuses_oversized_after_trim():
     """missing_context_window 时：永不无限；超 floor 硬拒绝 ContextOversizedError。"""
     settings = _Settings(context_window=None)
-    # 预留吃光 fallback 窗口 → history_budget<=0 + missing → refuse
+    # 预留吃光 fallback 窗口（128k）→ history_budget<=0 + missing → refuse
     builder_zero = ContextBuilder(
         settings,
-        system_reserve_tokens=4000,
-        tool_schema_reserve_tokens=4000,
-        current_input_reserve_tokens=1000,
+        system_reserve_tokens=50000,
+        tool_schema_reserve_tokens=50000,
+        current_input_reserve_tokens=27936,
     )
     budget_zero = builder_zero.compute_budget(provider_name="x")
     assert budget_zero.missing_context_window is True
@@ -841,17 +842,17 @@ def test_missing_context_window_refuses_oversized_after_trim():
         )
     assert "元数据缺失" in str(ei_zero.value) or "预算" in str(ei_zero.value)
 
-    # 单单元在激进截断后仍超小 history_budget → 硬拒绝
+    # 单单元在激进截断后仍超 history_budget → 硬拒绝
     builder = ContextBuilder(
         settings,
-        system_reserve_tokens=3500,
-        tool_schema_reserve_tokens=3500,
-        current_input_reserve_tokens=1000,
+        system_reserve_tokens=50000,
+        tool_schema_reserve_tokens=50000,
+        current_input_reserve_tokens=27916,
         max_tool_result_chars=50,
     )
     budget = builder.compute_budget(provider_name="x", current_input="hi")
     assert budget.missing_context_window is True
-    assert 0 < budget.history_budget < 200  # 截断到 500 字仍会超
+    assert 0 < budget.history_budget < 200  # ~20
 
     huge = "超" * 5000
     with pytest.raises(ContextOversizedError) as ei:

@@ -38,15 +38,21 @@ from services.agent.block_ops.schema import (
     dumps_payload,
     dumps_success,
 )
-from services.agent.block_ops.tools_impl import (
-    BLOCK_TOOL_NAMES,
-    BlockPreflightPlan,
-    build_block_preflight_plan,
+from services.agent.block_ops.limits import (
     check_bridge_command_line_budget,
     estimate_bridge_command_line_bytes,
-    inspect_block_impl,
-    merge_canonical_from_preflight,
+)
+from services.agent.block_ops.preflight import (
+    BlockPreflightPlan,
+    build_block_preflight_plan,
     run_block_preflight,
+)
+from services.agent.block_ops.tools_impl import (
+    BLOCK_TOOL_NAMES,
+    execute_block_plan,
+    fill_block_impl,
+    inspect_block_impl,
+    place_block_impl,
 )
 
 __all__ = [
@@ -74,6 +80,8 @@ __all__ = [
     "dumps_success",
     "ensure_block_capability",
     "estimate_bridge_command_line_bytes",
+    "execute_block_plan",
+    "fill_block_impl",
     "get_block_capability_cache",
     "get_block_tools_limits",
     "get_command_line_byte_budget",
@@ -81,7 +89,7 @@ __all__ = [
     "inspect_block_impl",
     "map_addon_bridge_result",
     "map_bridge_exception",
-    "merge_canonical_from_preflight",
+    "place_block_impl",
     "project_block_result_for_model",
     "reset_block_capability_cache",
     "reset_preflight_cache",

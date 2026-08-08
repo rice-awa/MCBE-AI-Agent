@@ -284,10 +284,12 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         ToolIntent.CHANGE_WORLD,
         ToolRisk.HIGH,
         "在单个格子上写入方块时使用；连续区域优先用 fill_block。",
-        "不要用于查询；不要拆成多个单格来填充连续区域；不要用于覆盖保护数据。",
+        "不要用于查询；不要拆成多个单格来填充连续区域；不要用于覆盖保护数据；"
+        "多格方块（门、床、高草等）不要用本工具，直接用 run_minecraft_command 的 setblock 放置。",
         "pos 为 [x,y,z] 绝对坐标；block 为 type_id 字符串，使用基岩版命名空间（如 \"minecraft:stone\"，缺失前缀自动补 minecraft:）；"
         "expect 默认 air（仅替换空气），可选 any（需再审批）/ type_id；"
-        "states 为可选的方块状态字典，键名使用基岩版状态名（如 {\"minecraft:cardinal_direction\":\"north\"}，不要用 Java 的 facing）。",
+        "states 为可选字典（默认留空，Bedrock 不支持 Java NBT，无需 NBT 参数），"
+        "键名使用基岩版状态名（如 {\"minecraft:cardinal_direction\":\"north\"}，不要用 Java 的 facing）。",
         preview=ParameterPreviewPolicy(
             include=("pos", "block", "expect", "states")
         ),
@@ -298,11 +300,13 @@ _TOOL_CATALOG: dict[str, ToolCatalogEntry] = {
         ToolIntent.CHANGE_WORLD,
         ToolRisk.HIGH,
         "填充连续区域（地板/墙体/屋顶等）时使用；单格用 place_block。",
-        "不要用于查询；不要用多个 place_block 模拟连续区域；不要用于覆盖保护数据。",
+        "不要用于查询；不要用多个 place_block 模拟连续区域；不要用于覆盖保护数据；"
+        "多格方块（门、床、高草等）不要用本工具，直接用 run_minecraft_command 的 setblock 放置。",
         "from 与 to 为两个绝对角点 [x,y,z]（自动归一化）；block 为 type_id 字符串，"
         "使用基岩版命名空间（如 \"minecraft:stone\"，缺失前缀自动补 minecraft:）；"
         "expect 默认 air（仅替换空气），可选 any（需再审批）/ type_id；"
-        "states 为可选的方块状态字典，键名使用基岩版状态名（如 {\"minecraft:cardinal_direction\":\"north\"}，不要用 Java 的 facing）。",
+        "states 为可选字典（默认留空，Bedrock 不支持 Java NBT，无需 NBT 参数），"
+        "键名使用基岩版状态名（如 {\"minecraft:cardinal_direction\":\"north\"}，不要用 Java 的 facing）。",
         preview=ParameterPreviewPolicy(
             include=("from", "to", "block", "expect", "states")
         ),
@@ -328,3 +332,30 @@ def group_tools_by_intent() -> dict[ToolIntent, list[ToolCatalogEntry]]:
     for entry in _TOOL_CATALOG.values():
         grouped[entry.intent].append(entry)
     return grouped
+
+
+# ── 工具使用指南投影 ──────────────────────────────────────────────
+# 从工具目录统一投影 TOOL_USAGE_GUIDE，消除 prompt.py / core.py 的手工副本。
+
+TOOL_USAGE_GUIDE_PREAMBLE = """你可以使用工具与 Minecraft 交互。
+- 当用户要求"执行命令/给物品/发送消息/发标题/查询 Wiki"等可操作任务时，优先调用对应工具执行，而不是只解释步骤。
+- 不要在有对应工具时直接说"我做不到"；若执行失败，要返回失败原因与下一步建议。
+- 对于纯问答类问题，可直接回答。
+- 执行命令 / 指定方块 / 物品时，一律使用基岩版（Bedrock Edition）命令语法与命名空间（minecraft:），不用 Java 版语法。
+"""
+
+
+def project_tool_usage_guide() -> str:
+    """从工具目录投影工具使用指南文本。
+
+    将每类意图的工具名称列在指南中，避免手工维护两份 TOOL_USAGE_GUIDE。
+    """
+    lines = [TOOL_USAGE_GUIDE_PREAMBLE.strip()]
+    # 按意图分组列出可用工具
+    for intent in ToolIntent:
+        entries = _TOOL_CATALOG.values()
+        intent_tools = sorted(e.name for e in entries if e.intent == intent and e.source == "builtin")
+        if not intent_tools:
+            continue
+        lines.append(f"  {intent.value}工具: {', '.join(intent_tools)}")
+    return "\n".join(lines)

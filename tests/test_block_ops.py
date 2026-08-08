@@ -50,19 +50,25 @@ from services.agent.block_ops.schema import (
     build_error_response,
     build_success_response,
 )
-from services.agent.block_ops.tools_impl import (
+from services.agent.block_ops.limits import (
     apply_limits_to_payload,
-    build_block_preflight_plan,
-    build_edit_payload,
-    build_inspect_payload,
     check_bridge_command_line_budget,
     estimate_bridge_command_line_bytes,
+    locked_targets_wire_limit_exceeded,
+    should_omit_locked_targets_on_wire,
+)
+from services.agent.block_ops.message import (
+    build_edit_payload,
+    build_inspect_payload,
+)
+from services.agent.block_ops.preflight import (
+    build_block_preflight_plan,
+    merge_canonical_from_preflight,
+)
+from services.agent.block_ops.tools_impl import (
     fill_block_impl,
     inspect_block_impl,
-    locked_targets_wire_limit_exceeded,
-    merge_canonical_from_preflight,
     place_block_impl,
-    should_omit_locked_targets_on_wire,
 )
 from services.agent.harness.execution import (
     HarnessCapability,
@@ -1213,9 +1219,8 @@ def test_locked_targets_wire_limit_exceeded_only_when_cap_positive() -> None:
     body = json.loads(fail.output)
     assert body["code"] == "LIMIT_EXCEEDED"
     assert body["reason"] == "max_locked_targets_on_wire"
-    assert body["suggested_max_discrete"] == 2
-    assert body["matched_count"] == 5
-    assert any(k in body.get("hint", "") for k in ("place", "batch", "fill"))
+    assert body["count"] == 5
+    assert body["max_locked_targets_on_wire"] == 2
 
 
 def test_absolute_execute_still_omits_when_max_locked_wire_zero() -> None:
@@ -2762,7 +2767,7 @@ async def test_harness_inspect_auto_allows_when_supported() -> None:
 
 
 def test_normalize_block_input_string_normalizes_namespace_and_case() -> None:
-    from services.agent.block_ops.tools_impl import _normalize_block_input
+    from services.agent.block_ops.validation import _normalize_block_input
 
     info, repairs = _normalize_block_input("Oak_Planks")
     assert info["type_id"] == "minecraft:oak_planks"
@@ -2771,7 +2776,7 @@ def test_normalize_block_input_string_normalizes_namespace_and_case() -> None:
 
 
 def test_normalize_block_input_object_keeps_states() -> None:
-    from services.agent.block_ops.tools_impl import _normalize_block_input
+    from services.agent.block_ops.validation import _normalize_block_input
 
     info, _ = _normalize_block_input({"type_id": "minecraft:stone", "states": {"lit": True}})
     assert info["type_id"] == "minecraft:stone"
@@ -2779,7 +2784,7 @@ def test_normalize_block_input_object_keeps_states() -> None:
 
 
 def test_normalize_expect_kinds() -> None:
-    from services.agent.block_ops.tools_impl import (
+    from services.agent.block_ops.validation import (
         _expect_info_to_legacy,
         _normalize_expect,
     )
@@ -2804,7 +2809,7 @@ def test_normalize_expect_kinds() -> None:
 
 def test_expect_to_legacy_permutation_descriptor() -> None:
     """T2-M3: expect={type_id, states} maps to expected_previous with states."""
-    from services.agent.block_ops.tools_impl import _expect_to_legacy
+    from services.agent.block_ops.validation import _expect_to_legacy
 
     replace_any, expected_previous, error = _expect_to_legacy(
         {"type_id": "minecraft:stone", "states": {"lit": True}}
@@ -3217,6 +3222,7 @@ def test_unsupported_block_placement_preserves_multiblock_flag() -> None:
     assert "多格" in body["hint"]
     assert "setblock" in body["hint"]
     assert "1.26.10" in body["hint"]
+    assert "NBT" in body["hint"]
 
 
 @pytest.mark.parametrize(

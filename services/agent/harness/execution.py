@@ -1336,8 +1336,7 @@ class HarnessToolset(WrapperToolset[Any]):
             )
             return materialize_tool_result(classified)
 
-        # 4) 结果分类与幂等写入
-        result_for_model = materialize_tool_result(raw_result)
+        # 4) 统一收尾：幂等写入 → 审计 → 追踪（与审批恢复路径共享同一实现）
         if name in _BLOCK_OPS_TOOLS:
             _record_block_edit_fallback_outcome(
                 raw_result,
@@ -1346,82 +1345,22 @@ class HarnessToolset(WrapperToolset[Any]):
                 run_id=str(run_id),
                 store=self.fallback_store,
             )
-        external_unknown = False
-        success = True
-        if isinstance(raw_result, ToolResult):
-            if name in _BLOCK_OPS_TOOLS:
-                success, external_unknown = _block_result_observability_status(raw_result)
-            else:
-                success = raw_result.is_success
-                external_unknown = raw_result.external_state_unknown
-            if not raw_result.is_success and name in _BLOCK_OPS_TOOLS:
-                log_tool_execution_failed(
-                    tool_name=name,
-                    ctx=ctx,
-                    result=raw_result,
-                    execution_stage="invocation",
-                    error_type=raw_result.error_type,
-                )
-            # 状态未知的副作用：不写入可重放成功缓存之外的自动重试语义
-            if raw_result.is_success and run_id and tool_call_id:
-                self.idempotency.put(
-                    str(run_id),
-                    str(tool_call_id),
-                    idempotency_args_hash,
-                    raw_result,
-                    external_state_unknown=False,
-                )
-            elif (
-                not raw_result.is_success
-                and raw_result.retryable
-                and entry is not None
-                and not entry.may_have_external_side_effects
-                and entry.risk == ToolRisk.LOW
-            ):
-                # 明确幂等的 transient 查询：不缓存失败，允许模型/上层重试
-                pass
-        else:
-            if run_id and tool_call_id:
-                self.idempotency.put(
-                    str(run_id),
-                    str(tool_call_id),
-                    idempotency_args_hash,
-                    result_for_model,
-                    external_state_unknown=False,
-                )
-
-        self._audit(
-            settings=settings,
-            tool_name=name,
-            parameters=normalized,
+        return self._finish_tool_execution(
+            name=name,
+            raw_result=raw_result,
             ctx=ctx,
-            status="success" if success else "failure",
-            duration_ms=_duration_ms(start),
-            result=raw_result if isinstance(raw_result, ToolResult) else result_for_model,
+            settings=settings,
+            run_id=str(run_id),
+            tool_call_id=str(tool_call_id),
+            connection_id=connection_id,
+            player_name=player_name,
+            trace_recorder=trace_recorder,
+            trace_context=trace_context,
+            normalized=normalized,
+            idempotency_args_hash=idempotency_args_hash,
+            entry=entry,
+            start=start,
         )
-
-        if external_unknown:
-            logger.warning(
-                "tool_external_state_unknown",
-                tool=name,
-                run_id=run_id,
-                tool_call_id=tool_call_id,
-            )
-            exec_status = "timeout_unknown"
-        elif success:
-            exec_status = "succeeded"
-        else:
-            exec_status = "failed"
-        self._trace_tool_result(
-            trace_recorder,
-            trace_context,
-            tool_name=name,
-            tool_call_id=str(tool_call_id) if tool_call_id else None,
-            result=raw_result if isinstance(raw_result, ToolResult) else result_for_model,
-            status=exec_status,
-            duration_ms=_duration_ms(start),
-        )
-        return result_for_model
 
     def _trace_tool_proposed(
         self,
@@ -1537,6 +1476,107 @@ class HarnessToolset(WrapperToolset[Any]):
         except Exception as exc:  # noqa: BLE001
             logger.debug("trace_tool_result_failed", error=str(exc))
 
+    def _finish_tool_execution(
+        self,
+        *,
+        name: str,
+        raw_result: Any,
+        ctx: RunContext[Any],
+        settings: Any,
+        run_id: str,
+        tool_call_id: str,
+        connection_id: str,
+        player_name: str | None,
+        trace_recorder: Any,
+        trace_context: Any,
+        normalized: dict[str, Any],
+        idempotency_args_hash: str,
+        entry: Any | None,
+        start: float,
+        authorized_args: dict[str, Any] | None = None,
+    ) -> Any:
+        """统一收尾链：结果分类 → 幂等写入 → 审计 → 追踪 → 返回。
+
+        普通执行与审批恢复共享此方法，确保两条路径的收尾行为一致。
+        """
+        result_for_model = materialize_tool_result(raw_result)
+        external_unknown = False
+        success = True
+        if isinstance(raw_result, ToolResult):
+            if name in _BLOCK_OPS_TOOLS:
+                success, external_unknown = _block_result_observability_status(raw_result)
+            else:
+                success = raw_result.is_success
+                external_unknown = raw_result.external_state_unknown
+            if not raw_result.is_success and name in _BLOCK_OPS_TOOLS:
+                log_tool_execution_failed(
+                    tool_name=name,
+                    ctx=ctx,
+                    result=raw_result,
+                    execution_stage="invocation",
+                    error_type=raw_result.error_type,
+                )
+            # 状态未知的副作用：不写入可重放成功缓存之外的自动重试语义
+            if raw_result.is_success and run_id and tool_call_id:
+                self.idempotency.put(
+                    str(run_id),
+                    str(tool_call_id),
+                    idempotency_args_hash,
+                    raw_result,
+                    external_state_unknown=False,
+                )
+            elif (
+                not raw_result.is_success
+                and raw_result.retryable
+                and entry is not None
+                and not entry.may_have_external_side_effects
+                and entry.risk == ToolRisk.LOW
+            ):
+                pass
+        else:
+            if run_id and tool_call_id:
+                self.idempotency.put(
+                    str(run_id),
+                    str(tool_call_id),
+                    idempotency_args_hash,
+                    result_for_model,
+                    external_state_unknown=False,
+                )
+
+        self._audit(
+            settings=settings,
+            tool_name=name,
+            parameters=normalized,
+            ctx=ctx,
+            status="success" if success else "failure",
+            duration_ms=_duration_ms(start),
+            result=raw_result if isinstance(raw_result, ToolResult) else result_for_model,
+            authorized_args=authorized_args,
+        )
+
+        if external_unknown:
+            logger.warning(
+                "tool_external_state_unknown",
+                tool=name,
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+            )
+            exec_status = "timeout_unknown"
+        elif success:
+            exec_status = "succeeded"
+        else:
+            exec_status = "failed"
+        self._trace_tool_result(
+            trace_recorder,
+            trace_context,
+            tool_name=name,
+            tool_call_id=str(tool_call_id) if tool_call_id else None,
+            result=raw_result if isinstance(raw_result, ToolResult) else result_for_model,
+            status=exec_status,
+            duration_ms=_duration_ms(start),
+        )
+        return result_for_model
+
     async def _ensure_block_capability(self, ctx: RunContext[Any]) -> None:
         deps = getattr(ctx, "deps", None)
         if deps is None:
@@ -1563,7 +1603,7 @@ class HarnessToolset(WrapperToolset[Any]):
         connection_id: str,
     ) -> tuple[ToolResult | None, Any | None]:
         """Run block-ops preflight; return (failure, separated plan)."""
-        from services.agent.block_ops.tools_impl import BlockPreflightPlan, run_block_preflight
+        from services.agent.block_ops.preflight import BlockPreflightPlan, run_block_preflight
 
         # Reuse cached canonical args on approval recovery (same original hash).
         cache = get_preflight_cache()
@@ -1645,17 +1685,17 @@ class HarnessToolset(WrapperToolset[Any]):
         trace_context: Any,
         start: float,
     ) -> Any:
-        """Approved plan_id 恢复：幂等 → execute_block_plan → 分类/审计/追踪。
+        """Approved plan_id 恢复：幂等 → execute_block_plan → 统一收尾。
 
-        镜像主路径 step 1/3/4：同 run+call 同参数只执行一次；成功写入幂等
-        缓存；审计 parameters/authorized_args 从缓存 canonical args 还原，
-        绝不包含隐藏 kwargs。
+        与主路径共享同一套收尾链（幂等写入 → 审计 → 追踪），审计参数
+        从缓存 canonical args 还原，绝不包含隐藏 kwargs。
         """
-        from services.agent.block_ops.tools_impl import _state_unknown_result, execute_block_plan
+        from services.agent.block_ops import execute_block_plan
+        from services.agent.block_ops.preflight import state_unknown_result
 
         entry = get_preflight_cache().get_by_plan_id(plan_id)
         if entry is None:
-            result = _state_unknown_result(plan_id)
+            result = state_unknown_result(plan_id)
             self._audit(
                 settings=settings,
                 tool_name=name,
@@ -1700,7 +1740,7 @@ class HarnessToolset(WrapperToolset[Any]):
         canonical = dict(entry.canonical_args)
         idempotency_args_hash = hash_normalized_args(normalize_tool_args(canonical))
 
-        # 幂等（同主路径 step 1）：同 run+call 同参数只执行一次
+        # 幂等（同主路径）：同 run+call 同参数只执行一次
         if run_id and tool_call_id:
             cached = self.idempotency.get(
                 str(run_id), str(tool_call_id), idempotency_args_hash
@@ -1742,57 +1782,24 @@ class HarnessToolset(WrapperToolset[Any]):
         )
         raw_result = await execute_block_plan(plan_id, ctx)
 
-        # 步骤 4 镜像：结果分类 / 幂等写入 / 审计 / 追踪
-        result_for_model = materialize_tool_result(raw_result)
-        success = True
-        external_unknown = False
-        if isinstance(raw_result, ToolResult):
-            success, external_unknown = _block_result_observability_status(raw_result)
-            if raw_result.is_success and run_id and tool_call_id:
-                self.idempotency.put(
-                    str(run_id),
-                    str(tool_call_id),
-                    idempotency_args_hash,
-                    raw_result,
-                    external_state_unknown=False,
-                )
-        else:
-            if run_id and tool_call_id:
-                self.idempotency.put(
-                    str(run_id),
-                    str(tool_call_id),
-                    idempotency_args_hash,
-                    result_for_model,
-                    external_state_unknown=False,
-                )
-
-        self._audit(
-            settings=settings,
-            tool_name=name,
-            parameters=canonical,
+        # 统一收尾：幂等写入 → 审计 → 追踪（与主路径共享同一实现）
+        return self._finish_tool_execution(
+            name=name,
+            raw_result=raw_result,
             ctx=ctx,
-            status="success" if success else "failure",
-            duration_ms=_duration_ms(start),
-            result=raw_result if isinstance(raw_result, ToolResult) else result_for_model,
+            settings=settings,
+            run_id=str(run_id),
+            tool_call_id=str(tool_call_id),
+            connection_id=connection_id,
+            player_name=player_name,
+            trace_recorder=trace_recorder,
+            trace_context=trace_context,
+            normalized=canonical,
+            idempotency_args_hash=idempotency_args_hash,
+            entry=get_tool_entry(name),
+            start=start,
             authorized_args=canonical,
         )
-
-        if external_unknown:
-            exec_status = "timeout_unknown"
-        elif success:
-            exec_status = "succeeded"
-        else:
-            exec_status = "failed"
-        self._trace_tool_result(
-            trace_recorder,
-            trace_context,
-            tool_name=name,
-            tool_call_id=tool_call_id or None,
-            result=raw_result if isinstance(raw_result, ToolResult) else result_for_model,
-            status=exec_status,
-            duration_ms=_duration_ms(start),
-        )
-        return result_for_model
 
     def _audit(
         self,

@@ -1,0 +1,33 @@
+{
+  "id": "architecture-review-optimization",
+  "name": "architecture-review-optimization",
+  "title": "架构优化：按 review 落实六项候选方案",
+  "description": "依据 docs/review/architecture-review-20260806-191022.md 审查结论，逐步落实六项架构优化候选方案。父任务只拥有源需求、子任务映射、跨子任务验收标准（报告 12.1 节）与最终集成复核，本身不承担具体实现。按报告第十一节确定推进顺序：先落地方案二的前置双玩家交错测试作为安全门；再实施方案一（首要）；随后按一→三→四→六的依赖顺序推进；方案五独立可随时并行。",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P1",
+  "creator": "rice-awa",
+  "assignee": "rice-awa",
+  "createdAt": "2026-08-06",
+  "completedAt": "2026-08-07",
+  "branch": null,
+  "base_branch": "dev",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "08-06-harness-tool-execution-lifecycle",
+    "08-06-player-identity-per-event",
+    "08-06-block-ops-host-message-prep",
+    "08-06-agent-worker-single-execution",
+    "08-06-tool-catalog-contract-center",
+    "08-06-agent-runtime-ownership"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "进度: 方案一 ✅ 方案二 ✅ 方案三 ✅ 方案四 ✅ 方案五 ✅ 方案六 ⏳ planning。方案四和方案五于 2026-08-07 完成并已归档。",
+  "meta": {}
+}

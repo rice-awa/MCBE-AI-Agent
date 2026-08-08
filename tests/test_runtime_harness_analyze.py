@@ -151,10 +151,18 @@ async def test_apply_llm_suggestions_uses_default_provider_without_tools(monkeyp
             captured["prompt"] = prompt
             return SimpleNamespace(output="- 收窄高失败工具的使用条件\n2. 强化危险工具调用确认")
 
-    from services.agent.providers import ProviderRegistry
     import pydantic_ai
 
-    monkeypatch.setattr(ProviderRegistry, "get_model", staticmethod(fake_get_model))
+    def fake_get_model(provider_config):
+        captured["provider_config"] = provider_config
+        return "fake-model"
+
+    monkeypatch.setattr(
+        "services.agent.runtime.get_agent_runtime",
+        lambda: SimpleNamespace(
+            runtime_adapters=SimpleNamespace(get_model=fake_get_model),
+        ),
+    )
     monkeypatch.setattr(pydantic_ai, "Agent", FakeAgent)
 
     result = await apply_llm_suggestions(analysis, settings)
@@ -190,10 +198,14 @@ async def test_apply_llm_suggestions_falls_back_to_rule_suggestions(monkeypatch)
         async def run(self, prompt):
             raise RuntimeError("model unavailable")
 
-    from services.agent.providers import ProviderRegistry
     import pydantic_ai
 
-    monkeypatch.setattr(ProviderRegistry, "get_model", staticmethod(lambda provider_config: "fake-model"))
+    monkeypatch.setattr(
+        "services.agent.runtime.get_agent_runtime",
+        lambda: SimpleNamespace(
+            runtime_adapters=SimpleNamespace(get_model=lambda provider_config: "fake-model"),
+        ),
+    )
     monkeypatch.setattr(pydantic_ai, "Agent", FailingAgent)
 
     result = await apply_llm_suggestions(analysis, settings)

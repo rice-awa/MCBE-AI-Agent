@@ -1,0 +1,2 @@
+{"file": "spec/backend/session-and-identity.md", "reason": "玩家身份/会话按 (connection_id, player_name) 分桶的约定与约束，方案二身份只来自当前事件、禁止回退到连接级状态的依据"}
+{"file": "spec/backend/runtime-architecture.md", "reason": "HostConnectionHook 异步 create_task 调度、命令路由与消息流的分层边界，用于定位身份传递路径"}

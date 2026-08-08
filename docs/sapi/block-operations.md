@@ -260,7 +260,7 @@ Microsoft 官方更新说明（`Update1.26.10`）：
 
 > "Fixed an issue where … `/setblock` and `/fill` commands incorrectly placing partial double blocks, such as the upper half of a door."
 
-即 Script API 单格写入的语义**始终不变**；命令回退路径从 1.26.10 起才能正确放置完整门。宿主对 `UNSUPPORTED_BLOCK_PLACEMENT` 的 `fallback_allowed` 按一元规则放行，模型可回退 `setblock <pos> minecraft:wooden_door`（无需 half 状态）。
+即 Script API 单格写入的语义**始终不变**；命令回退路径从 1.26.10 起才能正确放置完整门。提示词直接引导模型对多格方块使用 `run_minecraft_command` 的 `setblock <pos> minecraft:wooden_door`（默认无需 NBT 参数，也无需 half 状态）；若仍走了专用工具，宿主对 `UNSUPPORTED_BLOCK_PLACEMENT` 的 `fallback_allowed` 按一元规则放行命令回退。
 
 **Bedrock 门的状态清单**
 
@@ -271,10 +271,10 @@ Microsoft 官方更新说明（`Update1.26.10`）：
 | `open_bit` | `0` / `1` | 开关 |
 | `door_hinge_bit` | `0` / `1` | 铰链侧 |
 
-`setblock` 状态语法示例（Bedrock 格式 `["state":value]`，非 Java 的 `[facing=south,half=lower]`）：
+`setblock` 状态语法示例（Bedrock 格式 `["state"=value]`，非 Java 的 `[facing=south,half=lower]`）：
 
 ```text
-/setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction":"south"]
+/setblock 100 64 100 minecraft:wooden_door ["minecraft:cardinal_direction"="south"]
 ```
 
 **附注**：Add-on 未来若支持多格放置，路径为写上下两格（`upper_block_bit` 分设）+ 写后校验，或直接命令回退。

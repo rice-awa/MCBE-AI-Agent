@@ -89,6 +89,10 @@
     ".trellis/scripts/common/__pycache__/__init__.cpython-314.pyc": "6efdba2e1a120153093809a3996a1dff58ed17539998fdd71b884e7fe2ffdc4c",
     ".trellis/scripts/common/__pycache__/active_task.cpython-314.pyc": "42deb0d149088110296094d2fb2f9fe6b98b576bef2d9e3f51eed8c4cbf8f9c2",
     ".trellis/scripts/common/__pycache__/developer.cpython-314.pyc": "390672a642930f5d09a39d5693bc09516ac626961f0479f5417d2074050f1bae",
-    ".trellis/scripts/common/__pycache__/paths.cpython-314.pyc": "159e49a896b6c4427b910b9055cd370b729740992e89f3e75531647e9dda1af0"
+    ".trellis/scripts/common/__pycache__/paths.cpython-314.pyc": "159e49a896b6c4427b910b9055cd370b729740992e89f3e75531647e9dda1af0",
+    ".trellis/scripts/common/__pycache__/__init__.cpython-311.pyc": "1d4f3dfbe9106e8291fbd852b579cf738b06dfef334dcb4de472e56e26a39a6a",
+    ".trellis/scripts/common/__pycache__/active_task.cpython-311.pyc": "cf8c446469f78c3ccdf42cafc1a154da9b0679cb241bc2112f5abda2ccdba8a3",
+    ".trellis/scripts/common/__pycache__/developer.cpython-311.pyc": "34e945be7a0daf6bb20328d4e0d51b3063bbe1276c189b8d83accc107b34f2c7",
+    ".trellis/scripts/common/__pycache__/paths.cpython-311.pyc": "9f3d91e3427b0ec70c639e8aad01fdb025e97b678c0f53cc857378af7c6e6823"
   }
 }

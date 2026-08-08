@@ -118,10 +118,10 @@ def _build_llm_prompt(analysis: dict[str, Any]) -> str:
 
 
 def _get_default_model(settings: Settings) -> Any:
-    from services.agent.providers import ProviderRegistry
+    from services.agent.runtime import get_agent_runtime
 
     provider_config = settings.get_provider_config(settings.default_provider)
-    return ProviderRegistry.get_model(provider_config)
+    return get_agent_runtime().runtime_adapters.get_model(provider_config)
 
 
 def _parse_llm_suggestions(output: str) -> list[str]:

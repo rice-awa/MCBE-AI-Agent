@@ -16,7 +16,7 @@ from config.settings import LLMProviderConfig, Settings
 from models.agent import AgentDependencies
 from pydantic_ai.messages import ModelMessage
 from services.agent.core import stream_chat
-from services.agent.providers import ProviderRegistry
+from services.agent.runtime import get_agent_runtime
 
 pytestmark = pytest.mark.live
 
@@ -74,7 +74,7 @@ async def _run_live_multi_turn_tool_chain(model_name: str) -> tuple[list[dict], 
         enabled=True,
         timeout=120,
     )
-    model = ProviderRegistry.get_model(provider_config)
+    model = get_agent_runtime().runtime_adapters.get_model(provider_config)
 
     recorder = _ToolRecorder()
     settings = Settings(
@@ -110,7 +110,7 @@ async def _run_live_multi_turn_tool_chain(model_name: str) -> tuple[list[dict], 
     )
 
     await deps.http_client.aclose()
-    await ProviderRegistry.shutdown()
+    await get_agent_runtime().runtime_adapters.shutdown()
 
     return [first_meta, second_meta], recorder.commands
 

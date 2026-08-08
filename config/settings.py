@@ -563,28 +563,6 @@ class EnvInterpolatedJsonConfigSettingsSource(JsonConfigSettingsSource):
         return _flatten_json_config(_merge_minecraft_commands(resolved))
 
 
-MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    # DeepSeek
-    "deepseek-chat": 128000,
-    "deepseek-coder": 128000,
-    # OpenAI
-    "gpt-4o": 128000,
-    "gpt-4o-mini": 128000,
-    "gpt-4-turbo": 128000,
-    "gpt-4": 8192,
-    "gpt-3.5-turbo": 16385,
-    # Anthropic
-    "claude-sonnet-4-20250514": 200000,
-    "claude-opus-4-20250514": 200000,
-    "claude-3-5-sonnet-20240620": 200000,
-    "claude-3-opus-20240229": 200000,
-    "claude-3-haiku-20240307": 200000,
-    # Ollama (本地模型，默认 4k)
-    "llama3": 4096,
-    "llama3.1": 128000,
-    "mistral": 8192,
-    "codellama": 16384,
-}
 
 
 class FlowControlDelayConfig(BaseModel):
@@ -765,21 +743,21 @@ class Settings(BaseSettings):
 
     # DeepSeek 配置
     deepseek_api_key: str | None = Field(default=None, alias="DEEPSEEK_API_KEY")
-    deepseek_model: str = "deepseek-chat"
+    deepseek_model: str = "deepseek-v4-flash"
     deepseek_base_url: str = "https://api.deepseek.com"
 
     # OpenAI 配置
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
-    openai_model: str = "gpt-4o"
+    openai_model: str = "gpt-5.6"
     openai_base_url: str | None = None
 
     # Anthropic 配置
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
-    anthropic_model: str = "claude-sonnet-4-20250514"
+    anthropic_model: str = "claude-sonnet-5"
 
     # Ollama 配置
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "llama3"
+    ollama_model: str = "llama3.1"
 
     # Agent 配置
     system_prompt: str = "你是一个MCBE助手，请始终保持积极友好的态度。回答尽量保持一段话不要太长，适当添加换行符，尽量不要使用markdown，不要生成任何emoji"
@@ -970,13 +948,11 @@ class Settings(BaseSettings):
         """获取指定提供商的配置"""
         name = provider_name or self.default_provider
 
-        # 获取模型的上下文窗口大小：静态表优先，回退到 models.dev 元数据缓存
+        # 获取模型的上下文窗口大小：优先查询 models.dev 元数据缓存，不可用时返回合理默认值
         def get_context_window(provider: str, model: str) -> int | None:
-            if model in MODEL_CONTEXT_WINDOWS:
-                return MODEL_CONTEXT_WINDOWS[model]
             if self.model_metadata.enabled and self._model_metadata_cache is not None:
                 return self._model_metadata_cache.get_context_window(provider, model)
-            return None
+            return 128_000
 
         if name == "deepseek":
             return LLMProviderConfig(

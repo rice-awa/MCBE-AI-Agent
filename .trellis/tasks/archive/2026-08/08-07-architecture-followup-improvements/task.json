@@ -1,0 +1,30 @@
+{
+  "id": "architecture-followup-improvements",
+  "name": "architecture-followup-improvements",
+  "title": "架构优化后续改进：补全已验证模式、加深运行时与校验拆分",
+  "description": "",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "rice-awa",
+  "assignee": "rice-awa",
+  "createdAt": "2026-08-07",
+  "completedAt": "2026-08-07",
+  "branch": null,
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "08-07-spec-execution-result-pattern",
+    "08-07-runtime-deepening",
+    "08-07-block-ops-validation-split"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

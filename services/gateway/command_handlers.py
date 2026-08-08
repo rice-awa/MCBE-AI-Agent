@@ -7,9 +7,10 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from mcbe_ws_sdk import FlowControlSettings, McbeOutboundDelivery
+from mcbe_ws_sdk import FlowControlSettings, McbeOutboundDelivery, MinecraftProtocolHandler
 from mcbe_ws_sdk.addon import AddonBridgeService
 from mcbe_ws_sdk.gateway.connection import ConnectionState
+from mcbe_ws_sdk.gateway.handler import TellrawMessage
 
 from config.logging import get_logger
 from config.settings import Settings
@@ -17,12 +18,10 @@ from core.queue import MessageBroker, normalize_conversation_id
 from core.session import DEFAULT_CONVERSATION_ID
 from models.constants import DEFAULT_PLAYER_DISPLAY_NAME, DEFAULT_PLAYER_KEY
 from models.messages import ChatRequest
+from services.agent.trace import TraceContext, get_trace_recorder
 from services.auth.jwt_handler import JWTHandler
 from services.gateway.session_store import HostConnectionSession, HostSessionStore
 from services.gateway.ws_command_runner import WsCommandRunner
-from mcbe_ws_sdk import MinecraftProtocolHandler
-from mcbe_ws_sdk.gateway.handler import TellrawMessage
-from services.agent.trace import TraceContext, get_trace_recorder
 
 logger = get_logger(__name__)
 
@@ -79,8 +78,9 @@ class CommandHandlers:
             log_raw_payloads=self.log_raw,
         )
 
-    def _reply_target(self, state: ConnectionState, player_name: str | None) -> str:
-        return player_name or state._player_name or "@a"
+    def _reply_target(self, player_name: str | None) -> str:
+        # 身份只来自当前事件；缺失时广播到全体（非业务性默认），不读连接级状态。
+        return player_name or "@a"
 
     async def _send_player_reply(
         self,
@@ -93,7 +93,7 @@ class CommandHandlers:
         delivery = self._delivery(state)
         if delivery is None:
             return
-        target = self._reply_target(state, player_name)
+        target = self._reply_target(player_name)
         await delivery.send_tellraw(
             msg.text,
             color=msg.color,
@@ -111,7 +111,8 @@ class CommandHandlers:
         conversation_id: str,
     ) -> ChatRequest:
         host = self._require_host(state)
-        sender = player_name or state._player_name
+        # 身份只来自当前事件；缺失时用非业务性显示默认值，不读连接级状态。
+        sender = player_name or DEFAULT_PLAYER_DISPLAY_NAME
         session = host.get_player_session(sender)
         resolved_conversation = conversation_id or DEFAULT_CONVERSATION_ID
         # 一次玩家意图：trace_id == run_id（迁移期）；首次 attempt 新生成。
@@ -221,8 +222,6 @@ class CommandHandlers:
         content: str,
         player_name: str | None = None,
     ) -> None:
-        if player_name:
-            state._player_name = player_name
         if cmd_type == "login":
             await self.handle_login(state, content, player_name=player_name)
             return
@@ -295,9 +294,7 @@ class CommandHandlers:
             state.id,
             {
                 "type": "ai_response_sync",
-                "player_name": player_name
-                or state._player_name
-                or DEFAULT_PLAYER_DISPLAY_NAME,
+                "player_name": player_name or DEFAULT_PLAYER_DISPLAY_NAME,
                 "role": "user",
                 "text": content,
             },
@@ -435,9 +432,6 @@ class CommandHandlers:
         player_name: str,
         message: str,
     ) -> None:
-        if player_name:
-            state._player_name = player_name
-
         logger.info(
             "ui_chat_received",
             connection_id=str(state.id),
@@ -595,9 +589,9 @@ class CommandHandlers:
     async def _handle_conversation(
         self, state: ConnectionState, option: str, player_name: str | None = None
     ) -> TellrawMessage:
-        from core.conversation import get_conversation_manager
+        from services.agent.runtime import get_agent_runtime
 
-        conv_manager = get_conversation_manager(self.broker, self.settings)
+        conv_manager = get_agent_runtime().get_conversation_manager(self.broker, self.settings)
         host = self._require_host(state)
         session = host.get_player_session(player_name)
         actor = player_name or session.player_name
@@ -858,9 +852,9 @@ class CommandHandlers:
     async def handle_template(
         self, state: ConnectionState, content: str, player_name: str | None = None
     ) -> None:
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         connection_id = str(state.id)
         host = self._require_host(state)
         session = host.get_player_session(player_name)
@@ -910,9 +904,9 @@ class CommandHandlers:
     async def handle_setting(
         self, state: ConnectionState, content: str, player_name: str | None = None
     ) -> None:
-        from services.agent.prompt import get_prompt_manager
+        from services.agent.runtime import get_agent_runtime
 
-        manager = get_prompt_manager()
+        manager = get_agent_runtime().get_prompt_manager()
         connection_id = str(state.id)
         host = self._require_host(state)
         session = host.get_player_session(player_name)
@@ -1011,7 +1005,7 @@ class CommandHandlers:
         token_lower = token.casefold()
 
         host = self._require_host(state)
-        owner = player_name or state._player_name or DEFAULT_PLAYER_DISPLAY_NAME
+        owner = player_name or DEFAULT_PLAYER_DISPLAY_NAME
         conversation_id = self.broker.get_active_conversation_id(state.id, owner)
         store = get_agent_runtime().get_pending_approval_store(self.settings)
 
@@ -1491,9 +1485,10 @@ class CommandHandlers:
         content: str,
         player_name: str | None = None,
     ) -> None:
-        from services.agent.mcp import MCPConnectionStatus, get_mcp_manager
+        from services.agent.runtime import get_agent_runtime
+        from services.agent.mcp import MCPConnectionStatus
 
-        manager = get_mcp_manager(self.settings)
+        manager = get_agent_runtime().get_mcp_manager(self.settings)
         parts = content.strip().split(None, 1) if content.strip() else []
         action = parts[0] if parts else ""
         arg = parts[1] if len(parts) > 1 else ""

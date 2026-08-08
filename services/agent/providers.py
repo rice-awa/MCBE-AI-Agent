@@ -376,39 +376,3 @@ class RuntimeAdapterRegistry:
     @staticmethod
     def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
         return sanitize_headers(headers)
-
-
-class ProviderRegistry:
-    """Compatibility facade for the process default runtime adapter registry."""
-
-    @classmethod
-    def get_runtime_adapters(cls) -> RuntimeAdapterRegistry:
-        from services.agent.runtime import get_agent_runtime
-
-        return get_agent_runtime().runtime_adapters
-
-    @classmethod
-    def set_runtime_adapters(cls, runtime_adapters: RuntimeAdapterRegistry) -> None:
-        from services.agent.runtime import get_agent_runtime
-
-        get_agent_runtime().runtime_adapters = runtime_adapters
-
-    @classmethod
-    def get_model(cls, config: LLMProviderConfig) -> Model:
-        return cls.get_runtime_adapters().get_model(config)
-
-    @classmethod
-    def list_providers(cls) -> list[str]:
-        return cls.get_runtime_adapters().list_providers()
-
-    @classmethod
-    async def warmup_models(cls, settings: Settings) -> None:
-        await cls.get_runtime_adapters().warmup_models(settings)
-
-    @classmethod
-    async def shutdown(cls) -> None:
-        await cls.get_runtime_adapters().shutdown()
-
-    @classmethod
-    def get_model_string(cls, config: LLMProviderConfig) -> str:
-        return cls.get_runtime_adapters().get_model_string(config)

@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
+from types import SimpleNamespace
 
 import pytest
 
@@ -314,7 +315,12 @@ async def test_llm_summary_uses_plain_agent_without_tools(monkeypatch):
         return "fake-model"
 
     monkeypatch.setattr("core.conversation.Agent", FakeAgent)
-    monkeypatch.setattr("core.conversation.ProviderRegistry.get_model", fake_get_model)
+    monkeypatch.setattr(
+        "core.conversation.get_agent_runtime",
+        lambda: SimpleNamespace(
+            runtime_adapters=SimpleNamespace(get_model=fake_get_model),
+        ),
+    )
 
     summary = await manager.compressor.build_llm_summary(
         messages=_build_multi_turn(2),

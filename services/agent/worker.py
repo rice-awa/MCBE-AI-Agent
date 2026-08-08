@@ -4,8 +4,9 @@ import asyncio
 import copy
 import dataclasses
 import time
+from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import httpx
@@ -29,7 +30,6 @@ from services.agent.harness.audit import (
     extract_tool_validation_failures,
 )
 from services.agent.harness.execution import summarize_args_for_player
-from services.agent.providers import ProviderRegistry
 from services.agent.runtime import get_agent_runtime
 from services.agent.title import generate_conversation_title
 from services.agent.tool_results import CommandResult
@@ -49,6 +49,99 @@ from config.logging import get_logger
 from services.agent.trace import TraceContext, get_trace_recorder
 
 logger = get_logger(__name__)
+
+
+# ── 单次执行结果类型 ─────────────────────────────────────────────
+# 方案四：将单次 MCBE Chat Agent 执行从 AgentWorker 生命周期中独立。
+# AgentWorker 只提交上下文并接收 ExecutionResult，由内部模块协作完成
+# 准备/执行/恢复/输出转换/失败挽救/历史提交/收尾。
+
+
+@dataclass
+class ExecutionResult:
+    """单次 Agent 执行的结果，由 _execute_single_request 返回。
+
+    AgentWorker 根据 status 决定后续动作：
+    - success: 提交历史，生成标题，终态追踪
+    - approval_pending: 审批挂起，不提交历史（下游恢复时处理）
+    - partial: mid-run 失败，已落盘部分结果
+    - timeout / cancelled / exception / disconnected: 非终态，按需 cleanup
+    """
+
+    status: Literal[
+        "success",
+        "approval_pending",
+        "partial",
+        "timeout",
+        "cancelled",
+        "exception",
+        "disconnected",
+    ]
+    """执行终态"""
+
+    response_text: str = ""
+    """完整响应文本（仅 success 时有效）"""
+
+    reasoning_text: str = ""
+    """推理内容文本"""
+
+    event_count: int = 0
+    """流式事件总数"""
+
+    duration_ms: int = 0
+    """执行耗时（毫秒）"""
+
+    all_messages: list[ModelMessage] | None = None
+    """本次执行产生的完整消息列表（success/partial 时可用于保存历史）"""
+
+    new_messages: list[ModelMessage] | None = None
+    """本次执行新增的消息列表"""
+
+    usage: dict | None = None
+    """token 用量"""
+
+    error_kind: str | None = None
+    """错误分类"""
+
+    error_summary: str | None = None
+    """玩家可见错误摘要"""
+
+    diagnostic_summary: str | None = None
+    """诊断用错误详情"""
+
+    approval_id: str | None = None
+    """审批挂起 ID（仅 approval_pending 时有效）"""
+
+    validation_messages: list | None = None
+    """审批恢复时需要的原始消息"""
+
+    trace_context: TraceContext | None = None
+    """本次执行的追踪上下文"""
+
+    tool_events_count: int = 0
+    """工具调用事件数"""
+
+    provider: str | None = None
+    """使用的 provider 名称"""
+
+    stream_target: str | None = None
+    """流式消息目标"""
+
+    # ── 终态收尾标记 ──
+    history_updated: bool = False
+    """历史是否已提交（success 路径内自动提交）"""
+
+    title_generation_triggered: bool = False
+    """是否已触发对话标题生成"""
+
+    terminal_emitted: bool = False
+    """终态追踪事件是否已发出（避免重复 emit）"""
+
+    sequence: int = 0
+    """最后发送的消息序号"""
+
+    salvage_partial_run: bool = False
+    """是否已落盘部分运行结果"""
 
 
 class AgentWorker:
@@ -385,7 +478,15 @@ class AgentWorker:
         trace_context: TraceContext | None = None,
         enqueued_at_ns: int = 0,
     ) -> None:
-        """处理单个请求（已持有会话锁）"""
+        """处理单个请求（已持有会话锁）— 方案四重构版。
+
+        AgentWorker 负责：
+        1. 设置上下文（历史加载、依赖构建、广播）
+        2. 调用 _execute_single_request 执行
+        3. 基于 ExecutionResult 决定收尾动作（提交历史、生成标题、终态追踪）
+
+        单次执行核心逻辑在 _execute_single_request 中。
+        """
         if conversation_generation is None:
             conversation_generation = request.conversation_generation
         conversation_invalidation_epoch = request.conversation_invalidation_epoch
@@ -403,7 +504,6 @@ class AgentWorker:
             request, connection_id, trace_context=trace_context
         )
         recorder = get_trace_recorder(self.settings)
-        terminal_emitted = False
         validation_failures_seen: set[tuple[str, str, str]] = set()
 
         # queue.dequeued + agent.attempt.started / resumed
@@ -449,13 +549,13 @@ class AgentWorker:
             content_length=len(request.content),
         )
 
+        # ── 历史加载与依赖准备 ──
         message_history: list[ModelMessage] | None = None
         deferred_tool_results: DeferredToolResults | None = None
         resume_prompt: str | None = request.content
         cleared_count = 0
 
         if request.resume_approval_id and request.deferred_tool_results is not None:
-            # 审批恢复：使用原 messages，不把批准文本作为新 prompt
             resume_prompt = None
             raw_history = request.resume_message_history or []
             message_history = list(raw_history)
@@ -508,41 +608,19 @@ class AgentWorker:
                 cleared_reasoning_content_count=cleared_count,
             )
 
-        # 构建获取上下文信息的回调
-        def get_context_info() -> ContextInfo | None:
-            """获取当前对话的上下文使用信息"""
-            if not request.use_context:
-                return None
-
-            history = self.broker.get_conversation_history(
-                connection_id, request.player_name, request.conversation_id
-            )
-            message_count = len(history) if history else 0
-            from services.agent.context import estimate_history_tokens
-
-            estimated_tokens = estimate_history_tokens(history) if history else 0
-            # 获取模型最大上下文
-            provider_name = request.provider or self.settings.default_provider
-            provider_config = self.settings.get_provider_config(provider_name)
-            max_tokens = provider_config.context_window
-
-            return ContextInfo(
-                message_count=message_count,
-                estimated_tokens=estimated_tokens,
-                max_tokens=max_tokens,
-            )
-
         # 构建依赖
         deps = AgentDependencies(
             connection_id=connection_id,
             player_name=request.player_name or DEFAULT_PLAYER_DISPLAY_NAME,
             settings=self.settings,
-            http_client=self._http_client,  # type: ignore
+            http_client=self._http_client,
             send_to_game=self._create_send_callback(connection_id),
             run_command=self._create_command_callback(connection_id),
             addon_bridge=self._create_addon_bridge_client(connection_id),
             provider=request.provider or self.settings.default_provider,
-            get_context_info=get_context_info,
+            get_context_info=self._make_context_info_fn(
+                connection_id, request, run_id
+            ),
             run_id=run_id,
             attempt_id=request.attempt_id,
             conversation_id=request.conversation_id,
@@ -563,56 +641,185 @@ class AgentWorker:
                 ),
             )
 
-        # 模型请求前：token 预算优先压缩（审批恢复路径不压缩）
+        # ── 执行前压缩 ──
         provider_name = request.provider or self.settings.default_provider
-        if request.use_context and not (
-            request.resume_approval_id and request.deferred_tool_results is not None
-        ):
-            from core.conversation import get_conversation_manager
+        run_identifier = dict(
+            connection_id=connection_id,
+            player_name=request.player_name,
+            conversation_id=request.conversation_id,
+            run_id=run_id,
+        )
+        message_history = await self._maybe_compress_before_run(
+            request=request,
+            connection_id=connection_id,
+            provider_name=provider_name,
+            message_history=message_history,
+            run_id=run_id,
+            conversation_invalidation_epoch=conversation_invalidation_epoch,
+            cleared_count=cleared_count,
+            run_identifier=run_identifier,
+        )
 
-            conv_manager = get_conversation_manager(self.broker, self.settings)
-            compressed, compress_msg = await conv_manager.check_and_compress(
-                connection_id,
-                request.player_name,
-                force=False,
-                conversation_id=request.conversation_id,
-                provider_name=provider_name,
-            )
-            if compressed:
-                # 压缩后重新加载历史，确保本轮请求使用裁剪后的上下文
-                raw_history = self.broker.get_conversation_history(
-                    connection_id, request.player_name, request.conversation_id
+        # ── 执行单次请求 ──
+        result = await self._execute_single_request(
+            resume_prompt=resume_prompt,
+            deps=deps,
+            provider_name=provider_name,
+            message_history=message_history,
+            deferred_tool_results=deferred_tool_results,
+            request=request,
+            connection_id=connection_id,
+            stream_target=stream_target,
+            resolved_context=resolved_context,
+            recorder=recorder,
+            validation_failures_seen=validation_failures_seen,
+            conversation_invalidation_epoch=conversation_invalidation_epoch,
+            run_identifier=run_identifier,
+        )
+
+        # ── 收尾：基于 ExecutionResult 决定动作 ──
+        if result.status == "success":
+            # 成功路径：历史已在 _execute_single_request 的 is_complete 中提交
+            if not result.terminal_emitted and resolved_context is not None:
+                self._record_model_pairs_from_messages(
+                    resolved_context,
+                    result.new_messages,
+                    usage=result.usage,
+                    provider=provider_name,
                 )
-                message_history, cleared_count = self._sanitize_loaded_history(
-                    connection_id=connection_id,
-                    request=request,
-                    raw_history=raw_history,
-                    run_id=run_id,
-                    conversation_invalidation_epoch=conversation_invalidation_epoch,
+                try:
+                    recorder.record_final_response(
+                        resolved_context,
+                        content=result.response_text,
+                        duration_ms=result.duration_ms,
+                        status="completed",
+                        attributes={
+                            "chunk_count": result.event_count,
+                            "tool_events_count": result.tool_events_count,
+                        },
+                    )
+                except Exception as exc:
+                    logger.debug("trace_final_response_failed", error=str(exc))
+        elif result.status == "approval_pending":
+            if not result.terminal_emitted:
+                self._emit_lifecycle(
+                    "trace.suspended",
+                    resolved_context,
+                    status="suspended",
+                    attributes={
+                        "reason": "approval_required",
+                        "worker_id": self.worker_id,
+                    },
                 )
-                await self.broker.send_response(
+        elif result.status == "partial":
+            # mid-run 失败，已有部分历史落盘
+            if not result.terminal_emitted and resolved_context is not None:
+                self._record_model_pairs_from_messages(
+                    resolved_context,
+                    result.new_messages,
+                    usage=result.usage,
+                    provider=provider_name,
+                )
+                self._emit_lifecycle(
+                    "trace.failed",
+                    resolved_context,
+                    status="failed",
+                    attributes={
+                        "error_kind": result.error_kind,
+                        "diagnostic_summary": result.diagnostic_summary,
+                        "salvage_partial_run": result.salvage_partial_run,
+                    },
+                )
+        elif result.status in ("timeout", "cancelled"):
+            if not result.terminal_emitted:
+                self._emit_lifecycle(
+                    "trace.cancelled" if result.status == "cancelled" else "trace.failed",
+                    resolved_context,
+                    status=result.status,
+                    attributes={"worker_id": self.worker_id},
+                )
+            if result.status == "timeout":
+                await self._send_error_chunk(
                     connection_id,
-                    SystemNotification(
-                        connection_id=connection_id,
-                        level="info",
-                        message=f"对话历史已自动压缩，{compress_msg}",
-                        player_name=request.player_name,
-                    ),
+                    request.player_name,
+                    result.error_summary or "请求超时",
+                    result.sequence,
+                    target=stream_target,
+                    error_kind=result.error_kind,
+                    run_id=run_id,
+                    trace_id=request.trace_id or run_id,
+                    attempt_id=request.attempt_id,
                 )
-                logger.debug(
-                    "pre_request_compression_triggered",
-                    worker_id=self.worker_id,
-                    connection_id=str(connection_id),
-                    player=request.player_name,
-                    message=compress_msg,
-                    history_message_count=len(message_history),
-                    cleared_reasoning_content_count=cleared_count,
+        elif result.status == "exception":
+            if not result.terminal_emitted:
+                self._emit_lifecycle(
+                    "trace.failed",
+                    resolved_context,
+                    status="failed",
+                    attributes={
+                        "error_kind": result.error_kind,
+                        "diagnostic_summary": result.diagnostic_summary,
+                    },
+                )
+        elif result.status == "disconnected":
+            if not result.terminal_emitted:
+                self._emit_lifecycle(
+                    "trace.cancelled",
+                    resolved_context,
+                    status="cancelled",
+                    attributes={"reason": "connection_disconnected"},
                 )
 
+    async def _execute_single_request(
+        self,
+        *,
+        resume_prompt: str | None,
+        deps: AgentDependencies,
+        provider_name: str,
+        message_history: list[ModelMessage] | None,
+        deferred_tool_results: DeferredToolResults | None,
+        request: ChatRequest,
+        connection_id: UUID,
+        stream_target: str | None,
+        resolved_context: TraceContext | None,
+        recorder: Any,
+        validation_failures_seen: set[tuple[str, str, str]],
+        conversation_invalidation_epoch: int | None,
+        run_identifier: dict,
+    ) -> ExecutionResult:
+        """执行单次 Agent 请求的核心管道。
+
+        职责（单次执行深模块）：
+        - 获取模型实例
+        - 运行流式事件循环
+        - 收集响应/推理内容
+        - 处理 tool_call/tool_result/approval_required/error 事件
+        - 在 is_complete 时提交历史、触发标题生成
+        - 异常/取消/超时处理（包括 MCP 超时标记）
+        - 返回 ExecutionResult 供 AgentWorker 收尾
+
+        AgentWorker 不参与此模块的内部逻辑。
+        """
+        run_id = run_identifier["run_id"]
+        start_time = time.monotonic()
+        sequence = 0
+        event_count = 0
+        response_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        reasoning_started = False
+        thinking_end_sent = False
+        enable_reasoning_output = self.settings.enable_reasoning_output
+        terminal_emitted = False
+        history_updated = False
+        title_generation_triggered = False
+        salvage_partial_run = False
+
+        from services.agent.core import _is_mcp_timeout_error
+        mcp_manager = get_agent_runtime().get_mcp_manager(self.settings)
         # 获取模型
         try:
             provider_config = self.settings.get_provider_config(provider_name)
-            model = ProviderRegistry.get_model(provider_config)
+            model = get_agent_runtime().runtime_adapters.get_model(provider_config)
 
             logger.debug(
                 "using_provider",
@@ -620,7 +827,6 @@ class AgentWorker:
                 model=provider_config.model,
                 run_id=run_id,
             )
-
         except Exception as e:
             logger.error(
                 "provider_error",
@@ -628,7 +834,6 @@ class AgentWorker:
                 error=str(e),
                 run_id=run_id,
             )
-            # 玩家只收到稳定错误类别
             await self._send_error_chunk(
                 connection_id,
                 request.player_name,
@@ -640,35 +845,16 @@ class AgentWorker:
                 trace_id=request.trace_id or run_id,
                 attempt_id=request.attempt_id,
             )
-            if not terminal_emitted:
-                self._emit_lifecycle(
-                    "trace.failed",
-                    resolved_context,
-                    status="failed",
-                    attributes={
-                        "error_kind": "INTERNAL",
-                        "diagnostic_summary": str(e)[:200],
-                        "provider": provider_name,
-                    },
-                )
-                terminal_emitted = True
-            return
-
-        # 流式处理
-        sequence = 0
-        event_count = 0
-        response_parts: list[str] = []
-        reasoning_parts: list[str] = []
-        reasoning_started = False
-        thinking_end_sent = False
-        enable_reasoning_output = self.settings.enable_reasoning_output
-        start_time = time.monotonic()
-
-        from services.agent.core import _is_mcp_timeout_error
-        from services.agent.mcp import get_mcp_manager
-
-        # 尝试获取 MCP 管理器以跟踪服务器状态
-        mcp_manager = get_mcp_manager(self.settings)
+            return ExecutionResult(
+                status="exception",
+                error_kind="INTERNAL",
+                error_summary=player_facing_error("INTERNAL"),
+                diagnostic_summary=str(e)[:200],
+                trace_context=resolved_context,
+                terminal_emitted=False,
+                provider=provider_name,
+                stream_target=stream_target,
+            )
 
         try:
             async for event in stream_chat(
@@ -684,11 +870,9 @@ class AgentWorker:
                 elif event.event_type == "reasoning" and event.content:
                     reasoning_parts.append(event.content)
 
-                # 处理工具调用事件 - 游戏内显示截断消息；完整参数记入日志
                 elif event.event_type == "tool_call":
                     tool_name = event.metadata.get("tool_name", "unknown") if event.metadata else "unknown"
                     tool_args = event.metadata.get("args") if event.metadata else None
-                    # 确保 tool_args 是字典类型（Pydantic AI 有时会返回 JSON 字符串）
                     if isinstance(tool_args, str):
                         import json
                         try:
@@ -719,7 +903,6 @@ class AgentWorker:
                     await self.broker.send_response(connection_id, tool_chunk)
                     sequence += 1
 
-                # 处理工具返回事件 - 游戏内按配置显示截断结果；完整结果记入日志
                 elif event.event_type == "tool_result":
                     tool_name = event.metadata.get("tool_name") if event.metadata else None
                     result_content = event.content
@@ -731,7 +914,6 @@ class AgentWorker:
                         connection_id=str(connection_id),
                         player_name=request.player_name,
                     )
-                    # 只有在 tool_response_verbose 为 True 时才显示工具返回结果
                     if self.settings.tool_response_verbose:
                         tool_result_msg = format_tool_result_message(
                             tool_name or "tool",
@@ -774,8 +956,6 @@ class AgentWorker:
                         recorder=recorder,
                         seen=validation_failures_seen,
                     )
-                    # Flush model pairs for this attempt before suspend so the
-                    # model leg is present even when tools never execute.
                     if resolved_context is not None and event.metadata:
                         new_messages = event.metadata.get("new_messages_serialized")
                         if not isinstance(new_messages, list):
@@ -796,18 +976,18 @@ class AgentWorker:
                         stream_target=stream_target,
                         trace_context=resolved_context,
                     )
-                    if not terminal_emitted:
-                        self._emit_lifecycle(
-                            "trace.suspended",
-                            resolved_context,
-                            status="suspended",
-                            attributes={
-                                "reason": "approval_required",
-                                "worker_id": self.worker_id,
-                            },
-                        )
-                        terminal_emitted = True
-                    return
+                    return ExecutionResult(
+                        status="approval_pending",
+                        response_text="".join(response_parts),
+                        reasoning_text="".join(reasoning_parts),
+                        event_count=event_count,
+                        duration_ms=int((time.monotonic() - start_time) * 1000),
+                        terminal_emitted=terminal_emitted,
+                        trace_context=resolved_context,
+                        provider=provider_name,
+                        stream_target=stream_target,
+                        sequence=sequence,
+                    )
 
                 if event.metadata and event.metadata.get("is_complete"):
                     validation_messages = event.metadata.get("new_messages")
@@ -824,13 +1004,21 @@ class AgentWorker:
                         seen=validation_failures_seen,
                     )
                     all_messages = event.metadata.get("all_messages")
+                    tool_events = event.metadata.get("tool_events")
+                    tool_events_count = len(tool_events) if tool_events else 0
+                    usage = event.metadata.get("usage")
+                    usage_dict = usage if isinstance(usage, dict) else None
+                    new_messages = event.metadata.get("new_messages_serialized")
+                    if not isinstance(new_messages, list):
+                        new_messages = event.metadata.get("new_messages")
+
                     if isinstance(all_messages, list):
                         if self.broker.get_response_queue(connection_id) is not None:
                             trimmed_history = self._trim_history(
                                 all_messages,
                                 self.settings.max_history_turns,
                             )
-                            trimmed_history, cleared_count = self._strip_reasoning_content(
+                            trimmed_history, cleared_count_val = self._strip_reasoning_content(
                                 trimmed_history
                             )
                             history_updated = self.broker.set_conversation_history(
@@ -848,7 +1036,7 @@ class AgentWorker:
                                     player=request.player_name,
                                     conversation_id=request.conversation_id,
                                     history_message_count=len(trimmed_history),
-                                    cleared_reasoning_content_count=cleared_count,
+                                    cleared_reasoning_content_count=cleared_count_val,
                                 )
 
                                 if (
@@ -866,11 +1054,9 @@ class AgentWorker:
                                         request.content,
                                         model,
                                     )
+                                    title_generation_triggered = True
 
-                                # 自动压缩检查：当对话历史超过阈值的 80% 时自动压缩
-                                from core.conversation import get_conversation_manager
-
-                                conv_manager = get_conversation_manager(self.broker, self.settings)
+                                conv_manager = get_agent_runtime().get_conversation_manager(self.broker, self.settings)
                                 compressed, msg = await conv_manager.check_and_compress(
                                     connection_id,
                                     request.player_name,
@@ -919,12 +1105,11 @@ class AgentWorker:
                         reasoning_length=len(reasoning_text),
                         chunk_count=event_count,
                         duration_ms=duration_ms,
-                        usage=event.metadata.get("usage"),
-                        tool_events=event.metadata.get("tool_events"),
-                        tool_events_count=len(event.metadata.get("tool_events") or []),
+                        usage=usage_dict,
+                        tool_events=tool_events,
+                        tool_events_count=tool_events_count,
                     )
 
-                    # AI 响应同步到 Addon UI 历史记录
                     if response_text:
                         await self.broker.send_response(connection_id, {
                             "type": "ai_response_sync",
@@ -933,35 +1118,25 @@ class AgentWorker:
                             "text": response_text,
                         })
 
-                    # Trace: model pairs + final response (exactly once)
-                    if not terminal_emitted and resolved_context is not None:
-                        new_messages = event.metadata.get("new_messages_serialized")
-                        if not isinstance(new_messages, list):
-                            new_messages = event.metadata.get("new_messages")
-                        usage = event.metadata.get("usage")
-                        usage_dict = usage if isinstance(usage, dict) else None
-                        self._record_model_pairs_from_messages(
-                            resolved_context,
-                            new_messages if isinstance(new_messages, list) else None,
-                            usage=usage_dict,
-                            provider=provider_name,
-                        )
-                        try:
-                            recorder.record_final_response(
-                                resolved_context,
-                                content=response_text,
-                                duration_ms=duration_ms,
-                                status="completed",
-                                attributes={
-                                    "chunk_count": event_count,
-                                    "tool_events_count": len(
-                                        event.metadata.get("tool_events") or []
-                                    ),
-                                },
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            logger.debug("trace_final_response_failed", error=str(exc))
-                        terminal_emitted = True
+                    return ExecutionResult(
+                        status="success",
+                        response_text=response_text,
+                        reasoning_text=reasoning_text,
+                        event_count=event_count,
+                        duration_ms=duration_ms,
+                        all_messages=all_messages if isinstance(all_messages, list) else None,
+                        new_messages=new_messages if isinstance(new_messages, list) else None,
+                        usage=usage_dict,
+                        trace_context=resolved_context,
+                        tool_events_count=tool_events_count,
+                        provider=provider_name,
+                        stream_target=stream_target,
+                        history_updated=history_updated,
+                        title_generation_triggered=title_generation_triggered,
+                        terminal_emitted=terminal_emitted,
+                        sequence=sequence,
+                    )
+
                 elif event.event_type == "error":
                     response_text = "".join(response_parts)
                     error_kind = (
@@ -999,8 +1174,6 @@ class AgentWorker:
                         seen=validation_failures_seen,
                     )
 
-                    # mid-run 失败：尽量落盘已产生的工具/模型消息 + 错误说明，
-                    # 避免下轮 LLM 完全不知道本轮做了什么 / 为何中断。
                     if (
                         request.use_context
                         and event.metadata
@@ -1014,28 +1187,17 @@ class AgentWorker:
                             player_error_text=event.content or "",
                             conversation_invalidation_epoch=conversation_invalidation_epoch,
                         )
+                        salvage_partial_run = True
 
-                    if (
-                        not terminal_emitted
-                        and resolved_context is not None
-                        and event.metadata
-                    ):
-                        new_messages = event.metadata.get("new_messages_serialized")
-                        if not isinstance(new_messages, list):
-                            new_messages = event.metadata.get("new_messages")
-                        usage = event.metadata.get("usage")
-                        usage_dict = usage if isinstance(usage, dict) else None
-                        self._record_model_pairs_from_messages(
-                            resolved_context,
-                            new_messages if isinstance(new_messages, list) else None,
-                            usage=usage_dict,
-                            provider=provider_name,
-                        )
+                    new_messages = event.metadata.get("new_messages_serialized")
+                    if not isinstance(new_messages, list):
+                        new_messages = event.metadata.get("new_messages")
+                    usage = event.metadata.get("usage")
+                    usage_dict = usage if isinstance(usage, dict) else None
 
-                    # 错误事件需要发送到游戏（玩家只看稳定类别文案）
                     chunk = StreamChunk(
                         connection_id=connection_id,
-                        chunk_type=event.event_type,  # type: ignore
+                        chunk_type=event.event_type,
                         content=event.content,
                         sequence=sequence,
                         delivery=request.delivery,
@@ -1045,26 +1207,33 @@ class AgentWorker:
                     )
                     await self.broker.send_response(connection_id, chunk)
                     sequence += 1
-                    if not terminal_emitted:
-                        self._emit_lifecycle(
-                            "trace.failed",
-                            resolved_context,
-                            status="failed",
-                            attributes={
-                                "error_kind": error_kind,
-                                "diagnostic_summary": diagnostic_summary,
-                                "salvage_partial_run": bool(
-                                    event.metadata
-                                    and event.metadata.get("salvage_partial_run")
-                                ),
-                            },
-                        )
-                        terminal_emitted = True
 
-                # content 和 reasoning 事件需要发送到游戏
+                    return ExecutionResult(
+                        status="partial",
+                        response_text=response_text,
+                        reasoning_text="".join(reasoning_parts),
+                        event_count=event_count,
+                        duration_ms=int((time.monotonic() - start_time) * 1000),
+                        all_messages=(
+                            event.metadata.get("all_messages")
+                            if isinstance(event.metadata.get("all_messages"), list)
+                            else None
+                        ),
+                        new_messages=new_messages if isinstance(new_messages, list) else None,
+                        usage=usage_dict,
+                        error_kind=error_kind,
+                        error_summary=event.content or "",
+                        diagnostic_summary=diagnostic_summary,
+                        trace_context=resolved_context,
+                        provider=provider_name,
+                        stream_target=stream_target,
+                        salvage_partial_run=salvage_partial_run,
+                        terminal_emitted=terminal_emitted,
+                        sequence=sequence,
+                    )
+
                 elif event.event_type in ("content", "reasoning"):
                     if event.content:
-                        # 思考开始：第一个 reasoning 事件到来时发送 thinking_start 标识
                         if (
                             event.event_type == "reasoning"
                             and not reasoning_started
@@ -1084,7 +1253,6 @@ class AgentWorker:
                             await self.broker.send_response(connection_id, start_chunk)
                             sequence += 1
 
-                        # 思考结束：reasoning 之后第一个 content 事件到来时发送 thinking_end 标识
                         if (
                             event.event_type == "content"
                             and reasoning_started
@@ -1105,7 +1273,6 @@ class AgentWorker:
                             await self.broker.send_response(connection_id, end_chunk)
                             sequence += 1
 
-                        # reasoning 事件仅在启用思考输出时发送到游戏
                         should_send = (
                             enable_reasoning_output
                             if event.event_type == "reasoning"
@@ -1114,7 +1281,7 @@ class AgentWorker:
                         if should_send:
                             chunk = StreamChunk(
                                 connection_id=connection_id,
-                                chunk_type=event.event_type,  # type: ignore
+                                chunk_type=event.event_type,
                                 content=event.content,
                                 sequence=sequence,
                                 delivery=request.delivery,
@@ -1124,31 +1291,29 @@ class AgentWorker:
                             )
                             await self.broker.send_response(connection_id, chunk)
                             sequence += 1
-                # tool_call 事件已在上面处理并发送
-                # tool_result 事件已根据配置决定是否发送
-                # is_complete 事件不需要发送到游戏
 
         except asyncio.CancelledError:
-            # 审批暂停或上游取消：正常退出，不记成 stream_processing_error
             logger.info(
                 "stream_processing_cancelled",
                 worker_id=self.worker_id,
                 connection_id=str(connection_id),
                 run_id=run_id,
             )
-            if not terminal_emitted:
-                self._emit_lifecycle(
-                    "trace.cancelled",
-                    resolved_context,
-                    status="cancelled",
-                    attributes={"worker_id": self.worker_id},
-                )
-                terminal_emitted = True
-            raise
+            return ExecutionResult(
+                status="cancelled",
+                response_text="".join(response_parts),
+                reasoning_text="".join(reasoning_parts),
+                event_count=event_count,
+                duration_ms=int((time.monotonic() - start_time) * 1000),
+                trace_context=resolved_context,
+                terminal_emitted=terminal_emitted,
+                provider=provider_name,
+                stream_target=stream_target,
+                sequence=sequence,
+            )
         except Exception as e:
             error_kind, player_msg, diagnostic = classify_run_exception(e)
 
-            # 检查是否是 MCP 超时错误，如果是则更新 MCP 服务器状态
             if _is_mcp_timeout_error(e):
                 logger.warning(
                     "mcp_timeout_detected_in_worker",
@@ -1157,7 +1322,6 @@ class AgentWorker:
                     run_id=run_id,
                     error=diagnostic,
                 )
-                # 仅标记有证据关联的 server；无证据时不批量禁用
                 if mcp_manager is not None:
                     detail = diagnostic
                     matched = False
@@ -1168,10 +1332,7 @@ class AgentWorker:
                             )
                             matched = True
                     if matched:
-                        from services.agent.runtime import get_agent_runtime
-
                         get_agent_runtime().refresh_mcp_tools(self.settings)
-                # 不在当前 run 内递归重放
 
             logger.error(
                 "stream_processing_error",
@@ -1193,17 +1354,141 @@ class AgentWorker:
                 trace_id=request.trace_id or run_id,
                 attempt_id=request.attempt_id,
             )
-            if not terminal_emitted:
-                self._emit_lifecycle(
-                    "trace.failed",
-                    resolved_context,
-                    status="failed",
-                    attributes={
-                        "error_kind": error_kind,
-                        "diagnostic_summary": diagnostic,
-                    },
-                )
-                terminal_emitted = True
+            return ExecutionResult(
+                status="exception",
+                response_text="".join(response_parts),
+                reasoning_text="".join(reasoning_parts),
+                event_count=event_count,
+                duration_ms=int((time.monotonic() - start_time) * 1000),
+                error_kind=error_kind,
+                error_summary=player_msg,
+                diagnostic_summary=diagnostic,
+                trace_context=resolved_context,
+                terminal_emitted=terminal_emitted,
+                provider=provider_name,
+                stream_target=stream_target,
+                sequence=sequence,
+            )
+
+        # 流正常结束（无 is_complete 事件且无响应内容）：作为超时处理
+        end_text = "".join(response_parts)
+        if end_text:
+            # 有响应内容但没收到 is_complete：视为成功，避免误报超时
+            duration_ms = int((time.monotonic() - start_time) * 1000)
+            logger.info(
+                "stream_finished_without_is_complete",
+                worker_id=self.worker_id,
+                connection_id=str(connection_id),
+                run_id=run_id,
+                response_length=len(end_text),
+            )
+            return ExecutionResult(
+                status="success",
+                response_text=end_text,
+                reasoning_text="".join(reasoning_parts),
+                event_count=event_count,
+                duration_ms=duration_ms,
+                trace_context=resolved_context,
+                terminal_emitted=terminal_emitted,
+                provider=provider_name,
+                stream_target=stream_target,
+                sequence=sequence,
+            )
+        return ExecutionResult(
+            status="timeout",
+            event_count=event_count,
+            duration_ms=int((time.monotonic() - start_time) * 1000),
+            error_kind="TIMEOUT",
+            error_summary="请求超时",
+            trace_context=resolved_context,
+            terminal_emitted=terminal_emitted,
+            provider=provider_name,
+            stream_target=stream_target,
+            sequence=sequence,
+        )
+
+    def _make_context_info_fn(
+        self,
+        connection_id: UUID,
+        request: ChatRequest,
+        run_id: str,
+    ):
+        """构建获取上下文信息的回调。"""
+        def get_context_info() -> ContextInfo | None:
+            if not request.use_context:
+                return None
+            history = self.broker.get_conversation_history(
+                connection_id, request.player_name, request.conversation_id
+            )
+            message_count = len(history) if history else 0
+            from services.agent.context import estimate_history_tokens
+            estimated_tokens = estimate_history_tokens(history) if history else 0
+            provider_name = request.provider or self.settings.default_provider
+            provider_config = self.settings.get_provider_config(provider_name)
+            max_tokens = provider_config.context_window
+            return ContextInfo(
+                message_count=message_count,
+                estimated_tokens=estimated_tokens,
+                max_tokens=max_tokens,
+            )
+        return get_context_info
+
+    async def _maybe_compress_before_run(
+        self,
+        *,
+        request: ChatRequest,
+        connection_id: UUID,
+        provider_name: str,
+        message_history: list[ModelMessage] | None,
+        run_id: str,
+        conversation_invalidation_epoch: int | None,
+        cleared_count: int,
+        run_identifier: dict,
+    ) -> list[ModelMessage] | None:
+        """执行前压缩对话历史（审批恢复路径不压缩）。"""
+        if not request.use_context or (
+            request.resume_approval_id and request.deferred_tool_results is not None
+        ):
+            return message_history
+
+        conv_manager = get_agent_runtime().get_conversation_manager(self.broker, self.settings)
+        compressed, compress_msg = await conv_manager.check_and_compress(
+            connection_id,
+            request.player_name,
+            force=False,
+            conversation_id=request.conversation_id,
+            provider_name=provider_name,
+        )
+        if compressed:
+            raw_history = self.broker.get_conversation_history(
+                connection_id, request.player_name, request.conversation_id
+            )
+            message_history, cleared_count = self._sanitize_loaded_history(
+                connection_id=connection_id,
+                request=request,
+                raw_history=raw_history,
+                run_id=run_id,
+                conversation_invalidation_epoch=conversation_invalidation_epoch,
+            )
+            await self.broker.send_response(
+                connection_id,
+                SystemNotification(
+                    connection_id=connection_id,
+                    level="info",
+                    message=f"对话历史已自动压缩，{compress_msg}",
+                    player_name=request.player_name,
+                ),
+            )
+            logger.debug(
+                "pre_request_compression_triggered",
+                worker_id=self.worker_id,
+                connection_id=str(connection_id),
+                player=request.player_name,
+                message=compress_msg,
+                history_message_count=len(message_history),
+                cleared_reasoning_content_count=cleared_count,
+            )
+        return message_history
 
     async def _generate_title_for_conversation(
         self,
@@ -1371,9 +1656,7 @@ class AgentWorker:
             )
             # 失败路径也做一次压缩检查（与成功路径一致），避免超大 partial 历史
             try:
-                from core.conversation import get_conversation_manager
-
-                conv_manager = get_conversation_manager(self.broker, self.settings)
+                conv_manager = get_agent_runtime().get_conversation_manager(self.broker, self.settings)
                 provider_name = request.provider or self.settings.default_provider
                 compressed, msg = await conv_manager.check_and_compress(
                     connection_id,

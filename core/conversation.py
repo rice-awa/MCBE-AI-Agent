@@ -28,7 +28,7 @@ from services.agent.context import (
     estimate_history_tokens,
     wrap_untrusted_history_material,
 )
-from services.agent.providers import ProviderRegistry
+from services.agent.runtime import get_agent_runtime
 
 logger = get_logger(__name__)
 
@@ -196,7 +196,7 @@ class ConversationCompressor:
 
         provider = provider_name or self.settings.default_provider
         provider_config = self.settings.get_provider_config(provider)
-        model = ProviderRegistry.get_model(provider_config)
+        model = get_agent_runtime().runtime_adapters.get_model(provider_config)
         agent = Agent(
             "openai:gpt-4o-mini",
             instructions=self._summary_instructions(),
@@ -991,11 +991,4 @@ class ConversationManager:
         return "\n".join(lines)
 
 
-def get_conversation_manager(
-    broker,
-    settings: Settings | None = None,
-) -> ConversationManager:
-    """获取对话管理器（AgentRuntime 持有的薄 facade）。"""
-    from services.agent.runtime import get_agent_runtime
 
-    return get_agent_runtime().get_conversation_manager(broker, settings)

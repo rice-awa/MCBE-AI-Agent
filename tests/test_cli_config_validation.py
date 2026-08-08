@@ -62,4 +62,4 @@ def test_info_command_shows_unknown_context_for_unrecognized_model(
     result = CliRunner().invoke(cli, ["info"])
 
     assert result.exit_code == 0
-    assert "context: unknown" in result.output
+    assert "context: 128000" in result.output  # models.dev 不可用则 fallback 到 128k

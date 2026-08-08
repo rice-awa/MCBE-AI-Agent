@@ -229,7 +229,6 @@ def info():
 def test_provider(provider: str):
     """测试 LLM 提供商连接"""
     import httpx
-    from services.agent.providers import ProviderRegistry
 
     settings = get_settings()
 
@@ -243,7 +242,7 @@ def test_provider(provider: str):
             sys.exit(1)
 
         # 创建模型
-        model = ProviderRegistry.get_model(config)
+        model = get_agent_runtime().runtime_adapters.get_model(config)
 
         click.echo(f"✓ 提供商: {config.name}")
         click.echo(f"✓ 模型: {config.model}")
@@ -599,9 +598,10 @@ def mcp_status():
 
     # 尝试获取运行中的 MCP 管理器状态
     try:
-        from services.agent.mcp import get_mcp_manager, MCPConnectionStatus
+        from services.agent.runtime import get_agent_runtime
+        from services.agent.mcp import MCPConnectionStatus
 
-        manager = get_mcp_manager(settings)
+        manager = get_agent_runtime().get_mcp_manager(settings)
 
         if not manager.is_initialized:
             click.echo("⚠️  MCP 管理器尚未初始化")
@@ -658,9 +658,10 @@ def mcp_test(server_name: str | None):
         return
 
     async def _test_config():
-        from services.agent.mcp import get_mcp_manager, MCPConnectionStatus
+        from services.agent.runtime import get_agent_runtime
+        from services.agent.mcp import MCPConnectionStatus
 
-        manager = get_mcp_manager(settings)
+        manager = get_agent_runtime().get_mcp_manager(settings)
 
         # 如果未初始化，先初始化
         if not manager.is_initialized:

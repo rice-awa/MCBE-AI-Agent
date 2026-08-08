@@ -1,0 +1,2 @@
+{"file": "spec/backend/session-and-identity.md", "reason": "验收标准对校验：同一 connection_id 下玩家身份按 (connection_id, player_name) 隔离、缺少身份时落入非业务默认值"}
+{"file": "spec/backend/quality-guidelines.md", "reason": "质量检查：安全门测试的可控调度、竞态窗口复现与测试鲁棒性核对"}

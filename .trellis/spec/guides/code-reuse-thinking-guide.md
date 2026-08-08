@@ -22,6 +22,56 @@ rg -n "player_name|BrokerResponseBridge|chunkPayload|ToolResult|mcbews:" core mo
 
 当同一规则被两个以上跨层消费者读取，或重复逻辑会改变安全/并发/协议语义时，应在拥有数据的边界创建共享类型、decoder、normalizer 或 projection。只使用一次的简单转换不必为了形式抽象成公共模块；抽象必须让调用方更难绕过真实契约。
 
+### 已验证的反重复模式：统一收尾链
+
+当两条路径在"收尾"阶段（结果分类→幂等写入→审计→追踪）有相同实现时，提取到共享方法：
+
+- 主路径（`call_tool`）和审批恢复路径（`_resume_approved_block_plan`）在 `execution.py` 中共享 `_finish_tool_execution` 方法，消除约 35 行重复代码。
+- **注意**：幂等命中（idempotent hit）分支通常在收尾链之前提前返回，不在共享方法中。两条路径的幂等命中分支仍各自保留 inline audit+trace。如果在重构中删除了某条路径的幂等命中 audit+trace，这是回归，必须恢复。
+
+错误示例——重构后丢失审计/追踪：
+```python
+# _resume_approved_block_plan 中错误地删除了 audit+trace
+if cached is not None:
+    logger.info("tool_idempotent_hit", tool=name, ...)
+    return materialize_tool_result(cached.result)  # ❌ 丢失了 audit + trace
+```
+
+正确示例——保留审计/追踪：
+```python
+if cached is not None:
+    logger.info("tool_idempotent_hit", tool=name, ...)
+    self._audit(...)
+    self._trace_tool_result(..., attributes={"idempotent_hit": True})
+    return materialize_tool_result(cached.result)
+```
+
+### 已验证的反重复模式：已验证契约边界 — ExecutionResult
+
+当两条路径在"执行"与"收尾"之间需要稳定的返回值契约时，提取为共享 dataclass，让调用方基于结果而非内部实现来分发后续动作：
+
+- `_execute_single_request` 与 `_process_request_locked` 之间通过 `ExecutionResult`（`services/agent/worker.py`）交换单次 Agent 执行的终态。7 种 status（`success` / `approval_pending` / `partial` / `timeout` / `cancelled` / `exception` / `disconnected`）让 `AgentWorker` 根据结果而非内部实现分支收尾（终态追踪、标题生成、审批挂起标记）。
+- 收益：`_execute_single_request` 成为单一观察入口，内部不直接调用 trace 或审计；所有横切收尾收敛到 `_process_request_locked`。测试面向 `ExecutionResult` 稳定接口验证行为，不依赖内部状态。
+- 参考：`.trellis/spec/backend/runtime-architecture.md`（`ExecutionResult 契约` 条目）、`services/agent/worker.py`（`ExecutionResult` dataclass 定义、`_execute_single_request` 返回、`_process_request_locked` 收尾分发）。
+
+错误示例——绕过契约直接依赖内部实现：
+```python
+# 在收尾处直接检查内部变量而非使用 ExecutionResult
+if self._last_response_text:  # ❌ 依赖内部状态
+    self._emit_final_trace(...)
+```
+
+正确示例——通过 ExecutionResult 分发：
+```python
+# AgentWorker 只查看 ExecutionResult，不读取执行模块内部状态
+result = await self._execute_single_request(...)
+if result.status == "success":
+    # 终态成功追踪（不关心执行内部细节）
+    self._record_model_pairs_from_messages(resolved_context, result.new_messages, ...)
+elif result.status == "approval_pending":
+    self._emit_lifecycle("trace.suspended", resolved_context, status="suspended", ...)
+```
+
 ## 提交前复查
 
 - 搜索是否存在同名/同义实现和旧协议字符串。
