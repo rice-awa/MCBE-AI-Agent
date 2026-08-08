@@ -1,0 +1,8 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/addon/bridge-protocol.md", "reason": "会话管理协议扩展必须遵守现有桥协议规范"}
+{"file": ".trellis/spec/backend/session-and-identity.md", "reason": "会话分桶与玩家身份隔离规范"}
+{"file": ".trellis/spec/backend/runtime-architecture.md", "reason": "hook 非阻塞约束（asyncio.create_task）"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "错误处理规范"}
+{"file": ".trellis/tasks/08-08-ddui-streaming-sessions/research/addon-ui-current.md", "reason": "addon UI 现有代码模式（formAdapter/面板/responseSync/storage）"}
+{"file": ".trellis/tasks/08-08-ddui-streaming-sessions/research/python-protocol-points.md", "reason": "Python 侧协议改动点（worker/broker_bridge/command_handlers/SDK codec）"}
+{"file": ".trellis/tasks/08-08-ddui-streaming-sessions/research/constraints.md", "reason": "关键约束与可复用模式"}
