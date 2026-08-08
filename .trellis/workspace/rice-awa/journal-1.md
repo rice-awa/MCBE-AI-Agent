@@ -193,3 +193,24 @@ review近期6项任务完成状态，确认方案四和方案五已完成；合�
 
 [OK] **全部完成，已提交 dev 并归档**
 
+
+
+## Session 5: 接入 Anthropic 接口并支持自定义 base_url（官方/第三方兼容端点）
+
+**Date**: 2026-08-08
+**Task**: 接入 Anthropic 接口并支持自定义 base_url（官方/第三方兼容端点）
+**Branch**: `dev`
+
+### Summary
+
+让 anthropic provider 支持自定义 base_url：settings 新增 anthropic_base_url 字段，get_provider_config 透传到 LLMProviderConfig，_create_anthropic_model 传给 AnthropicProvider。未配置时退回官方 api.anthropic.com。用 DeepSeek Anthropic 兼容端点 https://api.deepseek.com/anthropic + DEEPSEEK_API_KEY 真实调用验证通过。补充 base_url 透传/默认值测试与 CLAUDE.md 配置说明。另归档 08-07-fix-model-metadata-online（代码已提交 dcdc0a0）。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b9bbabd` | (see git log) |
+
+### Status
+
+[OK] **Completed**
