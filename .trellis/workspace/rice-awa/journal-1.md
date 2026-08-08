@@ -214,3 +214,33 @@ review近期6项任务完成状态，确认方案四和方案五已完成；合�
 ### Status
 
 [OK] **Completed**
+
+---
+
+## 08-08 · DDUI UI 迁移（feature/ddui-ui-migration）
+
+**Branch**: `feature/ddui-ui-migration`
+
+### Summary
+
+将 beta 分支的 DDUI UI 前端移植到 dev（@minecraft/server-ui v2.1.0 stable）：
+- formAdapter 适配 v2.1.0 构造函数 API（`new CustomForm(player, title)`、`new ObservableString/Number/Boolean(value, {clientWritable: true})`、`DataDrivenScreenClosedReason.ClientClosed/ServerClosed`）
+- 面板层迁移 beta 版（agentConsole/morePanel/settingsPanel/statsPanel/routes/entry/state），morePanel 取代 dev 的 chatInput/historyPanel
+- responseSync 合并 beta 功能（refreshConversation 实时刷新 + isDuplicateUiUserEcho 去重），保留 dev 的 mcbews:text_resp 线协议
+- 依赖升级：@minecraft/server-ui 2.1.0 + @minecraft/server 2.8.0；补齐 just-scripts/prettier 工具链（dev 基线缺失，pnpm v11 allowBuilds 配置 esbuild）
+- 测试：4 个 DDUI 面板测试 + response-sync 测试移植，mock 适配 v2.1.0（closeButton、程序化关闭返回 ServerClose、failOnObservableCreate）
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6f38bca` | feat(ui): 移植 beta DDUI 面板到 @minecraft/server-ui v2.1.0 |
+
+### 遗留（人工决策）
+
+- `pnpm lint` 的 prettier 阶段仍失败：20 个 dev 基线文件（bootstrap/capabilities/router/toolPlayer/chunking/history/storage 等）不满足 prettier，dev 基线即存在问题（package.json 原本无 prettier 依赖）。已按 prd「bridge 层不修改」撤销格式化，建议单独 chore 处理。
+- 手动 MC 客户端验证（prd 验收标准第 8 项，可选）：DDUI 主面板实时刷新、发送消息后面板保持打开、历史去重正确。
+
+### Status
+
+[OK] **Implemented & verified**（117 tests green，eslint/build 通过）
