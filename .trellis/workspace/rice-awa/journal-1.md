@@ -153,6 +153,24 @@ review近期6项任务完成状态，确认方案四和方案五已完成；合�
 
 [OK] **Completed**
 
+## 2026-08-07 — 移除硬编码 MODEL_CONTEXT_WINDOWS，完全依赖 models.dev 在线数据
+
+### Summary
+
+删除 config/settings.py 中约 18 个模型的硬编码 MODEL_CONTEXT_WINDOWS 字典，get_context_window() 改为完全依赖 ModelMetadataCache 在线数据，不可用时返回 128_000 合理默认值。同步更新 DEFAULT_FALLBACK_CONTEXT_WINDOW（8192→128000）、默认模型名和对应测试。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| dcdc0a0 | feat(config): 移除硬编码 MODEL_CONTEXT_WINDOWS，完全依赖 models.dev 在线数据 |
+
+### Status
+
+[OK] **已完成，已提交 dev 并推送**
+
+---
+
 ## 2026-08-07 — 架构优化后续改进三项并行（ExecutionResult模式/运行时加深/校验拆分）
 
 ### Summary
