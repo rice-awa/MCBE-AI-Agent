@@ -143,6 +143,7 @@ export async function showAgentConsole(player: Player, uiState: AgentUiStateV2):
               uiState.isStreaming = false;
               uiState.streamingConversationId = null;
               uiState.streamingChars = 0;
+              uiState.streamingText = "";
               // Reset token stats for session
               uiState.stats = {
                 ...uiState.stats,
@@ -197,6 +198,12 @@ export async function showAgentConsole(player: Player, uiState: AgentUiStateV2):
 
 function buildTitleLine(uiState: AgentUiStateV2): string {
   const bucket = getActiveBucket(uiState);
+
+  if (uiState.isStreaming) {
+    const chars = uiState.streamingChars ?? 0;
+    return `✦ 生成中 ${chars} chars`;
+  }
+
   const shortId = bucket.shortId > 0 ? `#${bucket.shortId}` : "";
   const title = bucket.title || "未命名";
   return `✦ ${shortId} · ${title}`;
@@ -220,14 +227,19 @@ function buildConversationBody(uiState: AgentUiStateV2): string {
   const bucket = getActiveBucket(uiState);
   const items = getRecentTurns(bucket.history, RECENT_TURNS_COUNT * 2);
 
-  if (items.length === 0) {
+  if (items.length === 0 && !uiState.isStreaming) {
     return "暂无对话记录。输入消息开始聊天。";
   }
 
-  return items
-    .map((item) => {
-      const roleLabel = item.role === "user" ? "你" : "AI";
-      return `${roleLabel}: ${item.content}`;
-    })
-    .join("\n\n---\n\n");
+  const lines = items.map((item) => {
+    const roleLabel = item.role === "user" ? "你" : "AI";
+    return `${roleLabel}: ${item.content}`;
+  });
+
+  // Append streaming text with cursor (typewriter effect)
+  if (uiState.isStreaming && uiState.streamingText) {
+    lines.push(`AI: ${uiState.streamingText}▌`);
+  }
+
+  return lines.join("\n\n---\n\n");
 }

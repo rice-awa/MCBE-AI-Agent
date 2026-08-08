@@ -25,8 +25,8 @@ type AiRespChunk = {
   cid?: string;
   /** Optional title — absent for backward-compatible frames. */
   t?: string;
-  /** Optional usage stats — present on completion frame. */
-  u?: { i: number; o: number };
+  /** Optional usage stats — present on completion frame. Supports both compact (i/o) and verbose (input_tokens/output_tokens) formats. */
+  u?: Record<string, number>;
 };
 
 /** Tracks streaming state for one conversation. */
@@ -258,8 +258,8 @@ function handleChunk(chunk: AiRespChunk): void {
 
   // Extract usage from chunk if present (usually on last frame)
   if (chunk.u) {
-    streamState.inputTokens = chunk.u.i || 0;
-    streamState.outputTokens = chunk.u.o || 0;
+    streamState.inputTokens = chunk.u.i || chunk.u.input_tokens || 0;
+    streamState.outputTokens = chunk.u.o || chunk.u.output_tokens || 0;
   }
 
   // Update the active UI state's streaming fields
@@ -268,6 +268,9 @@ function handleChunk(chunk: AiRespChunk): void {
     activeState.isStreaming = !streamState.done;
     activeState.streamingConversationId = conversationId;
     activeState.streamingChars = streamState.assembled.length;
+    if (isV2State(activeState)) {
+      activeState.streamingText = streamState.assembled;
+    }
 
     // Update bridge status observable
     if (!streamState.done) {
@@ -385,6 +388,9 @@ function onMessageComplete(
     activeState.isStreaming = false;
     activeState.streamingConversationId = null;
     activeState.streamingChars = 0;
+    if (isV2State(activeState)) {
+      activeState.streamingText = "";
+    }
 
     // Refresh DDUI panel
     activeState.refreshConversation?.();
@@ -405,6 +411,9 @@ function cleanupStream(activeState: AgentUiStateV2 | AgentUiState, conversationI
   activeState.isStreaming = false;
   activeState.streamingConversationId = null;
   activeState.streamingChars = 0;
+  if (isV2State(activeState)) {
+    activeState.streamingText = "";
+  }
   streamingStates.delete(conversationId);
 }
 

@@ -36,13 +36,14 @@ export type SessionSavedInfo = {
 
 type PendingRequest = {
   resolve: (resp: SessionResp) => void;
-  timer: ReturnType<typeof setTimeout>;
+  timer: number;
 };
 
 // ── State ──
 
 const pendingRequests = new Map<string, PendingRequest>();
-const SESSION_TIMEOUT_MS = 5000;
+/** 5 seconds ≈ 100 ticks (1 tick = 50ms) */
+const SESSION_TIMEOUT_TICKS = 100;
 let isSessionRespRegistered = false;
 
 /**
@@ -50,7 +51,7 @@ let isSessionRespRegistered = false;
  */
 export function resetSessionClientForTests(): void {
   for (const [, pending] of pendingRequests) {
-    clearTimeout(pending.timer);
+    system.clearRun(pending.timer);
   }
   pendingRequests.clear();
   isSessionRespRegistered = false;
@@ -77,7 +78,7 @@ export function registerSessionRespHandler(): void {
       if (!pending) {
         return;
       }
-      clearTimeout(pending.timer);
+      system.clearRun(pending.timer);
       pendingRequests.delete(resp.request_id);
       pending.resolve(resp);
     } catch {
@@ -117,7 +118,8 @@ export function requestSession(
     const payload = JSON.stringify(payloadObj);
 
     // Set up the pending request (timeout guard)
-    const timer = setTimeout(() => {
+    // Minecraft scripting sandbox does not support setTimeout — use system.runTimeout.
+    const timer = system.runTimeout(() => {
       pendingRequests.delete(requestId);
       resolve({
         request_id: requestId,
@@ -126,7 +128,7 @@ export function requestSession(
         action,
         error: "会话同步不可用（服务端版本过旧）",
       });
-    }, SESSION_TIMEOUT_MS);
+    }, SESSION_TIMEOUT_TICKS);
 
     pendingRequests.set(requestId, { resolve, timer });
 
@@ -148,7 +150,7 @@ function sendSessionRequest(requestId: string, payload: string): void {
     // No tool player available — resolve with error
     const pending = pendingRequests.get(requestId);
     if (pending) {
-      clearTimeout(pending.timer);
+      system.clearRun(pending.timer);
       pendingRequests.delete(requestId);
       pending.resolve({
         request_id: requestId,

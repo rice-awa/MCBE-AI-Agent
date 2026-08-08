@@ -75,6 +75,8 @@ export type AgentUiStateV2 = {
   isStreaming: boolean;
   streamingConversationId: string | null;
   streamingChars: number;
+  /** 实时流式文本内容（用于打字机效果展示） */
+  streamingText: string;
   refreshConversation?: () => void;
 };
 
@@ -192,6 +194,7 @@ export function createAgentUiStateV2(): AgentUiStateV2 {
     isStreaming: false,
     streamingConversationId: null,
     streamingChars: 0,
+    streamingText: "",
   };
 }
 
