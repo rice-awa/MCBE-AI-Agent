@@ -40,11 +40,11 @@ export function getHistoryPage(
 ): HistoryPage {
   const normalizedPageSize = Math.max(1, Math.floor(pageSize));
   const normalizedPageIndex = Math.max(0, Math.floor(pageIndex));
-  const newestFirst = [...history].reverse();
+  // 正序：最旧的在前，最新的在后
   const start = normalizedPageIndex * normalizedPageSize;
 
   return {
-    items: newestFirst.slice(start, start + normalizedPageSize),
+    items: history.slice(start, start + normalizedPageSize),
     pageIndex: normalizedPageIndex,
     pageSize: normalizedPageSize,
     totalItems: history.length,
@@ -53,7 +53,8 @@ export function getHistoryPage(
 }
 
 export function formatHistoryItem(item: ChatHistoryItem): string {
-  return `[${item.role}/${item.source}] ${item.content}`;
+  const roleLabel = item.role === "user" ? "用户" : item.role === "assistant" ? "AI" : item.role;
+  return `[${roleLabel}] ${item.content}`;
 }
 
 export function summarizeHistoryItem(item: ChatHistoryItem, previewLength: number): string {
