@@ -2,22 +2,22 @@ import { describe, expect, it } from "vitest";
 
 import { buildAgentChatCommand, isUiTriggerItem } from "../../scripts/ui/commands";
 import { appendHistoryItem, clearHistory, getHistoryPage, summarizeHistoryItem } from "../../scripts/ui/history";
-import { createAgentUiState, DEFAULT_AGENT_UI_SETTINGS, DEFAULT_AGENT_UI_STATS } from "../../scripts/ui/state";
+import { createAgentUiStateV2, DEFAULT_AGENT_UI_SETTINGS_V2, DEFAULT_AGENT_UI_STATS } from "../../scripts/ui/state";
 import { loadAgentUiState, saveAgentUiState } from "../../scripts/ui/storage";
 
 describe("agent ui state", () => {
   it("starts with bridge disconnected state", () => {
-    const state = createAgentUiState();
+    const state = createAgentUiStateV2();
 
     expect(state.bridgeStatus.getData()).toBe("disconnected");
     expect(state.lastPrompt.getData()).toBe("");
     expect(state.lastResponsePreview.getData()).toBe("");
-    expect(state.history).toEqual([]);
-    expect(state.settings).toEqual(DEFAULT_AGENT_UI_SETTINGS);
+    expect(state.conversations.default.history).toEqual([]);
+    expect(state.settings).toEqual(DEFAULT_AGENT_UI_SETTINGS_V2);
     expect(state.stats).toEqual(DEFAULT_AGENT_UI_STATS);
   });
 
-  it("creates a player-scoped state from persisted dynamic properties", () => {
+  it("creates a player-scoped state from persisted v1 dynamic properties (auto-migrated)", () => {
     const player = createFakePlayer({
       "mcbeai:ui_state": JSON.stringify({
         version: 1,
@@ -50,9 +50,9 @@ describe("agent ui state", () => {
 
     const state = loadAgentUiState(player);
 
-    expect(state.settings.maxHistoryItems).toBe(20);
     expect(state.settings.defaultDelivery).toBe("scriptevent");
-    expect(state.history).toHaveLength(1);
+    expect(state.conversations.default.history).toHaveLength(1);
+    expect(state.conversations.default.history[0].role).toBe("user");
     expect(state.stats.openCount).toBe(3);
   });
 
@@ -61,8 +61,7 @@ describe("agent ui state", () => {
       "mcbeai:ui_state": JSON.stringify({
         version: 1,
         settings: {
-          maxHistoryItems: 50,
-          responsePreviewLength: 999,
+          showToolEvents: true,
         },
         history: [
           {
@@ -93,35 +92,35 @@ describe("agent ui state", () => {
 
     const state = loadAgentUiState(player);
 
-    expect(state.history.map((item) => item.id)).toEqual(["valid-1"]);
-    expect(state.settings.responsePreviewLength).toBe(240);
+    expect(state.conversations.default.history.map((item) => item.id)).toEqual(["valid-1"]);
     expect(state.stats.localHistoryCount).toBe(1);
   });
 
-  it("persists only the compact versioned UI state", () => {
+  it("persists only the compact versioned UI state (v2)", () => {
     const player = createFakePlayer();
-    const state = createAgentUiState({
-      history: Array.from({ length: 12 }, (_, index) => ({
-        id: `item-${index}`,
-        role: "user",
-        content: `message-${index}`,
-        createdAt: index,
-        source: "ui",
-      })),
-      stats: {
-        ...DEFAULT_AGENT_UI_STATS,
-        localHistoryCount: 12,
-      },
-    });
+    const state = createAgentUiStateV2();
+    // Fill the default bucket with items
+    state.conversations.default.history = Array.from({ length: 12 }, (_, index) => ({
+      id: `item-${index}`,
+      role: "user" as const,
+      content: `message-${index}`,
+      createdAt: index,
+      source: "ui" as const,
+    }));
+    state.stats = {
+      ...state.stats,
+      localHistoryCount: 12,
+    };
 
     const result = saveAgentUiState(player, state);
 
     expect(result.ok).toBe(true);
     const rawValue = player.getDynamicProperty("mcbeai:ui_state");
     const persisted = JSON.parse(String(rawValue));
-    expect(persisted.version).toBe(1);
-    expect(persisted.history).toHaveLength(12);
-    expect(persisted.history[0].id).toBe("item-0");
+    expect(persisted.version).toBe(2);
+    expect(persisted.conversations).toHaveLength(1);
+    expect(persisted.conversations[0].history).toHaveLength(12);
+    expect(persisted.conversations[0].id).toBe("default");
   });
 });
 

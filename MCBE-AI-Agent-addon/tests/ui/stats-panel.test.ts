@@ -5,7 +5,8 @@ import { __getLastCustomForm, __resetDduiMock, __setNextCustomFormInteraction } 
 import type { HistoryItem } from "../../scripts/ui/history";
 import { showStatsPanel } from "../../scripts/ui/panels/statsPanel";
 import { CLOSE_ROUTE } from "../../scripts/ui/panels/routes";
-import { createAgentUiState } from "../../scripts/ui/state";
+import { createAgentUiStateV2 } from "../../scripts/ui/state";
+import type { AgentUiStateV2 } from "../../scripts/ui/state";
 import { AGENT_UI_STATE_PROPERTY_KEY } from "../../scripts/ui/storage";
 
 describe("stats panel", () => {
@@ -20,10 +21,9 @@ describe("stats panel", () => {
     });
 
     const player = createFakePlayer();
-    const uiState = createAgentUiState({
-      history: createHistoryItems(3),
-      stats: { localHistoryCount: 0 },
-    });
+    const uiState = createAgentUiStateV2();
+    uiState.conversations.default.history = createHistoryItems(3);
+    uiState.stats = { ...uiState.stats, localHistoryCount: 0 };
 
     const route = await showStatsPanel(player, uiState);
 
@@ -33,48 +33,53 @@ describe("stats panel", () => {
 
   it("resets stats, preserves local history count, persists, notifies player, and returns main", async () => {
     __setNextCustomFormInteraction({
-      clickButtonLabel: "重置统计",
+      clickButtonLabel: "重置全局统计",
       autoCloseAfterButtonClick: true,
     });
 
     const player = createFakePlayer();
-    const uiState = createAgentUiState({
-      history: createHistoryItems(4),
-      stats: {
-        openCount: 7,
-        sentCount: 8,
-        localHistoryCount: 1,
-        responseChunkCount: 9,
-        lastOpenedAt: 100,
-        lastSentAt: 200,
-      },
-    });
+    const uiState = createAgentUiStateV2();
+    uiState.conversations.default.history = createHistoryItems(4);
+    uiState.stats = {
+      ...uiState.stats,
+      openCount: 7,
+      sentCount: 8,
+      localHistoryCount: 1,
+      responseChunkCount: 9,
+      lastOpenedAt: 100,
+      lastSentAt: 200,
+    };
 
     const route = await showStatsPanel(player, uiState);
 
     expect(route).toEqual({ panel: "main" });
-    expect(uiState.stats.openCount).toBe(0);
-    expect(uiState.stats.sentCount).toBe(0);
-    expect(uiState.stats.responseChunkCount).toBe(0);
-    expect(uiState.stats.lastSentAt).toBe(0);
+    expect(uiState.stats.openCount).toBe(7);
+    expect(uiState.stats.sentCount).toBe(8);
+    expect(uiState.stats.responseChunkCount).toBe(9);
+    expect(uiState.stats.lastSentAt).toBe(200);
     expect(uiState.stats.lastOpenedAt).toBeGreaterThan(0);
     expect(uiState.stats.localHistoryCount).toBe(4);
-    expect(player.messages).toContain("MCBE AI Agent: 统计信息已重置。");
+    expect(uiState.stats.totalInputTokens).toBe(0);
+    expect(uiState.stats.totalOutputTokens).toBe(0);
+    expect(uiState.stats.totalTokensCombined).toBe(0);
+    expect(player.messages).toContain("MCBE AI Agent: 全局统计已重置。");
 
     const persisted = JSON.parse(String(player.getDynamicProperty(AGENT_UI_STATE_PROPERTY_KEY)));
-    expect(persisted.stats.openCount).toBe(0);
-    expect(persisted.stats.sentCount).toBe(0);
-    expect(persisted.stats.responseChunkCount).toBe(0);
-    expect(persisted.stats.lastSentAt).toBe(0);
+    expect(persisted.stats.openCount).toBe(7);
+    expect(persisted.stats.sentCount).toBe(8);
+    expect(persisted.stats.responseChunkCount).toBe(9);
+    expect(persisted.stats.lastSentAt).toBe(200);
     expect(persisted.stats.localHistoryCount).toBe(4);
+    expect(persisted.stats.totalInputTokens).toBe(0);
+    expect(persisted.stats.totalOutputTokens).toBe(0);
+    expect(persisted.stats.totalTokensCombined).toBe(0);
   });
 
   it("routes to close and persists state when 关闭 is clicked", async () => {
     const player = createFakePlayer();
-    const uiState = createAgentUiState({
-      history: createHistoryItems(2),
-      stats: { sentCount: 5, localHistoryCount: 0 },
-    });
+    const uiState = createAgentUiStateV2();
+    uiState.conversations.default.history = createHistoryItems(2);
+    uiState.stats = { ...uiState.stats, sentCount: 5, localHistoryCount: 0 };
 
     const route = await showStatsPanel(player, uiState);
 
@@ -84,17 +89,17 @@ describe("stats panel", () => {
     const persisted = JSON.parse(String(persistedRaw));
     expect(persisted.stats.sentCount).toBe(5);
     expect(persisted.stats.localHistoryCount).toBe(2);
-    expect(persisted.version).toBe(1);
+    expect(persisted.version).toBe(2);
   });
 
   it("does not add a manual close button when the built-in close button exists", async () => {
-    await showStatsPanel(createFakePlayer(), createAgentUiState());
+    await showStatsPanel(createFakePlayer(), createAgentUiStateV2());
 
     const buttons = __getLastCustomForm()
       ?.getComponents()
       .filter((component) => component.startsWith("button:"));
 
-    expect(buttons).toEqual(["button:返回主面板", "button:重置统计"]);
+    expect(buttons).toEqual(["button:返回主面板", "button:重置全局统计"]);
   });
 
   it("routes to close and persists state when the player dismisses stats", async () => {
@@ -103,10 +108,9 @@ describe("stats panel", () => {
     });
 
     const player = createFakePlayer();
-    const uiState = createAgentUiState({
-      history: createHistoryItems(2),
-      stats: { sentCount: 5, localHistoryCount: 0 },
-    });
+    const uiState = createAgentUiStateV2();
+    uiState.conversations.default.history = createHistoryItems(2);
+    uiState.stats = { ...uiState.stats, sentCount: 5, localHistoryCount: 0 };
 
     const route = await showStatsPanel(player, uiState);
 
@@ -116,7 +120,7 @@ describe("stats panel", () => {
   });
 
   it("adds spacing around the stats body and actions", async () => {
-    await showStatsPanel(createFakePlayer(), createAgentUiState());
+    await showStatsPanel(createFakePlayer(), createAgentUiStateV2());
 
     const form = __getLastCustomForm();
 
@@ -129,7 +133,8 @@ describe("stats panel", () => {
     });
 
     const player = createFakePlayer();
-    const uiState = createAgentUiState({ history: createHistoryItems(1) });
+    const uiState = createAgentUiStateV2();
+    uiState.conversations.default.history = createHistoryItems(1);
 
     const route = await showStatsPanel(player, uiState);
 
@@ -154,6 +159,7 @@ function createFakePlayer(initialProperties: Record<string, unknown> = {}) {
 
   return {
     name: "TestPlayer",
+    id: "player-1",
     messages,
     getDynamicProperty(identifier: string) {
       return properties.get(identifier);

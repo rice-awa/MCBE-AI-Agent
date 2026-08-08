@@ -18,6 +18,7 @@ from core.queue import MessageBroker, normalize_conversation_id
 from core.session import DEFAULT_CONVERSATION_ID
 from models.constants import DEFAULT_PLAYER_DISPLAY_NAME, DEFAULT_PLAYER_KEY
 from models.messages import ChatRequest
+from services.agent.runtime import get_agent_runtime
 from services.agent.trace import TraceContext, get_trace_recorder
 from services.auth.jwt_handler import JWTHandler
 from services.gateway.session_store import HostConnectionSession, HostSessionStore
@@ -463,6 +464,234 @@ class CommandHandlers:
         )
         await self.handle_chat(
             state, message, delivery="tellraw", player_name=player_name
+        )
+
+    async def handle_session_req(
+        self,
+        state: ConnectionState,
+        session_req: dict[str, Any],
+    ) -> None:
+        """Handle a session_req from the addon.
+
+        Parses the request dict, routes to _handle_conversation logic,
+        and sends back a structured session_resp via the broker.
+        """
+        request_id = session_req.get("request_id", "")
+        action = session_req.get("action", "")
+        player_name = session_req.get("player_name") or None
+        cid = session_req.get("cid")  # optional conversation_id
+        sid = session_req.get("sid")  # optional session_id
+
+        if not action:
+            logger.warning(
+                "session_req_missing_action",
+                connection_id=str(state.id),
+                request_id=request_id,
+            )
+            await self.broker.send_response(
+                state.id,
+                {
+                    "type": "session_resp",
+                    "request_id": request_id,
+                    "player_name": player_name,
+                    "ok": False,
+                    "action": action,
+                    "error": "缺少 action 字段",
+                },
+            )
+            return
+
+        # Map action to _handle_conversation option string
+        action_option_map: dict[str, str] = {
+            "list": "list",
+            "new": f"new {cid}" if cid else "new",
+            "switch": f"switch {cid}" if cid else "",
+            "status": "status",
+            "clear": "clear",
+            "save": "save",
+            "restore": f"restore {sid}" if sid else "",
+            "saved": "saved",
+            "delete": f"delete {sid}" if sid else "",
+            "compress": "compress",
+        }
+
+        option = action_option_map.get(action)
+        if option is None:
+            await self.broker.send_response(
+                state.id,
+                {
+                    "type": "session_resp",
+                    "request_id": request_id,
+                    "player_name": player_name,
+                    "ok": False,
+                    "action": action,
+                    "error": f"未知操作: {action}",
+                },
+            )
+            return
+
+        if action == "switch" and not cid:
+            await self.broker.send_response(
+                state.id,
+                {
+                    "type": "session_resp",
+                    "request_id": request_id,
+                    "player_name": player_name,
+                    "ok": False,
+                    "action": action,
+                    "error": "缺少 cid 参数",
+                },
+            )
+            return
+
+        if action in ("restore", "delete") and not sid:
+            await self.broker.send_response(
+                state.id,
+                {
+                    "type": "session_resp",
+                    "request_id": request_id,
+                    "player_name": player_name,
+                    "ok": False,
+                    "action": action,
+                    "error": "缺少 sid 参数",
+                },
+            )
+            return
+
+        # Call the existing _handle_conversation logic
+        try:
+            msg = await self._handle_conversation(state, option, player_name)
+        except Exception as exc:
+            logger.error(
+                "session_req_handler_error",
+                connection_id=str(state.id),
+                action=action,
+                error=str(exc),
+                exc_info=True,
+            )
+            await self.broker.send_response(
+                state.id,
+                {
+                    "type": "session_resp",
+                    "request_id": request_id,
+                    "player_name": player_name,
+                    "ok": False,
+                    "action": action,
+                    "error": f"处理失败: {str(exc)}",
+                },
+            )
+            return
+
+        # Build structured response data for actions that support it
+        data: dict[str, Any] | None = None
+        error: str | None = None
+
+        if msg and hasattr(msg, "text"):
+            text = msg.text
+            # Determine ok/fail from message type
+            if hasattr(msg, "color") and str(msg.color) == "§c":  # red = error
+                error = text
+            else:
+                data = {"message": text}
+
+            # Build structured data for specific actions
+            if action == "list":
+                conv_metadata = list(self.broker.list_player_conversation_metadata(
+                    state.id, player_name
+                ))
+                active_cid = self.broker.get_active_conversation_id(
+                    state.id, player_name
+                )
+                conversations_list = []
+                for meta in conv_metadata:
+                    conversations_list.append({
+                        "id": meta.conversation_id,
+                        "short_id": meta.short_id,
+                        "title": meta.title or "",
+                        "message_count": 0,
+                        "is_active": meta.conversation_id == active_cid,
+                    })
+                data = {"conversations": conversations_list}
+
+            elif action == "saved":
+                try:
+                    conv_manager = get_agent_runtime().get_conversation_manager(
+                        self.broker, self.settings
+                    )
+                    saved_convs = await conv_manager.list_conversations(
+                        player_name=player_name
+                    )
+                    saved_list = []
+                    for entry in saved_convs:
+                        saved_list.append({
+                            "session_id": entry.get("session_id", ""),
+                            "title": entry.get("title") or "",
+                            "message_count": entry.get("message_count", 0),
+                            "updated_at": entry.get("updated_at", ""),
+                        })
+                    data = {"saved": saved_list}
+                except Exception as exc:
+                    logger.warning(
+                        "session_req_list_saved_failed",
+                        connection_id=str(state.id),
+                        error=str(exc),
+                    )
+                    data = {"message": text}
+
+            elif action == "status":
+                active_cid = self.broker.get_active_conversation_id(
+                    state.id, player_name
+                )
+                host = self._require_host(state)
+                session = host.get_player_session(player_name)
+                conv_metadata = self.broker.get_conversation_metadata(
+                    state.id, player_name, active_cid
+                )
+                history = self.broker.get_conversation_history(
+                    state.id, player_name, active_cid
+                )
+                turns = self._count_conversation_turns(history)
+                data = {
+                    "conversation_id": active_cid,
+                    "short_id": conv_metadata.short_id,
+                    "title": conv_metadata.title or "",
+                    "turns": turns,
+                    "max_history_turns": self.settings.max_history_turns,
+                    "context_enabled": session.context_enabled,
+                    "title_status": conv_metadata.title_status,
+                }
+
+            elif action in ("new", "switch"):
+                active_cid = self.broker.get_active_conversation_id(
+                    state.id, player_name
+                )
+                conv_metadata = self.broker.get_conversation_metadata(
+                    state.id, player_name, active_cid
+                )
+                history = self.broker.get_conversation_history(
+                    state.id, player_name, active_cid
+                )
+                data = {
+                    "conversation_id": active_cid,
+                    "short_id": conv_metadata.short_id,
+                    "title": conv_metadata.title or "",
+                    "message_count": len(history),
+                }
+
+        send_data = data if error is None else None
+        send_error = error
+
+        await self.broker.send_response(
+            state.id,
+            {
+                "type": "session_resp",
+                "request_id": request_id,
+                "player_name": player_name,
+                "ok": send_error is None,
+                "action": action,
+                "data": send_data,
+                "error": send_error,
+            },
         )
 
     # -- context / conversation ----------------------------------------------------

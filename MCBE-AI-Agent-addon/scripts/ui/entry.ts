@@ -7,7 +7,11 @@ import { showMorePanel } from "./panels/morePanel";
 import type { AgentPanelRoute } from "./panels/routes";
 import { showSettingsPanel } from "./panels/settingsPanel";
 import { showStatsPanel } from "./panels/statsPanel";
+import { showConversationPreviewPanel } from "./panels/conversationPreviewPanel";
+import { showConversationListPanel } from "./panels/conversationListPanel";
+import { showSessionFilesPanel } from "./panels/sessionFilesPanel";
 import { loadAgentUiState, saveAgentUiState } from "./storage";
+import type { AgentUiStateV2 } from "./state";
 import { recordUiOpened } from "./stats";
 import { setActiveUiState, clearActiveUiState } from "../bridge/responseSync";
 
@@ -42,7 +46,7 @@ export async function openAgentUi(player: Player): Promise<void> {
   }
 
   openPanels.add(player.id);
-  const uiState = loadAgentUiState(player);
+  const uiState: AgentUiStateV2 = loadAgentUiState(player);
   uiState.stats = recordUiOpened(uiState.stats);
   saveAgentUiState(player, uiState);
 
@@ -64,6 +68,15 @@ export async function openAgentUi(player: Player): Promise<void> {
           break;
         case "stats":
           route = await showStatsPanel(player, uiState);
+          break;
+        case "conversationList":
+          route = await showConversationListPanel(player, uiState);
+          break;
+        case "conversationPreview":
+          route = await showConversationPreviewPanel(player, uiState);
+          break;
+        case "sessionFiles":
+          route = await showSessionFilesPanel(player, uiState);
           break;
       }
     }

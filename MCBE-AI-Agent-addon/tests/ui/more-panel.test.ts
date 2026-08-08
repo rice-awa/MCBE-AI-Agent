@@ -4,7 +4,7 @@ import { __getLastCustomForm, __resetDduiMock, __setNextCustomFormInteraction } 
 
 import { showMorePanel } from "../../scripts/ui/panels/morePanel";
 import { CLOSE_ROUTE } from "../../scripts/ui/panels/routes";
-import { createAgentUiState } from "../../scripts/ui/state";
+import { createAgentUiStateV2 } from "../../scripts/ui/state";
 
 describe("more panel", () => {
   beforeEach(() => {
@@ -12,13 +12,13 @@ describe("more panel", () => {
   });
 
   it("offers settings and stats as secondary actions", async () => {
-    await showMorePanel(createFakePlayer(), createAgentUiState());
+    await showMorePanel(createFakePlayer(), createAgentUiStateV2());
 
     const buttons = __getLastCustomForm()
       ?.getComponents()
       .filter((component) => component.startsWith("button:"));
 
-    expect(buttons).toEqual(["button:设置", "button:统计信息"]);
+    expect(buttons).toEqual(["button:设置", "button:统计信息", "button:会话文件管理", "button:关闭"]);
   });
 
   it("routes to settings from the more menu", async () => {
@@ -27,7 +27,7 @@ describe("more panel", () => {
       autoCloseAfterButtonClick: true,
     });
 
-    const route = await showMorePanel(createFakePlayer(), createAgentUiState());
+    const route = await showMorePanel(createFakePlayer(), createAgentUiStateV2());
 
     expect(route).toEqual({ panel: "settings" });
   });
@@ -38,7 +38,7 @@ describe("more panel", () => {
       autoCloseAfterButtonClick: true,
     });
 
-    const route = await showMorePanel(createFakePlayer(), createAgentUiState());
+    const route = await showMorePanel(createFakePlayer(), createAgentUiStateV2());
 
     expect(route).toEqual({ panel: "stats" });
   });
@@ -48,7 +48,7 @@ describe("more panel", () => {
       closeReason: "UserClose",
     });
 
-    const route = await showMorePanel(createFakePlayer(), createAgentUiState());
+    const route = await showMorePanel(createFakePlayer(), createAgentUiStateV2());
 
     expect(route).toEqual(CLOSE_ROUTE);
   });

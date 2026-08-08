@@ -1,12 +1,12 @@
 import type { Player } from "@minecraft/server";
 
 import { createCustomForm, showCustomFormSafely } from "../forms/formAdapter";
-import type { AgentUiState } from "../state";
+import type { AgentUiStateV2 } from "../state";
 import { saveAgentUiState } from "../storage";
 import type { AgentPanelRoute } from "./routes";
 import { CLOSE_ROUTE } from "./routes";
 
-export async function showMorePanel(player: Player, uiState: AgentUiState): Promise<AgentPanelRoute> {
+export async function showMorePanel(player: Player, uiState: AgentUiStateV2): Promise<AgentPanelRoute> {
   try {
     let nextRoute: AgentPanelRoute = CLOSE_ROUTE;
 
@@ -18,6 +18,14 @@ export async function showMorePanel(player: Player, uiState: AgentUiState): Prom
       })
       .button("统计信息", () => {
         nextRoute = { panel: "stats" };
+        form.close();
+      })
+      .button("会话文件管理", () => {
+        nextRoute = { panel: "sessionFiles" };
+        form.close();
+      })
+      .button("关闭", () => {
+        saveAgentUiState(player, uiState);
         form.close();
       });
 

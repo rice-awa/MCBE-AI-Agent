@@ -244,3 +244,24 @@ review近期6项任务完成状态，确认方案四和方案五已完成；合�
 ### Status
 
 [OK] **Implemented & verified**（117 tests green，eslint/build 通过）
+
+
+## Session 6: DDUI 流式打字机 + 会话管理协议化 + 面板重构
+
+**Date**: 2026-08-08
+**Task**: DDUI 流式打字机 + 会话管理协议化 + 面板重构
+**Branch**: `feature/ddui-streaming-sessions`
+
+### Summary
+
+完成 DDUI 全面重构：流式打字机（分片排序/增量渲染/token统计），会话管理协议化（sessionClient + command_handlers + hook + broker_bridge），UI v2 数据结构（per-conversation桶/三级token统计/）
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `930d145` | (see git log) |
+
+### Status
+
+[OK] **Completed**
