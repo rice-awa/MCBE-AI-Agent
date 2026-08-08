@@ -136,7 +136,7 @@ describe("agent UI commands", () => {
 });
 
 describe("agent UI history", () => {
-  it("appends, truncates, and pages newest history first", () => {
+  it("appends, truncates, and pages oldest history first", () => {
     const history = Array.from({ length: 6 }, (_, index) => ({
       id: `item-${index}`,
       role: "user" as const,
@@ -158,8 +158,8 @@ describe("agent UI history", () => {
     );
 
     expect(nextHistory.map((item) => item.id)).toEqual(["item-2", "item-3", "item-4", "item-5", "item-6"]);
-    expect(getHistoryPage(nextHistory, 0, 3).items.map((item) => item.id)).toEqual(["item-6", "item-5", "item-4"]);
-    expect(getHistoryPage(nextHistory, 1, 3).items.map((item) => item.id)).toEqual(["item-3", "item-2"]);
+    expect(getHistoryPage(nextHistory, 0, 3).items.map((item) => item.id)).toEqual(["item-2", "item-3", "item-4"]);
+    expect(getHistoryPage(nextHistory, 1, 3).items.map((item) => item.id)).toEqual(["item-5", "item-6"]);
   });
 
   it("summarizes long history items for form display", () => {
