@@ -6,7 +6,8 @@ import { __getLastCustomForm, __resetDduiMock, __setNextCustomFormInteraction } 
 import { TOOL_PLAYER_NAME } from "../../scripts/bridge/constants";
 import { showAgentConsole } from "../../scripts/ui/panels/agentConsole";
 import { CLOSE_ROUTE } from "../../scripts/ui/panels/routes";
-import { createAgentUiState } from "../../scripts/ui/state";
+import { createAgentUiStateV2 } from "../../scripts/ui/state";
+import type { AgentUiStateV2 } from "../../scripts/ui/state";
 import { AGENT_UI_STATE_PROPERTY_KEY } from "../../scripts/ui/storage";
 
 describe("agent console panel", () => {
@@ -25,13 +26,13 @@ describe("agent console panel", () => {
     });
 
     const player = createFakePlayer();
-    const uiState = createAgentUiState();
+    const uiState = createAgentUiStateV2();
 
     const route = await showAgentConsole(player, uiState);
 
     expect(route).toEqual({ panel: "main" });
-    expect(uiState.history).toHaveLength(1);
-    expect(uiState.history[0]).toMatchObject({
+    expect(uiState.conversations.default.history).toHaveLength(1);
+    expect(uiState.conversations.default.history[0]).toMatchObject({
       role: "user",
       content: "你好 AI",
       source: "ui",
@@ -43,25 +44,47 @@ describe("agent console panel", () => {
     expect(player.messages).toContain("MCBE AI Agent: 消息已发送至 AI 服务。");
   });
 
-  it("keeps only send and more actions on the main panel", async () => {
-    await showAgentConsole(createFakePlayer(), createAgentUiState());
+  it("shows all expected buttons on the main panel", async () => {
+    await showAgentConsole(createFakePlayer(), createAgentUiStateV2());
 
     const buttons = __getLastCustomForm()
       ?.getComponents()
       .filter((component) => component.startsWith("button:"));
 
-    expect(buttons).toEqual(["button:发送", "button:其他"]);
+    expect(buttons).toEqual(["button:切换", "button:发送", "button:新会话", "button:全部对话", "button:更多"]);
   });
 
-  it("routes to the more menu from the main panel", async () => {
+  it("routes to the conversation list from the 切换 button", async () => {
     __setNextCustomFormInteraction({
-      clickButtonLabel: "其他",
+      clickButtonLabel: "切换",
       autoCloseAfterButtonClick: true,
     });
 
-    const route = await showAgentConsole(createFakePlayer(), createAgentUiState());
+    const route = await showAgentConsole(createFakePlayer(), createAgentUiStateV2());
+
+    expect(route).toEqual({ panel: "conversationList" });
+  });
+
+  it("routes to the more menu from the 更多 button", async () => {
+    __setNextCustomFormInteraction({
+      clickButtonLabel: "更多",
+      autoCloseAfterButtonClick: true,
+    });
+
+    const route = await showAgentConsole(createFakePlayer(), createAgentUiStateV2());
 
     expect(route).toEqual({ panel: "more" });
+  });
+
+  it("routes to conversation preview from the 全部对话 button", async () => {
+    __setNextCustomFormInteraction({
+      clickButtonLabel: "全部对话",
+      autoCloseAfterButtonClick: true,
+    });
+
+    const route = await showAgentConsole(createFakePlayer(), createAgentUiStateV2());
+
+    expect(route).toEqual({ panel: "conversationPreview" });
   });
 
   it("keeps the main panel open when the message is empty", async () => {
@@ -73,12 +96,12 @@ describe("agent console panel", () => {
     });
 
     const player = createFakePlayer();
-    const uiState = createAgentUiState();
+    const uiState = createAgentUiStateV2();
 
     const route = await showAgentConsole(player, uiState);
 
     expect(route).toEqual({ panel: "main" });
-    expect(uiState.history).toEqual([]);
+    expect(uiState.conversations.default.history).toEqual([]);
     expect(player.messages).toContain("MCBE AI Agent: 消息不能为空。");
   });
 
@@ -88,7 +111,7 @@ describe("agent console panel", () => {
     });
 
     const player = createFakePlayer();
-    const uiState = createAgentUiState();
+    const uiState = createAgentUiStateV2();
     uiState.lastPrompt.setData("hello");
 
     const route = await showAgentConsole(player, uiState);
@@ -98,11 +121,11 @@ describe("agent console panel", () => {
   });
 
   it("adds spacing between dense main panel sections", async () => {
-    await showAgentConsole(createFakePlayer(), createAgentUiState());
+    await showAgentConsole(createFakePlayer(), createAgentUiStateV2());
 
     const form = __getLastCustomForm();
 
-    expect(form?.getComponents().filter((component) => component === "spacer").length).toBeGreaterThanOrEqual(3);
+    expect(form?.getComponents().filter((component) => component === "spacer").length).toBeGreaterThanOrEqual(4);
   });
 
   it("closes cleanly when the DDUI observable api is unavailable", async () => {
@@ -111,7 +134,7 @@ describe("agent console panel", () => {
     });
 
     const player = createFakePlayer();
-    const uiState = createAgentUiState();
+    const uiState = createAgentUiStateV2();
 
     await expect(showAgentConsole(player, uiState)).resolves.toEqual(CLOSE_ROUTE);
     expect(player.messages).toContain("MCBE AI Agent: 表单暂时无法打开，请稍后再试。");

@@ -134,6 +134,8 @@ class BrokerResponseBridge:
                 await self._run_command(state, item)
             elif msg_type == "ai_response_sync":
                 await self._ai_sync(state, item)
+            elif msg_type == "session_resp":
+                await self._session_resp(state, item)
             elif msg_type == "game_message":
                 await self._game_message(state, item.get("content", ""))
             else:
@@ -326,6 +328,8 @@ class BrokerResponseBridge:
         player_name = response.get("player_name", DEFAULT_PLAYER_DISPLAY_NAME)
         role = response.get("role", "assistant")
         text = response.get("text", "")
+        conversation_id = response.get("conversation_id")
+        usage = response.get("usage")
         if not text:
             return
         delivery = self._delivery(state)
@@ -336,4 +340,36 @@ class BrokerResponseBridge:
             player_name=player_name,
             role=role,
             text=text,
+            conversation_id=conversation_id,
+            usage=usage,
+        )
+
+    async def _session_resp(self, state: ConnectionState, item: dict[str, Any]) -> None:
+        """Send a session response to the addon via scriptevent."""
+        delivery = self._delivery(state)
+        if delivery is None:
+            return
+        # Build the session_resp JSON payload
+        payload: dict[str, Any] = {
+            "request_id": item.get("request_id"),
+            "v": 1,
+            "ok": item.get("ok", False),
+        }
+        action = item.get("action")
+        if action:
+            payload["action"] = action
+        data = item.get("data")
+        if data is not None:
+            payload["data"] = data
+        error = item.get("error")
+        if error is not None:
+            payload["error"] = error
+
+        import json
+        payload_str = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        session_message_id = self._profile.session_response_message_id
+        await delivery.send_scriptevent(
+            payload_str,
+            message_id=session_message_id,
+            source="session_resp",
         )

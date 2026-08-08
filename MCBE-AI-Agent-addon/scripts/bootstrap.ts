@@ -2,6 +2,7 @@ import { system, world } from "@minecraft/server";
 import { registerBridgeRouter } from "./bridge/router";
 import { initializeToolPlayer } from "./bridge/toolPlayer";
 import { registerResponseSyncHandler } from "./bridge/responseSync";
+import { registerSessionRespHandler } from "./bridge/sessionClient";
 import { registerUiEntry } from "./ui/entry";
 
 const DEBUG = true;
@@ -20,6 +21,7 @@ export function initializeAddonEarly(): void {
   log("initializeAddonEarly: 开始早期初始化...");
   registerBridgeRouter();
   registerResponseSyncHandler();
+  registerSessionRespHandler();
   registerUiEntry();
   log("initializeAddonEarly: 早期初始化完成");
 }

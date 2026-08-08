@@ -1,43 +1,79 @@
 import type { Player } from "@minecraft/server";
 
 import { sendUiChatMessage } from "../../bridge/toolPlayer";
+import { requestSession } from "../../bridge/sessionClient";
 import { buildAgentChatCommand } from "../commands";
-import { appendHistoryItem, createHistoryId, summarizeHistoryItem } from "../history";
+import { createHistoryId, formatRecentConversation, getRecentTurns } from "../history";
+import type { AgentUiStateV2 } from "../state";
+import { getActiveBucket } from "../state";
 import { createCustomForm, createDduiObservable, showCustomFormSafely } from "../forms/formAdapter";
-import type { AgentUiState } from "../state";
 import { saveAgentUiState } from "../storage";
 import { recordPromptSent, syncLocalHistoryCount } from "../stats";
 import type { AgentPanelRoute } from "./routes";
 import { CLOSE_ROUTE, MAIN_ROUTE } from "./routes";
 
-const CONVERSATION_PREVIEW_LIMIT = 6;
+const RECENT_TURNS_COUNT = 5;
 
-export async function showAgentConsole(player: Player, uiState: AgentUiState): Promise<AgentPanelRoute> {
+/**
+ * 主面板 - 重构版。
+ *
+ * 布局：
+ * 1. 标题行: ✦ #short_id · 标题 [切换]
+ * 2. 状态行: 桥接状态 / 生成中 / 完成+token
+ * 3. 最近 5 轮完整对话（无 tool）
+ * 4. 输入框 + [发送] [新会话] [全部对话] [更多]
+ */
+export async function showAgentConsole(player: Player, uiState: AgentUiStateV2): Promise<AgentPanelRoute> {
   try {
-    const summary = createDduiObservable(buildSummary(uiState));
+    const bucket = getActiveBucket(uiState);
+
+    // ── Observables ──
+    const titleLine = createDduiObservable(buildTitleLine(uiState));
+    const statusLine = createDduiObservable(buildStatusLine(uiState));
     const conversationBody = createDduiObservable(buildConversationBody(uiState));
     const messageValue = createDduiObservable("");
     let nextRoute: AgentPanelRoute = MAIN_ROUTE;
 
+    // ── Refresh function (injected into uiState for external calls) ──
     const refreshConversation = () => {
-      summary.setData(buildSummary(uiState));
+      titleLine.setData(buildTitleLine(uiState));
+      statusLine.setData(buildStatusLine(uiState));
       conversationBody.setData(buildConversationBody(uiState));
     };
     uiState.refreshConversation = refreshConversation;
 
+    // ── Build form ──
     const form = createCustomForm(player, "MCBE AI Agent")
       .closeButton()
-      .label(summary)
+      // Title row
+      .label(titleLine)
+      .button("切换", () => {
+        nextRoute = { panel: "conversationList" };
+        saveAgentUiState(player, uiState);
+        form.close();
+      })
+      .spacer()
+      // Status row
+      .label(statusLine)
       .spacer()
       .divider()
       .spacer()
+      // Conversation body
       .label(conversationBody)
       .spacer()
       .divider()
       .spacer()
+      // Input field
       .textField("消息内容", messageValue, { description: "发送后面板会保持打开" })
       .spacer()
+      // Four buttons row
       .button("发送", () => {
+        // Disable send when streaming
+        if (uiState.isStreaming) {
+          player.sendMessage("MCBE AI Agent: 正在生成回复，请稍后。");
+          return;
+        }
+
         const message = messageValue.getData().trim();
         if (!message) {
           player.sendMessage("MCBE AI Agent: 消息不能为空。");
@@ -45,8 +81,11 @@ export async function showAgentConsole(player: Player, uiState: AgentUiState): P
         }
 
         const now = Date.now();
-        uiState.history = appendHistoryItem(
-          uiState.history,
+        const activeBucket = getActiveBucket(uiState);
+
+        // Write local history entry (source: "ui")
+        activeBucket.history = [
+          ...activeBucket.history,
           {
             id: createHistoryId("ui", now),
             role: "user",
@@ -54,21 +93,23 @@ export async function showAgentConsole(player: Player, uiState: AgentUiState): P
             createdAt: now,
             source: "ui",
           },
-          uiState.settings.maxHistoryItems
-        );
+        ];
+
         uiState.lastPrompt.setData(message);
         uiState.bridgeStatus.setData("connecting");
-        uiState.stats = syncLocalHistoryCount(recordPromptSent(uiState.stats, now), uiState.history.length);
+        uiState.stats = syncLocalHistoryCount(recordPromptSent(uiState.stats, now), activeBucket.history.length);
         messageValue.setData("");
         refreshConversation();
 
-        const command = buildAgentChatCommand(message);
+        // Send via tool player with conversation_id
+        const conversationId = uiState.activeConversationId;
         try {
-          sendUiChatMessage(player.name, message);
+          sendUiChatMessage(player.name, message, conversationId);
           uiState.bridgeStatus.setData("sent");
           player.sendMessage("MCBE AI Agent: 消息已发送至 AI 服务。");
         } catch {
           uiState.bridgeStatus.setData("error");
+          const command = buildAgentChatCommand(message);
           player.sendMessage(`MCBE AI Agent: 自动发送失败，请在聊天框手动发送：${command}`);
         }
 
@@ -78,12 +119,61 @@ export async function showAgentConsole(player: Player, uiState: AgentUiState): P
           player.sendMessage("MCBE AI Agent: 保存历史失败，本次仅内存生效。");
         }
       })
-      .button("其他", () => {
+      .button("新会话", () => {
+        const createNew = async () => {
+          const resp = await requestSession("new", { player_name: player.name });
+          if (resp.ok && resp.data) {
+            const data = resp.data as { conversation_id?: string; short_id?: number; title?: string };
+            if (data.conversation_id) {
+              // Switch local state to new conversation
+              uiState.activeConversationId = data.conversation_id;
+              if (!uiState.conversations[data.conversation_id]) {
+                uiState.conversations[data.conversation_id] = {
+                  id: data.conversation_id,
+                  shortId: data.short_id ?? 0,
+                  title: data.title ?? "",
+                  history: [],
+                  lastActiveAt: Date.now(),
+                };
+              }
+              if (!uiState.conversationOrder.includes(data.conversation_id)) {
+                uiState.conversationOrder.unshift(data.conversation_id);
+              }
+              // Reset streaming state
+              uiState.isStreaming = false;
+              uiState.streamingConversationId = null;
+              uiState.streamingChars = 0;
+              // Reset token stats for session
+              uiState.stats = {
+                ...uiState.stats,
+                sessionInputTokens: 0,
+                sessionOutputTokens: 0,
+                sessionTokensCombined: 0,
+                roundInputTokens: 0,
+                roundOutputTokens: 0,
+                roundTokensCombined: 0,
+              };
+              refreshConversation();
+              saveAgentUiState(player, uiState);
+            }
+          } else {
+            player.sendMessage(`MCBE AI Agent: 新建会话失败: ${resp.error || "未知错误"}`);
+          }
+        };
+        void createNew();
+      })
+      .button("全部对话", () => {
+        nextRoute = { panel: "conversationPreview" };
+        saveAgentUiState(player, uiState);
+        form.close();
+      })
+      .button("更多", () => {
         nextRoute = { panel: "more" };
         saveAgentUiState(player, uiState);
         form.close();
       });
 
+    // ── Show form ──
     const shown = await showCustomFormSafely(player, form);
     if (!shown.ok || (shown.closedByUser && nextRoute.panel === "main")) {
       saveAgentUiState(player, uiState);
@@ -103,19 +193,41 @@ export async function showAgentConsole(player: Player, uiState: AgentUiState): P
   }
 }
 
-function buildConversationBody(uiState: AgentUiState): string {
-  const items = uiState.history.slice(-CONVERSATION_PREVIEW_LIMIT);
+// ── Build functions ──
+
+function buildTitleLine(uiState: AgentUiStateV2): string {
+  const bucket = getActiveBucket(uiState);
+  const shortId = bucket.shortId > 0 ? `#${bucket.shortId}` : "";
+  const title = bucket.title || "未命名";
+  return `✦ ${shortId} · ${title}`;
+}
+
+function buildStatusLine(uiState: AgentUiStateV2): string {
+  if (uiState.isStreaming) {
+    const chars = uiState.streamingChars ?? 0;
+    return `⏳ 生成中… (${chars} chars)`;
+  }
+
+  const stats = uiState.stats;
+  if (stats.roundTokensCombined > 0) {
+    return `✓ 完成 · 本轮 ${stats.roundInputTokens}/${stats.roundOutputTokens} tokens (合计${stats.roundTokensCombined})`;
+  }
+
+  return `桥接状态: ${uiState.bridgeStatus.getData()} · 消息数: ${getActiveBucket(uiState).history.length}`;
+}
+
+function buildConversationBody(uiState: AgentUiStateV2): string {
+  const bucket = getActiveBucket(uiState);
+  const items = getRecentTurns(bucket.history, RECENT_TURNS_COUNT * 2);
+
   if (items.length === 0) {
     return "暂无对话记录。输入消息开始聊天。";
   }
 
-  return items.map((item) => summarizeHistoryItem(item, uiState.settings.responsePreviewLength)).join("\n\n---\n\n");
-}
-
-function buildSummary(uiState: AgentUiState): string {
-  return [
-    `桥接状态: ${uiState.bridgeStatus.getData()}`,
-    `历史条数: ${uiState.history.length}`,
-    `发送次数: ${uiState.stats.sentCount}`,
-  ].join("\n\n");
+  return items
+    .map((item) => {
+      const roleLabel = item.role === "user" ? "你" : "AI";
+      return `${roleLabel}: ${item.content}`;
+    })
+    .join("\n\n---\n\n");
 }

@@ -73,3 +73,54 @@ export function clearHistory(_history: ChatHistoryItem[]): ChatHistoryItem[] {
 export function createHistoryId(prefix = "ui", createdAt = Date.now()): string {
   return `${prefix}-${createdAt}-${Math.floor(Math.random() * 100000)}`;
 }
+
+/**
+ * Conversation bucket with history (for v2 data structure).
+ */
+export type ConversationBucketV2 = {
+  id: string;
+  shortId: number;
+  title: string;
+  history: HistoryItem[];
+  lastActiveAt: number;
+};
+
+/**
+ * Append an item to a conversation bucket and slice to the given limit.
+ */
+export function appendToBucket(
+  bucket: ConversationBucketV2,
+  item: HistoryItem,
+  limit: number,
+): ConversationBucketV2 {
+  const safeLimit = Math.max(0, Math.floor(limit));
+  const newHistory = safeLimit === 0 ? [] : [...bucket.history, item].slice(-safeLimit);
+  return {
+    ...bucket,
+    history: newHistory,
+    lastActiveAt: Date.now(),
+  };
+}
+
+/**
+ * 返回最近 N 个 user/assistant 轮次的完整对话内容。
+ * 过滤 tool 条目，按角色分组。
+ */
+export function getRecentTurns(history: ChatHistoryItem[], count: number): ChatHistoryItem[] {
+  const filtered = history.filter((item) => item.role === "user" || item.role === "assistant");
+  return filtered.slice(-count);
+}
+
+/**
+ * 格式化最近若干轮对话（不含 tool 条目）。
+ */
+export function formatRecentConversation(history: ChatHistoryItem[], count: number): string {
+  const turns = getRecentTurns(history, count);
+  if (turns.length === 0) return "";
+  return turns
+    .map((item) => {
+      const roleLabel = item.role === "user" ? "你" : "AI";
+      return `${roleLabel}: ${item.content}`;
+    })
+    .join("\n\n---\n\n");
+}

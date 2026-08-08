@@ -3,6 +3,9 @@ export type AgentPanelRoute =
   | { panel: "more" }
   | { panel: "settings" }
   | { panel: "stats" }
+  | { panel: "sessionFiles" }
+  | { panel: "conversationList" }
+  | { panel: "conversationPreview" }
   | { panel: "close" };
 
 export const MAIN_ROUTE: AgentPanelRoute = { panel: "main" };

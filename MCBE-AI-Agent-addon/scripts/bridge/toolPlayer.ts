@@ -70,7 +70,7 @@ export function sendBridgeResponseChunks(requestId: string, payload: string): vo
 
 let uiChatSeq = 0;
 
-export function sendUiChatMessage(playerName: string, message: string): void {
+export function sendUiChatMessage(playerName: string, message: string, conversationId?: string): void {
   const toolPlayer = world
     .getAllPlayers()
     .find((player) => player.name === TOOL_PLAYER_NAME);
@@ -80,7 +80,11 @@ export function sendUiChatMessage(playerName: string, message: string): void {
   }
 
   const id = `ui-${Date.now()}-${++uiChatSeq}`;
-  const payload = JSON.stringify({ player: playerName, message });
+  const payloadObj: Record<string, string> = { player: playerName, message };
+  if (conversationId) {
+    payloadObj.cid = conversationId;
+  }
+  const payload = JSON.stringify(payloadObj);
   const chunks = chunkUiChatPayload(id, payload, BRIDGE_MAX_CHUNK_CONTENT_LENGTH);
   for (const chunk of chunks) {
     toolPlayer.runCommand(`tell @s ${chunk}`);

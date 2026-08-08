@@ -1116,6 +1116,8 @@ class AgentWorker:
                             "player_name": request.player_name or DEFAULT_PLAYER_DISPLAY_NAME,
                             "role": "assistant",
                             "text": response_text,
+                            "conversation_id": request.conversation_id,
+                            "usage": usage_dict,
                         })
 
                     return ExecutionResult(

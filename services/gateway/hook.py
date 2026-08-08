@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from mcbe_ws_sdk import FlowControlSettings, McbeOutboundDelivery, NoOpHook
 from mcbe_ws_sdk.addon import AddonBridgeService
@@ -26,6 +27,9 @@ from mcbe_ws_sdk import MinecraftProtocolHandler
 logger = get_logger(__name__)
 
 _EXTERNAL_SENDERS = frozenset({"外部", "External"})
+# Prefix for session request messages from the addon bridge player.
+# The addon sends MCBEWS|SESSION|<json> via tell chat from MCBEWS_BRIDGE.
+_SESSION_REQ_PREFIX = "MCBEWS|SESSION|"
 
 
 class HostConnectionHook(NoOpHook):
@@ -183,6 +187,29 @@ class HostConnectionHook(NoOpHook):
     ) -> None:
         if player_event.sender in _EXTERNAL_SENDERS:
             return
+
+        # Check for session_req from the addon bridge player.
+        # The addon sends tell chat messages with MCBEWS|SESSION|<json>.
+        if player_event.message.startswith(_SESSION_REQ_PREFIX):
+            try:
+                payload_str = player_event.message[len(_SESSION_REQ_PREFIX):]
+                session_req = json.loads(payload_str)
+                session_req.setdefault("player_name", player_event.sender)
+                task = asyncio.create_task(
+                    self.handlers.handle_session_req(state, session_req),
+                    name=f"host-session-req:{state.id}",
+                )
+                self._track(task)
+                return
+            except (json.JSONDecodeError, Exception) as exc:
+                logger.warning(
+                    "session_req_parse_error",
+                    connection_id=str(state.id),
+                    sender=player_event.sender,
+                    error=str(exc),
+                )
+                return
+
         task = asyncio.create_task(
             self._dispatch(state, player_event, parsed),
             name=f"host-dispatch:{state.id}",

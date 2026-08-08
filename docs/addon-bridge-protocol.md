@@ -27,6 +27,9 @@ AgentWorker  ◄── 注入的 AddonBridgeService
 |------|-----|
 | Bridge 请求 scriptevent | `mcbews:bridge_req` |
 | AI / 文本响应 scriptevent | `mcbews:text_resp` |
+| Session 请求前缀 | `MCBEWS\|SESSION` |
+| Session 请求 scriptevent | `mcbews:session_req` |
+| Session 响应 scriptevent | `mcbews:session_resp` |
 | Bridge 响应聊天前缀 | `MCBEWS\|BRIDGE` |
 | UI 聊天前缀 | `MCBEWS\|UI_CHAT` |
 | 模拟工具玩家名 | `MCBEWS_BRIDGE` |
@@ -121,7 +124,130 @@ MCBEWS|BRIDGE|<request_id>|<index>/<total>|<payload_fragment>
 MCBEWS|UI_CHAT|<msg_id>|<index>/<total>|<payload_fragment>
 ```
 
-## 宿主接入点
+## 链路 D：会话管理协议（session v1）
+
+会话管理协议允许 Addon UI 以结构化方式操作 Python 侧的会话（对话），覆盖 `AGENT 对话` 命令的完整操作集。
+
+### 请求格式（Addon → Python）
+
+Addon 通过 `MCBEWS_BRIDGE` 模拟玩家的聊天分片发送，格式：
+
+```text
+MCBEWS|SESSION|<json>
+```
+
+JSON 字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `request_id` | string | 是 | 请求唯一 ID，响应中原样带回 |
+| `action` | string | 是 | 操作名称（见下方全集） |
+| `player_name` | string | 否 | 目标玩家名 |
+| `cid` | string | 否 | conversation_id（new/switch 用） |
+| `sid` | string | 否 | session_id（restore/delete 用） |
+| `v` | number | 否 | 协议版本，当前为 1 |
+
+### 操作全集
+
+| action | 对应命令 | 所需参数 | 说明 |
+|--------|----------|----------|------|
+| `list` | `AGENT 对话 list` | 无 | 列出当前连接内所有对话 |
+| `new` | `AGENT 对话 new` | `cid`（可选） | 新建并切换到指定/自动 ID 的对话 |
+| `switch` | `AGENT 对话 switch` | `cid`（必填） | 切换到指定对话 |
+| `status` | `AGENT 对话 status` | 无 | 当前对话状态 |
+| `clear` | `AGENT 对话 clear` | 无 | 清除当前对话历史 |
+| `save` | `AGENT 对话 save` | 无 | 保存当前对话到持久化存储 |
+| `restore` | `AGENT 对话 restore` | `sid`（必填） | 从持久化存储恢复会话 |
+| `saved` | `AGENT 对话 saved` | 无 | 列出已保存的会话 |
+| `delete` | `AGENT 对话 delete` | `sid`（必填） | 删除已保存的会话 |
+| `compress` | `AGENT 对话 compress` | 无 | 手动压缩当前对话 |
+
+### 响应格式（Python → Addon）
+
+Python 向 Addon 回发 `scriptevent mcbews:session_resp <json>`，JSON 格式：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `request_id` | string | 原请求 ID |
+| `v` | number | 协议版本 1 |
+| `ok` | boolean | 操作是否成功 |
+| `action` | string | 原操作名称 |
+| `data` | object/null | 结构化响应数据（见下方按 action） |
+| `error` | string/null | 错误消息（`ok=false` 时非空） |
+
+### 按 action 的 data 结构
+
+**list**:
+```json
+{
+  "conversations": [
+    {"id": "chat-...", "short_id": 1, "title": "...", "message_count": 5, "is_active": true}
+  ]
+}
+```
+
+**saved**:
+```json
+{
+  "saved": [
+    {"session_id": "...", "title": "...", "message_count": 5, "updated_at": "2026-08-08T..."}
+  ]
+}
+```
+
+**status**:
+```json
+{
+  "conversation_id": "chat-...",
+  "short_id": 1,
+  "title": "...",
+  "turns": 5,
+  "max_history_turns": 50,
+  "context_enabled": true,
+  "title_status": "ready"
+}
+```
+
+**new** / **switch**:
+```json
+{
+  "conversation_id": "chat-...",
+  "short_id": 1,
+  "title": "...",
+  "message_count": 0
+}
+```
+
+**clear / save / restore / delete / compress**: 返回 `{"message": "..."}` 文本结果文本。
+
+### 宿主接入
+
+| 组件 | 路径 |
+|------|------|
+| 协议入口 | `services/gateway/hook.py`（`on_player_message` 检测 SESSION 前缀并 fire-and-forget） |
+| 会话处理 | `services/gateway/command_handlers.py`（`handle_session_req` 复用 `_handle_conversation`） |
+| 响应桥 | `services/gateway/broker_bridge.py`（`_session_resp` 路由 session_resp→scriptevent） |
+| SDK 常量 | `mcbe-ws-sdk` 的 `McbewsV1Profile`（`session_request_message_id` / `session_response_message_id`） |
+| Addon 发送 | `MCBE-AI-Agent-addon/scripts/bridge/sessionClient.ts` |
+
+
+## text_resp 帧扩展
+
+`mcbews:text_resp` 帧在现有 6 字段（`id, i, n, p, r, c`）基础上扩展可选字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `cid` | string | conversation_id，缺省不输出 |
+| `t` | string | 对话标题，缺省不输出 |
+| `u` | object | usage 信息 `{i: input_tokens, o: output_tokens}`，缺省不输出 |
+
+缺省时帧结构与旧格式逐字节一致，旧 Addon 解析器按未知字段忽略处理（JSON 天然兼容）。
+
+## UI Chat 扩展
+
+`MCBEWS|UI_CHAT` 上行 payload 扩展可选字段 `cid`（conversation_id），Addon 发聊天时携带当前会话 ID。
+
+## 宿主接入点更新
 
 | 组件 | 路径 |
 |------|------|
@@ -129,6 +255,7 @@ MCBEWS|UI_CHAT|<msg_id>|<index>/<total>|<payload_fragment>
 | 设置映射 | `services/gateway/settings_map.py` |
 | Hook / 命令 | `services/gateway/hook.py`, `command_handlers.py` |
 | Broker 出站 | `services/gateway/broker_bridge.py` |
+| 会话协议入口 | `services/gateway/hook.py`（SESSION 前缀）, `command_handlers.py`（handle_session_req） |
 | WS command 关联 | `services/gateway/ws_command_runner.py` |
 | 宿主 Addon 常量 | `MCBE-AI-Agent-addon/scripts/bridge/constants.ts` |
 | 推荐 SDK Addon 参考 | `mcbe-ws-sdk/addon/scripts/bridge/` |

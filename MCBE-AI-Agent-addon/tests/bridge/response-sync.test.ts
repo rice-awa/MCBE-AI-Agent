@@ -9,7 +9,7 @@ import {
   setActiveUiState,
 } from "../../scripts/bridge/responseSync";
 import { AGENT_UI_STATE_PROPERTY_KEY, saveAgentUiState } from "../../scripts/ui/storage";
-import { createAgentUiState } from "../../scripts/ui/state";
+import { createAgentUiStateV2 } from "../../scripts/ui/state";
 
 const PLAYER_ID = "player-1";
 const PLAYER_NAME = "TestPlayer";
@@ -22,7 +22,7 @@ describe("response sync", () => {
 
   it("refreshes the active conversation when an assistant response completes", () => {
     const player = createFakePlayer();
-    const uiState = createAgentUiState();
+    const uiState = createAgentUiStateV2();
     let refreshCount = 0;
     uiState.refreshConversation = () => {
       refreshCount += 1;
@@ -44,8 +44,9 @@ describe("response sync", () => {
       }),
     });
 
-    expect(uiState.history).toHaveLength(1);
-    expect(uiState.history[0]).toMatchObject({
+    const defaultBucket = uiState.conversations["default"];
+    expect(defaultBucket.history).toHaveLength(1);
+    expect(defaultBucket.history[0]).toMatchObject({
       role: "assistant",
       content: "你好，玩家",
       source: "python",
@@ -58,17 +59,17 @@ describe("response sync", () => {
 
   it("ignores python user echoes that already exist as UI-submitted prompts", () => {
     const player = createFakePlayer();
-    const uiState = createAgentUiState({
-      history: [
-        {
-          id: "ui-1",
-          role: "user",
-          content: "你有什么工具",
-          createdAt: 1,
-          source: "ui",
-        },
-      ],
-    });
+    const uiState = createAgentUiStateV2();
+    // Pre-populate with a user message from the UI
+    uiState.conversations.default.history = [
+      {
+        id: "ui-1",
+        role: "user",
+        content: "你有什么工具",
+        createdAt: 1,
+        source: "ui",
+      },
+    ];
     let refreshCount = 0;
     uiState.refreshConversation = () => {
       refreshCount += 1;
@@ -91,8 +92,8 @@ describe("response sync", () => {
       }),
     });
 
-    expect(uiState.history).toHaveLength(1);
-    expect(uiState.history[0]).toMatchObject({
+    expect(uiState.conversations.default.history).toHaveLength(1);
+    expect(uiState.conversations.default.history[0]).toMatchObject({
       role: "user",
       content: "你有什么工具",
       source: "ui",
@@ -100,8 +101,9 @@ describe("response sync", () => {
     expect(refreshCount).toBe(0);
 
     const persisted = JSON.parse(String(player.getDynamicProperty(AGENT_UI_STATE_PROPERTY_KEY)));
-    expect(persisted.history).toHaveLength(1);
-    expect(persisted.history[0]).toMatchObject({
+    expect(persisted.conversations).toHaveLength(1);
+    expect(persisted.conversations[0].history).toHaveLength(1);
+    expect(persisted.conversations[0].history[0]).toMatchObject({
       role: "user",
       content: "你有什么工具",
       source: "ui",

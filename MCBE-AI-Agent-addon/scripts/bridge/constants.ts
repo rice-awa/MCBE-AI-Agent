@@ -27,3 +27,10 @@ export const BRIDGE_MAX_CHUNK_CONTENT_CODE_POINTS = 256;
 export const TEXT_RESP_MESSAGE_ID = "mcbews:text_resp";
 /** @deprecated Use TEXT_RESP_MESSAGE_ID */
 export const AI_RESP_MESSAGE_ID = TEXT_RESP_MESSAGE_ID;
+
+/** Session request event id. The addon sends MCBEWS|SESSION|<json> chat. */
+export const SESSION_REQ_MESSAGE_ID = "mcbews:session_req";
+/** Session response scriptevent id from Python. */
+export const SESSION_RESP_MESSAGE_ID = "mcbews:session_resp";
+/** Chat prefix for session requests from addon bridge player. */
+export const SESSION_REQ_PREFIX = "MCBEWS|SESSION";

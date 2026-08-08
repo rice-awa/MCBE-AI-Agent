@@ -2,7 +2,7 @@ import type { Player } from "@minecraft/server";
 
 import { createCustomForm, createDduiObservable, showCustomFormSafely } from "../forms/formAdapter";
 import { clearHistory } from "../history";
-import type { AgentUiDelivery, AgentUiState } from "../state";
+import type { AgentUiDelivery, AgentUiStateV2 } from "../state";
 import { saveAgentUiState } from "../storage";
 import { syncLocalHistoryCount } from "../stats";
 import type { AgentPanelRoute } from "./routes";
@@ -10,12 +10,14 @@ import { CLOSE_ROUTE, MAIN_ROUTE } from "./routes";
 
 const DELIVERY_OPTIONS: AgentUiDelivery[] = ["tellraw", "scriptevent"];
 
-export async function showSettingsPanel(player: Player, uiState: AgentUiState): Promise<AgentPanelRoute> {
+/**
+ * 设置面板 v2：移除 maxHistoryItems 和 responsePreviewLength。
+ * 保留 autoSaveHistory, showToolEvents, defaultDelivery。
+ */
+export async function showSettingsPanel(player: Player, uiState: AgentUiStateV2): Promise<AgentPanelRoute> {
   try {
     const autoSaveHistory = createDduiObservable(uiState.settings.autoSaveHistory);
-    const maxHistoryItems = createDduiObservable(uiState.settings.maxHistoryItems);
     const showToolEvents = createDduiObservable(uiState.settings.showToolEvents);
-    const responsePreviewLength = createDduiObservable(uiState.settings.responsePreviewLength);
     const defaultDeliveryIndex = Math.max(0, DELIVERY_OPTIONS.indexOf(uiState.settings.defaultDelivery));
     const defaultDelivery = createDduiObservable(defaultDeliveryIndex);
     let didSave = false;
@@ -28,28 +30,20 @@ export async function showSettingsPanel(player: Player, uiState: AgentUiState): 
       .spacer()
       .toggle("自动保存历史", autoSaveHistory)
       .spacer()
-      .slider("历史保留条数", maxHistoryItems, 10, 50, { step: 5 })
-      .spacer()
-      .toggle("显示工具事件", showToolEvents)
-      .spacer()
-      .slider("响应预览长度", responsePreviewLength, 60, 240, { step: 20 })
+      .toggle("显示工具事件", showToolEvents, { description: "控制全量对话预览中是否显示工具事件" })
       .spacer()
       .dropdown(
         "默认响应方式",
         defaultDelivery,
-        DELIVERY_OPTIONS.map((option, index) => ({ label: option, value: index }))
+        DELIVERY_OPTIONS.map((option, index) => ({ label: option, value: index })),
       )
       .spacer()
       .button("保存", () => {
         uiState.settings = {
           autoSaveHistory: autoSaveHistory.getData(),
-          maxHistoryItems: clampToStep(maxHistoryItems.getData(), 10, 50, 5),
           showToolEvents: showToolEvents.getData(),
-          responsePreviewLength: clampToStep(responsePreviewLength.getData(), 60, 240, 20),
           defaultDelivery: DELIVERY_OPTIONS[defaultDelivery.getData()] ?? "tellraw",
         };
-        uiState.history = uiState.history.slice(-uiState.settings.maxHistoryItems);
-        uiState.stats.localHistoryCount = uiState.history.length;
 
         const saveResult = saveAgentUiState(player, uiState);
         didSave = true;
@@ -59,8 +53,12 @@ export async function showSettingsPanel(player: Player, uiState: AgentUiState): 
         form.close();
       })
       .button("清空历史", () => {
-        uiState.history = clearHistory(uiState.history);
-        uiState.stats = syncLocalHistoryCount(uiState.stats, 0);
+        // Clear history of active conversation only
+        const activeBucket = uiState.conversations[uiState.activeConversationId];
+        if (activeBucket) {
+          activeBucket.history = clearHistory(activeBucket.history);
+        }
+        uiState.stats = syncLocalHistoryCount(uiState.stats, activeBucket?.history.length ?? 0);
         uiState.lastResponsePreview.setData("");
         saveAgentUiState(player, uiState);
         didSave = true;
@@ -83,9 +81,4 @@ export async function showSettingsPanel(player: Player, uiState: AgentUiState): 
     saveAgentUiState(player, uiState);
     return CLOSE_ROUTE;
   }
-}
-
-function clampToStep(value: number, min: number, max: number, step: number): number {
-  const stepped = Math.round((value - min) / step) * step + min;
-  return Math.min(max, Math.max(min, stepped));
 }
