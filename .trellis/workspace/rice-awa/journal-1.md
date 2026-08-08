@@ -265,3 +265,25 @@ review近期6项任务完成状态，确认方案四和方案五已完成；合�
 ### Status
 
 [OK] **Completed**
+
+
+## Session 7: DDUI 待审批 UI 与 byte budget 修复
+
+**Date**: 2026-08-08
+**Task**: DDUI 待审批 UI 与 byte budget 修复
+**Branch**: `dev`
+
+### Summary
+
+1) 后端：_compact_usage 精简 usage+SDK encode_frame 添加 u 字段+_ai_sync 修复非法 kwarg；2) StreamChunk 新增审批字段+worker 填充元数据+broker_bridge 审批帧发送+hook 路由审批命令；3) Addon：ApprovalInfo 类型+审批帧解析+主面板审批按钮与状态显示
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `bc00c53` | (see git log) |
+| `0a1ff32` | (see git log) |
+
+### Status
+
+[OK] **Completed**

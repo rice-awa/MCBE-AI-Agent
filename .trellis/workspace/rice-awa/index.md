@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 6
+- **Total Sessions**: 7
 - **Last Active**: 2026-08-08
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~267 | Active |
+| `journal-1.md` | ~289 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 7 | 2026-08-08 | DDUI 待审批 UI 与 byte budget 修复 | `bc00c53`, `0a1ff32` | `dev` |
 | 6 | 2026-08-08 | DDUI 流式打字机 + 会话管理协议化 + 面板重构 | `930d145` | `feature/ddui-streaming-sessions` |
 | 5 | 2026-08-08 | 接入 Anthropic 接口并支持自定义 base_url（官方/第三方兼容端点） | `b9bbabd` | `dev` |
 | 4 | 2026-08-07 | finish-work: 架构优化六项方案全部完成 | `4025b4a`, `22aa9bd`, `64b783f`, `f13978d` | `dev` |
