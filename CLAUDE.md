@@ -104,7 +104,7 @@ feature/* / fix/* / refactor/*  →  dev  →  master
 
 1. `master` 是稳定发布线，`dev` 是日常集成线；发布只从已验证的 `dev` 合入 `master`。
 2. 错别字、少量文档整理、简单配置调整等低风险小改动可直接提交到 `dev`，提交前运行相关检查。
-3. 新功能、非简单 bug 修复和跨模块改动从最新 `dev` 创建主题分支：`git fetch origin && git switch -c <type>/<name> origin/dev`，完成后合入 `dev`。
+3. 新功能、非简单 bug 修复和跨模块改动从最新 `dev` 创建主题分支：`git fetch origin && git switch -c <type>/<name> origin/dev`，完成后合入 `dev`。合并时默认使用 `--no-ff` 保留分支拓扑。
 4. 实现、测试和配套文档属于同一主题时放在同一分支 / PR；普通文档不单独创建 `docs/*` 分支。
 5. 新功能分支统一使用 `feature/*`，不使用 `feat/*`；`feat` 仅用于提交类型。其他允许的分支类型为 `fix/*`、`refactor/*`、`test/*`、`chore/*`。
 6. 合并完成后及时删除主题分支；紧急生产修复若从 `master` 拉出，合入后立即同步回 `dev`。
