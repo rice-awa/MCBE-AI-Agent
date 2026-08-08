@@ -25,6 +25,7 @@ export type AgentUiState = {
   history: HistoryItem[];
   settings: AgentUiSettings;
   stats: AgentUiStats;
+  refreshConversation?: () => void;
 };
 
 export type AgentUiStateInput = Partial<{

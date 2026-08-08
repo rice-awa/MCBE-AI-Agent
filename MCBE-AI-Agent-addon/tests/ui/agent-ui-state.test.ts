@@ -1,17 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import { buildAgentChatCommand, isUiTriggerItem } from "../../scripts/ui/commands";
-import {
-  appendHistoryItem,
-  clearHistory,
-  getHistoryPage,
-  summarizeHistoryItem,
-} from "../../scripts/ui/history";
-import {
-  createAgentUiState,
-  DEFAULT_AGENT_UI_SETTINGS,
-  DEFAULT_AGENT_UI_STATS,
-} from "../../scripts/ui/state";
+import { appendHistoryItem, clearHistory, getHistoryPage, summarizeHistoryItem } from "../../scripts/ui/history";
+import { createAgentUiState, DEFAULT_AGENT_UI_SETTINGS, DEFAULT_AGENT_UI_STATS } from "../../scripts/ui/state";
 import { loadAgentUiState, saveAgentUiState } from "../../scripts/ui/storage";
 
 describe("agent ui state", () => {
@@ -164,25 +155,12 @@ describe("agent UI history", () => {
         createdAt: 6,
         source: "python",
       },
-      5,
+      5
     );
 
-    expect(nextHistory.map((item) => item.id)).toEqual([
-      "item-2",
-      "item-3",
-      "item-4",
-      "item-5",
-      "item-6",
-    ]);
-    expect(getHistoryPage(nextHistory, 0, 3).items.map((item) => item.id)).toEqual([
-      "item-6",
-      "item-5",
-      "item-4",
-    ]);
-    expect(getHistoryPage(nextHistory, 1, 3).items.map((item) => item.id)).toEqual([
-      "item-3",
-      "item-2",
-    ]);
+    expect(nextHistory.map((item) => item.id)).toEqual(["item-2", "item-3", "item-4", "item-5", "item-6"]);
+    expect(getHistoryPage(nextHistory, 0, 3).items.map((item) => item.id)).toEqual(["item-6", "item-5", "item-4"]);
+    expect(getHistoryPage(nextHistory, 1, 3).items.map((item) => item.id)).toEqual(["item-3", "item-2"]);
   });
 
   it("summarizes long history items for form display", () => {
@@ -194,7 +172,7 @@ describe("agent UI history", () => {
         createdAt: 0,
         source: "ui",
       },
-      10,
+      10
     );
 
     expect(summary).toContain("[user/ui]");
@@ -211,7 +189,7 @@ describe("agent UI history", () => {
           createdAt: 1,
           source: "ui",
         },
-      ]),
+      ])
     ).toEqual([]);
   });
 });

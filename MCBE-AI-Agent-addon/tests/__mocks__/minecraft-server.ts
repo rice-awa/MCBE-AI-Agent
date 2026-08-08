@@ -1,10 +1,25 @@
 // Mock for @minecraft/server - provides minimal stubs for vitest unit tests
 
+type ScriptEventCallback = (event: { id: string; message: string }) => void;
+
+const scriptEventSubscribers = new Set<ScriptEventCallback>();
+
+export function __emitScriptEvent(event: { id: string; message: string }): void {
+  for (const subscriber of scriptEventSubscribers) {
+    subscriber(event);
+  }
+}
+
 export const system = {
   afterEvents: {
     scriptEventReceive: {
-      subscribe: () => {},
-      unsubscribe: () => {},
+      subscribe: (callback: ScriptEventCallback) => {
+        scriptEventSubscribers.add(callback);
+        return callback;
+      },
+      unsubscribe: (callback: ScriptEventCallback) => {
+        scriptEventSubscribers.delete(callback);
+      },
     },
   },
   currentTick: 0,
@@ -69,7 +84,7 @@ export function __setBlock(
     isWaterlogged?: boolean;
     components?: Record<string, unknown>;
     isValid?: boolean;
-  } = {},
+  } = {}
 ): MockBlock {
   const typeId = opts.typeId ?? "minecraft:air";
   const isAir = opts.isAir ?? typeId === "minecraft:air";
@@ -122,10 +137,7 @@ export class BlockPermutation {
     this.states = { ...states };
   }
 
-  static resolve(
-    typeId: string,
-    states?: Record<string, string | number | boolean>,
-  ): BlockPermutation {
+  static resolve(typeId: string, states?: Record<string, string | number | boolean>): BlockPermutation {
     if (!typeId || typeof typeId !== "string") {
       throw new Error("Invalid block type");
     }
@@ -155,10 +167,7 @@ export class BlockPermutation {
 export class BlockVolume {
   from: { x: number; y: number; z: number };
   to: { x: number; y: number; z: number };
-  constructor(
-    from: { x: number; y: number; z: number },
-    to: { x: number; y: number; z: number },
-  ) {
+  constructor(from: { x: number; y: number; z: number }, to: { x: number; y: number; z: number }) {
     this.from = from;
     this.to = to;
   }
@@ -220,12 +229,37 @@ export const BlockTypes = {
 const players: Array<{
   name: string;
   location: { x: number; y: number; z: number };
-  dimension: { id: string; getBlock: (loc: { x: number; y: number; z: number }) => MockBlock | undefined; fillBlocks?: Function; runCommand?: Function; getEntities?: Function };
+  dimension: {
+    id: string;
+    getBlock: (loc: { x: number; y: number; z: number }) => MockBlock | undefined;
+    fillBlocks?: Function;
+    runCommand?: Function;
+    getEntities?: Function;
+  };
   getRotation: () => { x: number; y: number };
   getTags?: () => string[];
   getGameMode?: () => string;
   getComponent?: () => undefined;
 }> = [];
+
+/**
+ * Reset player list, block store and scriptevent subscribers between tests
+ * (DDUI panel tests and responseSync tests).
+ */
+export function __resetMinecraftServerMock(): void {
+  players.length = 0;
+  blockStore.clear();
+  scriptEventSubscribers.clear();
+}
+
+/**
+ * Set the mock player list directly (DDUI panel tests use raw player objects
+ * with fields like id/name/getDynamicProperty/sendMessage).
+ */
+export function __setMockPlayers(list: unknown[]): void {
+  players.length = 0;
+  players.push(...(list as Array<(typeof players)[number]>));
+}
 
 export function __setPlayers(
   list: Array<{
@@ -233,7 +267,7 @@ export function __setPlayers(
     location: { x: number; y: number; z: number };
     dimensionId?: string;
     yaw?: number;
-  }>,
+  }>
 ): void {
   players.length = 0;
   for (const p of list) {
@@ -264,10 +298,7 @@ function createDimension(id: string) {
         isAir: true,
       });
     },
-    fillBlocks(
-      volume: BlockVolume,
-      permutation: BlockPermutation,
-    ) {
+    fillBlocks(volume: BlockVolume, permutation: BlockPermutation) {
       const minX = Math.min(volume.from.x, volume.to.x);
       const maxX = Math.max(volume.from.x, volume.to.x);
       const minY = Math.min(volume.from.y, volume.to.y);

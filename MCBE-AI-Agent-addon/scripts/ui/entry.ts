@@ -3,8 +3,7 @@ import type { Player } from "@minecraft/server";
 
 import { isUiTriggerItem } from "./commands";
 import { showAgentConsole } from "./panels/agentConsole";
-import { showChatInputPanel } from "./panels/chatInput";
-import { showHistoryPanel } from "./panels/historyPanel";
+import { showMorePanel } from "./panels/morePanel";
 import type { AgentPanelRoute } from "./panels/routes";
 import { showSettingsPanel } from "./panels/settingsPanel";
 import { showStatsPanel } from "./panels/statsPanel";
@@ -57,11 +56,8 @@ export async function openAgentUi(player: Player): Promise<void> {
         case "main":
           route = await showAgentConsole(player, uiState);
           break;
-        case "chatInput":
-          route = await showChatInputPanel(player, uiState);
-          break;
-        case "history":
-          route = await showHistoryPanel(player, uiState, route.pageIndex ?? 0);
+        case "more":
+          route = await showMorePanel(player, uiState);
           break;
         case "settings":
           route = await showSettingsPanel(player, uiState);

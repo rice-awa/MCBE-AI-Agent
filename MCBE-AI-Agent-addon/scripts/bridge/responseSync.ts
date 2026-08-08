@@ -39,6 +39,12 @@ export function clearActiveUiState(playerId: string): void {
   activeUiStates.delete(playerId);
 }
 
+export function resetResponseSyncForTests(): void {
+  chunkBuffers.clear();
+  activeUiStates.clear();
+  isRegistered = false;
+}
+
 /**
  * 注册 scriptEventReceive 订阅，监听 mcbews:text_resp 分片。
  */
@@ -114,37 +120,39 @@ function onMessageComplete(playerName: string, role: HistoryRole, text: string):
   // 尝试从内存中的活跃 UI 状态更新
   const activeState = activeUiStates.get(targetPlayer.id);
   if (activeState) {
-    activeState.history = appendHistoryItem(
-      activeState.history,
-      historyItem,
-      activeState.settings.maxHistoryItems,
-    );
+    // 用户 UI 回显去重：如果此条目与用户 UI 发送的回显内容相同则跳过
+    if (isDuplicateUiUserEcho(activeState.history, historyItem)) {
+      return;
+    }
+
+    activeState.history = appendHistoryItem(activeState.history, historyItem, activeState.settings.maxHistoryItems);
 
     // 仅 assistant 角色更新响应预览
     if (role === "assistant") {
       activeState.bridgeStatus.setData("ready");
       const previewLength = activeState.settings.responsePreviewLength;
       activeState.lastResponsePreview.setData(
-        text.length > previewLength ? `${text.slice(0, previewLength)}...` : text,
+        text.length > previewLength ? `${text.slice(0, previewLength)}...` : text
       );
     }
+
+    // 实时刷新 DDUI 面板
+    activeState.refreshConversation?.();
   }
 
   // 持久化到 DynamicProperty
   try {
     const uiState = loadAgentUiState(targetPlayer);
-    uiState.history = appendHistoryItem(
-      uiState.history,
-      historyItem,
-      uiState.settings.maxHistoryItems,
-    );
+    if (isDuplicateUiUserEcho(uiState.history, historyItem)) {
+      return;
+    }
+
+    uiState.history = appendHistoryItem(uiState.history, historyItem, uiState.settings.maxHistoryItems);
 
     if (role === "assistant") {
       uiState.bridgeStatus.setData("ready");
       const previewLength = uiState.settings.responsePreviewLength;
-      uiState.lastResponsePreview.setData(
-        text.length > previewLength ? `${text.slice(0, previewLength)}...` : text,
-      );
+      uiState.lastResponsePreview.setData(text.length > previewLength ? `${text.slice(0, previewLength)}...` : text);
     }
 
     const result = saveAgentUiState(targetPlayer, uiState);
@@ -154,4 +162,20 @@ function onMessageComplete(playerName: string, role: HistoryRole, text: string):
   } catch {
     // DynamicProperty 读写可能因世界未就绪而失败
   }
+}
+
+/**
+ * 判断历史条目是否为用户 UI 发送回显的重复（去重逻辑）。
+ * 当用户通过 DDUI 面板发送消息时，source 为 "ui" 的条目已写入本地。
+ * Python 回写历史时 source 为 "python"，内容相同则跳过以免重复。
+ */
+function isDuplicateUiUserEcho(history: HistoryItem[], item: HistoryItem): boolean {
+  if (item.role !== "user" || item.source !== "python") {
+    return false;
+  }
+
+  return history.some(
+    (existing) =>
+      existing.role === "user" && existing.source === "ui" && existing.content.trim() === item.content.trim()
+  );
 }
