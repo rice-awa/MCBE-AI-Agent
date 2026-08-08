@@ -786,6 +786,47 @@ def test_anthropic_model_receives_timeout_via_http_client(monkeypatch):
     assert captured["http_timeout"] == 33
     assert captured["provider_name"] == "anthropic"
     assert captured["provider_kwargs"]["http_client"] == "anthropic-http"
+    # 未配置 base_url 时，不传 base_url（退回官方默认）
+    assert "base_url" not in captured["provider_kwargs"]
+
+
+def test_anthropic_model_passes_custom_base_url(monkeypatch):
+    registry = RuntimeAdapterRegistry()
+    captured = {}
+
+    class FakeAnthropicModel:
+        def __init__(self, model, provider=None):
+            captured["model"] = model
+            captured["provider"] = provider
+
+    class FakeAnthropicProvider:
+        def __init__(self, **kwargs):
+            captured["provider_kwargs"] = kwargs
+
+    import pydantic_ai.models.anthropic as anthropic_models
+    import pydantic_ai.providers.anthropic as anthropic_providers
+
+    monkeypatch.setattr(anthropic_models, "AnthropicModel", FakeAnthropicModel)
+    monkeypatch.setattr(anthropic_providers, "AnthropicProvider", FakeAnthropicProvider)
+    monkeypatch.setattr(
+        registry,
+        "_get_or_create_http_client",
+        lambda config, name: "anthropic-http",
+    )
+
+    registry._create_anthropic_model(
+        provider_config(
+            name="anthropic",
+            model="deepseek-test",
+            api_key="k",
+            base_url="https://api.deepseek.com/anthropic",
+        )
+    )
+
+    assert captured["model"] == "deepseek-test"
+    assert captured["provider_kwargs"]["base_url"] == "https://api.deepseek.com/anthropic"
+    assert captured["provider_kwargs"]["api_key"] == "k"
+    assert captured["provider_kwargs"]["http_client"] == "anthropic-http"
 
 
 def test_ollama_model_receives_base_url_and_timeout(monkeypatch):

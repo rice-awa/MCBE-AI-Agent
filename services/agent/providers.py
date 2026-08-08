@@ -145,6 +145,7 @@ class RuntimeAdapterRegistry:
         logger.info(
             "creating_anthropic_model",
             model=config.model,
+            base_url=config.base_url or "https://api.anthropic.com (default)",
             timeout=config.timeout,
         )
 
@@ -152,12 +153,15 @@ class RuntimeAdapterRegistry:
         from pydantic_ai.providers.anthropic import AnthropicProvider
 
         http_client = self._get_or_create_http_client(config, "anthropic")
+        provider_kwargs: dict[str, Any] = {
+            "api_key": config.api_key,
+            "http_client": http_client,
+        }
+        if config.base_url:
+            provider_kwargs["base_url"] = config.base_url
         return AnthropicModel(
             config.model,
-            provider=AnthropicProvider(
-                api_key=config.api_key,
-                http_client=http_client,
-            ),
+            provider=AnthropicProvider(**provider_kwargs),
         )
 
     def _create_ollama_model(self, config: LLMProviderConfig) -> Model:

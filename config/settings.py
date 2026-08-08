@@ -464,6 +464,8 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["anthropic_api_key"] = anthropic["api_key"]
     if "model" in anthropic:
         result["anthropic_model"] = anthropic["model"]
+    if "base_url" in anthropic:
+        result["anthropic_base_url"] = anthropic["base_url"]
 
     ollama = providers.get("ollama", {})
     if "base_url" in ollama:
@@ -754,6 +756,8 @@ class Settings(BaseSettings):
     # Anthropic 配置
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
     anthropic_model: str = "claude-sonnet-5"
+    # 官方默认 api.anthropic.com；配置第三方 Anthropic 兼容端点（如 DeepSeek https://api.deepseek.com/anthropic）
+    anthropic_base_url: str | None = None
 
     # Ollama 配置
     ollama_base_url: str = "http://localhost:11434"
@@ -976,6 +980,7 @@ class Settings(BaseSettings):
             return LLMProviderConfig(
                 name="anthropic",
                 api_key=self.anthropic_api_key,
+                base_url=self.anthropic_base_url,
                 model=self.anthropic_model,
                 enabled=self.anthropic_api_key is not None,
                 context_window=get_context_window("anthropic", self.anthropic_model),
