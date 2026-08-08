@@ -100,6 +100,27 @@ Python 出站长文本的分片由 SDK 的 `McbewsV1Delivery` / `McbeOutboundDel
 - `t` — （v2 新增）会话标题，面板用它显示标题
 - `u` — （v2 新增）token 统计 `{ i: input, o: output }`，通常在最后一帧携带
 
+### 审批帧（r="approval"）
+
+工具需要审批时，后端通过同一 `mcbews:text_resp` 通道发送 `r="approval"` 帧：
+
+```json
+{
+  "id": "<message-id>",
+  "i": 1, "n": 1,
+  "p": "<player_name>",
+  "r": "approval",
+  "c": "{\"approval_id\":\"ap-xxx\",\"tool_name\":\"run_world_command\",\"args_summary\":\"/time set day\",\"reason\":\"需要确认\",\"batch_id\":\"b-1\",\"batch_size\":2,\"batch_index\":1}"
+}
+```
+
+- `r="approval"` — 角色标识，`responseSync.ts` 在 `ensureStreamingState` 之前按此分支解析
+- `c` — 内层 JSON 序列化的 `ApprovalInfo`：`approval_id`（决策回传用）、`tool_name`、`args_summary`、`reason`、`batch_id/batch_size/batch_index`（批次语义）
+- 审批帧**不进对话历史**，仅刷新 `uiState.pendingApprovals` Map
+- 决策命令复用 `tell @s` 通道：`MCBEWS|TOOL_APPROVE|<id>` / `MCBEWS|TOOL_DENY|<id>`
+- 后端 `hook.on_player_message` 按前缀路由到 `handle_tool_approval`
+- 多 tool 批次：后端为批内每个 tool 各发一帧，全部决策后才 resume
+
 ### 流式渲染规则
 
 1. 按 `id` 缓冲区累积分片，按 `i` 排序后拼接 `c`。
