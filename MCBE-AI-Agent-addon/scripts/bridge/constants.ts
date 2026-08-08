@@ -34,3 +34,7 @@ export const SESSION_REQ_MESSAGE_ID = "mcbews:session_req";
 export const SESSION_RESP_MESSAGE_ID = "mcbews:session_resp";
 /** Chat prefix for session requests from addon bridge player. */
 export const SESSION_REQ_PREFIX = "MCBEWS|SESSION";
+
+/** Tool approval decision prefixes (addon -> Python via tell chat). */
+export const TOOL_APPROVE_PREFIX = "MCBEWS|TOOL_APPROVE";
+export const TOOL_DENY_PREFIX = "MCBEWS|TOOL_DENY";

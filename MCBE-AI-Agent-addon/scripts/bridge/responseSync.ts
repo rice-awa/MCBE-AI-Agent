@@ -1,10 +1,10 @@
 import { system, world } from "@minecraft/server";
 import type { Player } from "@minecraft/server";
 
-import { TEXT_RESP_MESSAGE_ID } from "./constants";
+import { TEXT_RESP_MESSAGE_ID, TOOL_APPROVE_PREFIX, TOOL_DENY_PREFIX } from "./constants";
 import { appendHistoryItem, createHistoryId } from "../ui/history";
 import type { HistoryItem, HistoryRole } from "../ui/history";
-import type { AgentUiStateV2, AgentUiState } from "../ui/state";
+import type { AgentUiStateV2, AgentUiState, ApprovalInfo } from "../ui/state";
 import {
   PERSISTED_HISTORY_LIMIT,
   loadAgentUiState,
@@ -244,14 +244,35 @@ function handleChunk(chunk: AiRespChunk): void {
     return;
   }
 
+  // Compute sorted prefix: sort all known chunks by index, concatenate
+  const sortedChunks = [...buffer.values()].sort((a, b) => a.i - b.i);
+  const fullText = sortedChunks.map((c) => c.c).join("");
+
+  // ── Handle approval frames ──
+  if (role === "approval") {
+    // Wait for all chunks
+    if (buffer.size < n) {
+      return;
+    }
+    chunkBuffers.delete(id);
+
+    // Parse approval info from assembled content
+    try {
+      const approvalInfo = JSON.parse(fullText) as ApprovalInfo;
+      if (activeState && isV2State(activeState)) {
+        activeState.pendingApprovals.set(approvalInfo.approval_id, approvalInfo);
+        activeState.refreshConversation?.();
+      }
+    } catch {
+      // Ignore parse errors
+    }
+    return;
+  }
+
   // ── Streaming incremental output ──
 
   // Ensure streaming state
   const streamState = ensureStreamingState(conversationId, Date.now());
-
-  // Compute sorted prefix: sort all known chunks by index, concatenate
-  const sortedChunks = [...buffer.values()].sort((a, b) => a.i - b.i);
-  const fullText = sortedChunks.map((c) => c.c).join("");
 
   // Update assembled text
   streamState.assembled = fullText;

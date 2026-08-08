@@ -8,6 +8,17 @@ export type ObservableLike<T> = {
   setData(value: T): void;
 };
 
+/** 待审批工具调用信息（从 addon 侧审批帧解析） */
+export type ApprovalInfo = {
+  approval_id: string;
+  tool_name: string;
+  args_summary: string;
+  reason: string;
+  batch_id: string | null;
+  batch_size: number | null;
+  batch_index: number | null;
+};
+
 export type AgentUiDelivery = "tellraw" | "scriptevent";
 
 // ── v1 Settings (legacy) ──
@@ -77,6 +88,8 @@ export type AgentUiStateV2 = {
   streamingChars: number;
   /** 实时流式文本内容（用于打字机效果展示） */
   streamingText: string;
+  /** 待审批工具调用（<approval_id, ApprovalInfo>） */
+  pendingApprovals: Map<string, ApprovalInfo>;
   refreshConversation?: () => void;
 };
 
@@ -195,6 +208,7 @@ export function createAgentUiStateV2(): AgentUiStateV2 {
     streamingConversationId: null,
     streamingChars: 0,
     streamingText: "",
+    pendingApprovals: new Map(),
   };
 }
 
