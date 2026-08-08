@@ -13,7 +13,7 @@
 - 优先做小而完整的改动，避免无关重构和过度抽象。
 - 修改玩家会话、聊天、上下文、模板、变量、模型切换或下行消息路径时，必须显式传递当前事件的 `player_name` / `sender`。
 - 新增或修改下行长文本发送路径时，必须走 `BrokerResponseBridge` 或 SDK delivery（`McbeOutboundDelivery` / `McbewsV1Delivery`），不要在调用点重复实现分片。
-- 添加新功能或修复 bug 前，按 `CLAUDE.md` 要求使用现有工具获取相关库/框架文档。
+- 查询文档和资料优先使用 `context7`（库/框架官方文档与代码示例）和 `firecrawl`（网页内容与搜索），具体流程按 `CLAUDE.md` 执行。
 - 不提交 `.env`、`config.json`、日志、密钥或其他本地敏感文件。
 
 ## 开发规范（Git 工作流）
