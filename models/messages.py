@@ -80,6 +80,13 @@ class StreamChunk(BaseMessage):
     trace_id: str | None = None
     attempt_id: str | None = None
     conversation_id: str | None = None
+    # 审批相关字段（chunk_type=="approval_required" 时携带）
+    approval_id: str | None = None
+    args_summary: str | None = None
+    approval_reason: str | None = None
+    batch_id: str | None = None
+    batch_size: int | None = None
+    batch_index: int | None = None
 
 
 class SystemNotification(BaseMessage):

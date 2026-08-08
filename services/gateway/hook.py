@@ -30,6 +30,8 @@ _EXTERNAL_SENDERS = frozenset({"外部", "External"})
 # Prefix for session request messages from the addon bridge player.
 # The addon sends MCBEWS|SESSION|<json> via tell chat from MCBEWS_BRIDGE.
 _SESSION_REQ_PREFIX = "MCBEWS|SESSION|"
+_TOOL_APPROVE_PREFIX = "MCBEWS|TOOL_APPROVE|"
+_TOOL_DENY_PREFIX = "MCBEWS|TOOL_DENY|"
 
 
 class HostConnectionHook(NoOpHook):
@@ -208,6 +210,20 @@ class HostConnectionHook(NoOpHook):
                     sender=player_event.sender,
                     error=str(exc),
                 )
+                return
+
+        # Route tool approval/deny commands from the addon UI
+        for prefix, approved in ((_TOOL_APPROVE_PREFIX, True), (_TOOL_DENY_PREFIX, False)):
+            if player_event.message.startswith(prefix):
+                approval_id = player_event.message[len(prefix):].strip()
+                task = asyncio.create_task(
+                    self.handlers.handle_tool_approval(
+                        state, approval_id, approved=approved,
+                        player_name=player_event.sender,
+                    ),
+                    name=f"host-tool-approval:{state.id}",
+                )
+                self._track(task)
                 return
 
         task = asyncio.create_task(

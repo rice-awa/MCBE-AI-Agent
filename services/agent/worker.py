@@ -2282,6 +2282,7 @@ class AgentWorker:
             )
             store.put(pending)
             approval_ids.append(approval_id)
+            approval_ids_in_batch = len(approval_ids)  # 1-based index
 
             if trace_context is not None:
                 # tool.proposed is already emitted by harness call_tool; worker
@@ -2333,6 +2334,12 @@ class AgentWorker:
                 player_name=request.player_name,
                 target=stream_target or request.player_name,
                 tool_name=call.tool_name,
+                approval_id=approval_id,
+                args_summary=args_summary,
+                approval_reason=meta.get("reason") or "需要确认",
+                batch_id=batch_id,
+                batch_size=len(sibling_ids),
+                batch_index=approval_ids_in_batch,
                 **self._chunk_correlation(request),
             )
             await self.broker.send_response(connection_id, chunk)

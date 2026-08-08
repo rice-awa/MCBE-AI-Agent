@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from contextlib import suppress
 from typing import Any
@@ -28,6 +29,23 @@ from models.messages import SystemNotification as HostSystemNotification
 from services.gateway.ws_command_runner import WsCommandRunner
 
 logger = get_logger(__name__)
+
+
+def _compact_usage(usage: Any) -> dict[str, int] | None:
+    """Compact a PydanticAI usage dict to addon-friendly ``{"i","o"}`` format.
+
+    Returns ``{"i": input_tokens, "o": output_tokens}`` or ``None`` when
+    *usage* is not a dict or contains no token fields.  Accepts both
+    ``input_tokens``/``output_tokens`` (PydanticAI verbose) and
+    ``request_tokens``/``response_tokens`` (dataclass field alias) names.
+    """
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = usage.get("input_tokens") or usage.get("request_tokens")
+    output_tokens = usage.get("output_tokens") or usage.get("response_tokens")
+    if input_tokens is None and output_tokens is None:
+        return None
+    return {"i": int(input_tokens or 0), "o": int(output_tokens or 0)}
 
 
 class BrokerResponseBridge:
@@ -161,6 +179,37 @@ class BrokerResponseBridge:
         # Early-return chunk types never leave the host — skip delivery.*.
         if chunk.chunk_type == "thinking_end":
             return
+
+        # Approval_required: send structured info to addon via text_resp,
+        # then fall through to send the tellraw prompt (existing behavior).
+        if chunk.chunk_type == "approval_required":
+            try:
+                approval_json = json.dumps(
+                    {
+                        "approval_id": chunk.approval_id,
+                        "tool_name": chunk.tool_name,
+                        "args_summary": chunk.args_summary,
+                        "reason": chunk.approval_reason,
+                        "batch_id": chunk.batch_id,
+                        "batch_size": chunk.batch_size,
+                        "batch_index": chunk.batch_index,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                delivery_ap = self._delivery(state)
+                if delivery_ap is not None:
+                    v1_ap = McbewsV1Delivery(delivery_ap, profile=self._profile)
+                    asyncio.create_task(
+                        v1_ap.send_response(
+                            player_name=chunk.player_name or chunk.target or DEFAULT_PLAYER_DISPLAY_NAME,
+                            role="approval",
+                            text=approval_json,
+                        ),
+                        name=f"approval-frame:{chunk.approval_id}",
+                    )
+            except Exception as exc:
+                logger.debug("approval_frame_send_failed", error=str(exc))
 
         if chunk.chunk_type == "thinking_start":
             message = f"{MCColor.GRAY}{MCPrefix.THINKING}思考中..."
@@ -328,8 +377,7 @@ class BrokerResponseBridge:
         player_name = response.get("player_name", DEFAULT_PLAYER_DISPLAY_NAME)
         role = response.get("role", "assistant")
         text = response.get("text", "")
-        conversation_id = response.get("conversation_id")
-        usage = response.get("usage")
+        usage = _compact_usage(response.get("usage"))
         if not text:
             return
         delivery = self._delivery(state)
@@ -340,7 +388,6 @@ class BrokerResponseBridge:
             player_name=player_name,
             role=role,
             text=text,
-            conversation_id=conversation_id,
             usage=usage,
         )
 
