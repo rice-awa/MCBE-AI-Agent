@@ -1,8 +1,6 @@
 import { system, world } from "@minecraft/server";
 
-import { chunkPayload } from "./chunking";
 import {
-  BRIDGE_MAX_CHUNK_CONTENT_LENGTH,
   SESSION_REQ_PREFIX,
   SESSION_RESP_MESSAGE_ID,
   TOOL_PLAYER_NAME,
@@ -139,7 +137,7 @@ export function requestSession(
 
 /**
  * Send the session request as tell chat from the tool player.
- * Uses the same mechanism as sendUiChatMessage in toolPlayer.ts.
+ * Session payloads are small (well under 256 chars) so no chunking is needed.
  */
 function sendSessionRequest(requestId: string, payload: string): void {
   const toolPlayer = world
@@ -163,14 +161,5 @@ function sendSessionRequest(requestId: string, payload: string): void {
     return;
   }
 
-  const chunks = chunkPayload(
-    SESSION_REQ_PREFIX,
-    requestId,
-    payload,
-    BRIDGE_MAX_CHUNK_CONTENT_LENGTH,
-  );
-
-  for (const chunk of chunks) {
-    toolPlayer.runCommand(`tell @s ${chunk}`);
-  }
+  toolPlayer.runCommand(`tell @s ${SESSION_REQ_PREFIX}|${payload}`);
 }
