@@ -4,7 +4,11 @@
 
 UI 状态必须以玩家为边界。`responseSync.ts` 通过目标玩家 id 找到活跃的 `AgentUiStateV2` 或 `AgentUiState`，同时把必要状态保存到该玩家的 DynamicProperty；不要用单例状态承载所有玩家的历史、设置或响应预览。
 
-### v2 持久化格式
+DDUI persistence version `2` 是 DynamicProperty 的独立版本轴，不等于 MCBEWS/1、capability
+request schema `2`、session schema `1` 或 text response framing `1`。当前面板仍通过
+`ActionFormData` / `ModalFormData` 适配层运行；不要把 persistence `2` 写成已接入官方 DDUI API。
+
+### DDUI persistence 2 格式
 
 [`scripts/ui/storage.ts`](../../../MCBE-AI-Agent-addon/scripts/ui/storage.ts) 是 DynamicProperty 的唯一归一化边界。v2 采用 per-conversation 桶格式：
 
@@ -48,6 +52,10 @@ type PersistedAgentUiStateV2 = {
 
 ## Vitest 测试
 
+`mcbews:text_resp` 的 `usage`（compact `{i,o}`）只接受完成帧；`cid` / `t` 在同一响应的相关
+帧必须保持一致。测试至少覆盖 CJK/emoji、完成帧 usage、未知 role、metadata conflict、双玩家
+双 conversation 和 session 超限单帧错误。
+
 - `vitest.config.ts` 用 alias 把 `@minecraft/server`、`@minecraft/server-ui` 和 GameTest API 指向 `tests/__mocks__/`；依赖 Minecraft API 的测试必须使用这些 mock，不要在单元测试中连接真实世界。
 - 优先测试纯函数和边界：`chunking.test.ts` 验证确定性分片/非法长度，`agent-ui-state.test.ts` 验证默认状态、持久化过滤、历史截断、命令文本和分页。
 - router/capability 测试可以用 `vi.mock` 替换 `toolPlayer`，并通过 mock world 设置 block/player 状态；测试异步 handler 必须等待 `handleBridgeScriptEvent()` 完成后再断言。
@@ -59,6 +67,7 @@ type PersistedAgentUiStateV2 = {
 
 ```bash
 cd MCBE-AI-Agent-addon
+pnpm protocol:check
 pnpm test
 pnpm lint
 pnpm build

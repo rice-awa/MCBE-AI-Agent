@@ -23,6 +23,7 @@
 
 ```bash
 cd MCBE-AI-Agent-addon
+pnpm protocol:check
 pnpm test
 ```
 
