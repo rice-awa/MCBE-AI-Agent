@@ -58,6 +58,16 @@ describe("BoundedTextResponseAssembler", () => {
     expect(assembler.bufferCount).toBe(0);
   });
 
+  it("accepts usage when the completion frame arrives in normal order", () => {
+    const assembler = new BoundedTextResponseAssembler();
+    expect(assembler.push(chunk({ i: 1, n: 2, c: "answer " }))).toBeNull();
+    expect(assembler.push(chunk({ i: 2, n: 2, c: "done", u: { i: 3, o: 5 } }))).toMatchObject({
+      content: "answer done",
+      usage: { i: 3, o: 5 },
+    });
+    expect(assembler.bufferCount).toBe(0);
+  });
+
   it("enforces TTL, message/chunk/buffer/total byte limits and owner cleanup", () => {
     let now = 0;
     const assembler = new BoundedTextResponseAssembler(

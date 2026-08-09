@@ -250,7 +250,7 @@ export class BoundedTextResponseAssembler {
       state.role !== chunk.r ||
       state.conversationId !== conversationId ||
       state.title !== chunk.t ||
-      (chunk.i === chunk.n && !sameUsage(state.usage, chunk.u))
+      (chunk.i === chunk.n && state.usage !== undefined && !sameUsage(state.usage, chunk.u))
     ) {
       this.drop(key);
       return null;

@@ -50,6 +50,60 @@ type PersistedAgentUiStateV2 = {
 
 参考：[`scripts/ui/state.ts`](../../../MCBE-AI-Agent-addon/scripts/ui/state.ts)、[`scripts/ui/history.ts`](../../../MCBE-AI-Agent-addon/scripts/ui/history.ts)、[`scripts/bridge/responseSync.ts`](../../../MCBE-AI-Agent-addon/scripts/bridge/responseSync.ts)。
 
+## Scenario: text_resp completion-only usage 重组
+
+### 1. Scope / Trigger
+
+- 修改 `textResponseAssembler.ts`、`responseSync.ts` 或 SDK text-response vectors 时适用。
+- 该约束防止正常顺序的多帧响应在最终帧首次携带 `u` 时被误判为 metadata conflict。
+
+### 2. Signatures
+
+```typescript
+type TokenUsage = { i: number; o: number };
+type TextResponseChunk = { id: string; i: number; n: number; p: string; r: string; c: string; u?: TokenUsage };
+BoundedTextResponseAssembler.push(chunk: TextResponseChunk): TextResponseMessage | null;
+```
+
+### 3. Contracts
+
+- 非完成帧 `i < n` 不得携带 `u`；完成帧 `i == n` 可以首次携带 compact usage `{i,o}`。
+- 正常顺序与 final-first 乱序都必须可重组；buffer 在完成帧到达前允许 `state.usage` 为空。
+- 已记录 usage 后，重复完成帧必须逐字段一致；冲突时丢弃整个 stream buffer。
+- 完成结果把最终 usage 原样交给 `responseSync.ts` 的玩家+conversation 状态更新。
+
+### 4. Validation & Error Matrix
+
+| 条件 | 结果 |
+|---|---|
+| `i < n` 且存在 `u` | boundary 返回 `null`，不接受该帧 |
+| 非完成帧先到、完成帧首次带 `u` | 接受；片段齐全时返回含 usage 的完整消息 |
+| 完成帧先到且带 `u` | 缓冲 usage，等待缺失片段 |
+| 重复完成帧 usage 相同 | 幂等忽略重复帧 |
+| 重复完成帧 usage 不同或格式非法 | 丢弃该 stream buffer |
+
+### 5. Good / Base / Bad Cases
+
+- Good：`1/2` 无 `u`，随后 `2/2` 带 `{i:3,o:5}`，结果文本与 usage 均完整。
+- Base：单帧 `1/1` 可带 usage；usage 缺省时仍正常完成。
+- Bad：`1/2` 带 usage，或同一 `player+cid+id` 的两个完成帧 usage 冲突。
+
+### 6. Tests Required
+
+- `text-response-assembler.test.ts` 必须分别覆盖 normal-order final usage 与 final-first usage。
+- 断言完成消息的 `content`、`usage` 和 `bufferCount === 0`；冲突用例断言 buffer 被清理。
+- `response-sync.test.ts` 断言 usage 只更新目标玩家、目标 conversation 的 token stats。
+
+### 7. Wrong vs Correct
+
+```typescript
+// Wrong: 正常顺序下 state.usage 尚为空，会拒绝首次到达的完成帧。
+chunk.i === chunk.n && !sameUsage(state.usage, chunk.u)
+
+// Correct: 只有 buffer 已记录 usage 时才执行一致性比较。
+chunk.i === chunk.n && state.usage !== undefined && !sameUsage(state.usage, chunk.u)
+```
+
 ## Vitest 测试
 
 `mcbews:text_resp` 的 `usage`（compact `{i,o}`）只接受完成帧；`cid` / `t` 在同一响应的相关
