@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-import json
+from typing import Any
 
-from mcbe_ws_sdk import FlowControlSettings, McbeOutboundDelivery, NoOpHook
+from mcbe_ws_sdk import (
+    MCBEWS_V1,
+    FlowControlSettings,
+    McbeOutboundDelivery,
+    McbewsV1Profile,
+    MinecraftProtocolHandler,
+    NoOpHook,
+)
 from mcbe_ws_sdk.addon import AddonBridgeService
 from mcbe_ws_sdk.command.registry import ParsedCommand
 from mcbe_ws_sdk.gateway.connection import ConnectionState
+from mcbe_ws_sdk.profiles.mcbews_v1.classifier import ToolPlayerMessage
+from mcbe_ws_sdk.profiles.mcbews_v1.models import UiChatMessage
 from mcbe_ws_sdk.protocol.minecraft import (
     MinecraftCommandResponse,
     MinecraftErrorFrame,
@@ -20,19 +29,13 @@ from config.settings import Settings
 from core.queue import MessageBroker
 from services.gateway.broker_bridge import BrokerResponseBridge
 from services.gateway.command_handlers import CommandHandlers
+from services.gateway.ingress import HostAddonIngressAdapter
 from services.gateway.session_store import HostSessionStore
 from services.gateway.ws_command_runner import WsCommandRunner
-from mcbe_ws_sdk import MinecraftProtocolHandler
 
 logger = get_logger(__name__)
 
 _EXTERNAL_SENDERS = frozenset({"外部", "External"})
-# Prefix for session request messages from the addon bridge player.
-# The addon sends MCBEWS|SESSION|<json> via tell chat from MCBEWS_BRIDGE.
-_SESSION_REQ_PREFIX = "MCBEWS|SESSION|"
-_TOOL_APPROVE_PREFIX = "MCBEWS|TOOL_APPROVE|"
-_TOOL_DENY_PREFIX = "MCBEWS|TOOL_DENY|"
-
 
 class HostConnectionHook(NoOpHook):
     """SDK ConnectionHook that wires host sessions, broker, and command handlers."""
@@ -49,6 +52,7 @@ class HostConnectionHook(NoOpHook):
         handlers: CommandHandlers,
         protocol: MinecraftProtocolHandler,
         flow: FlowControlSettings,
+        profile: McbewsV1Profile | None = None,
         log_raw: bool = False,
     ) -> None:
         self.broker = broker
@@ -61,12 +65,16 @@ class HostConnectionHook(NoOpHook):
         self.protocol = protocol
         self.flow = flow
         self.log_raw = log_raw
-        self._background_tasks: set[asyncio.Task[None]] = set()
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self.ingress = HostAddonIngressAdapter(
+            handlers,
+            profile=profile or MCBEWS_V1,
+        )
 
-    def _track(self, task: asyncio.Task[None]) -> None:
+    def _track(self, task: asyncio.Task[Any]) -> None:
         self._background_tasks.add(task)
 
-        def _done(done: asyncio.Task[None]) -> None:
+        def _done(done: asyncio.Task[Any]) -> None:
             self._background_tasks.discard(done)
             if done.cancelled():
                 return
@@ -190,42 +198,6 @@ class HostConnectionHook(NoOpHook):
         if player_event.sender in _EXTERNAL_SENDERS:
             return
 
-        # Check for session_req from the addon bridge player.
-        # The addon sends tell chat messages with MCBEWS|SESSION|<json>.
-        if player_event.message.startswith(_SESSION_REQ_PREFIX):
-            try:
-                payload_str = player_event.message[len(_SESSION_REQ_PREFIX):]
-                session_req = json.loads(payload_str)
-                session_req.setdefault("player_name", player_event.sender)
-                task = asyncio.create_task(
-                    self.handlers.handle_session_req(state, session_req),
-                    name=f"host-session-req:{state.id}",
-                )
-                self._track(task)
-                return
-            except (json.JSONDecodeError, Exception) as exc:
-                logger.warning(
-                    "session_req_parse_error",
-                    connection_id=str(state.id),
-                    sender=player_event.sender,
-                    error=str(exc),
-                )
-                return
-
-        # Route tool approval/deny commands from the addon UI
-        for prefix, approved in ((_TOOL_APPROVE_PREFIX, True), (_TOOL_DENY_PREFIX, False)):
-            if player_event.message.startswith(prefix):
-                approval_id = player_event.message[len(prefix):].strip()
-                task = asyncio.create_task(
-                    self.handlers.handle_tool_approval(
-                        state, approval_id, approved=approved,
-                        player_name=player_event.sender,
-                    ),
-                    name=f"host-tool-approval:{state.id}",
-                )
-                self._track(task)
-                return
-
         task = asyncio.create_task(
             self._dispatch(state, player_event, parsed),
             name=f"host-dispatch:{state.id}",
@@ -235,12 +207,24 @@ class HostConnectionHook(NoOpHook):
     async def on_ui_chat_reassembled(
         self,
         state: ConnectionState,
-        player_name: str,
-        message: str,
+        message: UiChatMessage,
     ) -> None:
         task = asyncio.create_task(
-            self.handlers.handle_ui_chat(state, player_name, message),
+            self.ingress.handle_ui_chat(state, message),
             name=f"host-ui-chat:{state.id}",
+        )
+        self._track(task)
+
+    async def on_addon_control_message(
+        self,
+        state: ConnectionState,
+        message: ToolPlayerMessage,
+    ) -> None:
+        """Schedule typed session/approval handling off the SDK receive loop."""
+
+        task = asyncio.create_task(
+            self.ingress.handle_control_message(state, message),
+            name=f"host-addon-control:{state.id}:{message.channel}",
         )
         self._track(task)
 
