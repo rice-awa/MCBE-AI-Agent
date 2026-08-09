@@ -78,6 +78,7 @@ class HostGatewayServer:
             handlers=self._handlers,
             protocol=self._protocol,
             flow=self._gateway_settings.flow,
+            profile=self._gateway_settings.addon.profile,
             log_raw=settings.enable_ws_raw_log,
         )
         self._sink = HostResponseSink(

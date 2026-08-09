@@ -48,6 +48,7 @@ Message Broker ←→ Agent Worker (PydanticAI)
 - **多人会话隔离**: 身份只用 `event.sender` / 显式 `player_name`；历史、锁、上下文按 `(connection_id, player_name)` 分桶（`HostSessionStore`）
 - **统一流控**: 出站长文本走 SDK `FlowControlSettings` / `McbeOutboundDelivery` / `McbewsV1Delivery`
 - **线协议**: 仅 **mcbews v1**（`mcbews:bridge_req` / `mcbews:text_resp` / `MCBEWS|*`）；禁止运行时 `mcbeai:*`
+- **协议版本轴**: 兼容线 `MCBEWS/1` 与四个独立的 schema/persistence 轴（capability request `2`、session `1`、text response framing `1`、DDUI persistence `2`）分别维护；不要把它们混称为 v1/v2
 
 ## Flow Control (via mcbe-ws-sdk)
 
@@ -59,12 +60,17 @@ Message Broker ←→ Agent Worker (PydanticAI)
 
 流控参数（`config.json` → 映射到 SDK）：
 
-- `flow_control.command_line_byte_budget`（默认 461）
+- `flow_control.command_line_byte_budget`（默认 461；项目实测兼容预算，manifest 标记 `empirical`，不是官方 API 上限）
 - `flow_control.max_chunk_content_length`（默认 400）
 - `flow_control.chunk_sentence_mode`（默认 true）
 - `flow_control.chunk_delays.tellraw / scriptevent / text_resp / text_resp_prelude`
   - 旧键 `ai_resp` / `ai_resp_prelude` 仍可从 JSON 读入并映射到 `text_resp*`
 - `flow_control.non_stream_batch_max_chars` / `non_stream_send_delay`（宿主非流式批处理）
+
+`mcbews:text_resp` 的 `cid`/标题在同一响应的相关帧保持一致，compact usage `{i,o}` 只写入
+完成帧。Session response 绕过通用分片器，必须单帧可解析；超出预算时返回
+`SESSION_RESPONSE_TOO_LARGE` 结构化错误。能力广告中的 `multiblock_placement` 当前值为
+`command_fallback`，只表示经过安全策略/审批的宿主命令回退路径。
 
 新增下行发送路径应走 `BrokerResponseBridge` 或 SDK delivery，不要复制分片逻辑。
 
@@ -146,7 +152,7 @@ feature/* / fix/* / refactor/*  →  dev  →  master
 | `services/agent/core.py` | PydanticAI Agent 核心 |
 | `services/agent/worker.py` | 消费队列；注入 SDK `AddonBridgeService` |
 | `services/agent/tools.py` | Agent Tools |
-| `mcbe-ws-sdk` | pip 依赖（`>=0.1.0`）；线协议与分片由 SDK 拥有，勿改 SDK 源码除非另开 SDK PR |
+| `mcbe-ws-sdk` | pip 依赖（`>=0.2.0,<0.3.0`）；线协议与分片由 SDK 拥有，勿改 SDK 源码除非另开 SDK PR |
 | `docs/addon-bridge-protocol.md` | mcbews 桥协议说明 |
 
 ## Supported LLM Providers
@@ -197,13 +203,24 @@ feature/* / fix/* / refactor/*  →  dev  →  master
 - `agent.agent_retries` / `agent.worker_http_timeout` / `agent.worker_poll_timeout` / `agent.run_command_timeout` / `agent.system_prompt` / `agent.max_history_turns` / `agent.compression_*` / `agent.stream_sentence_mode` / `agent.llm_warmup_enabled` / `agent.run_timeout` / `agent.request_timeout`
 - `queue.llm_worker_count` / `queue.max_size`
 - `flow_control.command_line_byte_budget` / `flow_control.chunk_delays.*` / `flow_control.non_stream_*` / `flow_control.max_chunk_content_length` / `flow_control.chunk_sentence_mode`
-- `addon.protocol.*`（文档镜像；运行时强制 mcbews v1，旧 mcbeai 值会被忽略）
+- `addon.protocol.*`（deprecated/ignored 文档镜像；运行时值始终来自 SDK MCBEWS/1 manifest，旧 mcbeai 值会被忽略）
 - `storage.conversations_dir` / `storage.tokens_file`
 - `logging.level` / `logging.enable_file_logging` / `logging.log_dir` / `logging.files.*` / `logging.rotation_*`
 - `mcp.enabled` / `mcp.servers`
 - `minecraft.commands` / `minecraft.ai_broadcast_default`（新连接默认 AI 全服广播，默认 true）
 - `websocket.*`
 - `model_metadata.*`
+
+### MCBEWS/1 发布顺序与 smoke gate
+
+SDK 是独立仓库。发布时先合并并发布 SDK `v0.2.0`，验证 PyPI wheel metadata、manifest/vectors
+和 wheel-installed contract，再合并/发布 Host 与产品 Addon。当前仓库只准备门禁，不宣称该
+版本已发布，也不自动 push、tag 或上传 PyPI。
+
+发布前的真实 MCBE smoke 必须检查：事件 `sender` 与 ScriptEvent `sourceType`/source、可信
+`MCBEWS_BRIDGE` ToolPlayer 与业务 `player_name`/owner 的分离、两玩家×两 conversation 的
+CJK/emoji 和实测 461 字节预算、长 session 的单帧/结构化超限错误，以及 approval owner/批次和
+断线 task cleanup。默认 CI 使用构建后的 SDK wheel，不得被 nested editable checkout 掩盖。
 
 JSON 字符串可以通过 `${VAR}` 引用 `.env` 或进程环境变量。缺失或空值会导致启动失败并显示 JSON 路径和变量名。新增普通配置应进入 `config.json`，不要添加新的普通 `.env` 字段。
 

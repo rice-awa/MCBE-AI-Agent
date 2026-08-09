@@ -80,6 +80,11 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+宿主依赖固定为 `mcbe-ws-sdk>=0.2.0,<0.3.0`。该约束对应包含 MCBEWS/1 契约的 SDK wheel；
+发布/合入顺序必须是先在 SDK 仓库发布并验证 `v0.2.0` PyPI artifact，再安装或合并 Host 与
+产品 Addon。开发时若 SDK 尚未出现在 PyPI，请在 SDK 仓库本地构建 wheel 后安装到隔离 venv，
+不要把 nested checkout 以 editable 方式当作发布验证。
+
 ### 3. 初始化配置
 
 ```bash
@@ -235,8 +240,8 @@ MCBE 世界通常只通过 `/wsserver` 建立一条 WebSocket 连接，所有玩
 | `minecraft.commands` | 游戏内命令定义（前缀/类型/别名/用法） | 见 `config.example.json` |
 | `minecraft.ai_broadcast_default` | 新连接默认 AI 全服广播 | `true` |
 | `mcp.enabled` / `mcp.servers` | MCP 功能开关与服务器配置 | `false` / `{}` |
-| `flow_control.*` | 出站长文本分片流控（tellraw/scriptevent/text_resp） | 见 `config.example.json` |
-| `addon.protocol.*` | 桥协议文档镜像（运行时强制 mcbews v1） | - |
+| `flow_control.*` | 出站长文本分片流控（tellraw/scriptevent/text_resp）；`command_line_byte_budget=461` 是实测预算 | 见 `config.example.json` |
+| `addon.protocol.*` | deprecated/ignored 桥协议文档镜像；运行时值始终来自 SDK MCBEWS/1 manifest | - |
 | `logging.*` | 日志级别、文件、原始日志开关 | `INFO`；raw log 默认 `false` |
 | `storage.*` | 对话历史与 token 统计路径 | `data/` 下 |
 | `dev_mode` | 开发模式（跳过身份验证） | `false` |
@@ -324,6 +329,31 @@ npm install && npm test && npm run build && npm run local-deploy  # 2. 构建并
 
 > **⚠️ 使用 Addon 前置条件**：启用本 Addon 必须在世界设置中开启 **实验性 API**（创建世界时"实验性玩法"或世界设置的"实验性内容"里勾选 **实验性 API / Beta API**）。Addon 依赖实验性游戏测试框架（`@minecraft/server-gametest` 等），未开启时行为包不会加载，`MCBEWS_BRIDGE` 模拟玩家也不会生成。
 
+### MCBEWS/1 契约要点
+
+SDK manifest 将兼容线 `MCBEWS/1` 与四个独立的 schema/persistence 轴分别命名，不能把它们
+混称为一个 v1/v2：capability request schema `2`、session schema `1`、text response framing
+`1`，以及 Addon DynamicProperty 的 DDUI persistence `2`。`MCBEWS|UI_CHAT` 的 `cid` 会随真实
+`player_name` 传入对应 `ChatRequest`；`mcbews:text_resp` 的 `cid`/`t` 在相关帧保持一致，
+`u={i,o}` 只出现在完成帧。长 session 响应采用单帧原子策略，超出实测预算时返回
+`SESSION_RESPONSE_TOO_LARGE` 结构化错误，不发送碎 JSON。
+
+能力广告中的 `multiblock_placement=command_fallback` 表示宿主可在能力结果允许时走受审批的
+原生命令回退路径，不表示 Addon handler 已无条件完成多格放置。`addon.protocol.*` 仅是
+deprecated/ignored 配置镜像，任何旧 `mcbeai` 值都不能改变运行时 MCBEWS/1 wire。
+
+### 发布顺序与真实世界 smoke
+
+发布者应先合并并发布 SDK `v0.2.0`、确认 PyPI wheel artifact 与 wheel-installed contract
+通过，再合并/发布 Host 和产品 Addon。本仓库当前文档只准备 release gate，不宣称该版本已经
+发布，也不自动创建 tag 或上传 PyPI。
+
+发布前在真实 MCBE 世界至少检查：`sender` 与 ScriptEvent `sourceType` 的实际值；可信
+`MCBEWS_BRIDGE` ToolPlayer 与业务 owner 分离；两玩家×两 conversation 的 CJK/emoji 往返及
+`tell @s` 的实测 `461` 字节预算；长 session list/saved 的单帧或结构化超限错误；approval
+归属、伪造 owner、断线后的 pending/task 清理。完整步骤见
+[Addon Bridge Protocol](docs/addon-bridge-protocol.md)。
+
 ## 部署
 
 ### Termux（Android）
@@ -388,7 +418,7 @@ pip uninstall -r requirements.txt -y && pip install -r requirements.txt  # 重�
 ## 技术栈与致谢
 
 - **Python 3.11+** / **PydanticAI** / **Pydantic** / **WebSockets** / **httpx** / **PyJWT** / **structlog** / **Click**
-- **mcbe-ws-sdk**: Minecraft Bedrock WebSocket SDK（mcbews v1 线协议、出站流控与分片）
+- **mcbe-ws-sdk**: Minecraft Bedrock WebSocket SDK（mcbews v1 线协议、出站流控与分片；Host 约束 `>=0.2.0,<0.3.0`）
 - 原项目: [rice-awa/MCBE_WebSocket_gpt](https://github.com/rice-awa/MCBE_WebSocket_gpt)
 - PydanticAI: [pydantic/pydantic-ai](https://github.com/pydantic/pydantic-ai)
 - Termux: [termux/termux-app](https://github.com/termux/termux-app)

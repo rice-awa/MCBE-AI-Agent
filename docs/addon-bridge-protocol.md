@@ -6,6 +6,25 @@
 
 使用 `/scriptevent` 发起请求，并通过聊天分片返回响应；同时支持 Addon UI 向 Python 自动发送聊天消息。
 
+## 权威资产与独立版本轴
+
+Host、SDK 内置 Addon 和产品 Addon 以 SDK `0.2.0` wheel 内的
+`MCBEWS_V1_MANIFEST` / wire vectors 为契约来源；产品 Addon 的
+`scripts/bridge/protocol.generated.ts` 是由该资产同步的投影。兼容线
+`MCBEWS/1` 是独立的 wire 标识；其余四个 schema/persistence 版本轴也不能混用成一个
+“协议版本”：
+
+| 轴 | 当前值 | 含义 |
+|------|------:|------|
+| 兼容线 | `MCBEWS/1` | wire channel 与兼容策略；不启用 `mcbeai:*` |
+| capability request schema | `2` | `mcbews:bridge_req` 请求体的 `v` |
+| session schema | `1` | `MCBEWS|SESSION` 请求与 `mcbews:session_resp` 响应的 `v` |
+| text response framing | `1` | `mcbews:text_resp` 帧字段/分片语义 |
+| DDUI persistence | `2` | Addon 玩家 DynamicProperty 的 per-conversation 状态格式；不是 wire 版本 |
+
+`commandLine` 的 `461` 字节是本项目压力测试得到的**实测兼容预算**，不是
+Minecraft 官方 API 的稳定上限；SDK manifest 将其标记为 `empirical`，部署可以把预算调低。
+
 ## 运行时拓扑
 
 ```text
@@ -33,7 +52,7 @@ AgentWorker  ◄── 注入的 AddonBridgeService
 | Bridge 响应聊天前缀 | `MCBEWS\|BRIDGE` |
 | UI 聊天前缀 | `MCBEWS\|UI_CHAT` |
 | 模拟工具玩家名 | `MCBEWS_BRIDGE` |
-| Bridge request body 版本 | `v=2` |
+| capability request schema | `v=2` |
 
 世界存储动态属性键 `mcbeai:ui_state` **故意保留**，以免旧世界丢 UI 状态；它不是线协议的一部分。
 
@@ -95,7 +114,7 @@ AgentWorker / CommandHandlers
       "place": true,
       "batch": true,
       "fill": true,
-      "multiblock_placement": "unsupported"
+      "multiblock_placement": "command_fallback"
     }
   }
 }
@@ -104,7 +123,9 @@ AgentWorker / CommandHandlers
 - `block_ops.inspect=true` 时，宿主向模型公开 `inspect_block`、`place_block` 与 `fill_block`；缺失或为 `false` 时返回 `UNSUPPORTED_CAPABILITY`。
 - 模型只看到 `inspect_block(target)`、`place_block(pos, block, expect?, states?)` 与 `fill_block(from, to, block, expect?, states?)` 契约；`mode`、`edits`、`dimension`、以及 `locked_targets`、`phase` 等恢复字段均不在模型 schema 中。宿主把这些工具映射到既有 wire capability（`capability=edit_blocks` 的 `mode=place` / `mode=fill` 帧、`capability=inspect_block`），线协议字段不变。
 - `place_block` / `fill_block` 的失败结果必须含稳定 `code` 和 `fallback_allowed`。仅 `ADDON_UNAVAILABLE`、`UNSUPPORTED_CAPABILITY` 可为 `true`；其余失败为 `false`。宿主只会对 `setblock`、`fill`、`clone` 自动回退执行此结论，且允许的原始命令仍要单独审批。
-- `multiblock_placement="unsupported"` 表示门、床等多格方块会返回 `UNSUPPORTED_BLOCK_PLACEMENT`，不会假称只写入一格即完成。
+- `multiblock_placement="command_fallback"` 表示门、床等多格方块由宿主在获得明确能力结果后，
+  按允许的原生命令回退路径处理；它不表示 Addon 的能力 handler 已直接完成多格放置。
+  回退命令仍须经过既有审批与安全策略，不能把 `command_fallback` 当作无条件成功。
 
 `config.json` 的 `addon.block_tools` 可调整有界工作量：`max_discrete_positions`、`max_fill_volume`、`cells_per_tick`、`max_locked_targets_on_wire`、`inspect_summary_threshold`、`inspect_sample_limit`。默认值见 `config.example.json`；所有值均由宿主硬上限夹紧。
 
@@ -127,10 +148,12 @@ MCBEWS|UI_CHAT|<msg_id>|<index>/<total>|<payload_fragment>
 ## 链路 D：会话管理协议（session v1）
 
 会话管理协议允许 Addon UI 以结构化方式操作 Python 侧的会话（对话），覆盖 `AGENT 对话` 命令的完整操作集。
+会话请求和响应使用 `session_schema=1`；一个 session response 必须是一个完整、可解析的
+`mcbews:session_resp` ScriptEvent，不得经过通用长文本分片器。
 
 ### 请求格式（Addon → Python）
 
-Addon 通过 `MCBEWS_BRIDGE` 模拟玩家的聊天分片发送，格式：
+Addon 通过可信 ToolPlayer `MCBEWS_BRIDGE` 发送一条完整的聊天命令，格式：
 
 ```text
 MCBEWS|SESSION|<json>
@@ -145,7 +168,7 @@ JSON 字段：
 | `player_name` | string | 否 | 目标玩家名 |
 | `cid` | string | 否 | conversation_id（new/switch 用） |
 | `sid` | string | 否 | session_id（restore/delete 用） |
-| `v` | number | 否 | 协议版本，当前为 1 |
+| `v` | number | 是 | session schema，当前为 1 |
 
 ### 操作全集
 
@@ -173,7 +196,23 @@ Python 向 Addon 回发 `scriptevent mcbews:session_resp <json>`，JSON 格式�
 | `ok` | boolean | 操作是否成功 |
 | `action` | string | 原操作名称 |
 | `data` | object/null | 结构化响应数据（见下方按 action） |
-| `error` | string/null | 错误消息（`ok=false` 时非空） |
+| `error` | object/null | `{code, message}`；`ok=false` 时非空 |
+
+正常结果与超限结果都只发一个 ScriptEvent。若完整 JSON 超过实测命令预算，SDK 返回仍可
+单帧解析的结构化错误，而不是发送碎 JSON：
+
+```json
+{
+  "v": 1,
+  "request_id": "sess-1",
+  "action": "list",
+  "ok": false,
+  "error": {
+    "code": "SESSION_RESPONSE_TOO_LARGE",
+    "message": "session response exceeds the atomic command budget"
+  }
+}
+```
 
 ### 按 action 的 data 结构
 
@@ -227,11 +266,11 @@ Python 向 Addon 回发 `scriptevent mcbews:session_resp <json>`，JSON 格式�
 | 协议入口 | `services/gateway/hook.py`（`on_player_message` 检测 SESSION 前缀并 fire-and-forget） |
 | 会话处理 | `services/gateway/command_handlers.py`（`handle_session_req` 复用 `_handle_conversation`） |
 | 响应桥 | `services/gateway/broker_bridge.py`（`_session_resp` 路由 session_resp→scriptevent） |
-| SDK 常量 | `mcbe-ws-sdk` 的 `McbewsV1Profile`（`session_request_message_id` / `session_response_message_id`） |
+| SDK 契约 | `mcbe-ws-sdk` 的 `McbewsV1Profile`（`session_request_script_event_id` / `session_response_script_event_id`） |
 | Addon 发送 | `MCBE-AI-Agent-addon/scripts/bridge/sessionClient.ts` |
 
 
-## text_resp 帧扩展
+## text_resp 帧扩展（text framing schema 1）
 
 `mcbews:text_resp` 帧在现有 6 字段（`id, i, n, p, r, c`）基础上扩展可选字段：
 
@@ -239,13 +278,24 @@ Python 向 Addon 回发 `scriptevent mcbews:session_resp <json>`，JSON 格式�
 |------|------|------|
 | `cid` | string | conversation_id，缺省不输出 |
 | `t` | string | 对话标题，缺省不输出 |
-| `u` | object | usage 信息 `{i: input_tokens, o: output_tokens}`，缺省不输出 |
+| `u` | object | usage 信息 `{i: input_tokens, o: output_tokens}`，只允许出现在完成帧，缺省不输出 |
 
-缺省时帧结构与旧格式逐字节一致，旧 Addon 解析器按未知字段忽略处理（JSON 天然兼容）。
+`cid` / `t` 在同一响应的相关帧中保持一致；`u` 只在 `i == n` 的完成帧携带。
+缺省字段时帧结构与旧格式逐字节一致，旧 Addon 解析器按未知字段忽略处理（JSON 天然兼容）。
+接收端只接受 `user`、`assistant`、`approval` 三种 role；未知 role 在进入 history 前拒绝。
 
 ## UI Chat 扩展
 
 `MCBEWS|UI_CHAT` 上行 payload 扩展可选字段 `cid`（conversation_id），Addon 发聊天时携带当前会话 ID。
+SDK 重组后将 `cid` 传入 Host 的 `ChatRequest.conversation_id`；缺失时只归一化为 `default`，
+不会读取接收时的 active conversation 作为替代。
+
+## DDUI persistence 2 与玩家状态
+
+`responseSync.ts` 通过 `isV2State()` 运行时类型守卫区分旧版扁平 `history` 和 DDUI persistence
+`2` 的 `conversations[id].history` 桶。新增代码只使用 `AgentUiStateV2`；旧状态只在加载/迁移
+路径归入 `default` 会话。当前产品 UI 仍使用 `ActionFormData` / `ModalFormData` 适配层，
+因此 persistence version `2` 不宣称已接入官方 DDUI `CustomForm` / `Observable` API。
 
 ## 宿主接入点更新
 
@@ -321,7 +371,8 @@ AGENT 聊天 请读取我的玩家状态并告诉我当前位置
 - 现有 `AGENT 聊天`、`AGENT 上下文`、`切换模型`、`运行命令` 等聊天命令仍然是主入口。
 - 面板入口绑定为使用原版命令方块物品 `minecraft:command_block`，避免抢占聊天监听。
 - 面板支持发送消息、本地聊天记录、设置保存和统计信息；发送消息会记录本地历史，并提示等价的 `AGENT 聊天 <消息>`。
-- 当前本地 `@minecraft/server-ui` 类型只暴露 `ActionFormData` / `ModalFormData`，暂不能直接使用官方 DDUI `CustomForm` / `Observable`。
+- 当前本地 `@minecraft/server-ui` 类型只暴露 `ActionFormData` / `ModalFormData`，暂不能直接使用官方 DDUI `CustomForm` / `Observable`；
+  这不影响 DDUI persistence `2` 的 per-player/per-conversation DynamicProperty contract。
 - 后续如果类型和运行时支持真正 DDUI，可在 Addon 的表单适配层中替换实现，而不重写业务状态。
 
 ## 当前限制
@@ -338,4 +389,25 @@ AGENT 聊天 请读取我的玩家状态并告诉我当前位置
 2. 开启 **实验 → Beta APIs**；
 3. 重新 `/wsserver` 连接。
 
-配置里遗留的 `addon.protocol.*` mcbeai 值会被忽略：运行时强制 `McbewsV1Profile`。
+配置里遗留的 `addon.protocol.*` 值是 deprecated/ignored 的文档镜像：读取可产生迁移诊断，
+但不能改变任何运行时 wire 值；运行时始终使用 SDK `McbewsV1Profile` 的 MCBEWS/1 manifest。
+
+## 发布顺序与真实 MCBE smoke checklist
+
+本任务不宣称 SDK 已发布，也不自动创建 tag、上传 PyPI 或发布 Addon。发布者必须按以下顺序操作：
+
+1. 在 SDK 仓库合并包含本契约的变更，构建并发布 SDK `v0.2.0`，确认 PyPI 上的 wheel artifact
+   可下载、metadata 为 `0.2.0`，且 wheel-installed public/codec contract 通过。
+2. 在 Host 仓库以干净 venv 安装该 PyPI wheel，运行 `tests/test_sdk_dependency.py` 与 Host gate；
+   再合并/发布 Host 和产品 Addon。
+3. Addon 发布后再执行真实世界 smoke；不要以本地 editable SDK 或仅单元测试替代发布验证。
+
+真实 MCBE smoke 至少覆盖：
+
+- 记录 `PlayerMessage` 的真实 `sender`，并记录 ScriptEvent 的 `sourceType` / source object；
+  验证可信 ToolPlayer 为 `MCBEWS_BRIDGE`，业务 `player_name` 仍来自已验证 payload/pending owner。
+- 两名玩家、两个 conversation 交错发送 UI Chat；验证 CJK 与 surrogate-pair emoji 无损，最终
+  `tell @s` commandLine 不超过实测 `461` 字节。
+- 发送长 session `list` / `saved` 结果，确认正常响应是单帧，超限响应是可解析的
+  `SESSION_RESPONSE_TOO_LARGE`，而不是等待超时或碎 JSON。
+- 触发单个和批量 approval，验证玩家+CID 归属、伪造 owner 被拒绝、断线后 pending/task 清理。

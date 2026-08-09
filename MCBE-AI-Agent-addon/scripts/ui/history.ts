@@ -23,7 +23,7 @@ export type HistoryPage = {
 export function appendHistoryItem(
   history: ChatHistoryItem[],
   item: ChatHistoryItem,
-  maxHistoryItems: number,
+  maxHistoryItems: number
 ): ChatHistoryItem[] {
   const limit = Math.max(0, Math.floor(maxHistoryItems));
   if (limit === 0) {
@@ -33,11 +33,7 @@ export function appendHistoryItem(
   return [...history, item].slice(-limit);
 }
 
-export function getHistoryPage(
-  history: ChatHistoryItem[],
-  pageIndex: number,
-  pageSize: number,
-): HistoryPage {
+export function getHistoryPage(history: ChatHistoryItem[], pageIndex: number, pageSize: number): HistoryPage {
   const normalizedPageSize = Math.max(1, Math.floor(pageSize));
   const normalizedPageIndex = Math.max(0, Math.floor(pageIndex));
   // 正序：最旧的在前，最新的在后
@@ -60,9 +56,7 @@ export function formatHistoryItem(item: ChatHistoryItem): string {
 export function summarizeHistoryItem(item: ChatHistoryItem, previewLength: number): string {
   const normalizedLength = Math.max(0, Math.floor(previewLength));
   const content =
-    item.content.length > normalizedLength
-      ? `${item.content.slice(0, normalizedLength)}...`
-      : item.content;
+    item.content.length > normalizedLength ? `${item.content.slice(0, normalizedLength)}...` : item.content;
 
   return `[${item.role}/${item.source}] ${content}`;
 }
@@ -89,11 +83,7 @@ export type ConversationBucketV2 = {
 /**
  * Append an item to a conversation bucket and slice to the given limit.
  */
-export function appendToBucket(
-  bucket: ConversationBucketV2,
-  item: HistoryItem,
-  limit: number,
-): ConversationBucketV2 {
+export function appendToBucket(bucket: ConversationBucketV2, item: HistoryItem, limit: number): ConversationBucketV2 {
   const safeLimit = Math.max(0, Math.floor(limit));
   const newHistory = safeLimit === 0 ? [] : [...bucket.history, item].slice(-safeLimit);
   return {

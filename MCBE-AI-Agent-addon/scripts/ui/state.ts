@@ -1,5 +1,6 @@
 import type { HistoryItem } from "./history";
 import type { AgentUiStats } from "./stats";
+import { DDUI_PERSISTENCE_VERSION } from "../bridge/protocol";
 
 export type BridgeStatus = "disconnected" | "connecting" | "ready" | "sent" | "error";
 
@@ -17,6 +18,12 @@ export type ApprovalInfo = {
   batch_id: string | null;
   batch_size: number | null;
   batch_index: number | null;
+  /** Trusted owner copied from the outer text response frame. */
+  player_name: string;
+  /** Compact wire conversation id; always normalized to a non-empty value. */
+  cid: string;
+  /** Semantic alias retained for UI/domain adapters. */
+  conversation_id: string;
 };
 
 export type AgentUiDelivery = "tellraw" | "scriptevent";
@@ -191,7 +198,7 @@ export function createAgentUiStateV2(): AgentUiStateV2 {
   };
 
   return {
-    version: 2,
+    version: DDUI_PERSISTENCE_VERSION,
     activeConversationId: "default",
     conversations: {
       default: defaultBucket,
@@ -219,13 +226,15 @@ export function createAgentUiStateV2(): AgentUiStateV2 {
 export function getActiveBucket(state: AgentUiStateV2): ConversationBucket {
   const bucket = state.conversations[state.activeConversationId];
   if (!bucket) {
-    return state.conversations["default"] ?? {
-      id: "default",
-      shortId: 0,
-      title: "",
-      history: [],
-      lastActiveAt: Date.now(),
-    };
+    return (
+      state.conversations["default"] ?? {
+        id: "default",
+        shortId: 0,
+        title: "",
+        history: [],
+        lastActiveAt: Date.now(),
+      }
+    );
   }
   return bucket;
 }

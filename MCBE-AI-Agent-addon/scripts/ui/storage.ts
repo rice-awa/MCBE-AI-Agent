@@ -1,10 +1,14 @@
 import type { AgentUiSettingsV2, AgentUiStateV2, BridgeStatus, ConversationBucket } from "./state";
 import { createAgentUiStateV2 } from "./state";
+import { DDUI_PERSISTENCE_VERSION } from "../bridge/protocol";
 import type { HistoryItem } from "./history";
 import type { AgentUiStats } from "./stats";
 
 export const AGENT_UI_STATE_PROPERTY_KEY = "mcbeai:ui_state";
-export const AGENT_UI_STATE_VERSION = 2;
+/** DynamicProperty key is retained for old worlds; it is not a wire ID. */
+export const DDUI_PERSISTENCE_STATE_VERSION = DDUI_PERSISTENCE_VERSION;
+/** @deprecated Use DDUI_PERSISTENCE_STATE_VERSION. */
+export const AGENT_UI_STATE_VERSION = DDUI_PERSISTENCE_STATE_VERSION;
 export const PERSISTED_HISTORY_LIMIT = 100;
 export const MAX_CONVERSATIONS = 20;
 
@@ -65,7 +69,7 @@ export function loadAgentUiState(owner: DynamicPropertyOwner): AgentUiStateV2 {
       return migrateV1ToV2(persisted as PersistedAgentUiStateV1);
     }
 
-    if (persisted.version !== AGENT_UI_STATE_VERSION) {
+    if (persisted.version !== DDUI_PERSISTENCE_STATE_VERSION) {
       return createAgentUiStateV2();
     }
 
@@ -102,7 +106,7 @@ export function loadAgentUiState(owner: DynamicPropertyOwner): AgentUiStateV2 {
       ...rawStats,
       localHistoryCount: Math.min(
         normalizeNonNegativeNumber(rawStats.localHistoryCount) ?? activeHistoryLen,
-        activeHistoryLen,
+        activeHistoryLen
       ),
     };
 
@@ -134,7 +138,7 @@ function migrateV1ToV2(v1: PersistedAgentUiStateV1): AgentUiStateV2 {
     ...rawStats,
     localHistoryCount: Math.min(
       normalizeNonNegativeNumber(rawStats.localHistoryCount) ?? history.length,
-      history.length,
+      history.length
     ),
   };
   if (v1.bridgeStatus) {
@@ -163,8 +167,7 @@ function normalizeSettingsV2(settings: Partial<AgentUiSettingsV2> | undefined): 
   }
 
   return {
-    autoSaveHistory:
-      typeof settings.autoSaveHistory === "boolean" ? settings.autoSaveHistory : true,
+    autoSaveHistory: typeof settings.autoSaveHistory === "boolean" ? settings.autoSaveHistory : true,
     showToolEvents: typeof settings.showToolEvents === "boolean" ? settings.showToolEvents : false,
     defaultDelivery:
       settings.defaultDelivery === "tellraw" || settings.defaultDelivery === "scriptevent"
@@ -197,9 +200,7 @@ function normalizeHistory(history: unknown): HistoryItem[] {
 /**
  * Normalize v2 stats — includes token fields.
  */
-function normalizeStatsV2(
-  stats: Partial<AgentUiStats> | undefined,
-): Partial<AgentUiStats> {
+function normalizeStatsV2(stats: Partial<AgentUiStats> | undefined): Partial<AgentUiStats> {
   if (stats === undefined || typeof stats !== "object") {
     return {};
   }
@@ -243,10 +244,7 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.floor(value)));
 }
 
-export function saveAgentUiState(
-  owner: DynamicPropertyOwner,
-  state: AgentUiStateV2,
-): SaveAgentUiStateResult {
+export function saveAgentUiState(owner: DynamicPropertyOwner, state: AgentUiStateV2): SaveAgentUiStateResult {
   try {
     // Build bucket array (persist only recent history per bucket)
     const buckets: PersistedConversationBucketV2[] = [];
@@ -264,7 +262,7 @@ export function saveAgentUiState(
     }
 
     const persisted: PersistedAgentUiStateV2 = {
-      version: AGENT_UI_STATE_VERSION,
+      version: DDUI_PERSISTENCE_STATE_VERSION,
       activeConversationId: state.activeConversationId,
       conversations: buckets,
       conversationOrder: state.conversationOrder,

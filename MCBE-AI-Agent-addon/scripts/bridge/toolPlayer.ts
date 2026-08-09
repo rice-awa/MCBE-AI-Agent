@@ -2,10 +2,7 @@ import { GameMode, world, system } from "@minecraft/server";
 import { spawnSimulatedPlayer } from "@minecraft/server-gametest";
 
 import { chunkBridgePayload, chunkUiChatPayload } from "./chunking";
-import {
-  BRIDGE_MAX_CHUNK_CONTENT_LENGTH,
-  TOOL_PLAYER_NAME,
-} from "./constants";
+import { APPROVAL_ALLOW_CHAT_PREFIX, APPROVAL_DENY_CHAT_PREFIX, TRUSTED_BRIDGE_PLAYER_NAME } from "./protocol";
 
 const DEBUG = true;
 
@@ -22,18 +19,18 @@ const TOOL_PLAYER_CHECK_INTERVAL_TICKS = 20 * 30;
 let isToolPlayerInitialized = false;
 
 export function ensureToolPlayer(): void {
-  log(`ensureToolPlayer: 检查模拟玩家 ${TOOL_PLAYER_NAME} 是否存在...`);
+  log(`ensureToolPlayer: 检查模拟玩家 ${TRUSTED_BRIDGE_PLAYER_NAME} 是否存在...`);
 
-  const existing = world
-    .getAllPlayers()
-    .find((player) => player.name === TOOL_PLAYER_NAME);
+  const existing = world.getAllPlayers().find((player) => player.name === TRUSTED_BRIDGE_PLAYER_NAME);
 
   if (existing) {
     log("ensureToolPlayer: 模拟玩家已存在，跳过创建");
     return;
   }
 
-  log(`ensureToolPlayer: 模拟玩家不存在，尝试在 (${TOOL_PLAYER_LOCATION.x}, ${TOOL_PLAYER_LOCATION.y}, ${TOOL_PLAYER_LOCATION.z}) 创建...`);
+  log(
+    `ensureToolPlayer: 模拟玩家不存在，尝试在 (${TOOL_PLAYER_LOCATION.x}, ${TOOL_PLAYER_LOCATION.y}, ${TOOL_PLAYER_LOCATION.z}) 创建...`
+  );
   try {
     const dimension = world.getDimension(TOOL_PLAYER_DIMENSION);
     log(`ensureToolPlayer: 获取维度 ${TOOL_PLAYER_DIMENSION} 成功`);
@@ -43,8 +40,8 @@ export function ensureToolPlayer(): void {
         dimension,
         ...TOOL_PLAYER_LOCATION,
       },
-      TOOL_PLAYER_NAME,
-      GameMode.Creative,
+      TRUSTED_BRIDGE_PLAYER_NAME,
+      GameMode.Creative
     );
     log(`ensureToolPlayer: 模拟玩家创建成功: ${player.name}`);
   } catch (error) {
@@ -53,43 +50,70 @@ export function ensureToolPlayer(): void {
   }
 }
 
-export function sendBridgeResponseChunks(requestId: string, payload: string): void {
-  const toolPlayer = world
-    .getAllPlayers()
-    .find((player) => player.name === TOOL_PLAYER_NAME);
+export async function sendBridgeResponseChunks(requestId: string, payload: string): Promise<void> {
+  const toolPlayer = world.getAllPlayers().find((player) => player.name === TRUSTED_BRIDGE_PLAYER_NAME);
 
   if (!toolPlayer) {
     throw new Error("Tool player is not available");
   }
 
-  const chunks = chunkBridgePayload(requestId, payload, BRIDGE_MAX_CHUNK_CONTENT_LENGTH);
+  const chunks = chunkBridgePayload(requestId, payload);
   for (const chunk of chunks) {
-    toolPlayer.runCommand(`tell @s ${chunk}`);
+    await Promise.resolve(toolPlayer.runCommand(`tell @s ${chunk}`));
   }
 }
 
 let uiChatSeq = 0;
 
 export function sendUiChatMessage(playerName: string, message: string, conversationId?: string): void {
-  const toolPlayer = world
-    .getAllPlayers()
-    .find((player) => player.name === TOOL_PLAYER_NAME);
+  if (!playerName.trim()) throw new Error("UI chat requires player_name");
+  const toolPlayer = world.getAllPlayers().find((player) => player.name === TRUSTED_BRIDGE_PLAYER_NAME);
 
   if (!toolPlayer) {
     throw new Error("Tool player is not available");
   }
 
   const id = `ui-${Date.now()}-${++uiChatSeq}`;
-  const payloadObj: Record<string, string> = { player: playerName, message };
-  if (conversationId) {
-    payloadObj.cid = conversationId;
-  }
+  const payloadObj: Record<string, string> = {
+    player: playerName,
+    message,
+    cid: conversationId?.trim() || "default",
+  };
   const payload = JSON.stringify(payloadObj);
-  const chunks = chunkUiChatPayload(id, payload, BRIDGE_MAX_CHUNK_CONTENT_LENGTH);
+  const chunks = chunkUiChatPayload(id, payload);
   for (const chunk of chunks) {
     toolPlayer.runCommand(`tell @s ${chunk}`);
   }
 }
+
+export type ApprovalDecisionKind = "approve" | "deny";
+
+/** Centralized typed approval sender; panels never construct wire strings. */
+export async function sendApprovalDecision(
+  playerName: string,
+  conversationId: string,
+  approvalId: string,
+  decision: ApprovalDecisionKind
+): Promise<void> {
+  if (decision !== "approve" && decision !== "deny") {
+    throw new Error("invalid approval decision");
+  }
+  if (!playerName.trim() || !conversationId.trim() || !approvalId.trim()) {
+    throw new Error("approval decision requires player_name, cid, and approval_id");
+  }
+  const toolPlayer = world.getAllPlayers().find((player) => player.name === TRUSTED_BRIDGE_PLAYER_NAME);
+  if (!toolPlayer) throw new Error("Tool player is not available");
+  const prefix = decision === "approve" ? APPROVAL_ALLOW_CHAT_PREFIX : APPROVAL_DENY_CHAT_PREFIX;
+  const payload = JSON.stringify({
+    v: 1,
+    approval_id: approvalId,
+    player_name: playerName,
+    cid: conversationId,
+  });
+  await Promise.resolve(toolPlayer.runCommand(`tell @s ${prefix}|${payload}`));
+}
+
+export const sendToolApprovalDecision = sendApprovalDecision;
 
 export function initializeToolPlayer(): void {
   log("initializeToolPlayer: 开始初始化...");

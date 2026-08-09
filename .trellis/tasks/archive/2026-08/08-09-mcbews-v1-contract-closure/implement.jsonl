@@ -1,0 +1,13 @@
+{"file":".trellis/spec/backend/index.md","reason":"Host/Gateway pre-development checklist and package boundary"}
+{"file":".trellis/spec/backend/runtime-architecture.md","reason":"Broker, SDK delivery, async lifecycle and approval task ownership"}
+{"file":".trellis/spec/backend/session-and-identity.md","reason":"player_name/conversation_id propagation and multiplayer isolation"}
+{"file":".trellis/spec/backend/error-handling.md","reason":"typed boundary errors, cancellation and external-state semantics"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Python typing and regression-test requirements"}
+{"file":".trellis/spec/backend/configuration-and-secrets.md","reason":"deprecated addon.protocol compatibility and config updates"}
+{"file":".trellis/spec/addon/index.md","reason":"Product Addon pre-development and build checklist"}
+{"file":".trellis/spec/addon/bridge-protocol.md","reason":"Current wire/framing/session rules to correct and preserve"}
+{"file":".trellis/spec/addon/state-testing-and-build.md","reason":"DDUI state isolation, persistence and Vitest conventions"}
+{"file":".trellis/spec/addon/directory-structure.md","reason":"Protocol kernel facade, generated assets and UI module placement"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"End-to-end identity/CID/protocol data-flow checklist"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Single contract and no duplicate framing implementations"}
+{"file":".trellis/tasks/08-09-mcbews-v1-contract-closure/research/review-evidence.md","reason":"Verified defects, repository boundaries and official API findings"}

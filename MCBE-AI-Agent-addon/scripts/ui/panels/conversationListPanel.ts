@@ -3,7 +3,7 @@ import type { Player } from "@minecraft/server";
 import { createCustomForm, createDduiObservable, showCustomFormSafely } from "../forms/formAdapter";
 import type { AgentUiStateV2 } from "../state";
 import { saveAgentUiState } from "../storage";
-import { requestSession } from "../../bridge/sessionClient";
+import { formatResponseError, requestSession } from "../../bridge/sessionClient";
 import type { SessionConversationInfo } from "../../bridge/sessionClient";
 import type { AgentPanelRoute } from "./routes";
 import { MAIN_ROUTE } from "./routes";
@@ -14,10 +14,7 @@ const PAGE_SIZE = 5;
  * 会话列表面板。
  * 每页 5 个会话，点击切换，附"新会话"按钮。
  */
-export async function showConversationListPanel(
-  player: Player,
-  uiState: AgentUiStateV2,
-): Promise<AgentPanelRoute> {
+export async function showConversationListPanel(player: Player, uiState: AgentUiStateV2): Promise<AgentPanelRoute> {
   try {
     // Fetch session list from Python
     const resp = await requestSession("list", { player_name: player.name });
@@ -126,7 +123,7 @@ export async function showConversationListPanel(
             uiState.activeConversationId = conv.id;
             saveAgentUiState(player, uiState);
           } else {
-            player.sendMessage(`MCBE AI Agent: 切换会话失败: ${switchResp.error || "未知错误"}`);
+            player.sendMessage(`MCBE AI Agent: 切换会话失败: ${formatResponseError(switchResp.error)}`);
           }
           form.close();
         };
@@ -148,10 +145,7 @@ export async function showConversationListPanel(
   }
 }
 
-function formatPage(
-  conversations: SessionConversationInfo[],
-  pageIndex: number,
-): string {
+function formatPage(conversations: SessionConversationInfo[], pageIndex: number): string {
   const totalPages = Math.max(1, Math.ceil(conversations.length / PAGE_SIZE));
   const start = pageIndex * PAGE_SIZE;
   const pageItems = conversations.slice(start, start + PAGE_SIZE);
@@ -163,15 +157,12 @@ function formatPage(
   return pageItems
     .map(
       (conv) =>
-        `#${conv.short_id} · ${conv.title || "未命名"} · ${conv.message_count}条${conv.is_active ? " [当前]" : ""}`,
+        `#${conv.short_id} · ${conv.title || "未命名"} · ${conv.message_count}条${conv.is_active ? " [当前]" : ""}`
     )
     .join("\n\n---\n\n");
 }
 
-function formatPageInfo(
-  conversations: SessionConversationInfo[],
-  pageIndex: number,
-): string {
+function formatPageInfo(conversations: SessionConversationInfo[], pageIndex: number): string {
   const totalPages = Math.max(1, Math.ceil(conversations.length / PAGE_SIZE));
   return `第 ${pageIndex + 1} 页 / 共 ${totalPages} 页 · ${conversations.length}个会话`;
 }

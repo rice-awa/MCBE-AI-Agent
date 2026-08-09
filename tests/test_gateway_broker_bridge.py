@@ -52,7 +52,9 @@ async def test_stream_chunk_becomes_outbound_payload():
     assert sent, "expected tellraw payloads"
     payloads = [json.loads(payload) for payload in sent]
     assert any("你好" in payload["body"]["commandLine"] for payload in payloads)
-    assert all(payload["body"]["origin"]["type"] == "say" for payload in payloads)
+    # MCBEWS/1 SDK commandRequest tellraw uses the public Minecraft origin
+    # contract: ``player`` (``say`` describes an inbound PlayerMessage).
+    assert all(payload["body"]["origin"]["type"] == "player" for payload in payloads)
     assert all(
         payload["body"]["commandLine"].startswith("tellraw Steve ")
         for payload in payloads

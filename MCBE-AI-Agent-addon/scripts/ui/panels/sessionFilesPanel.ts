@@ -3,7 +3,7 @@ import type { Player } from "@minecraft/server";
 import { createCustomForm, createDduiObservable, showCustomFormSafely } from "../forms/formAdapter";
 import type { AgentUiStateV2 } from "../state";
 import { saveAgentUiState } from "../storage";
-import { requestSession } from "../../bridge/sessionClient";
+import { formatResponseError, requestSession } from "../../bridge/sessionClient";
 import type { SessionSavedInfo } from "../../bridge/sessionClient";
 import type { AgentPanelRoute } from "./routes";
 import { CLOSE_ROUTE, MAIN_ROUTE } from "./routes";
@@ -14,10 +14,7 @@ const PAGE_SIZE = 5;
  * 会话文件管理面板。
  * 保存当前会话 + saved 列表 + 恢复/删除（二次确认）。
  */
-export async function showSessionFilesPanel(
-  player: Player,
-  uiState: AgentUiStateV2,
-): Promise<AgentPanelRoute> {
+export async function showSessionFilesPanel(player: Player, uiState: AgentUiStateV2): Promise<AgentPanelRoute> {
   try {
     let nextRoute: AgentPanelRoute = CLOSE_ROUTE;
     const saveStatus = createDduiObservable("");
@@ -57,7 +54,7 @@ export async function showSessionFilesPanel(
           saveStatus.setData(`✅ 已保存: ${sid}`);
           await fetchSaved();
         } else {
-          saveStatus.setData(`❌ 保存失败: ${resp.error || "未知错误"}`);
+          saveStatus.setData(`❌ 保存失败: ${formatResponseError(resp.error)}`);
         }
       })
       .spacer()
@@ -68,9 +65,8 @@ export async function showSessionFilesPanel(
 
     // Dynamically add saved session entries if available
     const savedResp = await requestSession("saved", { player_name: player.name });
-    const savedList: SessionSavedInfo[] = (savedResp.ok && Array.isArray(savedResp.data?.saved))
-      ? (savedResp.data.saved as SessionSavedInfo[])
-      : [];
+    const savedList: SessionSavedInfo[] =
+      savedResp.ok && Array.isArray(savedResp.data?.saved) ? (savedResp.data.saved as SessionSavedInfo[]) : [];
 
     // Add sorted saved session entries
     // Sort by updated_at descending
@@ -100,7 +96,7 @@ export async function showSessionFilesPanel(
                 player.sendMessage("MCBE AI Agent: 已删除会话。");
                 await fetchSaved();
               } else {
-                player.sendMessage(`MCBE AI Agent: 删除失败: ${delResp.error || "未知错误"}`);
+                player.sendMessage(`MCBE AI Agent: 删除失败: ${formatResponseError(delResp.error)}`);
               }
               pendingDeleteId = null;
               nextRoute = MAIN_ROUTE;
@@ -127,7 +123,7 @@ export async function showSessionFilesPanel(
                 player.sendMessage("MCBE AI Agent: 会话已恢复。");
                 saveAgentUiState(player, uiState);
               } else {
-                player.sendMessage(`MCBE AI Agent: 恢复失败: ${restoreResp.error || "未知错误"}`);
+                player.sendMessage(`MCBE AI Agent: 恢复失败: ${formatResponseError(restoreResp.error)}`);
               }
               nextRoute = MAIN_ROUTE;
               form.close();
@@ -160,7 +156,7 @@ function formatSavedList(
   saved: SessionSavedInfo[],
   pageIndex: number,
   _pageSize: number,
-  _pendingDeleteId: string | null,
+  _pendingDeleteId: string | null
 ): string {
   if (saved.length === 0) {
     return "暂无保存的会话。";

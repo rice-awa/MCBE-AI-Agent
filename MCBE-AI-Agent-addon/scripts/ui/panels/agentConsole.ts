@@ -1,8 +1,7 @@
 import type { Player } from "@minecraft/server";
-import { world } from "@minecraft/server";
 
-import { sendUiChatMessage } from "../../bridge/toolPlayer";
-import { requestSession } from "../../bridge/sessionClient";
+import { sendApprovalDecision, sendUiChatMessage } from "../../bridge/toolPlayer";
+import { formatResponseError, requestSession } from "../../bridge/sessionClient";
 import { buildAgentChatCommand } from "../commands";
 import { createHistoryId, formatRecentConversation, getRecentTurns } from "../history";
 import type { AgentUiStateV2 } from "../state";
@@ -12,7 +11,6 @@ import { saveAgentUiState } from "../storage";
 import { recordPromptSent, syncLocalHistoryCount } from "../stats";
 import type { AgentPanelRoute } from "./routes";
 import { CLOSE_ROUTE, MAIN_ROUTE } from "./routes";
-import { TOOL_APPROVE_PREFIX, TOOL_DENY_PREFIX, TOOL_PLAYER_NAME } from "../../bridge/constants";
 
 const RECENT_TURNS_COUNT = 5;
 
@@ -160,7 +158,7 @@ export async function showAgentConsole(player: Player, uiState: AgentUiStateV2):
               saveAgentUiState(player, uiState);
             }
           } else {
-            player.sendMessage(`MCBE AI Agent: 新建会话失败: ${resp.error || "未知错误"}`);
+            player.sendMessage(`MCBE AI Agent: 新建会话失败: ${formatResponseError(resp.error)}`);
           }
         };
         void createNew();
@@ -176,38 +174,42 @@ export async function showAgentConsole(player: Player, uiState: AgentUiStateV2):
         form.close();
       })
       .spacer()
-      .divider()
-      .spacer()
-      // Approval buttons — visible when pending approvals exist
-      .label(createDduiObservable(buildApprovalStatusLine(uiState)))
-      .button("同意", () => {
-        const first = uiState.pendingApprovals.values().next().value;
-        if (!first) {
-          player.sendMessage("MCBE AI Agent: 当前没有待审批的工具调用。");
-          return;
-        }
-        const tp = world.getAllPlayers().find((p) => p.name === TOOL_PLAYER_NAME);
-        if (tp) {
-          tp.runCommand(`tell @s ${TOOL_APPROVE_PREFIX}|${first.approval_id}`);
-          uiState.pendingApprovals.delete(first.approval_id);
-          refreshConversation();
-        }
-      })
-      .button("拒绝", () => {
-        const first = uiState.pendingApprovals.values().next().value;
-        if (!first) {
-          player.sendMessage("MCBE AI Agent: 当前没有待审批的工具调用。");
-          return;
-        }
-        const tp = world.getAllPlayers().find((p) => p.name === TOOL_PLAYER_NAME);
-        if (tp) {
-          tp.runCommand(`tell @s ${TOOL_DENY_PREFIX}|${first.approval_id}`);
-          uiState.pendingApprovals.delete(first.approval_id);
-          refreshConversation();
-        }
-      })
-      .spacer()
       .divider();
+
+    // Approval controls are scoped to this player's pending records.
+    if (uiState.pendingApprovals.size > 0) {
+      form
+        .spacer()
+        .label(createDduiObservable(buildApprovalStatusLine(uiState)))
+        .button("同意", () => {
+          const first = uiState.pendingApprovals.values().next().value;
+          if (!first) {
+            player.sendMessage("MCBE AI Agent: 当前没有待审批的工具调用。");
+            return;
+          }
+          void sendApprovalDecision(first.player_name, first.cid, first.approval_id, "approve")
+            .then(() => {
+              uiState.pendingApprovals.delete(first.approval_id);
+              refreshConversation();
+            })
+            .catch(() => player.sendMessage("MCBE AI Agent: 审批发送失败，请稍后重试。"));
+        })
+        .button("拒绝", () => {
+          const first = uiState.pendingApprovals.values().next().value;
+          if (!first) {
+            player.sendMessage("MCBE AI Agent: 当前没有待审批的工具调用。");
+            return;
+          }
+          void sendApprovalDecision(first.player_name, first.cid, first.approval_id, "deny")
+            .then(() => {
+              uiState.pendingApprovals.delete(first.approval_id);
+              refreshConversation();
+            })
+            .catch(() => player.sendMessage("MCBE AI Agent: 审批发送失败，请稍后重试。"));
+        })
+        .spacer()
+        .divider();
+    }
 
     // ── Show form ──
     const shown = await showCustomFormSafely(player, form);
@@ -294,9 +296,7 @@ function buildApprovalStatusLine(uiState: AgentUiStateV2): string {
   let idx = 0;
   for (const info of uiState.pendingApprovals.values()) {
     idx++;
-    const batchInfo = info.batch_size && info.batch_size > 1
-      ? ` [批次 ${info.batch_index}/${info.batch_size}]`
-      : "";
+    const batchInfo = info.batch_size && info.batch_size > 1 ? ` [批次 ${info.batch_index}/${info.batch_size}]` : "";
     parts.push(`  ${idx}. ${info.tool_name}${batchInfo}: ${info.args_summary}`);
   }
   return `⏳ 待审批 ${count} 项:\n${parts.join("\n")}`;

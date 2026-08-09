@@ -1,0 +1,89 @@
+name: SDK Wheel Contract
+
+on:
+  push:
+    branches: [master, dev, beta]
+    paths:
+      - ".github/workflows/sdk-wheel-contract.yml"
+      - "requirements.txt"
+      - "tests/test_sdk_dependency.py"
+      - "tools/check_sdk_wheel.py"
+      - "docs/**"
+      - "README*"
+      - "MCBE-AI-Agent-addon/README.md"
+      - "CLAUDE.md"
+      - "config.example.json"
+      - ".trellis/spec/**"
+  pull_request:
+    branches: [master, dev, beta]
+    paths:
+      - ".github/workflows/sdk-wheel-contract.yml"
+      - "requirements.txt"
+      - "tests/test_sdk_dependency.py"
+      - "tools/check_sdk_wheel.py"
+      - "docs/**"
+      - "README*"
+      - "MCBE-AI-Agent-addon/README.md"
+      - "CLAUDE.md"
+      - "config.example.json"
+      - ".trellis/spec/**"
+  workflow_dispatch:
+    inputs:
+      sdk_ref:
+        description: "SDK ref to build (release gate defaults to v0.2.0)"
+        required: false
+        default: "refs/tags/v0.2.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wheel-contract:
+    name: Build SDK wheel and run Host contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Host repository
+        uses: actions/checkout@v4
+
+      # The SDK is a separate repository and is intentionally not installed
+      # from an editable checkout.  The v0.2.0 tag is a release gate: the Host
+      # contract must stay red until that artifact is published by the SDK repo.
+      - name: Checkout SDK release source
+        uses: actions/checkout@v4
+        with:
+          repository: rice-awa/mcbe-ws-sdk
+          ref: ${{ inputs.sdk_ref || 'refs/tags/v0.2.0' }}
+          path: mcbe-ws-sdk
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build SDK wheel in an isolated environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONTRACT_VENV="$RUNNER_TEMP/mcbe-host-contract"
+          SDK_DIST="$RUNNER_TEMP/mcbe-sdk-dist"
+          python -m venv "$CONTRACT_VENV"
+          "$CONTRACT_VENV/bin/python" -m pip install --upgrade pip build twine
+          mkdir -p "$SDK_DIST"
+          "$CONTRACT_VENV/bin/python" -m build --wheel --outdir "$SDK_DIST" mcbe-ws-sdk
+          "$CONTRACT_VENV/bin/python" -m twine check "$SDK_DIST"/*.whl
+          "$CONTRACT_VENV/bin/python" -m pip install --force-reinstall "$SDK_DIST"/*.whl
+          "$CONTRACT_VENV/bin/python" -m pip install -r requirements.txt
+          "$CONTRACT_VENV/bin/python" tools/check_sdk_wheel.py \
+            --wheel "$SDK_DIST"/*.whl \
+            --source-root "$GITHUB_WORKSPACE"
+
+      - name: Run public, codec and Host-facing contract tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONTRACT_VENV="$RUNNER_TEMP/mcbe-host-contract"
+          "$CONTRACT_VENV/bin/python" -m pytest -q tests/test_sdk_dependency.py

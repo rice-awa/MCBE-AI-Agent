@@ -1,10 +1,18 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
+  activateBridge,
+  _testingReset,
+  _testingGetQueueSize,
+  MAX_PRE_READY_REQUESTS,
+  parseBridgeRequest,
+  registerBridgeRouter,
+  setCapabilityHandler,
   shouldHandleScriptEvent,
   BRIDGE_MESSAGE_ID,
   BRIDGE_REQUEST_MESSAGE_ID,
   handleBridgeScriptEvent,
 } from "../../scripts/bridge/router";
+import { system } from "@minecraft/server";
 
 // Mock tool player so handleBridgeScriptEvent can finish without a simulated player
 vi.mock("../../scripts/bridge/toolPlayer", () => ({
@@ -16,6 +24,8 @@ import { sendBridgeResponseChunks } from "../../scripts/bridge/toolPlayer";
 describe("bridge router", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    _testingReset();
+    system.afterEvents.scriptEventReceive.clear?.();
   });
 
   describe("shouldHandleScriptEvent", () => {
@@ -100,5 +110,49 @@ describe("bridge router", () => {
       expect(response.ok).toBe(true);
       expect(response.payload.blocks[0].type_id).toBe("minecraft:stone");
     });
+  });
+
+  it("returns stable validation errors for malformed, invalid, and unsupported requests", () => {
+    expect(parseBridgeRequest("not-json")).toMatchObject({
+      ok: false,
+      response: { error: { code: "MALFORMED_JSON" } },
+    });
+    expect(parseBridgeRequest(JSON.stringify({ request_id: "r", payload: {} }))).toMatchObject({
+      ok: false,
+      response: { error: { code: "INVALID_REQUEST" } },
+    });
+    expect(parseBridgeRequest(JSON.stringify({ v: 9, request_id: "r", capability: "x" }))).toMatchObject({
+      ok: false,
+      response: { error: { code: "UNSUPPORTED_VERSION" } },
+    });
+  });
+
+  it("catches handler and response sender failures", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const sender = vi.fn().mockRejectedValue(new Error("send failed"));
+    await activateBridge(sender);
+    setCapabilityHandler(() => {
+      throw new Error("handler failed");
+    });
+    await expect(
+      handleBridgeScriptEvent({
+        id: BRIDGE_MESSAGE_ID,
+        message: JSON.stringify({ request_id: "failure", capability: "x", payload: {} }),
+      } as never),
+    ).resolves.toBeUndefined();
+    expect(errorSpy).toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it("bounds requests received before activation", () => {
+    registerBridgeRouter();
+    for (let index = 0; index < MAX_PRE_READY_REQUESTS + 1; index += 1) {
+      system.afterEvents.scriptEventReceive.emit({
+        id: BRIDGE_MESSAGE_ID,
+        message: JSON.stringify({ request_id: `r-${index}`, capability: "x", payload: {} }),
+        sourceType: "Entity",
+      });
+    }
+    expect(_testingGetQueueSize()).toBe(MAX_PRE_READY_REQUESTS);
   });
 });

@@ -1,0 +1,10 @@
+{"file":".trellis/spec/backend/index.md","reason":"Backend Quality Check section"}
+{"file":".trellis/spec/backend/runtime-architecture.md","reason":"Async lifecycle, delivery and cross-layer architecture audit"}
+{"file":".trellis/spec/backend/session-and-identity.md","reason":"Two-player/two-conversation isolation audit"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"pytest/ruff/mypy delivery gate"}
+{"file":".trellis/spec/addon/index.md","reason":"Addon Quality Check and build gate"}
+{"file":".trellis/spec/addon/bridge-protocol.md","reason":"Wire/schema/framing conformance audit"}
+{"file":".trellis/spec/addon/state-testing-and-build.md","reason":"Bounded state, persistence, Vitest and build audit"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Full SDK→Host→Addon data-flow verification"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Duplicate constants/framing/decoder search"}
+{"file":".trellis/tasks/08-09-mcbews-v1-contract-closure/research/review-evidence.md","reason":"Acceptance evidence and external API constraints"}
