@@ -13,17 +13,17 @@
 
 ### Phase 1 — SDK protocol authority
 
-- [ ] Create canonical MCBEWS/1 manifest and executable wire vectors under the installed Python package.
-- [ ] Add semantic profile names/version axes/error codes and deprecated aliases; make internal settings,
+- [x] Create canonical MCBEWS/1 manifest and executable wire vectors under the installed Python package.
+- [x] Add semantic profile names/version axes/error codes and deprecated aliases; make internal settings,
   codec, service, session and delivery concrete to MCBEWS/1.
-- [ ] Add typed session request/response, approval decision and text response models/decoders.
-- [ ] Extend the trusted ToolPlayer classifier and Facade/Hook typed control callback; propagate UI Chat cid.
-- [ ] Make text response usage completion-frame-only and add atomic session response delivery with correlated
+- [x] Add typed session request/response, approval decision and text response models/decoders.
+- [x] Extend the trusted ToolPlayer classifier and Facade/Hook typed control callback; propagate UI Chat cid.
+- [x] Make text response usage completion-frame-only and add atomic session response delivery with correlated
   oversize error.
-- [ ] Generate/verify SDK reference Addon constants, byte-aware chunker, bounded assembler and router assets
+- [x] Generate/verify SDK reference Addon constants, byte-aware chunker, bounded assembler and router assets
   against manifest/vectors.
-- [ ] Expand parity/conformance checks from strings to fields, versions, optional metadata and behavior vectors.
-- [ ] Bump SDK Python and Addon metadata to `0.2.0`; update release notes/docs.
+- [x] Expand parity/conformance checks from strings to fields, versions, optional metadata and behavior vectors.
+- [x] Bump SDK Python and Addon metadata to `0.2.0`; update release notes/docs.
 
 SDK gate:
 
@@ -49,17 +49,17 @@ adding the SDK source tree to `PYTHONPATH`.
 
 ### Phase 2 — Host ingress, domain results and typed outbound
 
-- [ ] Add Host addon ingress adapter and wire it to the SDK typed callback; remove prefix/JSON/identity
+- [x] Add Host addon ingress adapter and wire it to the SDK typed callback; remove prefix/JSON/identity
   parsing from independent `HostConnectionHook.on_player_message` branches.
-- [ ] Pass `UiChatMessage.conversation_id` into `handle_ui_chat`/`handle_chat` and `ChatRequest`; include cid
+- [x] Pass `UiChatMessage.conversation_id` into `handle_ui_chat`/`handle_chat` and `ChatRequest`; include cid
   in the user echo.
-- [ ] Add typed gateway outbound models and migrate every run-command/text/session/game producer.
-- [ ] Update `BrokerResponseBridge` typed dispatch, CID/title/usage forwarding, approval task tracking and
+- [x] Add typed gateway outbound models and migrate every run-command/text/session/game producer.
+- [x] Update `BrokerResponseBridge` typed dispatch, CID/title/usage forwarding, approval task tracking and
   atomic session delivery.
-- [ ] Add pending-approval owner lookup for legacy id-only decisions and strict claim cross-checking for new
+- [x] Add pending-approval owner lookup for legacy id-only decisions and strict claim cross-checking for new
   payloads.
-- [ ] Extract `ConversationOperations`; adapt chat renderer and typed session response; fix real message counts.
-- [ ] Convert `models/addon_bridge.py` to deprecated SDK re-exports and make `AddonProtocolConfig` explicitly
+- [x] Extract `ConversationOperations`; adapt chat renderer and typed session response; fix real message counts.
+- [x] Convert `models/addon_bridge.py` to deprecated SDK re-exports and make `AddonProtocolConfig` explicitly
   ignored/deprecated rather than runtime-configurable.
 
 Host focused gate:
@@ -71,16 +71,16 @@ pytest -q tests/test_gateway_hook_auth_chat.py tests/test_gateway_broker_bridge.
 
 ### Phase 3 — Product Addon protocol adapters
 
-- [ ] Generate/sync semantic constants and vectors from the installed SDK resource; migrate internal imports
+- [x] Generate/sync semantic constants and vectors from the installed SDK resource; migrate internal imports
   away from deprecated aliases.
-- [ ] Replace UTF-16 length slicing with the byte-aware convergent chunker and route bridge/UI Chat through it.
-- [ ] Split raw text framing/assembly from `responseSync` UI facade; implement all bounds, consistency and
+- [x] Replace UTF-16 length slicing with the byte-aware convergent chunker and route bridge/UI Chat through it.
+- [x] Split raw text framing/assembly from `responseSync` UI facade; implement all bounds, consistency and
   player+cid+response stream keys.
-- [ ] Extend approval DTO/decision transport with player+cid and centralize ToolPlayer sending outside panels.
-- [ ] Strengthen session client request/response validation, immediate send failure and oversize handling.
-- [ ] Replace router casts with validated decoder/stable errors/bounded startup queue; co-locate capability
+- [x] Extend approval DTO/decision transport with player+cid and centralize ToolPlayer sending outside panels.
+- [x] Strengthen session client request/response validation, immediate send failure and oversize handling.
+- [x] Replace router casts with validated decoder/stable errors/bounded startup queue; co-locate capability
   metadata with handlers.
-- [ ] Ensure UI close, persistence and streaming completion clean only the owning player/response state.
+- [x] Ensure UI close, persistence and streaming completion clean only the owning player/response state.
 
 Addon gate:
 
@@ -93,12 +93,12 @@ pnpm build
 
 ### Phase 4 — Packaging, CI and documentation
 
-- [ ] Pin Host to `mcbe-ws-sdk>=0.2.0,<0.3.0` and update dependency contract tests.
-- [ ] Add SDK wheel-installed contract job/check and root workflow step that cannot pass through an editable
+- [x] Pin Host to `mcbe-ws-sdk>=0.2.0,<0.3.0` and update dependency contract tests.
+- [x] Add SDK wheel-installed contract job/check and root workflow step that cannot pass through an editable
   nested checkout.
-- [ ] Update main protocol doc, Addon README, CLAUDE/config docs and Trellis addon/backend specs.
-- [ ] Document release order: merge/release SDK `v0.2.0`, verify PyPI artifact, then merge Host/Add-on.
-- [ ] Add real-MCBE smoke checklist for sender source, ToolPlayer identity, Unicode, long session and approval.
+- [x] Update main protocol doc, Addon README, CLAUDE/config docs and Trellis addon/backend specs.
+- [x] Document release order: merge/release SDK `v0.2.0`, verify PyPI artifact, then merge Host/Add-on.
+- [x] Add real-MCBE smoke checklist for sender source, ToolPlayer identity, Unicode, long session and approval.
 
 ### Phase 5 — Full integration review
 
@@ -136,5 +136,5 @@ pnpm build
 - [x] Repository evidence and current library docs are captured in `research/review-evidence.md`.
 - [x] No unresolved user-owned product/UX/risk decision remains.
 - [x] `prd.md`, `design.md`, `implement.md`, `implement.jsonl` and `check.jsonl` exist.
-- [ ] User explicitly approves this latest planning summary in a subsequent message.
-- [ ] Run `task.py start` only after that approval; do not edit product code before it.
+- [x] User explicitly approves this latest planning summary in a subsequent message.
+- [x] Run `task.py start` only after that approval; do not edit product code before it.
