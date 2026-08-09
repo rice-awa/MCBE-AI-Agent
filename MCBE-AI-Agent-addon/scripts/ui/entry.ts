@@ -51,7 +51,7 @@ export async function openAgentUi(player: Player): Promise<void> {
   saveAgentUiState(player, uiState);
 
   // 注册活跃 UI 状态，以便响应同步模块实时更新
-  setActiveUiState(player.id, uiState);
+  setActiveUiState(player.id, uiState, player.name);
 
   try {
     let route: AgentPanelRoute = { panel: "main" };

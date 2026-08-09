@@ -3,6 +3,8 @@
 type ScriptEventCallback = (event: { id: string; message: string }) => void;
 
 const scriptEventSubscribers = new Set<ScriptEventCallback>();
+let nextTimerId = 1;
+const timers = new Map<number, ReturnType<typeof setTimeout>>();
 
 export function __emitScriptEvent(event: { id: string; message: string }): void {
   for (const subscriber of scriptEventSubscribers) {
@@ -20,10 +22,29 @@ export const system = {
       unsubscribe: (callback: ScriptEventCallback) => {
         scriptEventSubscribers.delete(callback);
       },
+      emit: (event: { id: string; message: string }) => {
+        for (const subscriber of scriptEventSubscribers) subscriber(event);
+      },
     },
   },
   currentTick: 0,
   runInterval: () => {},
+  runTimeout: (callback: () => void, ticks: number) => {
+    const id = nextTimerId++;
+    const timer = setTimeout(() => {
+      timers.delete(id);
+      callback();
+    }, Math.max(0, ticks) * 1);
+    timers.set(id, timer);
+    return id;
+  },
+  clearRun: (id: number) => {
+    const timer = timers.get(id);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timers.delete(id);
+    }
+  },
   run: (callback: () => void) => {
     // Execute immediately in tests (simulate next tick)
     queueMicrotask(callback);
@@ -250,6 +271,8 @@ export function __resetMinecraftServerMock(): void {
   players.length = 0;
   blockStore.clear();
   scriptEventSubscribers.clear();
+  for (const timer of timers.values()) clearTimeout(timer);
+  timers.clear();
 }
 
 /**

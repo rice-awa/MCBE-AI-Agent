@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { chunkBridgePayload, formatResponseChunk } from "../../scripts/bridge/chunking";
+import {
+  chunkBridgePayload,
+  chunkUiChatPayload,
+  formatResponseChunk,
+  utf8ByteLength,
+} from "../../scripts/bridge/chunking";
 
 describe("bridge chunking", () => {
   it("chunks payload into deterministic parts with sequential metadata", () => {
@@ -24,5 +29,25 @@ describe("bridge chunking", () => {
     expect(() => chunkBridgePayload("req-4", "{\"ok\":true}", 0)).toThrowError(
       "maxChunkContentLength must be greater than 0",
     );
+  });
+
+  it("splits Unicode code points and keeps tell command lines within 461 UTF-8 bytes", () => {
+    const payload = JSON.stringify({ player: "玩家", message: `${"中".repeat(256)}😀` });
+    const chunks = chunkUiChatPayload("ui-unicode", payload);
+
+    expect(chunks.map((chunk) => chunk.split("|").slice(4).join("|")).join("")).toBe(payload);
+    for (const chunk of chunks) {
+      expect(utf8ByteLength(`tell @s ${chunk}`)).toBeLessThanOrEqual(461);
+      expect(Array.from(chunk.split("|").slice(4).join("|")).length).toBeLessThanOrEqual(256);
+    }
+  });
+
+  it("emits an empty 1/1 frame and rejects wrappers with no room", () => {
+    expect(chunkBridgePayload("empty", "")).toEqual(["MCBEWS|BRIDGE|empty|1/1|"]);
+    expect(() =>
+      chunkBridgePayload("too-large", "中", {
+        commandLineByteBudget: 5,
+      }),
+    ).toThrowError("chunk framing leaves no room for one Unicode code point");
   });
 });

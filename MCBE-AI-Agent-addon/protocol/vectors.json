@@ -1,0 +1,214 @@
+{
+  "bridge_requests": [
+    {
+      "name": "legacy-v1-without-version",
+      "version": 1,
+      "message": "{\"request_id\":\"r-1\",\"capability\":\"greet\",\"payload\":{\"name\":\"Steve\"}}"
+    },
+    {
+      "name": "current-v2",
+      "version": 2,
+      "message": "{\"v\":2,\"request_id\":\"r-1\",\"capability\":\"greet\",\"payload\":{\"name\":\"Steve\"}}"
+    }
+  ],
+  "ui_chat": [
+    {
+      "name": "ui-chat-cid",
+      "message": "MCBEWS|UI_CHAT|ui-1|1/1|{\"player\":\"Steve\",\"message\":\"你好 😀\",\"cid\":\"chat-a\"}",
+      "player_name": "Steve",
+      "conversation_id": "chat-a",
+      "text": "你好 😀"
+    }
+  ],
+  "text_response": [
+    {
+      "name": "assistant-final-usage",
+      "frame": {
+        "id": "resp-1",
+        "i": 1,
+        "n": 1,
+        "p": "Steve",
+        "r": "assistant",
+        "c": "ok",
+        "cid": "chat-a",
+        "t": "Chat",
+        "u": {
+          "i": 3,
+          "o": 5
+        }
+      }
+    },
+    {
+      "name": "approval-role",
+      "frame": {
+        "id": "approval-1",
+        "i": 1,
+        "n": 1,
+        "p": "Steve",
+        "r": "approval",
+        "c": "{\"approval_id\":\"ap-1\"}",
+        "cid": "chat-a"
+      }
+    }
+  ],
+  "session": [
+    {
+      "name": "session-list",
+      "request": "{\"request_id\":\"sess-1\",\"v\":1,\"action\":\"list\",\"player_name\":\"Steve\",\"cid\":\"chat-a\"}"
+    }
+  ],
+  "approval": [
+    {
+      "name": "approval-allow",
+      "message": "MCBEWS|TOOL_APPROVE|{\"v\":1,\"approval_id\":\"ap-1\",\"player_name\":\"Steve\",\"cid\":\"chat-a\"}",
+      "decision": "approve"
+    },
+    {
+      "name": "approval-legacy-id",
+      "message": "MCBEWS|TOOL_DENY|ap-1",
+      "decision": "deny",
+      "legacy": true
+    }
+  ],
+  "behavior": {
+    "chunking": [
+      {
+        "name": "unicode-bounded",
+        "prefix": "MCBEWS|BRIDGE",
+        "id": "unicode-1",
+        "payload": "中文😀中文😀中文😀中文😀中文😀中文😀中文😀中文😀",
+        "budget": 80,
+        "max_content_code_points": 256,
+        "wrapper_prefix": "tell @s "
+      },
+      {
+        "name": "empty-payload",
+        "prefix": "MCBEWS|BRIDGE",
+        "id": "empty-1",
+        "payload": "",
+        "budget": 461,
+        "max_content_code_points": 256,
+        "wrapper_prefix": "tell @s "
+      },
+      {
+        "name": "empty-wrapper-no-room",
+        "prefix": "MCBEWS|BRIDGE",
+        "id": "empty-2",
+        "payload": "",
+        "budget": 20,
+        "max_content_code_points": 256,
+        "wrapper_prefix": "tell @s wrapper-that-does-not-fit "
+      }
+    ],
+    "text_response": [
+      {
+        "name": "final-first-identical-duplicate",
+        "chunks": [
+          {
+            "id": "dup-1",
+            "i": 3,
+            "n": 3,
+            "p": "Steve",
+            "r": "assistant",
+            "c": "done",
+            "cid": "chat-a",
+            "u": {
+              "i": 1,
+              "o": 2
+            }
+          },
+          {
+            "id": "dup-1",
+            "i": 1,
+            "n": 3,
+            "p": "Steve",
+            "r": "assistant",
+            "c": "answer ",
+            "cid": "chat-a"
+          },
+          {
+            "id": "dup-1",
+            "i": 3,
+            "n": 3,
+            "p": "Steve",
+            "r": "assistant",
+            "c": "done",
+            "cid": "chat-a",
+            "u": {
+              "i": 1,
+              "o": 2
+            }
+          },
+          {
+            "id": "dup-1",
+            "i": 2,
+            "n": 3,
+            "p": "Steve",
+            "r": "assistant",
+            "c": "",
+            "cid": "chat-a"
+          }
+        ],
+        "expected": {
+          "player_name": "Steve",
+          "role": "assistant",
+          "text": "answer done",
+          "response_id": "dup-1",
+          "conversation_id": "chat-a",
+          "usage": {
+            "i": 1,
+            "o": 2
+          }
+        }
+      },
+      {
+        "name": "metadata-conflict",
+        "chunks": [
+          {
+            "id": "meta-1",
+            "i": 1,
+            "n": 2,
+            "p": "Steve",
+            "r": "assistant",
+            "c": "a",
+            "cid": "chat-a",
+            "t": "one"
+          },
+          {
+            "id": "meta-1",
+            "i": 2,
+            "n": 2,
+            "p": "Steve",
+            "r": "assistant",
+            "c": "b",
+            "cid": "chat-a",
+            "t": "two"
+          }
+        ],
+        "expected_error": "metadata"
+      },
+      {
+        "name": "duplicate-content-conflict",
+        "chunks": [
+          {
+            "id": "dup-2",
+            "i": 1,
+            "n": 2,
+            "p": "Steve",
+            "r": "assistant",
+            "c": "a"
+          },
+          {
+            "id": "dup-2",
+            "i": 1,
+            "n": 2,
+            "p": "Steve",
+            "r": "assistant",
+            "c": "A"
+          }
+        ],
+        "expected_error": "duplicate"
+      }
+    ]
+  }
+}

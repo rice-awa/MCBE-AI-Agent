@@ -1,20 +1,46 @@
 import { system, world } from "@minecraft/server";
 
 import {
-  SESSION_REQ_PREFIX,
-  SESSION_RESP_MESSAGE_ID,
-  TOOL_PLAYER_NAME,
-} from "./constants";
+  COMMAND_LINE_BYTE_BUDGET,
+  SESSION_REQUEST_CHAT_PREFIX,
+  SESSION_RESPONSE_SCRIPT_EVENT_ID,
+  SESSION_SCHEMA_VERSION,
+  TRUSTED_BRIDGE_PLAYER_NAME,
+} from "./protocol";
+import { utf8ByteLength } from "./chunking";
 
-// ── Types ──
+export const SESSION_TIMEOUT_TICKS = 100;
+
+export type SessionAction =
+  | "new"
+  | "switch"
+  | "list"
+  | "status"
+  | "clear"
+  | "save"
+  | "restore"
+  | "saved"
+  | "delete"
+  | "compress";
+
+export type SessionRequestParams = {
+  cid?: string;
+  sid?: string;
+  player_name?: string;
+};
+
+export type SessionError = {
+  code: string;
+  message: string;
+};
 
 export type SessionResp = {
   request_id: string;
   v: number;
   ok: boolean;
-  action: string;
+  action: SessionAction | string;
   data?: Record<string, unknown>;
-  error?: string;
+  error?: SessionError;
 };
 
 export type SessionConversationInfo = {
@@ -33,133 +59,167 @@ export type SessionSavedInfo = {
 };
 
 type PendingRequest = {
-  resolve: (resp: SessionResp) => void;
+  resolve: (response: SessionResp) => void;
   timer: number;
+  action: SessionAction;
 };
 
-// ── State ──
-
+const SESSION_ACTIONS: readonly SessionAction[] = [
+  "new",
+  "switch",
+  "list",
+  "status",
+  "clear",
+  "save",
+  "restore",
+  "saved",
+  "delete",
+  "compress",
+];
 const pendingRequests = new Map<string, PendingRequest>();
-/** 5 seconds ≈ 100 ticks (1 tick = 50ms) */
-const SESSION_TIMEOUT_TICKS = 100;
 let isSessionRespRegistered = false;
 
-/**
- * Reset internal state for tests.
- */
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+function isSessionAction(value: unknown): value is SessionAction {
+  return typeof value === "string" && SESSION_ACTIONS.includes(value as SessionAction);
+}
+
+function failure(requestId: string, action: SessionAction | string, code: string, message: string): SessionResp {
+  return {
+    request_id: requestId,
+    v: SESSION_SCHEMA_VERSION,
+    ok: false,
+    action,
+    error: { code, message },
+  };
+}
+
+function formatResponseError(error: SessionError | undefined): string {
+  return error ? `${error.code}: ${error.message}` : "未知错误";
+}
+
+export { formatResponseError };
+
+export function parseSessionResponse(value: unknown): SessionResp | null {
+  if (!isRecord(value)) return null;
+  if (
+    typeof value.request_id !== "string" ||
+    !value.request_id.trim() ||
+    value.v !== SESSION_SCHEMA_VERSION ||
+    typeof value.ok !== "boolean" ||
+    !isSessionAction(value.action)
+  ) {
+    return null;
+  }
+  if (value.data !== undefined && !isRecord(value.data)) return null;
+  let error: SessionError | undefined;
+  if (value.error !== undefined) {
+    if (!isRecord(value.error) || typeof value.error.code !== "string" || typeof value.error.message !== "string") {
+      return null;
+    }
+    error = { code: value.error.code, message: value.error.message };
+  }
+  if (value.ok && error !== undefined) return null;
+  if (!value.ok && error === undefined) return null;
+  return {
+    request_id: value.request_id,
+    v: SESSION_SCHEMA_VERSION,
+    ok: value.ok,
+    action: value.action,
+    ...(value.data === undefined ? {} : { data: value.data }),
+    ...(error === undefined ? {} : { error }),
+  };
+}
+
+function settle(requestId: string, response: SessionResp): void {
+  const pending = pendingRequests.get(requestId);
+  if (!pending) return;
+  system.clearRun(pending.timer);
+  pendingRequests.delete(requestId);
+  pending.resolve(response);
+}
+
 export function resetSessionClientForTests(): void {
-  for (const [, pending] of pendingRequests) {
+  for (const [requestId, pending] of pendingRequests) {
     system.clearRun(pending.timer);
+    pending.resolve(failure(requestId, pending.action, "SESSION_CANCELLED", "session request was cancelled"));
   }
   pendingRequests.clear();
   isSessionRespRegistered = false;
 }
 
-/**
- * Register the mcbews:session_resp scriptevent listener.
- * Idempotent — safe to call multiple times.
- */
 export function registerSessionRespHandler(): void {
-  if (isSessionRespRegistered) {
-    return;
-  }
+  if (isSessionRespRegistered) return;
   isSessionRespRegistered = true;
-
   system.afterEvents.scriptEventReceive.subscribe((event) => {
-    if (event.id !== SESSION_RESP_MESSAGE_ID) {
+    if (event.id !== SESSION_RESPONSE_SCRIPT_EVENT_ID) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(event.message);
+    } catch {
       return;
     }
-
-    try {
-      const resp = JSON.parse(event.message) as SessionResp;
-      const pending = pendingRequests.get(resp.request_id);
-      if (!pending) {
-        return;
-      }
-      system.clearRun(pending.timer);
-      pendingRequests.delete(resp.request_id);
-      pending.resolve(resp);
-    } catch {
-      // Ignore parse errors
-    }
+    const response = parseSessionResponse(parsed);
+    if (!response) return;
+    const pending = pendingRequests.get(response.request_id);
+    if (!pending || pending.action !== response.action) return;
+    settle(response.request_id, response);
   });
 }
 
-/**
- * Send a session request to Python and wait for the response.
- *
- * @param action - Session action (new, switch, list, status, clear, save, restore, saved, delete, compress)
- * @param params - Optional parameters (cid?, sid?, player_name?)
- * @returns Promise that resolves with the session response or a timeout error
- */
-export function requestSession(
-  action: string,
-  params?: { cid?: string; sid?: string; player_name?: string },
-): Promise<SessionResp> {
-  return new Promise<SessionResp>((resolve) => {
-    const requestId = `sess-${Date.now()}-${Math.floor(Math.random() * 0x10000).toString(16)}`;
-    const playerName = params?.player_name ?? "";
-
-    // Build the JSON payload
-    const payloadObj: Record<string, unknown> = {
-      request_id: requestId,
-      v: 1,
-      action,
-      player_name: playerName,
-    };
-    if (params?.cid) {
-      payloadObj.cid = params.cid;
-    }
-    if (params?.sid) {
-      payloadObj.sid = params.sid;
-    }
-    const payload = JSON.stringify(payloadObj);
-
-    // Set up the pending request (timeout guard)
-    // Minecraft scripting sandbox does not support setTimeout — use system.runTimeout.
-    const timer = system.runTimeout(() => {
-      pendingRequests.delete(requestId);
-      resolve({
-        request_id: requestId,
-        v: 1,
-        ok: false,
-        action,
-        error: "会话同步不可用（服务端版本过旧）",
-      });
-    }, SESSION_TIMEOUT_TICKS);
-
-    pendingRequests.set(requestId, { resolve, timer });
-
-    // Send via tool player's runCommand
-    sendSessionRequest(requestId, payload);
-  });
-}
-
-/**
- * Send the session request as tell chat from the tool player.
- * Session payloads are small (well under 256 chars) so no chunking is needed.
- */
-function sendSessionRequest(requestId: string, payload: string): void {
-  const toolPlayer = world
-    .getAllPlayers()
-    .find((player) => player.name === TOOL_PLAYER_NAME);
-
-  if (!toolPlayer) {
-    // No tool player available — resolve with error
-    const pending = pendingRequests.get(requestId);
-    if (pending) {
-      system.clearRun(pending.timer);
-      pendingRequests.delete(requestId);
-      pending.resolve({
-        request_id: requestId,
-        v: 1,
-        ok: false,
-        action: "",
-        error: "Tool player is not available",
-      });
-    }
-    return;
+export function requestSession(action: string, params: SessionRequestParams = {}): Promise<SessionResp> {
+  const requestId = `sess-${Date.now()}-${Math.floor(Math.random() * 0x10000).toString(16)}`;
+  if (!isSessionAction(action)) {
+    return Promise.resolve(failure(requestId, action, "INVALID_SESSION_REQUEST", "unsupported session action"));
+  }
+  const playerName = params.player_name?.trim() ?? "";
+  if (!playerName) {
+    return Promise.resolve(failure(requestId, action, "INVALID_SESSION_REQUEST", "player_name is required"));
+  }
+  if (action === "switch" && !params.cid?.trim()) {
+    return Promise.resolve(failure(requestId, action, "INVALID_SESSION_REQUEST", "switch requires cid"));
+  }
+  if ((action === "restore" || action === "delete") && !params.sid?.trim()) {
+    return Promise.resolve(failure(requestId, action, "INVALID_SESSION_REQUEST", `${action} requires sid`));
   }
 
-  toolPlayer.runCommand(`tell @s ${SESSION_REQ_PREFIX}|${payload}`);
+  const payloadObj: Record<string, unknown> = {
+    request_id: requestId,
+    v: SESSION_SCHEMA_VERSION,
+    action,
+    player_name: playerName,
+    cid: params.cid?.trim() || "default",
+    ...(params.sid?.trim() ? { sid: params.sid.trim() } : {}),
+  };
+  const payload = JSON.stringify(payloadObj);
+  return new Promise<SessionResp>((resolve) => {
+    const timer = system.runTimeout(() => {
+      settle(requestId, failure(requestId, action, "SESSION_TIMEOUT", "session request timed out"));
+    }, SESSION_TIMEOUT_TICKS);
+    pendingRequests.set(requestId, { resolve, timer, action });
+    void sendSessionRequest(payload).catch((error: unknown) => {
+      settle(
+        requestId,
+        failure(
+          requestId,
+          action,
+          "SESSION_SEND_FAILED",
+          error instanceof Error ? error.message : "session request could not be sent"
+        )
+      );
+    });
+  });
+}
+
+/** Send one complete session request; it is never passed through bridge chunking. */
+async function sendSessionRequest(payload: string): Promise<void> {
+  const toolPlayer = world.getAllPlayers().find((player) => player.name === TRUSTED_BRIDGE_PLAYER_NAME);
+  if (!toolPlayer) throw new Error("Tool player is not available");
+  const command = `tell @s ${SESSION_REQUEST_CHAT_PREFIX}|${payload}`;
+  if (utf8ByteLength(command) > COMMAND_LINE_BYTE_BUDGET) {
+    throw new Error("session request exceeds atomic command budget");
+  }
+  await Promise.resolve(toolPlayer.runCommand(command));
 }

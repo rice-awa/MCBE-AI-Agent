@@ -81,11 +81,7 @@ export function resetStats(resetAt = Date.now()): AgentUiStats {
 /**
  * 记录本轮 token 用量，更新全局和会话累计值。
  */
-export function recordTokenUsage(
-  stats: AgentUiStats,
-  inputTokens: number,
-  outputTokens: number,
-): AgentUiStats {
+export function recordTokenUsage(stats: AgentUiStats, inputTokens: number, outputTokens: number): AgentUiStats {
   const totalTokens = inputTokens + outputTokens;
   return {
     ...stats,

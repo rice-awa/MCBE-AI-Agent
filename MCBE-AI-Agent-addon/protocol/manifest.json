@@ -1,0 +1,56 @@
+{
+  "protocol_line": "MCBEWS/1",
+  "wire": {
+    "capability_request_script_event_id": "mcbews:bridge_req",
+    "capability_response_chat_prefix": "MCBEWS|BRIDGE",
+    "ui_chat_chunk_prefix": "MCBEWS|UI_CHAT",
+    "session_request_chat_prefix": "MCBEWS|SESSION",
+    "session_request_script_event_id": "mcbews:session_req",
+    "session_response_script_event_id": "mcbews:session_resp",
+    "text_response_script_event_id": "mcbews:text_resp",
+    "approval_allow_chat_prefix": "MCBEWS|TOOL_APPROVE",
+    "approval_deny_chat_prefix": "MCBEWS|TOOL_DENY",
+    "trusted_bridge_player_name": "MCBEWS_BRIDGE"
+  },
+  "versions": {
+    "capability_request_schema": 2,
+    "session_schema": 1,
+    "text_response_framing": 1,
+    "ddui_persistence": 2
+  },
+  "limits": {
+    "command_line_byte_budget": 461,
+    "command_line_budget_source": "empirical",
+    "upstream_max_content_code_points": 256,
+    "response_max_buffers": 64,
+    "response_max_chunks_per_message": 128,
+    "response_max_message_bytes": 65536,
+    "response_max_total_buffer_bytes": 262144,
+    "response_buffer_ttl_ms": 30000,
+    "session_response_max_command_bytes": 461
+  },
+  "text_response": {
+    "allowed_roles": [
+      "user",
+      "assistant",
+      "approval"
+    ],
+    "usage_field": "u",
+    "usage_completion_only": true,
+    "conversation_id_field": "cid",
+    "title_field": "t"
+  },
+  "error_codes": [
+    "MALFORMED_JSON",
+    "INVALID_REQUEST",
+    "UNSUPPORTED_VERSION",
+    "UNSUPPORTED_CAPABILITY",
+    "CAPABILITY_FAILED",
+    "RESPONSE_SEND_FAILED",
+    "BRIDGE_NOT_READY_QUEUE_FULL",
+    "SESSION_RESPONSE_TOO_LARGE",
+    "INVALID_SESSION_REQUEST",
+    "INVALID_APPROVAL_DECISION",
+    "UNKNOWN_TEXT_ROLE"
+  ]
+}
