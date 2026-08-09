@@ -9,6 +9,9 @@
 
 以上提交均只在本地分支，尚未 push、开 PR、打 tag 或发布。
 
+- 根仓库当前分支：`fix/mcbews-v1-contract-closure`，相对远端 ahead 4。
+- SDK 提交当前位于既有 `feature/session-text-resp-fields`，相对远端 ahead 1；创建 SDK PR 前仍需按计划确认其真实 integration target，并决定是否把该提交迁移到 `fix/mcbews-v1-contract-closure`。
+
 ## 已完成范围
 
 - Phase 1：SDK canonical manifest/vectors、typed codec/control、reference Addon、0.2.0 package 与 clean-wheel gate。
