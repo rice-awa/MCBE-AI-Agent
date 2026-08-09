@@ -3,7 +3,7 @@
   "name": "mcbews-v1-contract-closure",
   "title": "MCBEWS/1 契约闭合与协议内核收敛",
   "description": "闭合 MCBEWS/1 的 CID、身份、framing、session、approval 与发布契约，并收敛 SDK/Host/产品 Addon 的协议内核。",
-  "status": "in_progress",
+  "status": "completed",
   "dev_type": "bugfix",
   "scope": "services/gateway, models, core, tests, mcbe-ws-sdk, MCBE-AI-Agent-addon, docs, CI",
   "package": null,
@@ -11,7 +11,7 @@
   "creator": "rice-awa",
   "assignee": "rice-awa",
   "createdAt": "2026-08-09",
-  "completedAt": null,
+  "completedAt": "2026-08-09",
   "branch": "fix/mcbews-v1-contract-closure",
   "base_branch": "dev",
   "worktree_path": null,
@@ -21,6 +21,6 @@
   "children": [],
   "parent": null,
   "relatedFiles": [],
-  "notes": "2026-08-09 checkpoint: Phase 1-4 committed; Phase 5 integration review and external release/smoke gates remain. See status.md.",
+  "notes": "2026-08-09: Phase 1-5 source and integration review complete; archived before SDK/Root PR integration. External SDK release and real-MCBE smoke remain. See status.md.",
   "meta": {}
 }

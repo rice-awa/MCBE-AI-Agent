@@ -102,11 +102,11 @@ pnpm build
 
 ### Phase 5 — Full integration review
 
-- [ ] Run generated-asset check and search all legacy aliases/magic dict producers.
-- [ ] Trace UI Chat and text response data flow end to end for two players/two conversations.
-- [ ] Trace session and approval sender/business identity independently.
-- [ ] Run full SDK, root Python and product Addon gates; fix all regressions.
-- [ ] Use `trellis-update-spec` to preserve final executable contracts, then use `trellis-check` for the final
+- [x] Run generated-asset check and search all legacy aliases/magic dict producers.
+- [x] Trace UI Chat and text response data flow end to end for two players/two conversations.
+- [x] Trace session and approval sender/business identity independently.
+- [x] Run full SDK, root Python and product Addon gates; fix all regressions.
+- [x] Use `trellis-update-spec` to preserve final executable contracts, then use `trellis-check` for the final
   full-scope quality pass.
 
 ## Mandatory regression matrix
