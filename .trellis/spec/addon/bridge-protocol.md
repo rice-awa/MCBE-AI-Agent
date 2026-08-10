@@ -138,9 +138,14 @@ ConversationOperations.execute(..., player_name: str, action="switch", conversat
 
 - SDK：alias、字段名、省略、空白四类模型输入，以及用户原始帧经
   `AddonBridgeService.handle_player_message()` 得到 typed control message。
-- Host：切换到 default 后断言 active conversation，并断言同连接另一玩家不变与缺失目标失败。
-- Addon：断言 switch/default 只发送一条原子命令，并按 request id/action 关联响应。
+- Host：切换到 default 后断言 active conversation，并断言同连接另一玩家不变；`None` 与空白
+  目标都必须返回 `INVALID_ARGUMENT`。
+- Addon：断言 switch/default 只调用一次 `runCommand`，完整命令 UTF-8 字节数不超过
+  `COMMAND_LINE_BYTE_BUDGET`，payload 保留当前 `player_name` / `cid="default"`，并按
+  request id/action 关联响应。
 - 协议资产：权威 vector、Python fixture、SDK reference Addon 与产品 Addon 投影必须通过生成检查。
+- wheel contract：隔离安装后断言精确版本 `0.2.1`、`session-switch-default` vector 存在，且
+  `mcbe_ws_sdk.__file__` 不位于 Host 的 nested SDK checkout。
 
 ### 7. Wrong vs Correct
 
