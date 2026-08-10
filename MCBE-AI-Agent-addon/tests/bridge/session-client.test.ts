@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { __emitScriptEvent, __resetMinecraftServerMock, __setMockPlayers } from "@minecraft/server";
 
-import { SESSION_RESP_MESSAGE_ID, TOOL_PLAYER_NAME } from "../../scripts/bridge/constants";
+import {
+  COMMAND_LINE_BYTE_BUDGET,
+  SESSION_REQ_PREFIX,
+  SESSION_RESP_MESSAGE_ID,
+  TOOL_PLAYER_NAME,
+} from "../../scripts/bridge/constants";
+import { utf8ByteLength } from "../../scripts/bridge/chunking";
 import {
   registerSessionRespHandler,
   requestSession,
@@ -35,6 +41,38 @@ describe("session client", () => {
     });
 
     await expect(pending).resolves.toMatchObject({ ok: true, request_id: request.request_id });
+  });
+
+  it("sends an explicit default switch as one atomic request and correlates it", async () => {
+    const runCommand = vi.fn(() => ({ successCount: 1 }));
+    __setMockPlayers([{ name: TOOL_PLAYER_NAME, runCommand }]);
+    registerSessionRespHandler();
+
+    const pending = requestSession("switch", { player_name: "Alice", cid: "default" });
+    expect(runCommand).toHaveBeenCalledTimes(1);
+    const command = String(runCommand.mock.calls[0][0]);
+    expect(command.startsWith(`tell @s ${SESSION_REQ_PREFIX}|`)).toBe(true);
+    expect(utf8ByteLength(command)).toBeLessThanOrEqual(COMMAND_LINE_BYTE_BUDGET);
+    const request = JSON.parse(command.split("|").slice(2).join("|"));
+    expect(request).toMatchObject({ v: 1, action: "switch", player_name: "Alice", cid: "default" });
+
+    __emitScriptEvent({
+      id: SESSION_RESP_MESSAGE_ID,
+      message: JSON.stringify({
+        v: 1,
+        request_id: request.request_id,
+        action: "switch",
+        ok: true,
+        data: { conversation_id: "default" },
+      }),
+    });
+
+    await expect(pending).resolves.toMatchObject({
+      ok: true,
+      request_id: request.request_id,
+      action: "switch",
+      data: { conversation_id: "default" },
+    });
   });
 
   it("returns an immediate structured send failure when ToolPlayer is missing or throws", async () => {

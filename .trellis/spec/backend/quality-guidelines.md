@@ -24,7 +24,7 @@
 - Python 服务保持异步边界：Hook 不等待 LLM；队列负责解耦；生命周期停止要清理后台任务和连接资源。
 - Pydantic 消息模型、工具结果和 bridge result 是跨层契约；不要让消费者各自定义同一 JSON 字段的私有解释。
 - SDK 依赖契约必须在构建 wheel 后的隔离环境验证；默认 Host 测试不要求从 PyPI 安装尚未发布的
-  `0.2.0`，本地应使用 SDK wheel。禁止让 nested editable checkout 掩盖 public/codec/Host API 漂移。
+  `0.2.1`，本地应使用 SDK wheel。禁止让 nested editable checkout 掩盖 public/codec/Host API 漂移。
 - `command_line_byte_budget=461` 是 empirical 兼容预算；Unicode 分片测试应覆盖 CJK、emoji 和
   wrapper 完整 UTF-8 字节数，而不是把 461 写成官方 API 上限。
 - 不提交 `.env`、`config.json`、`data/`、`logs/`、密钥、缓存、编译产物或真实服务输出。

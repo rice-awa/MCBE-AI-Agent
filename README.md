@@ -80,8 +80,8 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-宿主依赖固定为 `mcbe-ws-sdk>=0.2.0,<0.3.0`。该约束对应包含 MCBEWS/1 契约的 SDK wheel；
-发布/合入顺序必须是先在 SDK 仓库发布并验证 `v0.2.0` PyPI artifact，再安装或合并 Host 与
+宿主依赖固定为 `mcbe-ws-sdk>=0.2.1,<0.3.0`。该约束对应包含 MCBEWS/1 契约的 SDK wheel；
+发布/合入顺序必须是先在 SDK 仓库发布并验证 `v0.2.1` PyPI artifact，再安装或合并 Host 与
 产品 Addon。开发时若 SDK 尚未出现在 PyPI，请在 SDK 仓库本地构建 wheel 后安装到隔离 venv，
 不要把 nested checkout 以 editable 方式当作发布验证。
 
@@ -344,7 +344,7 @@ deprecated/ignored 配置镜像，任何旧 `mcbeai` 值都不能改变运行时
 
 ### 发布顺序与真实世界 smoke
 
-发布者应先合并并发布 SDK `v0.2.0`、确认 PyPI wheel artifact 与 wheel-installed contract
+发布者应先合并并发布 SDK `v0.2.1`、确认 PyPI wheel artifact 与 wheel-installed contract
 通过，再合并/发布 Host 和产品 Addon。本仓库当前文档只准备 release gate，不宣称该版本已经
 发布，也不自动创建 tag 或上传 PyPI。
 
@@ -418,7 +418,7 @@ pip uninstall -r requirements.txt -y && pip install -r requirements.txt  # 重�
 ## 技术栈与致谢
 
 - **Python 3.11+** / **PydanticAI** / **Pydantic** / **WebSockets** / **httpx** / **PyJWT** / **structlog** / **Click**
-- **mcbe-ws-sdk**: Minecraft Bedrock WebSocket SDK（mcbews v1 线协议、出站流控与分片；Host 约束 `>=0.2.0,<0.3.0`）
+- **mcbe-ws-sdk**: Minecraft Bedrock WebSocket SDK（mcbews v1 线协议、出站流控与分片；Host 约束 `>=0.2.1,<0.3.0`）
 - 原项目: [rice-awa/MCBE_WebSocket_gpt](https://github.com/rice-awa/MCBE_WebSocket_gpt)
 - PydanticAI: [pydantic/pydantic-ai](https://github.com/pydantic/pydantic-ai)
 - Termux: [termux/termux-app](https://github.com/termux/termux-app)

@@ -18,7 +18,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, NoReturn
 
-EXPECTED_VERSION = "0.2.0"
+EXPECTED_VERSION = "0.2.1"
 DIST_NAME = "mcbe-ws-sdk"
 PACKAGE_NAME = "mcbe_ws_sdk"
 
@@ -56,7 +56,7 @@ def _assert_wheel_archive(wheel: Path) -> None:
                 _fail(f"expected one dist-info/METADATA, found {metadata_names}")
             metadata = archive.read(metadata_names[0]).decode("utf-8")
             if _metadata_version(metadata) != EXPECTED_VERSION:
-                _fail("wheel metadata is not version 0.2.0")
+                _fail(f"wheel metadata is not version {EXPECTED_VERSION}")
             required_assets = {
                 "mcbe_ws_sdk/profiles/mcbews_v1/manifest.json",
                 "mcbe_ws_sdk/profiles/mcbews_v1/vectors.json",
@@ -127,6 +127,8 @@ def _assert_protocol_contract(sdk: Any) -> None:
         _fail("text response usage is not completion-frame-only")
     if not all(name in vectors for name in ("bridge_requests", "ui_chat", "text_response", "session", "approval")):
         _fail("wire vectors are incomplete")
+    if not any(vector.get("name") == "session-switch-default" for vector in vectors["session"]):
+        _fail("session-switch-default vector is missing")
 
 
 def main() -> int:
