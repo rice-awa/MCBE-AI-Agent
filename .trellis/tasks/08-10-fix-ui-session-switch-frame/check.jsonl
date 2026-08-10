@@ -1,0 +1,7 @@
+{"file":".trellis/tasks/08-10-fix-ui-session-switch-frame/research/root-cause.md","reason":"复验原始帧、负例矩阵和 Host 切换根因是否全部转绿"}
+{"file":".trellis/spec/backend/session-and-identity.md","reason":"审查 player_name 显式传递与同连接玩家会话隔离"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"审查相邻测试、SDK wheel 隔离门禁和提交清洁度"}
+{"file":".trellis/spec/addon/bridge-protocol.md","reason":"审查 session schema 1、MCBEWS/1 原子帧及生成资产一致性"}
+{"file":".trellis/spec/addon/state-testing-and-build.md","reason":"审查 Addon session client 测试和完整前端质量命令"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"审查是否保持 SDK 权威 vector 的单一契约来源"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"审查 SDK、Host、Addon 三层数据流和版本引用一致性"}
