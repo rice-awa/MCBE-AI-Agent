@@ -41,6 +41,8 @@
 - [ ] 列出事件、消息模型、队列、服务、协议和 UI/世界的每个边界。
 - [ ] 明确 `player_name`、`conversation_id`、`trace_id` 和 request id 的来源与去向。
 - [ ] 明确验证位置：Pydantic、Addon boundary、block preflight 或 response reassembly。
+- [ ] 若默认值本身也是合法业务 ID，先区分字段“显式提供”和“省略”，再做默认值归一化；具体矩阵见
+      [`../addon/bridge-protocol.md`](../addon/bridge-protocol.md#scenario-显式切换到-default-会话)。
 - [ ] 明确超时/取消/重复/外部状态未知的语义。
 
 完成后：

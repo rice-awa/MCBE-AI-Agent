@@ -11,7 +11,7 @@ MCBE AI Agent 的 Minecraft Bedrock 侧组件：提供脚本桥接（Script Brid
 
 ## MCBEWS/1 契约
 
-协议资产由 SDK `0.2.0` wheel 提供；本 Addon 的 `scripts/bridge/protocol.generated.ts`
+协议资产由 SDK `0.2.1` wheel 提供；本 Addon 的 `scripts/bridge/protocol.generated.ts`
 是同步后的投影。兼容线为 `MCBEWS/1`，另有四个独立的 schema/persistence 轴：capability
 request schema `2`、session schema `1`、text response framing `1`、DDUI persistence `2`。其中 persistence `2` 是玩家
 DynamicProperty 的 per-conversation 状态格式，不宣称当前运行时已提供官方 DDUI API。
@@ -43,7 +43,7 @@ pnpm local-deploy
 
 `local-deploy` 支持 `--watch` 模式监听变更自动编译部署。
 
-发布顺序：先在 SDK 仓库合并并发布 `v0.2.0`，验证 PyPI wheel artifact 与 wheel-installed
+发布顺序：先在 SDK 仓库合并并发布 `v0.2.1`，验证 PyPI wheel artifact 与 wheel-installed
 contract，再合并/发布 Host 和产品 Addon。本仓库不在此处宣称 SDK 已发布。
 
 发布前真实 MCBE smoke 需覆盖：`sender`/ScriptEvent source、可信 `MCBEWS_BRIDGE` 与业务

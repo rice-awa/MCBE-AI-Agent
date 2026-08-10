@@ -13,11 +13,11 @@
 | Addon → Python 会话请求前缀 | `MCBEWS|SESSION` |
 | Python → Addon 会话响应 | `mcbews:session_resp` |
 
-这些值的权威来源是 SDK `0.2.0` wheel 的 manifest/vectors，Addon 的
+这些值的权威来源是 SDK `0.2.1` wheel 的 manifest/vectors，Addon 的
 [`scripts/bridge/constants.ts`](../../../MCBE-AI-Agent-addon/scripts/bridge/constants.ts)
 只是同步后的投影，协议说明是 [`docs/addon-bridge-protocol.md`](../../../docs/addon-bridge-protocol.md)。不要把 `mcbeai:*` 或 `MCBEAI|*` 当作运行时兼容分支。`mcbeai:ui_state` DynamicProperty 键是旧世界状态兼容保留值，不属于线协议。
 
-协议资产来自 SDK `0.2.0` wheel 的 manifest/vectors。必须分别记录以下版本轴：兼容线
+协议资产来自 SDK `0.2.1` wheel 的 manifest/vectors。必须分别记录以下版本轴：兼容线
 `MCBEWS/1`、capability request schema `2`、session schema `1`、text response framing `1`、
 DDUI persistence `2`。DDUI persistence 只描述玩家 DynamicProperty 的 per-conversation 格式，
 不代表当前产品已经接入官方 DDUI API。
@@ -90,6 +90,74 @@ Python 出站长文本的分片由 SDK 的 `McbewsV1Delivery` / `McbeOutboundDel
 `ok: false, error: {"code": "SESSION_UNAVAILABLE", "message": "会话同步不可用（服务端版本过旧）"}`。
 
 参考实现：[`scripts/bridge/sessionClient.ts`](../../../MCBE-AI-Agent-addon/scripts/bridge/sessionClient.ts)。Python 侧需要实现 `mcbews:session_resp` 的响应发射才能完整工作。
+
+## Scenario: 显式切换到 default 会话
+
+### 1. Scope / Trigger
+
+- 修改 SDK `SessionRequest`、Host 会话切换或 Addon `sessionClient` 的 `switch` 行为时适用。
+- 该契约防止把合法默认 ID `"default"` 误判成调用方没有提供 `cid`。
+
+### 2. Signatures
+
+```python
+conversation_id: str = Field(default="default", alias="cid")
+ConversationOperations.execute(..., player_name: str, action="switch", conversation_id: str | None)
+```
+
+```json
+{"v":1,"action":"switch","player_name":"Steve","cid":"default"}
+```
+
+### 3. Contracts
+
+- SDK 必须按 `conversation_id` 是否存在于 `model_fields_set` 判断 `cid` 是否显式提供；alias
+  `cid` 与字段名 `conversation_id` 都归一为该字段名。
+- 显式非空 `cid`（包括 `"default"`）合法；省略或空白 `cid` 非法。
+- Host 只拒绝 `None` / 空白目标，不得把 `DEFAULT_CONVERSATION_ID` 当成缺失哨兵。
+- Addon 保持一个预算内 `MCBEWS|SESSION|<json>` 原子请求，并显式携带业务
+  `player_name`；session schema 仍为 `1`。
+
+### 4. Validation & Error Matrix
+
+| 输入 | SDK | Host |
+|---|---|---|
+| `switch`, `cid="default"` | 接受 typed request | 切换到 default |
+| `switch`, `cid="chat-a"` | 接受 typed request | 切换到 chat-a |
+| `switch`, 省略 `cid` | `switch requires cid` | `INVALID_ARGUMENT` |
+| `switch`, 空白 `cid` | `value must not be empty` | `INVALID_ARGUMENT` |
+
+### 5. Good / Base / Bad Cases
+
+- Good：Alice 从 `chat-a` 切换到 `default`，Bob 在同连接下仍停留在自己的会话。
+- Base：显式 `cid="chat-a"` 沿用普通切换行为。
+- Bad：用 `conversation_id == "default"` 推断字段缺失，或用 ToolPlayer sender 替代
+  payload 中的 `player_name`。
+
+### 6. Tests Required
+
+- SDK：alias、字段名、省略、空白四类模型输入，以及用户原始帧经
+  `AddonBridgeService.handle_player_message()` 得到 typed control message。
+- Host：切换到 default 后断言 active conversation，并断言同连接另一玩家不变；`None` 与空白
+  目标都必须返回 `INVALID_ARGUMENT`。
+- Addon：断言 switch/default 只调用一次 `runCommand`，完整命令 UTF-8 字节数不超过
+  `COMMAND_LINE_BYTE_BUDGET`，payload 保留当前 `player_name` / `cid="default"`，并按
+  request id/action 关联响应。
+- 协议资产：权威 vector、Python fixture、SDK reference Addon 与产品 Addon 投影必须通过生成检查。
+- wheel contract：隔离安装后断言精确版本 `0.2.1`、`session-switch-default` vector 存在，且
+  `mcbe_ws_sdk.__file__` 不位于 Host 的 nested SDK checkout。
+
+### 7. Wrong vs Correct
+
+```python
+# Wrong: 合法默认值被当成“字段缺失”。
+if self.action == "switch" and self.conversation_id == "default":
+    raise ValueError("switch requires cid")
+
+# Correct: 检查调用方是否显式提供字段。
+if self.action == "switch" and "conversation_id" not in self.model_fields_set:
+    raise ValueError("switch requires cid")
+```
 
 ## 流式响应协议（mcbews:text_resp）
 

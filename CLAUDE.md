@@ -152,7 +152,7 @@ feature/* / fix/* / refactor/*  →  dev  →  master
 | `services/agent/core.py` | PydanticAI Agent 核心 |
 | `services/agent/worker.py` | 消费队列；注入 SDK `AddonBridgeService` |
 | `services/agent/tools.py` | Agent Tools |
-| `mcbe-ws-sdk` | pip 依赖（`>=0.2.0,<0.3.0`）；线协议与分片由 SDK 拥有，勿改 SDK 源码除非另开 SDK PR |
+| `mcbe-ws-sdk` | pip 依赖（`>=0.2.1,<0.3.0`）；线协议与分片由 SDK 拥有，勿改 SDK 源码除非另开 SDK PR |
 | `docs/addon-bridge-protocol.md` | mcbews 桥协议说明 |
 
 ## Supported LLM Providers
@@ -213,7 +213,7 @@ feature/* / fix/* / refactor/*  →  dev  →  master
 
 ### MCBEWS/1 发布顺序与 smoke gate
 
-SDK 是独立仓库。发布时先合并并发布 SDK `v0.2.0`，验证 PyPI wheel metadata、manifest/vectors
+SDK 是独立仓库。发布时先合并并发布 SDK `v0.2.1`，验证 PyPI wheel metadata、manifest/vectors
 和 wheel-installed contract，再合并/发布 Host 与产品 Addon。当前仓库只准备门禁，不宣称该
 版本已发布，也不自动 push、tag 或上传 PyPI。
 

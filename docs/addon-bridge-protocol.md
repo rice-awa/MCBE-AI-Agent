@@ -8,7 +8,7 @@
 
 ## 权威资产与独立版本轴
 
-Host、SDK 内置 Addon 和产品 Addon 以 SDK `0.2.0` wheel 内的
+Host、SDK 内置 Addon 和产品 Addon 以 SDK `0.2.1` wheel 内的
 `MCBEWS_V1_MANIFEST` / wire vectors 为契约来源；产品 Addon 的
 `scripts/bridge/protocol.generated.ts` 是由该资产同步的投影。兼容线
 `MCBEWS/1` 是独立的 wire 标识；其余四个 schema/persistence 版本轴也不能混用成一个
@@ -396,8 +396,8 @@ AGENT 聊天 请读取我的玩家状态并告诉我当前位置
 
 本任务不宣称 SDK 已发布，也不自动创建 tag、上传 PyPI 或发布 Addon。发布者必须按以下顺序操作：
 
-1. 在 SDK 仓库合并包含本契约的变更，构建并发布 SDK `v0.2.0`，确认 PyPI 上的 wheel artifact
-   可下载、metadata 为 `0.2.0`，且 wheel-installed public/codec contract 通过。
+1. 在 SDK 仓库合并包含本契约的变更，构建并发布 SDK `v0.2.1`，确认 PyPI 上的 wheel artifact
+   可下载、metadata 为 `0.2.1`，且 wheel-installed public/codec contract 通过。
 2. 在 Host 仓库以干净 venv 安装该 PyPI wheel，运行 `tests/test_sdk_dependency.py` 与 Host gate；
    再合并/发布 Host 和产品 Addon。
 3. Addon 发布后再执行真实世界 smoke；不要以本地 editable SDK 或仅单元测试替代发布验证。

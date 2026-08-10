@@ -155,6 +155,10 @@ export const MCBEWS_V1_WIRE_VECTORS = {
       name: "session-list",
       request: '{"request_id":"sess-1","v":1,"action":"list","player_name":"Steve","cid":"chat-a"}',
     },
+    {
+      name: "session-switch-default",
+      request: '{"request_id":"sess-default","v":1,"action":"switch","player_name":"Steve","cid":"default"}',
+    },
   ],
   approval: [
     {

@@ -199,6 +199,48 @@ async def test_conversation_operations_report_real_message_count() -> None:
 
 
 @pytest.mark.asyncio
+async def test_conversation_operations_switch_default_preserves_player_isolation() -> None:
+    broker = MessageBroker(max_size=5)
+    connection_id = uuid4()
+    broker.register_connection(connection_id)
+    broker.set_conversation_history(connection_id, "Alice", [ModelRequest(parts=[])], "chat-a")
+    broker.set_conversation_history(connection_id, "Bob", [ModelRequest(parts=[])], "chat-b")
+    broker.set_active_conversation_id(connection_id, "Alice", "chat-a")
+    broker.set_active_conversation_id(connection_id, "Bob", "chat-b")
+
+    operations = ConversationOperations(broker, SimpleNamespace(), sessions=None)
+    switched = await operations.execute(
+        connection_id,
+        player_name="Alice",
+        action="switch",
+        conversation_id="default",
+    )
+
+    assert switched.ok is True
+    assert switched.data["conversation_id"] == "default"
+    assert broker.get_active_conversation_id(connection_id, "Alice") == "default"
+    assert broker.get_active_conversation_id(connection_id, "Bob") == "chat-b"
+
+    missing = await operations.execute(
+        connection_id,
+        player_name="Alice",
+        action="switch",
+        conversation_id=None,
+    )
+    assert missing.ok is False
+    assert missing.code == "INVALID_ARGUMENT"
+
+    blank = await operations.execute(
+        connection_id,
+        player_name="Alice",
+        action="switch",
+        conversation_id=" \t",
+    )
+    assert blank.ok is False
+    assert blank.code == "INVALID_ARGUMENT"
+
+
+@pytest.mark.asyncio
 async def test_typed_bridge_forwards_text_metadata_and_atomic_session() -> None:
     broker = MessageBroker(max_size=5)
     connection_id = uuid4()

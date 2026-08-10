@@ -232,7 +232,7 @@ class ConversationOperations:
         target_id: str | None,
     ) -> ConversationOperationResult:
         raw = str(target_id or "").strip()
-        if not raw or raw == DEFAULT_CONVERSATION_ID:
+        if not raw:
             return ConversationOperationResult.failure(
                 "switch", "请指定要切换的对话 ID", code="INVALID_ARGUMENT"
             )
