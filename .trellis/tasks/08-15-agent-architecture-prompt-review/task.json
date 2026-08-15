@@ -1,0 +1,31 @@
+{
+  "id": "agent-architecture-prompt-review",
+  "name": "agent-architecture-prompt-review",
+  "title": "MCBE Chat Agent 架构与提示词审查",
+  "description": "",
+  "status": "planning",
+  "dev_type": "docs",
+  "scope": "docs/review",
+  "package": null,
+  "priority": "P1",
+  "creator": "rice-awa",
+  "assignee": "rice-awa",
+  "createdAt": "2026-08-15",
+  "completedAt": null,
+  "branch": "dev",
+  "base_branch": "dev",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "dev_type": "docs",
+    "planning_status": "completed",
+    "research_status": "completed",
+    "next_action": "等待用户批准后启动任务并撰写 docs 审查报告"
+  }
+}
