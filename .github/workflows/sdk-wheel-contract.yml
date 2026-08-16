@@ -47,20 +47,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Host repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # The SDK is a separate repository and is intentionally not installed
       # from an editable checkout.  The v0.2.1 tag is a release gate: the Host
       # contract must stay red until that artifact is published by the SDK repo.
       - name: Checkout SDK release source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: rice-awa/mcbe-ws-sdk
           ref: ${{ inputs.sdk_ref || 'refs/tags/v0.2.1' }}
           path: mcbe-ws-sdk
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
