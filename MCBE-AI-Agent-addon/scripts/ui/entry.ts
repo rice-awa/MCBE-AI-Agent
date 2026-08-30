@@ -3,12 +3,15 @@ import type { Player } from "@minecraft/server";
 
 import { isUiTriggerItem } from "./commands";
 import { showAgentConsole } from "./panels/agentConsole";
-import { showChatInputPanel } from "./panels/chatInput";
-import { showHistoryPanel } from "./panels/historyPanel";
+import { showMorePanel } from "./panels/morePanel";
 import type { AgentPanelRoute } from "./panels/routes";
 import { showSettingsPanel } from "./panels/settingsPanel";
 import { showStatsPanel } from "./panels/statsPanel";
+import { showConversationPreviewPanel } from "./panels/conversationPreviewPanel";
+import { showConversationListPanel } from "./panels/conversationListPanel";
+import { showSessionFilesPanel } from "./panels/sessionFilesPanel";
 import { loadAgentUiState, saveAgentUiState } from "./storage";
+import type { AgentUiStateV2 } from "./state";
 import { recordUiOpened } from "./stats";
 import { setActiveUiState, clearActiveUiState } from "../bridge/responseSync";
 
@@ -34,6 +37,12 @@ export function registerUiEntry(): void {
       player.sendMessage("MCBE AI Agent: 面板打开失败，请稍后再试。");
     });
   });
+
+  // 玩家下线时清理其打开状态，避免模块级 Map/Set 泄漏与后续误判“面板已打开”。
+  world.afterEvents.playerLeave.subscribe((event) => {
+    lastOpenedTicks.delete(event.playerId);
+    openPanels.delete(event.playerId);
+  });
 }
 
 export async function openAgentUi(player: Player): Promise<void> {
@@ -43,12 +52,12 @@ export async function openAgentUi(player: Player): Promise<void> {
   }
 
   openPanels.add(player.id);
-  const uiState = loadAgentUiState(player);
+  const uiState: AgentUiStateV2 = loadAgentUiState(player);
   uiState.stats = recordUiOpened(uiState.stats);
   saveAgentUiState(player, uiState);
 
   // 注册活跃 UI 状态，以便响应同步模块实时更新
-  setActiveUiState(player.id, uiState);
+  setActiveUiState(player.id, uiState, player.name);
 
   try {
     let route: AgentPanelRoute = { panel: "main" };
@@ -57,17 +66,23 @@ export async function openAgentUi(player: Player): Promise<void> {
         case "main":
           route = await showAgentConsole(player, uiState);
           break;
-        case "chatInput":
-          route = await showChatInputPanel(player, uiState);
-          break;
-        case "history":
-          route = await showHistoryPanel(player, uiState, route.pageIndex ?? 0);
+        case "more":
+          route = await showMorePanel(player, uiState);
           break;
         case "settings":
           route = await showSettingsPanel(player, uiState);
           break;
         case "stats":
           route = await showStatsPanel(player, uiState);
+          break;
+        case "conversationList":
+          route = await showConversationListPanel(player, uiState);
+          break;
+        case "conversationPreview":
+          route = await showConversationPreviewPanel(player, uiState);
+          break;
+        case "sessionFiles":
+          route = await showSessionFilesPanel(player, uiState);
           break;
       }
     }

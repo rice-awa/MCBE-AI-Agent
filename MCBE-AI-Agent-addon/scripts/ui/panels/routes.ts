@@ -1,9 +1,11 @@
 export type AgentPanelRoute =
   | { panel: "main" }
-  | { panel: "chatInput" }
-  | { panel: "history"; pageIndex?: number }
+  | { panel: "more" }
   | { panel: "settings" }
   | { panel: "stats" }
+  | { panel: "sessionFiles" }
+  | { panel: "conversationList" }
+  | { panel: "conversationPreview" }
   | { panel: "close" };
 
 export const MAIN_ROUTE: AgentPanelRoute = { panel: "main" };

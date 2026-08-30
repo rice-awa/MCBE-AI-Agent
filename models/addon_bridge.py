@@ -1,38 +1,46 @@
-"""Addon 桥接协议模型。"""
+"""Deprecated compatibility exports for the SDK MCBEWS/1 DTOs.
 
-from typing import Any
+The Host no longer owns a second copy of the bridge wire models.  Keep this
+module importable for extensions that used the old root path, while making the
+SDK's typed models the only source of fields and validation.
+"""
 
-from pydantic import BaseModel
+from __future__ import annotations
 
+import warnings
 
-class AddonBridgeChunk(BaseModel):
-    """从聊天消息解析出的桥接响应分片。"""
+from mcbe_ws_sdk.profiles.mcbews_v1.models import (
+    AddonBridgeChunk,
+    AddonBridgeRequest,
+    AddonBridgeResponse,
+    ApprovalDecision,
+    SessionError,
+    SessionRequest,
+    SessionResponse,
+    TextResponseChunk,
+    TextResponseMessage,
+    TokenUsage,
+    UiChatChunk,
+    UiChatMessage,
+)
 
-    request_id: str
-    chunk_index: int
-    total_chunks: int
-    content: str
+warnings.warn(
+    "models.addon_bridge is deprecated; import MCBEWS/1 DTOs from mcbe_ws_sdk",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
-
-class AddonBridgeResponse(BaseModel):
-    """重组后的桥接响应。"""
-
-    request_id: str
-    payload: dict[str, Any]
-
-
-class UiChatChunk(BaseModel):
-    """从聊天消息解析出的 UI 聊天分片。"""
-
-    msg_id: str
-    chunk_index: int
-    total_chunks: int
-    content: str
-
-
-class UiChatMessage(BaseModel):
-    """重组后的 UI 聊天消息。"""
-
-    msg_id: str
-    player_name: str
-    message: str
+__all__ = [
+    "AddonBridgeChunk",
+    "AddonBridgeRequest",
+    "AddonBridgeResponse",
+    "ApprovalDecision",
+    "SessionError",
+    "SessionRequest",
+    "SessionResponse",
+    "TextResponseChunk",
+    "TextResponseMessage",
+    "TokenUsage",
+    "UiChatChunk",
+    "UiChatMessage",
+]

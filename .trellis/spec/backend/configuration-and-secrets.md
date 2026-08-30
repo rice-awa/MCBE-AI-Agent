@@ -23,8 +23,17 @@
 
 ## 兼容和迁移
 
-- `addon.protocol.*` 是配置/文档镜像；运行时线协议固定为 mcbews v1，旧 `mcbeai` 值不得重新启用旧协议。
+- `addon.protocol.*` 是 deprecated/ignored 配置/文档镜像；运行时线协议固定为 MCBEWS/1，
+  所有 wire/schema/framing 值来自 SDK `0.2.1` manifest，旧 `mcbeai` 值不得重新启用旧协议。
+  兼容读取可以产生 deprecation 诊断，但不能覆盖 SDK profile。
 - `flow_control.ai_resp*` 等旧键如仍需读取，应在设置迁移边界映射到 `text_resp*`，不要让调用点同时维护两套字段。
 - 配置错误要在启动边界快速失败，并指出 JSON 路径和环境变量名；不要等到第一次聊天或第一次桥调用时才暴露缺失配置。
 
 参考测试：[`tests/test_json_settings.py`](../../../tests/test_json_settings.py)、[`tests/test_cli_config_validation.py`](../../../tests/test_cli_config_validation.py)、[`tests/test_gateway_settings_map.py`](../../../tests/test_gateway_settings_map.py)。
+
+## SDK 发布门禁
+
+Host 的依赖约束为 `mcbe-ws-sdk>=0.2.1,<0.3.0`。发布顺序必须是先合并/发布 SDK `v0.2.1` 并
+验证 PyPI wheel artifact，再合并 Host/Add-on；默认 root contract workflow 从构建 wheel 的
+隔离环境运行，不得用 nested editable checkout 掩盖缺失 API。真实 MCBE sender/source、ToolPlayer
+owner、Unicode/461 字节、长 session 与 approval 断线清理属于发布前手工 smoke，而非默认 pytest。

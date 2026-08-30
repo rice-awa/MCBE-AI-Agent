@@ -1,0 +1,28 @@
+{
+  "id": "anthropic-base-url",
+  "name": "anthropic-base-url",
+  "title": "接入 Anthropic 接口并支持自定义 base_url（官方/第三方兼容端点）",
+  "description": "真正接入 Anthropic AI 接口：让 anthropic provider 支持自定义 base_url，从而同时支持官方 api.anthropic.com 与第三方 Anthropic 兼容端点（如 DeepSeek 的 https://api.deepseek.com/anthropic）。测试用 DeepSeek 的 Anthropic 兼容接口 + DEEPSEEK_API_KEY。",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P1",
+  "creator": "rice-awa",
+  "assignee": "rice-awa",
+  "createdAt": "2026-08-08",
+  "completedAt": "2026-08-08",
+  "branch": null,
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "provider": "anthropic"
+  }
+}

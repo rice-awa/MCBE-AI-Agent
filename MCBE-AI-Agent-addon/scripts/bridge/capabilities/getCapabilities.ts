@@ -22,6 +22,7 @@ export function handleGetCapabilities(_payload: Record<string, unknown> = {}): {
     };
   };
 } {
+  const registered = new Set(projectCapabilityAdvertisements().map((item) => item.name));
   return {
     ok: true,
     payload: {
@@ -29,13 +30,14 @@ export function handleGetCapabilities(_payload: Record<string, unknown> = {}): {
       capabilities: {
         block_ops: {
           version: 1,
-          inspect: true,
-          place: true,
-          batch: true,
-          fill: true,
+          inspect: registered.has("inspect_block"),
+          place: registered.has("edit_blocks"),
+          batch: registered.has("edit_blocks"),
+          fill: registered.has("edit_blocks"),
           multiblock_placement: "command_fallback",
         },
       },
     },
   };
 }
+import { projectCapabilityAdvertisements } from "./registry";

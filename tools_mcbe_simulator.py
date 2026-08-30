@@ -29,14 +29,19 @@ from pathlib import Path
 from typing import Any
 
 import websockets
-
 from mcbe_ws_sdk import MCBEWS_V1
 
-BRIDGE_TOOL_PLAYER_NAME = MCBEWS_V1.bridge_sender
-BRIDGE_REQUEST_MESSAGE_ID = MCBEWS_V1.bridge_request_message_id
-BRIDGE_RESPONSE_PREFIX = MCBEWS_V1.bridge_response_prefix
-TEXT_RESP_MESSAGE_ID = MCBEWS_V1.response_message_id
-from tools_mcbe_ws_recorder import PacketRecord, RecorderLogger, SessionRecorder, load_replay_packets, replay_delay
+from tools_mcbe_ws_recorder import (
+    PacketRecord,
+    RecorderLogger,
+    SessionRecorder,
+    load_replay_packets,
+)
+
+BRIDGE_TOOL_PLAYER_NAME = MCBEWS_V1.trusted_bridge_player_name
+BRIDGE_REQUEST_MESSAGE_ID = MCBEWS_V1.capability_request_script_event_id
+BRIDGE_RESPONSE_PREFIX = MCBEWS_V1.capability_response_chat_prefix
+TEXT_RESP_MESSAGE_ID = MCBEWS_V1.text_response_script_event_id
 
 MCBE_VERSION = 17104896
 COMMAND_VERSION = 17039360

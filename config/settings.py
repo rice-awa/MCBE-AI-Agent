@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import warnings
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -464,6 +465,8 @@ def _flatten_json_config(data: dict[str, Any]) -> dict[str, Any]:
         result["anthropic_api_key"] = anthropic["api_key"]
     if "model" in anthropic:
         result["anthropic_model"] = anthropic["model"]
+    if "base_url" in anthropic:
+        result["anthropic_base_url"] = anthropic["base_url"]
 
     ollama = providers.get("ollama", {})
     if "base_url" in ollama:
@@ -649,13 +652,30 @@ class MCPConfig(BaseModel):
 
 
 class AddonProtocolConfig(BaseModel):
-    """Addon 桥接协议标识配置（线协议镜像；运行时以 SDK McbewsV1Profile 为准）。"""
+    """Deprecated wire mirror accepted for compatibility but ignored at runtime."""
 
     bridge_message_id: str = "mcbews:bridge_req"
     bridge_prefix: str = "MCBEWS|BRIDGE"
     ui_chat_prefix: str = "MCBEWS|UI_CHAT"
     bridge_tool_player_name: str = "MCBEWS_BRIDGE"
     ai_resp_message_id: str = "mcbews:text_resp"
+
+    @property
+    def runtime_ignored(self) -> bool:
+        """Whether this compatibility mirror is intentionally ignored."""
+
+        return True
+
+    @property
+    def deprecation_message(self) -> str:
+        return "addon.protocol is deprecated and ignored; runtime values come from mcbe-ws-sdk MCBEWS/1"
+
+    def model_post_init(self, __context: Any) -> None:
+        # Config files may still contain these keys for one migration cycle;
+        # make that compatibility use observable without allowing it to alter
+        # the SDK profile.
+        if self.model_fields_set:
+            warnings.warn(self.deprecation_message, DeprecationWarning, stacklevel=2)
 
 
 class AddonBlockToolsConfig(BaseModel):
@@ -754,6 +774,8 @@ class Settings(BaseSettings):
     # Anthropic 配置
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
     anthropic_model: str = "claude-sonnet-5"
+    # 官方默认 api.anthropic.com；配置第三方 Anthropic 兼容端点（如 DeepSeek https://api.deepseek.com/anthropic）
+    anthropic_base_url: str | None = None
 
     # Ollama 配置
     ollama_base_url: str = "http://localhost:11434"
@@ -976,6 +998,7 @@ class Settings(BaseSettings):
             return LLMProviderConfig(
                 name="anthropic",
                 api_key=self.anthropic_api_key,
+                base_url=self.anthropic_base_url,
                 model=self.anthropic_model,
                 enabled=self.anthropic_api_key is not None,
                 context_window=get_context_window("anthropic", self.anthropic_model),

@@ -193,3 +193,118 @@ review近期6项任务完成状态，确认方案四和方案五已完成；合�
 
 [OK] **全部完成，已提交 dev 并归档**
 
+
+
+## Session 5: 接入 Anthropic 接口并支持自定义 base_url（官方/第三方兼容端点）
+
+**Date**: 2026-08-08
+**Task**: 接入 Anthropic 接口并支持自定义 base_url（官方/第三方兼容端点）
+**Branch**: `dev`
+
+### Summary
+
+让 anthropic provider 支持自定义 base_url：settings 新增 anthropic_base_url 字段，get_provider_config 透传到 LLMProviderConfig，_create_anthropic_model 传给 AnthropicProvider。未配置时退回官方 api.anthropic.com。用 DeepSeek Anthropic 兼容端点 https://api.deepseek.com/anthropic + DEEPSEEK_API_KEY 真实调用验证通过。补充 base_url 透传/默认值测试与 CLAUDE.md 配置说明。另归档 08-07-fix-model-metadata-online（代码已提交 dcdc0a0）。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b9bbabd` | (see git log) |
+
+### Status
+
+[OK] **Completed**
+
+---
+
+## 08-08 · DDUI UI 迁移（feature/ddui-ui-migration）
+
+**Branch**: `feature/ddui-ui-migration`
+
+### Summary
+
+将 beta 分支的 DDUI UI 前端移植到 dev（@minecraft/server-ui v2.1.0 stable）：
+- formAdapter 适配 v2.1.0 构造函数 API（`new CustomForm(player, title)`、`new ObservableString/Number/Boolean(value, {clientWritable: true})`、`DataDrivenScreenClosedReason.ClientClosed/ServerClosed`）
+- 面板层迁移 beta 版（agentConsole/morePanel/settingsPanel/statsPanel/routes/entry/state），morePanel 取代 dev 的 chatInput/historyPanel
+- responseSync 合并 beta 功能（refreshConversation 实时刷新 + isDuplicateUiUserEcho 去重），保留 dev 的 mcbews:text_resp 线协议
+- 依赖升级：@minecraft/server-ui 2.1.0 + @minecraft/server 2.8.0；补齐 just-scripts/prettier 工具链（dev 基线缺失，pnpm v11 allowBuilds 配置 esbuild）
+- 测试：4 个 DDUI 面板测试 + response-sync 测试移植，mock 适配 v2.1.0（closeButton、程序化关闭返回 ServerClose、failOnObservableCreate）
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6f38bca` | feat(ui): 移植 beta DDUI 面板到 @minecraft/server-ui v2.1.0 |
+
+### 遗留（人工决策）
+
+- `pnpm lint` 的 prettier 阶段仍失败：20 个 dev 基线文件（bootstrap/capabilities/router/toolPlayer/chunking/history/storage 等）不满足 prettier，dev 基线即存在问题（package.json 原本无 prettier 依赖）。已按 prd「bridge 层不修改」撤销格式化，建议单独 chore 处理。
+- 手动 MC 客户端验证（prd 验收标准第 8 项，可选）：DDUI 主面板实时刷新、发送消息后面板保持打开、历史去重正确。
+
+### Status
+
+[OK] **Implemented & verified**（117 tests green，eslint/build 通过）
+
+
+## Session 6: DDUI 流式打字机 + 会话管理协议化 + 面板重构
+
+**Date**: 2026-08-08
+**Task**: DDUI 流式打字机 + 会话管理协议化 + 面板重构
+**Branch**: `feature/ddui-streaming-sessions`
+
+### Summary
+
+完成 DDUI 全面重构：流式打字机（分片排序/增量渲染/token统计），会话管理协议化（sessionClient + command_handlers + hook + broker_bridge），UI v2 数据结构（per-conversation桶/三级token统计/）
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `930d145` | (see git log) |
+
+### Status
+
+[OK] **Completed**
+
+
+## Session 7: DDUI 待审批 UI 与 byte budget 修复
+
+**Date**: 2026-08-08
+**Task**: DDUI 待审批 UI 与 byte budget 修复
+**Branch**: `dev`
+
+### Summary
+
+1) 后端：_compact_usage 精简 usage+SDK encode_frame 添加 u 字段+_ai_sync 修复非法 kwarg；2) StreamChunk 新增审批字段+worker 填充元数据+broker_bridge 审批帧发送+hook 路由审批命令；3) Addon：ApprovalInfo 类型+审批帧解析+主面板审批按钮与状态显示
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `bc00c53` | (see git log) |
+| `0a1ff32` | (see git log) |
+
+### Status
+
+[OK] **Completed**
+
+
+## Session 8: 完成 MCBE Chat Agent 架构与提示词审查
+
+**Date**: 2026-08-16
+**Task**: 完成 MCBE Chat Agent 架构与提示词审查
+**Branch**: `dev`
+
+### Summary
+
+完成架构与提示词审查报告、验收与质量检查记录；确认无需更新代码规范，并归档 Trellis 任务。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ec2a499` | (see git log) |
+
+### Status
+
+[OK] **Completed**

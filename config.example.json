@@ -23,6 +23,7 @@
     },
     "anthropic": {
       "api_key": null,
+      "base_url": null,
       "model": "claude-sonnet-5"
     },
     "ollama": {
@@ -203,6 +204,7 @@
   },
   "addon": {
     "protocol": {
+      "_comment": "Deprecated/ignored documentation mirror; runtime wire values always come from the mcbe-ws-sdk MCBEWS/1 manifest.",
       "bridge_message_id": "mcbews:bridge_req",
       "bridge_prefix": "MCBEWS|BRIDGE",
       "ui_chat_prefix": "MCBEWS|UI_CHAT",

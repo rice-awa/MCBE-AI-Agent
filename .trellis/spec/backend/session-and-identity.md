@@ -9,6 +9,10 @@ Minecraft 世界通常只有一条 `/wsserver` WebSocket 连接，因此 `connec
 - `conversation_id`：该玩家在当前连接下的对话桶。
 - `trace_id` / `run_id` / `attempt_id`：一次玩家意图、一次执行和一次重试/审批恢复的执行身份。
 
+MCBEWS/1 的 transport `sender` 只证明消息来自可信 ToolPlayer（`MCBEWS_BRIDGE`）；它不是业务
+玩家。Session/approval 的业务 `player_name`、`conversation_id` 必须来自已验证 payload 或
+pending approval owner，不能把 ToolPlayer 名称回填为业务身份。
+
 `models/messages.py` 中的 `ChatRequest`、`StreamChunk` 和 `SystemNotification` 已显式携带这些跨层需要的字段。新增玩家相关消息或内部 request 时，沿用同一字段，而不是在下游重新猜测玩家。
 
 ## 分桶与锁
@@ -16,6 +20,9 @@ Minecraft 世界通常只有一条 `/wsserver` WebSocket 连接，因此 `connec
 统一使用 [`core/session.py`](../../../core/session.py) 中的构造函数：
 
 - 对话历史键为 `(connection_id, player_name, conversation_id)`，空玩家名回落到 `DEFAULT_PLAYER_KEY`，空对话 ID 回落到 `default`。
+- `default` 是可被显式选择的真实 conversation ID，不是“字段缺失”哨兵。要求调用方显式提供
+  `cid` 的边界必须在默认值归一化前检查字段存在性；Host 收到 typed target 后只拒绝
+  `None` / 空白。完整输入矩阵见 [`../addon/bridge-protocol.md`](../addon/bridge-protocol.md#scenario-显式切换到-default-会话)。
 - 同一玩家的处理锁为 `(connection_id, player_name)`，所以同一玩家跨对话串行，不同玩家可以并行。
 - `ConversationSessionStore` 同时维护活动对话、短 ID、元数据、历史 generation 和管理操作 invalidation epoch；清除/切换/恢复等管理操作必须使用它的 API，不能直接改内部字典。
 - `HostSessionStore` 管理连接级的玩家 session，包括上下文开关、当前 provider、模板、变量和 AI 广播策略。通过 `get_player_session(player_name)` 获取，不要把这些值挂在连接本身。
@@ -30,6 +37,10 @@ Minecraft 世界通常只有一条 `/wsserver` WebSocket 连接，因此 `connec
 2. ChatRequest → Worker → Agent dependencies、工具上下文、TraceContext 和 StreamChunk。
 3. Broker 响应 → `BrokerResponseBridge` / `McbewsV1Delivery` → Addon `mcbews:text_resp` 的玩家字段。
 4. 对话、模板、变量、模型切换、广播设置和审批恢复。
+
+UI Chat 的 `cid` 必须沿 SDK reassembly → Host adapter → `ChatRequest.conversation_id` 传递；
+text response 的 `cid`/title 在相关帧保持一致，usage 只出现在完成帧。Session response 使用
+request id correlation 并且原子单帧发送，超限时返回结构化错误。
 
 禁止使用 SDK `ConnectionState.player_name` 做业务分支；该属性既不是多人世界中的真实玩家身份，也不应替代事件中的 `sender`。禁止使用全局“当前玩家”、单一连接历史或未带玩家参数的缓存。
 

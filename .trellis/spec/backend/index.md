@@ -34,3 +34,5 @@
 - 检查新增的长文本下行仍经过现有 bridge/delivery，而不是复制分片逻辑。
 - 检查日志、Trace 和工具审计没有写入密钥、完整凭据或未经允许的正文。
 - 若修改配置字段，同时更新 `config.example.json`、Settings 模型和相邻配置测试。
+- 涉及 SDK 契约时，运行 root `SDK Wheel Contract`：从 SDK 构建 wheel、安装到隔离环境后执行
+  `tools/check_sdk_wheel.py` 与 `tests/test_sdk_dependency.py`；不要以 nested editable checkout 代替。

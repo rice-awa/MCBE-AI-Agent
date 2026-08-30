@@ -1,0 +1,12 @@
+{"file": ".trellis/spec/backend/runtime-architecture.md", "reason": "运行时数据流与 Agent 组装约束"}
+{"file": ".trellis/spec/backend/session-and-identity.md", "reason": "玩家与对话隔离约束"}
+{"file": ".trellis/spec/backend/configuration-and-secrets.md", "reason": "MCP 环境变量与密钥边界"}
+{"file": ".trellis/spec/backend/logging-and-observability.md", "reason": "日志、审计与 Trace 约束"}
+{"file": "docs/harness-engineering-research.md", "reason": "已有运行时 Harness 调研背景，避免重复"}
+{"file": ".trellis/tasks/08-15-agent-architecture-prompt-review/research.md", "reason": "五路调研与源码审查的交叉核验结论"}
+{"file": ".trellis/tasks/08-15-agent-architecture-prompt-review/subagent-memos/openai_codex_research.md", "reason": "OpenAI 与 Codex 子代理原始研究备忘录"}
+{"file": ".trellis/tasks/08-15-agent-architecture-prompt-review/subagent-memos/anthropic_mcp_research.md", "reason": "Anthropic 与 MCP 子代理原始研究备忘录"}
+{"file": ".trellis/tasks/08-15-agent-architecture-prompt-review/subagent-memos/framework_research.md", "reason": "PydanticAI 与 LangGraph 子代理原始研究备忘录"}
+{"file": ".trellis/tasks/08-15-agent-architecture-prompt-review/subagent-memos/prompt_context_audit.md", "reason": "提示词与上下文源码审查原始备忘录"}
+{"file": ".trellis/tasks/08-15-agent-architecture-prompt-review/subagent-memos/tool_runtime_audit.md", "reason": "工具与运行时 Harness 源码审查原始备忘录"}
+{"file": ".trellis/tasks/08-15-agent-architecture-prompt-review/progress.md", "reason": "规划检查点与后续执行边界"}

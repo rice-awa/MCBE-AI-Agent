@@ -11,7 +11,6 @@ from typing import Any
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.tools import DeferredToolRequests
 
-
 DEFAULT_APPROVAL_TTL_SECONDS = 120.0
 
 
@@ -146,7 +145,7 @@ class PendingApprovalStore:
             get_trace_recorder().emit(
                 event_name,
                 context,
-                status=status,  # type: ignore[arg-type]
+                status=status,
                 tool_call_id=pending.tool_call_id,
                 attributes=attrs,
             )
@@ -190,7 +189,7 @@ class PendingApprovalStore:
         if pending is None:
             # 可能存在但 owner 不匹配
             with self._lock:
-                for key, item in self._items.items():
+                for key, _item in self._items.items():
                     if key[3] == approval_id:
                         if key[0] != str(connection_id) or key[1] != str(player_name):
                             return None, "跨玩家或跨连接审批被拒绝"
@@ -207,6 +206,41 @@ class PendingApprovalStore:
             )
             return None, "审批已过期"
         return pending, None
+
+    def resolve_legacy(
+        self,
+        *,
+        connection_id: str,
+        approval_id: str,
+    ) -> tuple[PendingApproval | None, str | None]:
+        """Resolve a legacy id-only decision without guessing its owner.
+
+        The old ToolPlayer wire form contains no business player or
+        conversation.  It is accepted only when this connection has exactly
+        one unexpired, undecided pending record with that id.  A duplicate id
+        across player/conversation buckets is deliberately ambiguous and is
+        rejected closed.
+        """
+
+        target = str(approval_id).strip()
+        if not target:
+            return None, "approval_id 不能为空"
+        connection = str(connection_id)
+        with self._lock:
+            self._purge_expired_unlocked()
+            matches = [
+                item
+                for key, item in self._items.items()
+                if key[0] == connection
+                and key[3] == target
+                and item.decision is None
+                and not item.is_expired()
+            ]
+        if not matches:
+            return None, "未找到该审批或已处理"
+        if len(matches) != 1:
+            return None, "审批 id 在当前连接内不唯一"
+        return matches[0], None
 
     def list_pending_for_owner(
         self,
@@ -299,7 +333,7 @@ class PendingApprovalStore:
             key = self.make_key(connection_id, player_name, conversation_id, approval_id)
             pending = self._items.get(key)
             if pending is None:
-                for existing_key, item in self._items.items():
+                for existing_key, _item in self._items.items():
                     if existing_key[3] == approval_id:
                         if existing_key[0] != str(connection_id) or existing_key[1] != str(player_name):
                             return None, "跨玩家或跨连接审批被拒绝", None

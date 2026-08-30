@@ -63,9 +63,36 @@ class ExecutionResult:
 
 `mcbe-ws-sdk` 拥有 WebSocket 生命周期、mcbews v1 线协议、下行分片和 delivery。宿主仓库只在 `services/gateway/` 实现业务适配：命令处理、会话映射、Broker 响应转换和配置映射。
 
+SDK manifest 分别定义兼容线 `MCBEWS/1`、capability request schema `2`、session schema `1`、
+text response framing `1` 和 DDUI persistence `2`；这些版本轴不能混用。Session response 是
+单帧原子消息，超过实测 command budget 时由 SDK 编码 `SESSION_RESPONSE_TOO_LARGE`，不得走通用
+分片器。`commandLine` 的默认 `461` 字节是 empirical 兼容预算，不是官方上限。
+
 - 长文本发送统一经过 `BrokerResponseBridge` 或 SDK 的 `McbeOutboundDelivery` / `McbewsV1Delivery`。
 - 不在调用点重新计算 `commandLine` 字节预算，不复制 tellraw、scriptevent 或 `text_resp` 分片逻辑。
 - 不直接修改安装的 SDK 源码；若 SDK 契约确实不足，应形成独立 SDK 变更并在本仓库更新依赖/适配测试。
+
+### Python → Addon Token 用量契约
+
+`BrokerResponseBridge._ai_sync` 在出口处把 PydanticAI 的完整 usage dict（含 `cache_*`/`details`/`requests` 等字段，
+约 286 字节）精磨为 addon 所需的 compact 格式 `{"i": <input_tokens>, "o": <output_tokens>}`
+（约 17 字节），再传给 `McbewsV1Delivery.send_response(usage=compact_usage)`。
+
+关键约束：
+- **出口精磨**：精简发生在 `broker_bridge._ai_sync`，不改变 `worker.py` 的 usage 结构（trace/audit/日志仍需完整 usage）。
+- **兼容 None**：usage 为 None 或缺 `input_tokens`/`output_tokens` 字段时，`u` 字段不写入 frame（`send_response(usage=None)`）。
+- **别名兼容**：同时检查 `input_tokens`/`request_tokens` 和 `output_tokens`/`response_tokens` 两套字段名。
+- **SDK 交付**：SDK `encode_text_response_commands` 的 `encode_frame` 闭包在 `index == total` 时把 `usage` 写入 `frame["u"]`，
+  确保 token 统计在最后一帧到达。
+- **Byte budget**：compact 格式 17 字节 vs 完整格式 286 字节，消除了长 `conversation_id` 场景下
+  `mcbews:text_resp` 最后一帧超 461 字节预算的风险。
+- 若未来 addon 需要更多 token 字段（如 `cache_read_tokens`），应扩展 compact 格式而非回退到完整 dict。`_compact_usage` 在 `broker_bridge.py` 是模块级独立函数，便于增强。
+
+实现参考：`services/gateway/broker_bridge.py` `_compact_usage()`。
+
+审批仍复用 `mcbews:text_resp` 的 `role="approval"`，但必须显式携带 `player_name`、
+`conversation_id` 和 approval correlation；未知 role 在进入 history 前拒绝。发送 approval frame
+的辅助 task 必须按 connection 跟踪，并在 `BrokerResponseBridge.stop()`/断线时取消、等待和清理。
 
 ## Harness、审计和 Trace
 

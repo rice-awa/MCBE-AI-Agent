@@ -256,6 +256,53 @@ def test_json_placeholders_resolve_from_dotenv_and_process_env(tmp_path, monkeyp
     assert settings.deepseek_api_key == "process-deepseek"
 
 
+def test_anthropic_base_url_loaded_and_propagated_to_provider_config(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    write_json_config(
+        tmp_path,
+        {
+            "providers": {
+                "default": "anthropic",
+                "anthropic": {
+                    "api_key": "test-key",
+                    "base_url": "https://api.deepseek.com/anthropic",
+                    "model": "deepseek-chat",
+                },
+            },
+        },
+    )
+
+    settings = Settings()
+
+    # config.json 的 base_url 读入 Settings 字段
+    assert settings.anthropic_base_url == "https://api.deepseek.com/anthropic"
+    # 透传到 get_provider_config → LLMProviderConfig.base_url
+    provider_config = settings.get_provider_config("anthropic")
+    assert provider_config.base_url == "https://api.deepseek.com/anthropic"
+    assert provider_config.model == "deepseek-chat"
+
+
+def test_anthropic_base_url_defaults_to_none(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    write_json_config(
+        tmp_path,
+        {
+            "providers": {
+                "default": "anthropic",
+                "anthropic": {"api_key": "k", "model": "claude-sonnet-5"},
+            },
+        },
+    )
+
+    settings = Settings()
+
+    # 未配置 base_url 时默认 None → 退回官方默认 api.anthropic.com
+    assert settings.anthropic_base_url is None
+    assert settings.get_provider_config("anthropic").base_url is None
+
+
 def test_missing_placeholder_reports_path_and_variable(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     write_json_config(

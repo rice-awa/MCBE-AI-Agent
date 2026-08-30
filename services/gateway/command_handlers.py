@@ -4,22 +4,31 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 from mcbe_ws_sdk import FlowControlSettings, McbeOutboundDelivery, MinecraftProtocolHandler
 from mcbe_ws_sdk.addon import AddonBridgeService
 from mcbe_ws_sdk.gateway.connection import ConnectionState
 from mcbe_ws_sdk.gateway.handler import TellrawMessage
+from mcbe_ws_sdk.profiles.mcbews_v1.models import SessionRequest, UiChatMessage
 
 from config.logging import get_logger
 from config.settings import Settings
 from core.queue import MessageBroker, normalize_conversation_id
 from core.session import DEFAULT_CONVERSATION_ID
 from models.constants import DEFAULT_PLAYER_DISPLAY_NAME, DEFAULT_PLAYER_KEY
-from models.messages import ChatRequest
+from models.messages import (
+    ChatRequest,
+    SessionResponseOutbound,
+    TextResponseOutbound,
+)
 from services.agent.trace import TraceContext, get_trace_recorder
 from services.auth.jwt_handler import JWTHandler
+from services.gateway.conversation_operations import (
+    ConversationOperationResult,
+    ConversationOperations,
+)
 from services.gateway.session_store import HostConnectionSession, HostSessionStore
 from services.gateway.ws_command_runner import WsCommandRunner
 
@@ -52,6 +61,11 @@ class CommandHandlers:
         self.flow = flow
         self.log_raw = log_raw
         self.dev_mode = settings.dev_mode
+        self.conversation_operations = ConversationOperations(
+            broker,
+            settings,
+            sessions,
+        )
 
     # -- session / delivery helpers ------------------------------------------------
 
@@ -109,6 +123,7 @@ class CommandHandlers:
         delivery: str,
         player_name: str | None,
         conversation_id: str,
+        correlation_id: str | None = None,
     ) -> ChatRequest:
         host = self._require_host(state)
         # 身份只来自当前事件；缺失时用非业务性显示默认值，不读连接级状态。
@@ -116,15 +131,18 @@ class CommandHandlers:
         session = host.get_player_session(sender)
         resolved_conversation = conversation_id or DEFAULT_CONVERSATION_ID
         # 一次玩家意图：trace_id == run_id（迁移期）；首次 attempt 新生成。
-        trace_id = str(uuid4())
+        trace_id = str(correlation_id or uuid4())
         attempt_id = str(uuid4())
+        request_delivery: Literal["tellraw", "scriptevent"] = (
+            "scriptevent" if delivery == "scriptevent" else "tellraw"
+        )
         return ChatRequest(
             connection_id=state.id,
             content=content,
             player_name=sender,
             use_context=session.context_enabled,
             provider=session.current_provider,
-            delivery=delivery or "tellraw",
+            delivery=request_delivery,
             conversation_id=resolved_conversation,
             auto_approve_tools=host.should_auto_approve_tools(
                 sender, resolved_conversation
@@ -290,14 +308,19 @@ class CommandHandlers:
         await self.handle_chat(
             state, content, delivery="tellraw", player_name=player_name
         )
+        owner = player_name or DEFAULT_PLAYER_DISPLAY_NAME
+        conversation_id = self.broker.get_active_conversation_id(state.id, owner)
+        correlation_id = str(uuid4())
         await self.broker.send_response(
             state.id,
-            {
-                "type": "ai_response_sync",
-                "player_name": player_name or DEFAULT_PLAYER_DISPLAY_NAME,
-                "role": "user",
-                "text": content,
-            },
+            TextResponseOutbound(
+                player_name=owner,
+                conversation_id=conversation_id,
+                correlation_id=correlation_id,
+                response_id=correlation_id,
+                role="user",
+                text=content,
+            ),
         )
 
     # -- auth ----------------------------------------------------------------------
@@ -361,6 +384,8 @@ class CommandHandlers:
         content: str,
         delivery: str,
         player_name: str | None = None,
+        conversation_id: str | None = None,
+        correlation_id: str | None = None,
     ) -> None:
         if not content:
             msg = self.protocol.create_error_message("请输入聊天内容")
@@ -370,7 +395,7 @@ class CommandHandlers:
             return
 
         host = self._require_host(state)
-        active_conversation_id = self.broker.get_active_conversation_id(
+        active_conversation_id = conversation_id or self.broker.get_active_conversation_id(
             state.id, player_name
         )
         chat_req = self._build_chat_request(
@@ -379,6 +404,7 @@ class CommandHandlers:
             delivery=delivery,
             player_name=player_name,
             conversation_id=active_conversation_id,
+            correlation_id=correlation_id,
         )
         self.broker.ensure_conversation(
             state.id, chat_req.player_name, chat_req.conversation_id
@@ -429,14 +455,37 @@ class CommandHandlers:
     async def handle_ui_chat(
         self,
         state: ConnectionState,
-        player_name: str,
-        message: str,
+        message: UiChatMessage | str,
+        legacy_message: str | None = None,
     ) -> None:
+        """Handle a typed UI chat message without losing its CID.
+
+        ``(state, player_name, message)`` remains accepted for one migration
+        cycle because external Host integrations may call the old method
+        directly.  The SDK callback uses the typed two-argument form.
+        """
+
+        if isinstance(message, UiChatMessage):
+            ui_message = message
+        else:
+            # Legacy positional callback: the first string is the player and
+            # the third argument is the message body.  It has no CID and is
+            # normalized to the default conversation.
+            ui_message = UiChatMessage(
+                msg_id=str(uuid4()),
+                player_name=message,
+                message=legacy_message or "",
+                cid=DEFAULT_CONVERSATION_ID,
+            )
+        player_name = ui_message.player_name
+        message_text = ui_message.message
+        conversation_id = ui_message.conversation_id or DEFAULT_CONVERSATION_ID
         logger.info(
             "ui_chat_received",
             connection_id=str(state.id),
             player=player_name,
-            content_length=len(message),
+            conversation_id=conversation_id,
+            content_length=len(message_text),
         )
 
         if not self.dev_mode and not await self.check_auth(state):
@@ -454,15 +503,103 @@ class CommandHandlers:
 
         await self.broker.send_response(
             state.id,
-            {
-                "type": "ai_response_sync",
-                "player_name": player_name or DEFAULT_PLAYER_DISPLAY_NAME,
-                "role": "user",
-                "text": message,
-            },
+            TextResponseOutbound(
+                player_name=player_name or DEFAULT_PLAYER_DISPLAY_NAME,
+                conversation_id=conversation_id,
+                correlation_id=ui_message.msg_id,
+                response_id=ui_message.msg_id,
+                role="user",
+                text=message_text,
+            ),
         )
         await self.handle_chat(
-            state, message, delivery="tellraw", player_name=player_name
+            state,
+            message_text,
+            delivery="tellraw",
+            player_name=player_name,
+            conversation_id=conversation_id,
+            correlation_id=ui_message.msg_id,
+        )
+
+    async def handle_session_req(
+        self,
+        state: ConnectionState,
+        session_req: SessionRequest | dict[str, Any],
+    ) -> None:
+        """Compatibility wrapper; new callers pass the SDK ``SessionRequest``."""
+
+        raw_session_payload = session_req if isinstance(session_req, dict) else None
+        if raw_session_payload is not None:
+            try:
+                session_req = SessionRequest.model_validate(raw_session_payload)
+            except Exception as exc:  # Keep old public method fail-closed.
+                request_id = str(raw_session_payload.get("request_id") or "invalid")
+                from mcbe_ws_sdk.profiles.mcbews_v1.models import SessionResponse
+
+                response = SessionResponse.failure(
+                    request_id=request_id,
+                    action="status",
+                    code="INVALID_REQUEST",
+                    message=str(exc)[:256],
+                )
+                await self.broker.send_response(
+                    state.id,
+                    SessionResponseOutbound(
+                        player_name=str(
+                            raw_session_payload.get("player_name")
+                            or DEFAULT_PLAYER_DISPLAY_NAME
+                        ),
+                        conversation_id=str(
+                            raw_session_payload.get("cid")
+                            or DEFAULT_CONVERSATION_ID
+                        ),
+                        correlation_id=request_id,
+                        response=response,
+                    ),
+                )
+                return
+        assert isinstance(session_req, SessionRequest)
+        await self.handle_session_request(state, session_req)
+
+    async def handle_session_request(
+        self,
+        state: ConnectionState,
+        request: SessionRequest,
+    ) -> None:
+        """Run a validated SDK session request and enqueue a typed response."""
+
+        lock = self.broker.get_session_lock(
+            state.id,
+            request.player_name,
+            request.conversation_id,
+        )
+        async with lock:
+            result = await self.conversation_operations.execute(
+                state.id,
+                player_name=request.player_name,
+                action=request.action,
+                conversation_id=request.conversation_id,
+                saved_session_id=request.saved_session_id,
+            )
+        from mcbe_ws_sdk.profiles.mcbews_v1.models import SessionError, SessionResponse
+
+        response = SessionResponse(
+            request_id=request.request_id,
+            action=request.action,
+            ok=result.ok,
+            data=result.data if result.ok else None,
+            error=None
+            if result.ok
+            else SessionError(code=result.code, message=result.message[:256]),
+        )
+        await self.broker.send_response(
+            state.id,
+            SessionResponseOutbound(
+                player_name=request.player_name,
+                conversation_id=request.conversation_id,
+                correlation_id=request.request_id,
+                response=response,
+            ),
         )
 
     # -- context / conversation ----------------------------------------------------
@@ -589,179 +726,45 @@ class CommandHandlers:
     async def _handle_conversation(
         self, state: ConnectionState, option: str, player_name: str | None = None
     ) -> TellrawMessage:
-        from services.agent.runtime import get_agent_runtime
-
-        conv_manager = get_agent_runtime().get_conversation_manager(self.broker, self.settings)
-        host = self._require_host(state)
-        session = host.get_player_session(player_name)
-        actor = player_name or session.player_name
-
         parts = option.strip().split(None, 1) if option.strip() else []
-        action = parts[0].lower() if parts else "状态"
+        raw_action = parts[0].lower() if parts else "status"
         arg = parts[1].strip() if len(parts) > 1 else ""
-        conversation_id = self.broker.get_active_conversation_id(state.id, actor)
-
-        if action in ("new", "新建", "创建"):
-            new_id = self._generate_unique_conversation_id(state.id, actor, arg)
-            if new_id is None:
-                target_id = normalize_conversation_id(arg)
-                return self.protocol.create_error_message(
-                    f"对话 {target_id} 已存在，请使用 AGENT 对话 switch {target_id} 切换"
-                )
-            self.broker.bump_conversation_invalidation_epoch(
-                state.id, actor, conversation_id
-            )
-            self.broker.set_active_conversation_id(state.id, actor, new_id)
-            self.broker.set_conversation_history(state.id, actor, [], new_id)
-            metadata = self.broker.ensure_conversation_metadata(state.id, actor, new_id)
-            return self.protocol.create_success_message(
-                f"已新建并切换到对话: #{metadata.short_id} {new_id}"
-            )
-        if action in ("switch", "切换"):
-            if not arg:
-                return self.protocol.create_error_message(
-                    "请指定要切换的对话 ID\n用法: AGENT 对话 switch <ID>"
-                )
-            resolved_id = self.broker.resolve_conversation_short_id(
-                state.id, actor, arg
-            )
-            target_id = normalize_conversation_id(resolved_id or arg)
-            was_existing = self.broker.conversation_exists(state.id, actor, target_id)
-            self.broker.bump_conversation_invalidation_epoch(
-                state.id, actor, conversation_id
-            )
-            if target_id != conversation_id:
-                self.broker.bump_conversation_invalidation_epoch(
-                    state.id, actor, target_id
-                )
-            if not was_existing:
-                self.broker.set_conversation_history(state.id, actor, [], target_id)
-            self.broker.set_active_conversation_id(state.id, actor, target_id)
-            history = self.broker.get_conversation_history(state.id, actor, target_id)
-            turns = self._count_conversation_turns(history)
-            metadata = self.broker.ensure_conversation_metadata(
-                state.id, actor, target_id
-            )
-            display_id = f"#{metadata.short_id} {target_id}"
-            message = (
-                f"已切换到对话: {display_id}（{turns}轮）"
-                if was_existing
-                else f"已创建并切换到新会话: {display_id}"
-            )
-            return self.protocol.create_success_message(message)
-        if action in ("clear", "清除"):
-            self.broker.clear_conversation_history(state.id, actor, conversation_id)
-            self.broker.set_conversation_history(state.id, actor, [], conversation_id)
-            return self.protocol.create_success_message(
-                f"对话 {conversation_id} 的历史已清除"
-            )
-        if action in ("状态", "status", ""):
-            history = self.broker.get_conversation_history(
-                state.id, actor, conversation_id
-            )
-            turns = self._count_conversation_turns(history)
-            context_status = "启用" if session.context_enabled else "关闭"
-            return self.protocol.create_info_message(
-                f"当前对话: {conversation_id}"
-                f"\n对话轮数: {turns}/{self.settings.max_history_turns}"
-                f"\n压缩触发: {self._conversation_compression_status_text()}"
-                f"\n上下文携带: {context_status}"
-            )
-        if action in ("list", "列表"):
-            live_conversations = dict(
-                self.broker.list_player_conversations(state.id, actor)
-            )
-            live_conversations.setdefault(
-                conversation_id,
-                len(
-                    self.broker.get_conversation_history(
-                        state.id, actor, conversation_id
-                    )
-                ),
-            )
-            for conv_id in live_conversations:
-                self.broker.ensure_conversation_metadata(state.id, actor, conv_id)
-            lines = ["当前连接内对话:"]
-            for metadata in self.broker.list_player_conversation_metadata(
-                state.id, actor
-            ):
-                conv_id = metadata.conversation_id
-                message_count = live_conversations.get(
-                    conv_id,
-                    len(
-                        self.broker.get_conversation_history(
-                            state.id, actor, conv_id
-                        )
-                    ),
-                )
-                marker = " *" if conv_id == conversation_id else ""
-                title = metadata.title or "未命名"
-                lines.append(
-                    f"• #{metadata.short_id} {conv_id}{marker} - {title} - {message_count} 条消息"
-                )
-            return self.protocol.create_info_message("\n".join(lines))
-        if action in ("压缩", "compress"):
-            success, result = await conv_manager.check_and_compress(
-                state.id,
-                actor,
-                force=True,
-                conversation_id=conversation_id,
-                provider_name=session.current_provider or self.settings.default_provider,
-            )
-            return (
-                self.protocol.create_success_message(result)
-                if success
-                else self.protocol.create_info_message(result)
-            )
-        if action in ("保存", "save"):
-            success, result = await conv_manager.save_conversation(
-                connection_id=state.id,
-                player_name=actor,
-                provider=session.current_provider or self.settings.default_provider,
-                template=session.current_template,
-                custom_variables=session.custom_variables,
-                conversation_id=conversation_id,
-            )
-            return (
-                self.protocol.create_success_message(f"对话已保存: {result}")
-                if success
-                else self.protocol.create_error_message(result)
-            )
-        if action in ("恢复", "restore"):
-            if not arg:
-                return self.protocol.create_error_message(
-                    "请指定要恢复的会话 ID\n用法: AGENT 对话 restore <保存ID>"
-                )
-            success, result = await conv_manager.restore_conversation(
-                state.id, arg, player_name=actor, conversation_id=conversation_id
-            )
-            return (
-                self.protocol.create_success_message(result)
-                if success
-                else self.protocol.create_error_message(result)
-            )
-        if action in ("已保存", "saved"):
-            conversations = await conv_manager.list_conversations(player_name=actor)
-            list_text = conv_manager.format_conversation_list(conversations)
-            return self.protocol.create_info_message(list_text)
-        if action in ("删除", "delete"):
-            if not arg:
-                return self.protocol.create_error_message(
-                    "请指定要删除的保存会话 ID\n用法: AGENT 对话 delete <保存ID>"
-                )
-            success, result = await conv_manager.delete_conversation(
-                arg, player_name=actor
-            )
-            return (
-                self.protocol.create_success_message(result)
-                if success
-                else self.protocol.create_error_message(result)
-            )
-
-        return self.protocol.create_error_message(
-            "无效选项，请使用: new [ID]/switch <ID>/clear/status/list/"
-            "compress/save/restore <保存ID>/saved/delete <保存ID>"
+        aliases = {
+            "新建": "new",
+            "创建": "new",
+            "切换": "switch",
+            "列表": "list",
+            "状态": "status",
+            "清除": "clear",
+            "压缩": "compress",
+            "保存": "save",
+            "恢复": "restore",
+            "已保存": "saved",
+            "删除": "delete",
+        }
+        action = aliases.get(raw_action, raw_action)
+        active = self.broker.get_active_conversation_id(
+            state.id, player_name or DEFAULT_PLAYER_KEY
         )
+        result = await self.conversation_operations.execute(
+            state.id,
+            player_name=player_name or DEFAULT_PLAYER_KEY,
+            action=action,
+            conversation_id=(arg if action in {"new", "switch"} else active),
+            saved_session_id=(arg if action in {"restore", "delete"} else None),
+        )
+        return self._render_conversation_result(result)
+
+    def _render_conversation_result(
+        self, result: ConversationOperationResult
+    ) -> TellrawMessage:
+        """Render a typed domain result without inspecting color/format fields."""
+
+        if not result.ok:
+            return self.protocol.create_error_message(result.message)
+        if result.action in {"list", "status", "saved", "compress"}:
+            return self.protocol.create_info_message(result.message)
+        return self.protocol.create_success_message(result.message)
 
     def _generate_unique_conversation_id(
         self,
@@ -790,7 +793,7 @@ class CommandHandlers:
             + uuid4().hex[:6]
         )
 
-    def _count_conversation_turns(self, history: list) -> int:
+    def _count_conversation_turns(self, history: list[Any]) -> int:
         turns = 0
         for message in history:
             if hasattr(message, "parts"):
@@ -870,10 +873,10 @@ class CommandHandlers:
             else:
                 msg = self.protocol.create_info_message(f"当前模板: {current}")
         elif content.strip() == "list":
-            templates = manager.list_templates()
+            template_names = manager.list_templates()
             current = manager.get_session_template(connection_id, actor)
             lines = ["可用模板:"]
-            for name in templates:
+            for name in template_names:
                 template = manager.get_template(name)
                 marker = " *" if name == current else ""
                 desc = template.description if template else ""
@@ -892,9 +895,9 @@ class CommandHandlers:
                     f"已切换到模板: {template_name} ({desc})"
                 )
             else:
-                templates = ", ".join(manager.list_templates())
+                available_templates = ", ".join(manager.list_templates())
                 msg = self.protocol.create_error_message(
-                    f"模板不存在: {template_name}\n可用: {templates}"
+                    f"模板不存在: {template_name}\n可用: {available_templates}"
                 )
 
         await self._send_player_reply(
@@ -988,6 +991,7 @@ class CommandHandlers:
         *,
         approved: bool,
         player_name: str | None = None,
+        conversation_id: str | None = None,
     ) -> None:
         """处理 `AGENT 同意|拒绝 [approval_id|对话|永远]`。
 
@@ -997,7 +1001,6 @@ class CommandHandlers:
           - 对话：仅当前对话生效，切换对话后需重新开启
           - 永远：本连接该玩家所有对话生效（切换对话仍生效，断线清零）
         """
-        from services.agent.runtime import get_agent_runtime
 
         source = "tool_approve" if approved else "tool_deny"
         raw = content.strip()
@@ -1006,8 +1009,15 @@ class CommandHandlers:
 
         host = self._require_host(state)
         owner = player_name or DEFAULT_PLAYER_DISPLAY_NAME
-        conversation_id = self.broker.get_active_conversation_id(state.id, owner)
-        store = get_agent_runtime().get_pending_approval_store(self.settings)
+        conversation_id = conversation_id or self.broker.get_active_conversation_id(
+            state.id, owner
+        )
+        # Resolve the runtime at call time.  Besides allowing the runtime to
+        # be replaced during application lifecycle, this keeps the legacy
+        # approval-command seam patchable for embedding hosts/tests.
+        from services.agent.runtime import get_agent_runtime as get_runtime
+
+        store = get_runtime().get_pending_approval_store(self.settings)
 
         # `AGENT 同意 对话|永远` / `AGENT 拒绝 对话|永远`
         scope_tokens = {
@@ -1333,7 +1343,12 @@ class CommandHandlers:
             player_name=owner,
             use_context=pending.use_context,
             provider=pending.provider or session.current_provider,
-            delivery=pending.delivery,  # type: ignore[arg-type]
+            delivery=cast(
+                Literal["tellraw", "scriptevent"],
+                pending.delivery
+                if pending.delivery in {"tellraw", "scriptevent"}
+                else "tellraw",
+            ),
             conversation_id=conversation_id,
             conversation_generation=generation,
             conversation_invalidation_epoch=invalidation_epoch,
@@ -1485,8 +1500,8 @@ class CommandHandlers:
         content: str,
         player_name: str | None = None,
     ) -> None:
-        from services.agent.runtime import get_agent_runtime
         from services.agent.mcp import MCPConnectionStatus
+        from services.agent.runtime import get_agent_runtime
 
         manager = get_agent_runtime().get_mcp_manager(self.settings)
         parts = content.strip().split(None, 1) if content.strip() else []
@@ -1542,9 +1557,9 @@ class CommandHandlers:
                 else:
                     success = manager.reload_toolset(arg)
                     if success:
-                        from services.agent.runtime import get_agent_runtime
+                        from services.agent.runtime import get_agent_runtime as get_runtime
 
-                        get_agent_runtime().refresh_mcp_tools(self.settings)
+                        get_runtime().refresh_mcp_tools(self.settings)
                         msg = self.protocol.create_success_message(
                             f"服务器 {arg} 配置已重新加载"
                         )

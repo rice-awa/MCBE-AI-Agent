@@ -1,0 +1,7 @@
+{"file":".trellis/tasks/08-10-fix-ui-session-switch-frame/research/root-cause.md","reason":"提供用户原始 SESSION 帧、SDK/Host 稳定复现和 Pydantic 字段存在性探针"}
+{"file":".trellis/spec/backend/session-and-identity.md","reason":"约束 session 请求中的 player_name、conversation_id 与同连接多玩家隔离"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"约束 Host pytest、SDK wheel 隔离契约和 Python 质量门禁"}
+{"file":".trellis/spec/addon/bridge-protocol.md","reason":"约束 MCBEWS/1 session 原子帧、request id 关联与协议版本轴"}
+{"file":".trellis/spec/addon/state-testing-and-build.md","reason":"约束 Addon 玩家 UI 状态、Vitest、lint 与 build 门禁"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"确保复用 SDK 权威协议资产和现有会话边界，不复制契约"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"检查 Addon→SDK→Host 全链路字段、身份和协议投影一致性"}

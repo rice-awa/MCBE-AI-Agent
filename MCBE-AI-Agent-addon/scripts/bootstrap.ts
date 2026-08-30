@@ -1,7 +1,8 @@
 import { system, world } from "@minecraft/server";
-import { registerBridgeRouter } from "./bridge/router";
-import { initializeToolPlayer } from "./bridge/toolPlayer";
+import { activateBridge, registerBridgeRouter } from "./bridge/router";
+import { initializeToolPlayer, sendBridgeResponseChunks } from "./bridge/toolPlayer";
 import { registerResponseSyncHandler } from "./bridge/responseSync";
+import { registerSessionRespHandler } from "./bridge/sessionClient";
 import { registerUiEntry } from "./ui/entry";
 
 const DEBUG = true;
@@ -20,6 +21,7 @@ export function initializeAddonEarly(): void {
   log("initializeAddonEarly: 开始早期初始化...");
   registerBridgeRouter();
   registerResponseSyncHandler();
+  registerSessionRespHandler();
   registerUiEntry();
   log("initializeAddonEarly: 早期初始化完成");
 }
@@ -39,6 +41,7 @@ export function initializeAddonAfterWorldLoad(): void {
     log("init: 尝试初始化 ToolPlayer...");
     try {
       initializeToolPlayer();
+      void activateBridge(sendBridgeResponseChunks);
       log("init: ToolPlayer 初始化成功");
     } catch (error) {
       log(`init: ToolPlayer 初始化失败: ${error instanceof Error ? error.message : String(error)}`);
@@ -61,7 +64,9 @@ export function initializeAddonAfterWorldLoad(): void {
       log("system.run 兜底: 尝试立即初始化...");
       init();
     } catch (error) {
-      log(`system.run 兜底: 初始化失败，等待 worldLoad 事件: ${error instanceof Error ? error.message : String(error)}`);
+      log(
+        `system.run 兜底: 初始化失败，等待 worldLoad 事件: ${error instanceof Error ? error.message : String(error)}`
+      );
     }
   });
 }

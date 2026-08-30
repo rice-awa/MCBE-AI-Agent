@@ -34,7 +34,14 @@ from services.agent.runtime import get_agent_runtime
 from services.agent.title import generate_conversation_title
 from services.agent.tool_results import CommandResult
 from models.constants import DEFAULT_PLAYER_DISPLAY_NAME
-from models.messages import ChatRequest, StreamChunk, SystemNotification
+from models.messages import (
+    ChatRequest,
+    GameMessageOutbound,
+    RunCommandOutbound,
+    StreamChunk,
+    SystemNotification,
+    TextResponseOutbound,
+)
 from models.agent import (
     AgentDependencies,
     ContextInfo,
@@ -614,8 +621,18 @@ class AgentWorker:
             player_name=request.player_name or DEFAULT_PLAYER_DISPLAY_NAME,
             settings=self.settings,
             http_client=self._http_client,
-            send_to_game=self._create_send_callback(connection_id),
-            run_command=self._create_command_callback(connection_id),
+            send_to_game=self._create_send_callback(
+                connection_id,
+                player_name=request.player_name or DEFAULT_PLAYER_DISPLAY_NAME,
+                conversation_id=request.conversation_id,
+                correlation_id=run_id,
+            ),
+            run_command=self._create_command_callback(
+                connection_id,
+                player_name=request.player_name or DEFAULT_PLAYER_DISPLAY_NAME,
+                conversation_id=request.conversation_id,
+                correlation_id=run_id,
+            ),
             addon_bridge=self._create_addon_bridge_client(connection_id),
             provider=request.provider or self.settings.default_provider,
             get_context_info=self._make_context_info_fn(
@@ -1111,12 +1128,19 @@ class AgentWorker:
                     )
 
                     if response_text:
-                        await self.broker.send_response(connection_id, {
-                            "type": "ai_response_sync",
-                            "player_name": request.player_name or DEFAULT_PLAYER_DISPLAY_NAME,
-                            "role": "assistant",
-                            "text": response_text,
-                        })
+                        response_id = str(request.id)
+                        await self.broker.send_response(
+                            connection_id,
+                            TextResponseOutbound(
+                                player_name=request.player_name or DEFAULT_PLAYER_DISPLAY_NAME,
+                                conversation_id=request.conversation_id,
+                                correlation_id=run_id,
+                                response_id=response_id,
+                                role="assistant",
+                                text=response_text,
+                                usage=usage_dict,
+                            ),
+                        )
 
                     return ExecutionResult(
                         status="success",
@@ -1967,20 +1991,47 @@ class AgentWorker:
 
         return cleared_count
 
-    def _create_send_callback(self, connection_id: UUID):
-        """创建发送消息到游戏的回调"""
+    def _create_send_callback(
+        self,
+        connection_id: UUID,
+        *,
+        player_name: str | None = None,
+        conversation_id: str | None = None,
+        correlation_id: str | None = None,
+    ):
+        """创建发送消息到游戏的回调。"""
+
+        owner = player_name or DEFAULT_PLAYER_DISPLAY_NAME
+        cid = conversation_id or "default"
+        corr = correlation_id or str(uuid4())
 
         async def send_to_game(message: str) -> None:
             # 发送到响应队列，由 WebSocket Handler 处理
             await self.broker.send_response(
                 connection_id,
-                {"type": "game_message", "content": message},
+                GameMessageOutbound(
+                    player_name=owner,
+                    conversation_id=cid,
+                    correlation_id=corr,
+                    content=message,
+                ),
             )
 
         return send_to_game
 
-    def _create_command_callback(self, connection_id: UUID):
+    def _create_command_callback(
+        self,
+        connection_id: UUID,
+        *,
+        player_name: str | None = None,
+        conversation_id: str | None = None,
+        correlation_id: str | None = None,
+    ):
         """创建执行命令的回调，返回结构化 CommandResult。"""
+
+        owner = player_name or DEFAULT_PLAYER_DISPLAY_NAME
+        cid = conversation_id or "default"
+        corr = correlation_id or str(uuid4())
 
         async def run_command(command: str) -> CommandResult:
             # 发送到响应队列，由 WebSocket Handler 处理并等待命令结果
@@ -1988,11 +2039,13 @@ class AgentWorker:
             future: asyncio.Future[str] = loop.create_future()
             sent = await self.broker.send_response(
                 connection_id,
-                {
-                    "type": "run_command",
-                    "command": command,
-                    "result_future": future,
-                },
+                RunCommandOutbound(
+                    command=command,
+                    result_future=future,
+                    player_name=owner,
+                    conversation_id=cid,
+                    correlation_id=corr,
+                ),
             )
 
             if not sent:
@@ -2280,6 +2333,7 @@ class AgentWorker:
             )
             store.put(pending)
             approval_ids.append(approval_id)
+            approval_ids_in_batch = len(approval_ids)  # 1-based index
 
             if trace_context is not None:
                 # tool.proposed is already emitted by harness call_tool; worker
@@ -2331,6 +2385,12 @@ class AgentWorker:
                 player_name=request.player_name,
                 target=stream_target or request.player_name,
                 tool_name=call.tool_name,
+                approval_id=approval_id,
+                args_summary=args_summary,
+                approval_reason=meta.get("reason") or "需要确认",
+                batch_id=batch_id,
+                batch_size=len(sibling_ids),
+                batch_index=approval_ids_in_batch,
                 **self._chunk_correlation(request),
             )
             await self.broker.send_response(connection_id, chunk)

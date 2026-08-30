@@ -1,0 +1,4 @@
+{"file": ".trellis/tasks/08-08-ddui-ui-migration/research/server-ui-v2.1.0-ddui-api.md", "reason": "DDUI v2.1.0 新 API（构造函数/Observable 拆分/枚举改名），formAdapter 适配依据"}
+{"file": ".trellis/spec/addon/state-testing-and-build.md", "reason": "UI 状态/DynamicProperty/Vitest 构建规范"}
+{"file": ".trellis/spec/addon/bridge-protocol.md", "reason": "mcbews v1 线协议与分片，responseSync 合并边界"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "source 字段契约与 Python 回写核对"}
