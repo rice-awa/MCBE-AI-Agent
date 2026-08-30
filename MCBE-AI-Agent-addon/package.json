@@ -1,6 +1,6 @@
 {
   "name": "mcbe-ai-agent-addon",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "productName": "MCBE-AI-Agent",
   "description": "Script bridge and in-game UI for MCBE AI Agent",
   "private": true,

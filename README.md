@@ -1,4 +1,4 @@
-# MCBE AI Agent v2.5.0
+# MCBE AI Agent v2.6.0
 
 基于 **PydanticAI** 的 Minecraft Bedrock Edition AI 聊天机器人服务器。这是 [MCBE WebSocket GPT](https://github.com/rice-awa/MCBE_WebSocket_gpt) 项目的完全重构版本：现代化异步架构，WebSocket 连接与 LLM 请求完全解耦，支持多 LLM 提供商、多人会话隔离、Addon 桥接与完整的游戏内命令系统。
 
