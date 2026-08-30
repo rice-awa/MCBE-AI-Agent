@@ -37,6 +37,12 @@ export function registerUiEntry(): void {
       player.sendMessage("MCBE AI Agent: 面板打开失败，请稍后再试。");
     });
   });
+
+  // 玩家下线时清理其打开状态，避免模块级 Map/Set 泄漏与后续误判“面板已打开”。
+  world.afterEvents.playerLeave.subscribe((event) => {
+    lastOpenedTicks.delete(event.playerId);
+    openPanels.delete(event.playerId);
+  });
 }
 
 export async function openAgentUi(player: Player): Promise<void> {

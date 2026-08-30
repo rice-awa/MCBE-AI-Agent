@@ -1,7 +1,7 @@
 import { system, world } from "@minecraft/server";
 import type { Player } from "@minecraft/server";
 
-import { TEXT_RESPONSE_SCRIPT_EVENT_ID } from "./protocol";
+import { RESPONSE_BUFFER_TTL_MS, TEXT_RESPONSE_SCRIPT_EVENT_ID } from "./protocol";
 import {
   BoundedTextResponseAssembler,
   DEFAULT_RESPONSE_ASSEMBLER_LIMITS,
@@ -10,6 +10,7 @@ import {
   type TextResponseChunk,
   type TextResponseMessage,
   type TextResponseRole,
+  type TokenUsage,
 } from "./textResponseAssembler";
 import { appendHistoryItem, createHistoryId } from "../ui/history";
 import type { HistoryItem } from "../ui/history";
@@ -38,6 +39,7 @@ type StreamingState = {
   role: "user" | "assistant";
   assembled: string;
   startedAt: number;
+  lastUpdatedAt: number;
   done: boolean;
   inputTokens: number;
   outputTokens: number;
@@ -50,6 +52,7 @@ const streamingStates = new Map<string, StreamingState>();
 let legacyHandler: TextRespHandler | null = null;
 let typedHandler: TextResponseMessageHandler | null = null;
 let isRegistered = false;
+const STREAMING_STATE_TTL_MS = RESPONSE_BUFFER_TTL_MS;
 
 export function setTextRespHandler(handler: TextRespHandler): void {
   legacyHandler = handler;
@@ -71,17 +74,22 @@ export function setActiveUiState(playerId: string, uiState: AgentUiStateV2 | Age
  */
 export function clearActiveUiState(playerId: string): void {
   const uiState = activeUiStates.get(playerId);
-  const playerName =
-    activePlayerNames.get(playerId) ?? world.getAllPlayers().find((player) => player.id === playerId)?.name;
+  const player = world.getAllPlayers().find((candidate) => candidate.id === playerId);
+  const playerName = activePlayerNames.get(playerId) ?? player?.name;
   if (playerName) assembler.clearForPlayer(playerName);
 
+  let dirty = false;
   for (const [key, streamState] of streamingStates) {
     if (streamState.playerId !== playerId && streamState.playerName !== playerName) continue;
     if (uiState && !streamState.done && streamState.assembled) {
       finalizeStreamItem(uiState, streamState);
+      dirty = true;
     } else {
       streamingStates.delete(key);
     }
+  }
+  if (dirty && player && uiState && isV2State(uiState)) {
+    saveAgentUiState(player, uiState);
   }
   activeUiStates.delete(playerId);
   activePlayerNames.delete(playerId);
@@ -193,6 +201,7 @@ function updateStreamingPreview(
   content: string
 ): void {
   state.assembled = content;
+  state.lastUpdatedAt = Date.now();
   if (!activeState || state.conversationId !== (activeState.activeConversationId ?? "default")) return;
   activeState.isStreaming = true;
   activeState.streamingConversationId = state.conversationId;
@@ -257,7 +266,11 @@ function normalizeApprovalInfo(value: unknown, message: TextResponseMessage): Ap
   };
 }
 
-function handleApproval(message: TextResponseMessage, activeState: AgentUiStateV2 | AgentUiState | undefined): void {
+function handleApproval(
+  message: TextResponseMessage,
+  activeState: AgentUiStateV2 | AgentUiState | undefined,
+  player: Player | undefined
+): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(message.content);
@@ -265,9 +278,15 @@ function handleApproval(message: TextResponseMessage, activeState: AgentUiStateV
     return;
   }
   const approvalInfo = normalizeApprovalInfo(parsed, message);
-  if (!approvalInfo || !activeState || !isV2State(activeState)) return;
-  activeState.pendingApprovals.set(approvalInfo.approval_id, approvalInfo);
-  activeState.refreshConversation?.();
+  if (!approvalInfo) return;
+  if (activeState && isV2State(activeState)) {
+    activeState.pendingApprovals.set(approvalInfo.approval_id, approvalInfo);
+    activeState.refreshConversation?.();
+  } else if (player) {
+    const persisted = loadAgentUiState(player);
+    persisted.pendingApprovals.set(approvalInfo.approval_id, approvalInfo);
+    saveAgentUiState(player, persisted);
+  }
 }
 
 function notifyResponseHandlers(message: TextResponseMessage): void {
@@ -275,13 +294,22 @@ function notifyResponseHandlers(message: TextResponseMessage): void {
   legacyHandler?.(message.playerName, message.role, message.content);
 }
 
+function pruneStreamingStates(now: number): void {
+  for (const [key, state] of streamingStates) {
+    if (now - state.lastUpdatedAt >= STREAMING_STATE_TTL_MS) {
+      streamingStates.delete(key);
+    }
+  }
+}
+
 function handleChunk(chunk: TextResponseChunk): void {
+  pruneStreamingStates(Date.now());
   const owner = getActiveState(chunk.p);
   const result = assembler.push(chunk);
   if (chunk.r === "approval") {
     if (result) {
       notifyResponseHandlers(result);
-      handleApproval(result, owner.uiState);
+      handleApproval(result, owner.uiState, owner.player);
     }
     return;
   }
@@ -299,6 +327,7 @@ function handleChunk(chunk: TextResponseChunk): void {
       role: chunk.r,
       assembled: "",
       startedAt: Date.now(),
+      lastUpdatedAt: Date.now(),
       done: false,
       inputTokens: 0,
       outputTokens: 0,
@@ -326,6 +355,7 @@ function onMessageComplete(
   streamState: StreamingState
 ): void {
   streamState.assembled = message.content;
+  streamState.lastUpdatedAt = Date.now();
   const item = historyItem(message.role === "user" ? "user" : "assistant", message.content, streamState.startedAt);
 
   if (targetPlayer && activeState && !isDuplicateUiUserEcho(activeState, item, message.conversationId)) {
@@ -364,7 +394,7 @@ function onMessageComplete(
     }
   }
 
-  if (targetPlayer) persistToDynamicProperty(targetPlayer, item, message.conversationId, message.title);
+  if (targetPlayer) persistToDynamicProperty(targetPlayer, item, message.conversationId, message.title, message.usage);
   streamingStates.delete(streamState.streamKey);
 }
 
@@ -372,7 +402,8 @@ function persistToDynamicProperty(
   targetPlayer: Player,
   item: HistoryItem,
   conversationId: string,
-  title?: string
+  title?: string,
+  usage?: TokenUsage
 ): void {
   try {
     const uiState = loadAgentUiState(targetPlayer);
@@ -383,6 +414,21 @@ function persistToDynamicProperty(
     if (item.role === "assistant") uiState.bridgeStatus.setData("ready");
     const preview = item.content.length > 100 ? `${item.content.slice(0, 100)}...` : item.content;
     uiState.lastResponsePreview.setData(preview);
+    // 当 UI 已关闭（无 activeState）时，onMessageComplete 不会更新内存 stats，这里单独累计 token。
+    if (!activeUiStates.has(targetPlayer.id) && usage) {
+      const inputTokens = usage.i ?? 0;
+      const outputTokens = usage.o ?? 0;
+      const total = inputTokens + outputTokens;
+      uiState.stats = {
+        ...uiState.stats,
+        totalInputTokens: uiState.stats.totalInputTokens + inputTokens,
+        totalOutputTokens: uiState.stats.totalOutputTokens + outputTokens,
+        totalTokensCombined: uiState.stats.totalTokensCombined + total,
+        sessionInputTokens: uiState.stats.sessionInputTokens + inputTokens,
+        sessionOutputTokens: uiState.stats.sessionOutputTokens + outputTokens,
+        sessionTokensCombined: uiState.stats.sessionTokensCombined + total,
+      };
+    }
     saveAgentUiState(targetPlayer, uiState);
   } catch {
     // DynamicProperty is an external boundary; the in-memory response is valid.

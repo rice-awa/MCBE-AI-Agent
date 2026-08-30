@@ -10,7 +10,7 @@ import {
   setTextRespHandler,
   setTextResponseMessageHandler,
 } from "../../scripts/bridge/responseSync";
-import { AGENT_UI_STATE_PROPERTY_KEY, saveAgentUiState } from "../../scripts/ui/storage";
+import { AGENT_UI_STATE_PROPERTY_KEY, MAX_CONVERSATIONS, saveAgentUiState } from "../../scripts/ui/storage";
 import { createAgentUiStateV2 } from "../../scripts/ui/state";
 
 const PLAYER_ID = "player-1";
@@ -208,6 +208,81 @@ describe("response sync", () => {
       expect.objectContaining({ playerName: PLAYER_NAME, conversationId: "chat-a", content: "完成" })
     );
     expect(legacy).toHaveBeenCalledWith(PLAYER_NAME, "assistant", "完成");
+  });
+
+  it("persists pending approvals when the UI is closed", () => {
+    const player = createFakePlayer();
+    __setMockPlayers([player]);
+    registerResponseSyncHandler();
+
+    __emitScriptEvent({
+      id: TEXT_RESP_MESSAGE_ID,
+      message: JSON.stringify({
+        id: "approval-closed-1",
+        i: 1,
+        n: 1,
+        p: PLAYER_NAME,
+        r: "approval",
+        cid: "chat-a",
+        c: JSON.stringify({ approval_id: "ap-closed-1", tool_name: "run_world_command" }),
+      }),
+    });
+
+    const persisted = JSON.parse(String(player.getDynamicProperty(AGENT_UI_STATE_PROPERTY_KEY)));
+    expect(persisted.pendingApprovals).toHaveLength(1);
+    expect(persisted.pendingApprovals[0]).toMatchObject({
+      approval_id: "ap-closed-1",
+      player_name: PLAYER_NAME,
+      cid: "chat-a",
+      conversation_id: "chat-a",
+    });
+    clearActiveUiState(PLAYER_ID);
+  });
+
+  it("accumulates token stats when the UI is closed", () => {
+    const player = createFakePlayer();
+    __setMockPlayers([player]);
+    registerResponseSyncHandler();
+
+    __emitScriptEvent({
+      id: TEXT_RESP_MESSAGE_ID,
+      message: JSON.stringify({
+        id: "stats-closed-1",
+        i: 1,
+        n: 1,
+        p: PLAYER_NAME,
+        r: "assistant",
+        c: "无面板回复",
+        cid: "chat-a",
+        u: { i: 2, o: 3 },
+      }),
+    });
+
+    const persisted = JSON.parse(String(player.getDynamicProperty(AGENT_UI_STATE_PROPERTY_KEY)));
+    expect(persisted.stats.totalInputTokens).toBe(2);
+    expect(persisted.stats.totalOutputTokens).toBe(3);
+    expect(persisted.stats.totalTokensCombined).toBe(5);
+    expect(persisted.stats.sessionInputTokens).toBe(2);
+    expect(persisted.stats.sessionOutputTokens).toBe(3);
+    expect(persisted.stats.sessionTokensCombined).toBe(5);
+  });
+
+  it("caps and filters conversationOrder to the persisted buckets", () => {
+    const player = createFakePlayer();
+    const state = createAgentUiStateV2();
+    for (let index = 0; index < 25; index += 1) {
+      const id = `chat-${index}`;
+      state.conversations[id] = { id, shortId: index, title: `c${index}`, history: [], lastActiveAt: index };
+      state.conversationOrder.push(id);
+    }
+    state.conversationOrder.push("ghost");
+    saveAgentUiState(player, state);
+
+    const persisted = JSON.parse(String(player.getDynamicProperty(AGENT_UI_STATE_PROPERTY_KEY)));
+    expect(persisted.conversations).toHaveLength(MAX_CONVERSATIONS);
+    expect(persisted.conversationOrder).toHaveLength(MAX_CONVERSATIONS);
+    expect(persisted.conversationOrder).not.toContain("ghost");
+    expect(persisted.conversationOrder.slice(-1)[0]).toBe("chat-18");
   });
 });
 

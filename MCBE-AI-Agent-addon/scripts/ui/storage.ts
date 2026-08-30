@@ -1,4 +1,4 @@
-import type { AgentUiSettingsV2, AgentUiStateV2, BridgeStatus, ConversationBucket } from "./state";
+import type { AgentUiSettingsV2, AgentUiStateV2, ApprovalInfo, BridgeStatus, ConversationBucket } from "./state";
 import { createAgentUiStateV2 } from "./state";
 import { DDUI_PERSISTENCE_VERSION } from "../bridge/protocol";
 import type { HistoryItem } from "./history";
@@ -51,6 +51,7 @@ type PersistedAgentUiStateV2 = {
   settings: Partial<AgentUiSettingsV2>;
   stats?: Partial<AgentUiStats>;
   bridgeStatus?: BridgeStatus;
+  pendingApprovals?: ApprovalInfo[];
 };
 
 export type SaveAgentUiStateResult = { ok: true } | { ok: false; error: unknown };
@@ -109,6 +110,7 @@ export function loadAgentUiState(owner: DynamicPropertyOwner): AgentUiStateV2 {
         activeHistoryLen
       ),
     };
+    state.pendingApprovals = normalizeApprovals(v2.pendingApprovals);
 
     return state;
   } catch {
@@ -155,6 +157,21 @@ function normalizeBridgeStatus(status: unknown): BridgeStatus | undefined {
     status === "error"
     ? status
     : undefined;
+}
+
+/**
+ * Normalize persisted pending approvals (array) into a Map keyed by approval_id.
+ */
+function normalizeApprovals(value: unknown): Map<string, ApprovalInfo> {
+  const map = new Map<string, ApprovalInfo>();
+  if (!Array.isArray(value)) return map;
+  for (const entry of value) {
+    if (entry === null || typeof entry !== "object") continue;
+    const candidate = entry as Partial<ApprovalInfo>;
+    if (typeof candidate.approval_id !== "string" || !candidate.approval_id.trim()) continue;
+    map.set(candidate.approval_id, candidate as ApprovalInfo);
+  }
+  return map;
 }
 
 function normalizeSettingsV2(settings: Partial<AgentUiSettingsV2> | undefined): AgentUiSettingsV2 {
@@ -261,14 +278,17 @@ export function saveAgentUiState(owner: DynamicPropertyOwner, state: AgentUiStat
       if (buckets.length >= MAX_CONVERSATIONS) break;
     }
 
+    const persistedIds = buckets.map((bucket) => bucket.id);
+    const order = state.conversationOrder.filter((id) => persistedIds.includes(id)).slice(0, MAX_CONVERSATIONS);
     const persisted: PersistedAgentUiStateV2 = {
       version: DDUI_PERSISTENCE_STATE_VERSION,
       activeConversationId: state.activeConversationId,
       conversations: buckets,
-      conversationOrder: state.conversationOrder,
+      conversationOrder: order.length > 0 ? order : ["default"],
       settings: state.settings,
       stats: state.stats,
       bridgeStatus: state.bridgeStatus.getData(),
+      pendingApprovals: Array.from(state.pendingApprovals.values()),
     };
 
     owner.setDynamicProperty(AGENT_UI_STATE_PROPERTY_KEY, JSON.stringify(persisted));
