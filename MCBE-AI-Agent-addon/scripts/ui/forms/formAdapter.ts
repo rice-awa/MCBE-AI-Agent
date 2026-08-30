@@ -39,7 +39,7 @@ export type DduiCustomForm = {
     options?: { description?: string; step?: number }
   ): DduiCustomForm;
   dropdown(label: string, value: DduiObservable<number>, options: DduiDropdownOption<number>[]): DduiCustomForm;
-  button(label: string, callback: () => void, options?: { tooltip?: string }): DduiCustomForm;
+  button(label: string | DduiObservable<string>, callback: () => void, options?: { tooltip?: string }): DduiCustomForm;
   show(): Promise<unknown>;
 };
 

@@ -32,6 +32,7 @@ export async function showAgentConsole(player: Player, uiState: AgentUiStateV2):
     const statusLine = createDduiObservable(buildStatusLine(uiState));
     const conversationBody = createDduiObservable(buildConversationBody(uiState));
     const messageValue = createDduiObservable("");
+    const approvalStatusLine = createDduiObservable(buildApprovalStatusLine(uiState));
     let nextRoute: AgentPanelRoute = MAIN_ROUTE;
 
     // ── Refresh function (injected into uiState for external calls) ──
@@ -39,6 +40,7 @@ export async function showAgentConsole(player: Player, uiState: AgentUiStateV2):
       titleLine.setData(buildTitleLine(uiState));
       statusLine.setData(buildStatusLine(uiState));
       conversationBody.setData(buildConversationBody(uiState));
+      approvalStatusLine.setData(buildApprovalStatusLine(uiState));
     };
     uiState.refreshConversation = refreshConversation;
 
@@ -176,40 +178,38 @@ export async function showAgentConsole(player: Player, uiState: AgentUiStateV2):
       .spacer()
       .divider();
 
-    // Approval controls are scoped to this player's pending records.
-    if (uiState.pendingApprovals.size > 0) {
-      form
-        .spacer()
-        .label(createDduiObservable(buildApprovalStatusLine(uiState)))
-        .button("同意", () => {
-          const first = uiState.pendingApprovals.values().next().value;
-          if (!first) {
-            player.sendMessage("MCBE AI Agent: 当前没有待审批的工具调用。");
-            return;
-          }
-          void sendApprovalDecision(first.player_name, first.cid, first.approval_id, "approve")
-            .then(() => {
-              uiState.pendingApprovals.delete(first.approval_id);
-              refreshConversation();
-            })
-            .catch(() => player.sendMessage("MCBE AI Agent: 审批发送失败，请稍后重试。"));
-        })
-        .button("拒绝", () => {
-          const first = uiState.pendingApprovals.values().next().value;
-          if (!first) {
-            player.sendMessage("MCBE AI Agent: 当前没有待审批的工具调用。");
-            return;
-          }
-          void sendApprovalDecision(first.player_name, first.cid, first.approval_id, "deny")
-            .then(() => {
-              uiState.pendingApprovals.delete(first.approval_id);
-              refreshConversation();
-            })
-            .catch(() => player.sendMessage("MCBE AI Agent: 审批发送失败，请稍后重试。"));
-        })
-        .spacer()
-        .divider();
-    }
+    // 审批段常驻：无论当前是否已有待审批项都构建，审批到达后通过 observable 原地更新
+    form
+      .spacer()
+      .label(approvalStatusLine)
+      .button("同意", () => {
+        const first = uiState.pendingApprovals.values().next().value;
+        if (!first) {
+          player.sendMessage("MCBE AI Agent: 当前没有待审批的工具调用。");
+          return;
+        }
+        void sendApprovalDecision(first.player_name, first.cid, first.approval_id, "approve")
+          .then(() => {
+            uiState.pendingApprovals.delete(first.approval_id);
+            refreshConversation();
+          })
+          .catch(() => player.sendMessage("MCBE AI Agent: 审批发送失败，请稍后重试。"));
+      })
+      .button("拒绝", () => {
+        const first = uiState.pendingApprovals.values().next().value;
+        if (!first) {
+          player.sendMessage("MCBE AI Agent: 当前没有待审批的工具调用。");
+          return;
+        }
+        void sendApprovalDecision(first.player_name, first.cid, first.approval_id, "deny")
+          .then(() => {
+            uiState.pendingApprovals.delete(first.approval_id);
+            refreshConversation();
+          })
+          .catch(() => player.sendMessage("MCBE AI Agent: 审批发送失败，请稍后重试。"));
+      })
+      .spacer()
+      .divider();
 
     // ── Show form ──
     const shown = await showCustomFormSafely(player, form);

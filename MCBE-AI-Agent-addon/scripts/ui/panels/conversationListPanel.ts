@@ -1,6 +1,7 @@
 import type { Player } from "@minecraft/server";
 
 import { createCustomForm, createDduiObservable, showCustomFormSafely } from "../forms/formAdapter";
+import type { DduiObservable } from "../forms/formAdapter";
 import type { AgentUiStateV2 } from "../state";
 import { saveAgentUiState } from "../storage";
 import { formatResponseError, requestSession } from "../../bridge/sessionClient";
@@ -46,6 +47,33 @@ export async function showConversationListPanel(player: Player, uiState: AgentUi
       pageInfo.setData(formatPageInfo(localConversations, currentPage));
     };
 
+    // 固定数量按钮槽：每页 PAGE_SIZE 个会话槽，翻页时原地更新 label/target
+    const slots: { label: DduiObservable<string>; target: SessionConversationInfo | null }[] = [];
+    for (let i = 0; i < PAGE_SIZE; i++) {
+      slots.push({ label: createDduiObservable(""), target: null });
+    }
+
+    const renderPage = () => {
+      const start = currentPage * PAGE_SIZE;
+      const pageItems = localConversations.slice(start, start + PAGE_SIZE);
+      for (let i = 0; i < PAGE_SIZE; i++) {
+        const slot = slots[i];
+        const conv = pageItems[i];
+        if (conv) {
+          slot.target = conv;
+          slot.label.setData(
+            `#${conv.short_id} · ${conv.title || "未命名"} · ${conv.message_count}轮${conv.is_active ? " ★" : ""}`
+          );
+        } else {
+          slot.target = null;
+          slot.label.setData("（无）");
+        }
+      }
+    };
+
+    // 初始化时绑定当前页
+    renderPage();
+
     const form = createCustomForm(player, "会话列表")
       .closeButton()
       .label(pageInfo)
@@ -55,11 +83,40 @@ export async function showConversationListPanel(player: Player, uiState: AgentUi
       .label(page)
       .spacer()
       .divider()
+      .spacer();
+
+    // 会话按钮槽（固定数量，可点击切换）
+    for (const slot of slots) {
+      form.button(slot.label, () => {
+        const switchConv = async () => {
+          if (!slot.target) {
+            player.sendMessage("MCBE AI Agent: 该位置暂无会话。");
+            return;
+          }
+          const switchResp = await requestSession("switch", {
+            cid: slot.target.id,
+            player_name: player.name,
+          });
+          if (switchResp.ok) {
+            // Switch active conversation in local state
+            uiState.activeConversationId = slot.target.id;
+            saveAgentUiState(player, uiState);
+          } else {
+            player.sendMessage(`MCBE AI Agent: 切换会话失败: ${formatResponseError(switchResp.error)}`);
+          }
+          form.close();
+        };
+        void switchConv();
+      });
+    }
+
+    form
       .spacer()
       .button("上一页", () => {
         if (currentPage > 0) {
           currentPage--;
           refreshPage();
+          renderPage();
         } else {
           player.sendMessage("MCBE AI Agent: 已是第一页。");
         }
@@ -69,6 +126,7 @@ export async function showConversationListPanel(player: Player, uiState: AgentUi
         if (currentPage < totalPages - 1) {
           currentPage++;
           refreshPage();
+          renderPage();
         } else {
           player.sendMessage("MCBE AI Agent: 已是最后一页。");
         }
@@ -106,30 +164,6 @@ export async function showConversationListPanel(player: Player, uiState: AgentUi
         saveAgentUiState(player, uiState);
         form.close();
       });
-
-    // Add per-session clickable buttons (current page items)
-    const start = currentPage * PAGE_SIZE;
-    const pageItems = localConversations.slice(start, start + PAGE_SIZE);
-    for (const conv of pageItems) {
-      const label = `#${conv.short_id} · ${conv.title || "未命名"} · ${conv.message_count}轮${conv.is_active ? " ★" : ""}`;
-      form.button(label, () => {
-        const switchConv = async () => {
-          const switchResp = await requestSession("switch", {
-            cid: conv.id,
-            player_name: player.name,
-          });
-          if (switchResp.ok) {
-            // Switch active conversation in local state
-            uiState.activeConversationId = conv.id;
-            saveAgentUiState(player, uiState);
-          } else {
-            player.sendMessage(`MCBE AI Agent: 切换会话失败: ${formatResponseError(switchResp.error)}`);
-          }
-          form.close();
-        };
-        void switchConv();
-      });
-    }
 
     const shown = await showCustomFormSafely(player, form);
     if (!shown.ok || shown.closedByUser) {

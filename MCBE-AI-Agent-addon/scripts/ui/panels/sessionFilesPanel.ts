@@ -1,6 +1,12 @@
 import type { Player } from "@minecraft/server";
 
-import { createCustomForm, createDduiObservable, showCustomFormSafely } from "../forms/formAdapter";
+import {
+  createActionForm,
+  createCustomForm,
+  createDduiObservable,
+  showActionFormSafely,
+  showCustomFormSafely,
+} from "../forms/formAdapter";
 import type { AgentUiStateV2 } from "../state";
 import { saveAgentUiState } from "../storage";
 import { formatResponseError, requestSession } from "../../bridge/sessionClient";
@@ -20,15 +26,12 @@ export async function showSessionFilesPanel(player: Player, uiState: AgentUiStat
     const saveStatus = createDduiObservable("");
     const listBody = createDduiObservable("");
 
-    // Delete confirm state: session_id of entry pending deletion
-    let pendingDeleteId: string | null = null;
-
     // Fetch saved sessions list
     const fetchSaved = async () => {
       const resp = await requestSession("saved", { player_name: player.name });
       if (resp.ok && Array.isArray(resp.data?.saved)) {
         const saved = resp.data.saved as SessionSavedInfo[];
-        listBody.setData(formatSavedList(saved, 0, PAGE_SIZE, pendingDeleteId));
+        listBody.setData(formatSavedList(saved, 0, PAGE_SIZE));
       } else {
         listBody.setData(resp.ok ? "暂无保存的会话。" : "会话同步不可用。");
       }
@@ -48,7 +51,10 @@ export async function showSessionFilesPanel(player: Player, uiState: AgentUiStat
       .divider()
       .spacer()
       .button("保存当前会话", async () => {
-        const resp = await requestSession("save", { player_name: player.name });
+        const resp = await requestSession("save", {
+          player_name: player.name,
+          cid: uiState.activeConversationId,
+        });
         if (resp.ok && resp.data?.session_id) {
           const sid = resp.data.session_id as string;
           saveStatus.setData(`✅ 已保存: ${sid}`);
@@ -81,61 +87,50 @@ export async function showSessionFilesPanel(player: Player, uiState: AgentUiStat
 
     for (const item of pageItems) {
       const displayLabel = `${item.title || "未命名"} · ${item.message_count}条 · ${item.updated_at.slice(0, 16)}`;
-
-      if (pendingDeleteId === item.session_id) {
-        // Show confirm delete prompt
-        form
-          .label(`⚠ 确认删除? [${item.title || "未命名"}]`)
-          .button("确认删除", () => {
-            const doDelete = async () => {
-              const delResp = await requestSession("delete", {
-                sid: item.session_id,
-                player_name: player.name,
-              });
-              if (delResp.ok) {
-                player.sendMessage("MCBE AI Agent: 已删除会话。");
-                await fetchSaved();
-              } else {
-                player.sendMessage(`MCBE AI Agent: 删除失败: ${formatResponseError(delResp.error)}`);
-              }
-              pendingDeleteId = null;
-              nextRoute = MAIN_ROUTE;
-              form.close();
-            };
-            void doDelete();
-          })
-          .button("取消", () => {
-            pendingDeleteId = null;
-            // Re-fetch to refresh display
-            void fetchSaved();
+      form
+        .label(displayLabel)
+        .button("恢复", () => {
+          const doRestore = async () => {
+            const restoreResp = await requestSession("restore", {
+              sid: item.session_id,
+              player_name: player.name,
+            });
+            if (restoreResp.ok) {
+              player.sendMessage("MCBE AI Agent: 会话已恢复。");
+              saveAgentUiState(player, uiState);
+            } else {
+              player.sendMessage(`MCBE AI Agent: 恢复失败: ${formatResponseError(restoreResp.error)}`);
+            }
+            nextRoute = MAIN_ROUTE;
             form.close();
-          });
-      } else {
-        form
-          .label(displayLabel)
-          .button("恢复", () => {
-            const doRestore = async () => {
-              const restoreResp = await requestSession("restore", {
-                sid: item.session_id,
-                player_name: player.name,
-              });
-              if (restoreResp.ok) {
-                player.sendMessage("MCBE AI Agent: 会话已恢复。");
-                saveAgentUiState(player, uiState);
-              } else {
-                player.sendMessage(`MCBE AI Agent: 恢复失败: ${formatResponseError(restoreResp.error)}`);
-              }
-              nextRoute = MAIN_ROUTE;
+          };
+          void doRestore();
+        })
+        .button("删除", () => {
+          const confirmDelete = async () => {
+            const confirmResp = await showActionFormSafely(
+              player,
+              createActionForm("确认删除", `确定要删除会话「${item.title || "未命名"}」吗？`)
+                .button("删除")
+                .button("取消")
+            );
+            if (!confirmResp || confirmResp.selection !== 0) {
+              return;
+            }
+            const delResp = await requestSession("delete", {
+              sid: item.session_id,
+              player_name: player.name,
+            });
+            if (delResp.ok) {
+              player.sendMessage("MCBE AI Agent: 已删除会话。");
+              nextRoute = { panel: "sessionFiles" };
               form.close();
-            };
-            void doRestore();
-          })
-          .button("删除", () => {
-            pendingDeleteId = item.session_id;
-            void fetchSaved();
-            form.close();
-          });
-      }
+            } else {
+              player.sendMessage(`MCBE AI Agent: 删除失败: ${formatResponseError(delResp.error)}`);
+            }
+          };
+          void confirmDelete();
+        });
     }
 
     const shown = await showCustomFormSafely(player, form);
@@ -152,12 +147,7 @@ export async function showSessionFilesPanel(player: Player, uiState: AgentUiStat
   }
 }
 
-function formatSavedList(
-  saved: SessionSavedInfo[],
-  pageIndex: number,
-  _pageSize: number,
-  _pendingDeleteId: string | null
-): string {
+function formatSavedList(saved: SessionSavedInfo[], pageIndex: number, _pageSize: number): string {
   if (saved.length === 0) {
     return "暂无保存的会话。";
   }

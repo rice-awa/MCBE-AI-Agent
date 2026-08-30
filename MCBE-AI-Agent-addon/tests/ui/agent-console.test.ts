@@ -51,7 +51,15 @@ describe("agent console panel", () => {
       ?.getComponents()
       .filter((component) => component.startsWith("button:"));
 
-    expect(buttons).toEqual(["button:切换", "button:发送", "button:新会话", "button:全部对话", "button:更多"]);
+    expect(buttons).toEqual([
+      "button:切换",
+      "button:发送",
+      "button:新会话",
+      "button:全部对话",
+      "button:更多",
+      "button:同意",
+      "button:拒绝",
+    ]);
   });
 
   it("routes to the conversation list from the 切换 button", async () => {
